@@ -8,6 +8,7 @@ from typing import Annotated, NoReturn
 
 import pandas as pd
 import typer
+import uvicorn
 
 from fraud_detection.data import (
     DEFAULT_TARGET,
@@ -178,6 +179,25 @@ def inspect_command(
     except ModelArtifactError as exc:
         _abort(str(exc))
     typer.echo(json.dumps(model.metadata, indent=2, sort_keys=True))
+
+
+@app.command("serve")
+def serve_command(
+    model_path: Annotated[
+        Path,
+        typer.Argument(exists=True, readable=True, help="Model file or artifact directory."),
+    ],
+    host: Annotated[str, typer.Option(help="Interface to bind.")] = "127.0.0.1",
+    port: Annotated[int, typer.Option(min=1, max=65_535, help="TCP port.")] = 8000,
+) -> None:
+    """Run the versioned HTTP prediction service."""
+    from fraud_detection.api import create_app
+
+    try:
+        model = load_model(model_path)
+    except ModelArtifactError as exc:
+        _abort(str(exc))
+    uvicorn.run(create_app(model=model), host=host, port=port)
 
 
 def _abort(message: str) -> NoReturn:
