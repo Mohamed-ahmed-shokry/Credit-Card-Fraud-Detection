@@ -251,6 +251,11 @@ def train_model(
         false_positive_cost=settings.false_positive_cost,
         false_negative_cost=settings.false_negative_cost,
     )
+    feature_effects = _extract_feature_effects(
+        estimator,
+        dataset.feature_names,
+        calibration_method=settings.calibration_method,
+    )
 
     metadata: dict[str, Any] = {
         "artifact_version": ARTIFACT_VERSION,
@@ -282,6 +287,7 @@ def train_model(
         },
         "training_config": asdict(settings),
         "reference_profile": build_reference_profile(features_train),
+        "feature_effects": feature_effects,
         "validation_metrics": validation_metrics_payload,
         "test_metrics": test_metrics_payload,
     }
@@ -403,6 +409,42 @@ def _dataset_fingerprint(dataset: ValidatedDataset) -> str:
     digest.update(cast(np.ndarray, feature_hash).tobytes())
     digest.update(cast(np.ndarray, target_hash).tobytes())
     return digest.hexdigest()
+
+
+def _extract_feature_effects(
+    estimator: Any,
+    feature_names: tuple[str, ...],
+    *,
+    calibration_method: CalibrationMethod,
+) -> list[dict[str, str | float | int]]:
+    if calibration_method is CalibrationMethod.NONE:
+        fitted_pipelines = [estimator]
+    else:
+        fitted_pipelines = [
+            calibrated_classifier.estimator
+            for calibrated_classifier in estimator.calibrated_classifiers_
+        ]
+
+    coefficient_rows = [
+        np.asarray(pipeline.named_steps["classifier"].coef_[0], dtype=float)
+        for pipeline in fitted_pipelines
+    ]
+    mean_coefficients = np.mean(np.vstack(coefficient_rows), axis=0)
+    ranked = sorted(
+        zip(feature_names, mean_coefficients, strict=True),
+        key=lambda item: abs(item[1]),
+        reverse=True,
+    )
+    return [
+        {
+            "rank": rank,
+            "feature": feature,
+            "coefficient": float(coefficient),
+            "absolute_effect": float(abs(coefficient)),
+            "direction": ("higher_fraud_risk" if coefficient >= 0 else "lower_fraud_risk"),
+        }
+        for rank, (feature, coefficient) in enumerate(ranked, start=1)
+    ]
 
 
 def _ensure_split_capacity(target: pd.Series, config: TrainingConfig) -> None:

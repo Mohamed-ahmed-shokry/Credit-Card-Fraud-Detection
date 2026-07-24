@@ -48,6 +48,17 @@ def test_train_model_produces_reproducible_model_card(
     assert model.artifact_version == ARTIFACT_VERSION
     assert len(model.metadata["dataset_fingerprint"]) == 64
     assert len(model.metadata["reference_profile"]) == 30
+    effects = model.metadata["feature_effects"]
+    assert len(effects) == 30
+    assert [effect["rank"] for effect in effects] == list(range(1, 31))
+    assert all(
+        effects[index]["absolute_effect"] >= effects[index + 1]["absolute_effect"]
+        for index in range(len(effects) - 1)
+    )
+    assert {effect["direction"] for effect in effects} <= {
+        "higher_fraud_risk",
+        "lower_fraud_risk",
+    }
 
     repeated = train_model(dataset)
     assert repeated.threshold == pytest.approx(model.threshold)
