@@ -289,6 +289,7 @@ Run the same gates used in CI:
 python -m ruff format --check src tests
 python -m ruff check src tests
 python -m mypy src
+python -m pip_audit --skip-editable
 python -m pytest --cov=fraud_detection --cov-report=term-missing
 python -m build
 ```
