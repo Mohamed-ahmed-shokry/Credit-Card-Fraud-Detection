@@ -239,6 +239,14 @@ Example response:
 
 The service accepts at most 1,000 transactions per request.
 
+Every HTTP response includes:
+
+- `X-Request-ID`, which propagates a safe caller-supplied identifier or generates one;
+- `X-Process-Time-Ms`, the server-side request duration.
+
+Completion and failure logs carry the same request ID for correlation. Request IDs
+are operational labels only and must not contain cardholder or personal data.
+
 ## Monitor feature drift
 
 Compare recent transactions with the training distribution:

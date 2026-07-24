@@ -16,6 +16,8 @@ All notable changes to this project are documented here. The format follows
   model interpretation.
 - Optional chronological train/validation/test evaluation with persisted time ranges
   and safeguards against single-class windows.
+- API request correlation, processing-time response headers, and structured
+  completion/failure log fields.
 
 ### Changed
 
