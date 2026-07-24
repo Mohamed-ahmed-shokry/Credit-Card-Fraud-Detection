@@ -10,6 +10,12 @@ All notable changes to this project are documented here. The format follows
 
 - Validation-only cost-sensitive threshold selection with configurable false-positive
   and false-negative weights plus holdout expected-cost reporting.
+- Cross-validated sigmoid or isotonic probability calibration, optional raw scores,
+  and holdout Brier-score reporting.
+
+### Changed
+
+- Model artifacts now use format version 2 for the calibrated estimator contract.
 
 ## [0.1.0] - 2026-07-24
 

@@ -18,7 +18,9 @@ binary target contains exactly `0` (legitimate) and `1` (fraud).
 - **Imbalance-aware decisions:** class-balanced logistic regression and a threshold
   selected on validation F1 or weighted business cost—not a hard-coded `0.5`.
 - **Relevant metrics:** average precision, ROC AUC, precision, recall, F1, balanced
-  accuracy, and the complete confusion matrix.
+  accuracy, Brier score, and the complete confusion matrix.
+- **Probability calibration:** three-fold sigmoid calibration is fitted inside the
+  training split before validation threshold selection.
 - **Reproducible artifacts:** dataset fingerprint, dependency version, split sizes,
   configuration, metrics, threshold, and feature contract travel with the model.
 - **Safe inference boundary:** missing, extra, non-numeric, null, and infinite
@@ -101,6 +103,20 @@ fraud-detect train Dataset/creditcard.csv \
 The costs are relative weights, not currency. For example, `25` says a missed fraud
 is treated as costly as 25 false alerts. The chosen policy and holdout expected cost
 per transaction are persisted in `metadata.json`.
+
+Scores use three-fold sigmoid calibration by default. Larger representative datasets
+can opt into isotonic calibration, while `none` exposes the underlying classifier
+scores:
+
+```bash
+fraud-detect train Dataset/creditcard.csv \
+  --calibration-method isotonic \
+  --calibration-folds 5
+```
+
+Calibration is learned only from training folds. Brier score is reported on
+validation and untouched test data; lower is better. Calibration improves probability
+interpretation but cannot correct unrepresentative or shifted data.
 
 Training writes:
 
@@ -251,7 +267,7 @@ tests/              # unit, integration, CLI, and API tests
 
 This is a reference implementation, not an autonomous financial decision-maker.
 Real deployments need representative temporal data, validated business-cost inputs,
-monitoring for data/concept drift, calibration analysis, access controls, audit
+monitoring for data/concept drift, ongoing calibration analysis, access controls, audit
 logging, incident response, and human review for consequential decisions.
 
 The anonymized public dataset does not represent every geography, merchant type,
