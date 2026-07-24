@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
-from fraud_detection.api import create_app
+from fraud_detection.api import (
+    MODEL_PATH_ENVIRONMENT_VARIABLE,
+    app_from_environment,
+    create_app,
+)
 from fraud_detection.data import ValidatedDataset, generate_synthetic_data, validate_frame
-from fraud_detection.model import FraudModel, train_model
+from fraud_detection.model import FraudModel, save_model, train_model
 
 
 @pytest.fixture(scope="module")
@@ -89,3 +94,32 @@ def test_openapi_describes_versioned_prediction_endpoint(client: TestClient) -> 
 
     assert document["info"]["version"] == "0.1.0"
     assert "/v1/predict" in document["paths"]
+
+
+def test_environment_factory_loads_persisted_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, model, _ = api_context
+    artifact_directory = tmp_path / "artifact"
+    save_model(model, artifact_directory)
+    monkeypatch.setenv(MODEL_PATH_ENVIRONMENT_VARIABLE, str(artifact_directory))
+
+    with TestClient(app_from_environment()) as environment_client:
+        response = environment_client.get("/health")
+
+    assert response.status_code == 200
+    assert response.json()["model_created_at"] == model.metadata["created_at"]
+
+
+def test_environment_factory_requires_model_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(MODEL_PATH_ENVIRONMENT_VARIABLE, raising=False)
+
+    with (
+        pytest.raises(RuntimeError, match="No model configured"),
+        TestClient(app_from_environment()),
+    ):
+        pass

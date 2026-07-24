@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
+import pytest
 from typer.testing import CliRunner
 
 from fraud_detection.cli import app
@@ -12,7 +14,7 @@ from fraud_detection.model import METADATA_FILENAME, MODEL_FILENAME
 runner = CliRunner()
 
 
-def test_cli_end_to_end(tmp_path: Path) -> None:
+def test_cli_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     data_path = tmp_path / "transactions.csv"
     artifact_path = tmp_path / "artifact"
     predictions_path = tmp_path / "predictions.csv"
@@ -82,6 +84,20 @@ def test_cli_end_to_end(tmp_path: Path) -> None:
     assert prediction_summary["rows"] == 800
     scored = pd.read_csv(predictions_path)
     assert {"fraud_probability", "is_fraud"}.issubset(scored.columns)
+
+    server_call: dict[str, Any] = {}
+
+    def fake_run(application: object, *, host: str, port: int) -> None:
+        server_call.update(application=application, host=host, port=port)
+
+    monkeypatch.setattr("fraud_detection.cli.uvicorn.run", fake_run)
+    served = runner.invoke(
+        app,
+        ["serve", str(artifact_path), "--host", "0.0.0.0", "--port", "9000"],
+    )
+    assert served.exit_code == 0, served.output
+    assert server_call["host"] == "0.0.0.0"
+    assert server_call["port"] == 9000
 
 
 def test_generate_data_protects_existing_file(tmp_path: Path) -> None:
