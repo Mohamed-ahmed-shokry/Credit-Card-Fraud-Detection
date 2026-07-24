@@ -48,8 +48,9 @@ dev = [
 fraud-detect = "fraud_detection.cli:app"
 
 [project.urls]
-Homepage = "https://github.com/"
-Repository = "https://github.com/"
+Homepage = "https://github.com/Mohamed-ahmed-shokry/Credit-Card-Fraud-Detection"
+Issues = "https://github.com/Mohamed-ahmed-shokry/Credit-Card-Fraud-Detection/issues"
+Repository = "https://github.com/Mohamed-ahmed-shokry/Credit-Card-Fraud-Detection.git"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/fraud_detection"]
