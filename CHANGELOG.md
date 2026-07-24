@@ -12,6 +12,8 @@ All notable changes to this project are documented here. The format follows
   and false-negative weights plus holdout expected-cost reporting.
 - Cross-validated sigmoid or isotonic probability calibration, optional raw scores,
   and holdout Brier-score reporting.
+- Persisted, ranked standardized feature effects and an `explain` CLI for global
+  model interpretation.
 
 ### Changed
 

@@ -74,6 +74,7 @@ Run the complete workflow without downloading private data:
 fraud-detect generate-data --output data/demo.csv --rows 5000
 fraud-detect train data/demo.csv --output artifacts/model
 fraud-detect inspect artifacts/model
+fraud-detect explain artifacts/model --top 10
 fraud-detect drift artifacts/model data/demo.csv
 fraud-detect predict artifacts/model data/demo.csv --output predictions.csv
 ```
@@ -135,6 +136,22 @@ fraud-detect train transactions.csv --target is_fraud --output artifacts/model
 
 Every feature column must be numeric and finite. The target must contain both `0`
 and `1`, with enough examples of each class for all three stratified splits.
+
+## Explain global feature effects
+
+Show the strongest standardized logistic-regression effects:
+
+```bash
+fraud-detect explain artifacts/model --top 10
+```
+
+The report ranks coefficients by absolute magnitude and labels whether increasing a
+feature is associated with higher or lower fraud risk. For calibrated models,
+coefficients are averaged across the fitted calibration folds.
+
+These are global associations, not causal claims or explanations of an individual
+transaction. In the common anonymized dataset, `V1`…`V28` are transformed components,
+so their operational interpretation is intentionally limited.
 
 ## Serve predictions
 
@@ -255,7 +272,7 @@ Project layout:
 ```text
 src/fraud_detection/
 ├── api.py          # versioned online prediction service
-├── cli.py          # generate, train, inspect, predict, and serve workflows
+├── cli.py          # training, scoring, explanation, drift, and serving workflows
 ├── data.py         # ingestion, schema validation, and synthetic data
 ├── drift.py        # training profiles and PSI drift reporting
 ├── evaluation.py   # threshold tuning and imbalance-aware metrics
