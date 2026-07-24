@@ -118,10 +118,7 @@ def expected_classification_cost(
     false_positives = int(np.sum((predictions == 1) & (y_true == 0)))
     false_negatives = int(np.sum((predictions == 0) & (y_true == 1)))
     return float(
-        (
-            false_positives * false_positive_cost
-            + false_negatives * false_negative_cost
-        )
+        (false_positives * false_positive_cost + false_negatives * false_negative_cost)
         / y_true.size
     )
 
