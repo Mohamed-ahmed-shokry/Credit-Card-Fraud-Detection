@@ -15,6 +15,7 @@ from fraud_detection.model import (
     MODEL_FILENAME,
     FraudModel,
     ModelArtifactError,
+    ThresholdStrategy,
     TrainingConfig,
     load_model,
     save_model,
@@ -39,6 +40,7 @@ def test_train_model_produces_reproducible_model_card(
     assert model.metadata["fraud_count"] == int(dataset.target.sum())
     assert sum(model.metadata["splits"].values()) == 1_500
     assert model.metadata["test_metrics"]["roc_auc"] > 0.7
+    assert "expected_cost_per_transaction" in model.metadata["test_metrics"]
     assert len(model.metadata["dataset_fingerprint"]) == 64
     assert len(model.metadata["reference_profile"]) == 30
 
@@ -154,9 +156,14 @@ def test_load_model_requires_valid_integrity_manifest(
         {"test_size": 0.4, "validation_size": 0.3},
         {"max_iterations": 10},
         {"regularization": 0},
+        {"threshold_strategy": "unknown"},
+        {"false_positive_cost": 0},
+        {"false_negative_cost": float("inf")},
     ],
 )
-def test_training_config_rejects_invalid_values(kwargs: dict[str, float | int]) -> None:
+def test_training_config_rejects_invalid_values(
+    kwargs: dict[str, float | int | str],
+) -> None:
     with pytest.raises(ValueError):
         TrainingConfig(**kwargs)  # type: ignore[arg-type]
 
@@ -167,3 +174,17 @@ def test_train_model_rejects_too_few_fraud_rows() -> None:
 
     with pytest.raises(ValueError, match="at least 6"):
         train_model(ValidatedDataset(features, target))
+
+
+def test_train_model_supports_cost_sensitive_thresholds() -> None:
+    dataset = validate_frame(generate_synthetic_data(rows=800, fraud_rate=0.1))
+    config = TrainingConfig(
+        threshold_strategy=ThresholdStrategy.COST,
+        false_positive_cost=1,
+        false_negative_cost=25,
+    )
+
+    model = train_model(dataset, config=config)
+
+    assert model.metadata["training_config"]["threshold_strategy"] == "cost"
+    assert model.metadata["training_config"]["false_negative_cost"] == 25

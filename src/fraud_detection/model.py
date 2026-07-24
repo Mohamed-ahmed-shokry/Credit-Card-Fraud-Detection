@@ -6,6 +6,7 @@ import hashlib
 import json
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
 from typing import Any, cast
 
@@ -20,7 +21,12 @@ from sklearn.preprocessing import StandardScaler
 
 from fraud_detection.data import ValidatedDataset
 from fraud_detection.drift import build_reference_profile
-from fraud_detection.evaluation import evaluate_predictions, select_f1_threshold
+from fraud_detection.evaluation import (
+    evaluate_predictions,
+    expected_classification_cost,
+    select_cost_threshold,
+    select_f1_threshold,
+)
 
 ARTIFACT_VERSION = 1
 MODEL_FILENAME = "model.joblib"
@@ -32,6 +38,13 @@ class ModelArtifactError(ValueError):
     """Raised when a model artifact or inference request is invalid."""
 
 
+class ThresholdStrategy(StrEnum):
+    """Supported validation-set decision-threshold objectives."""
+
+    F1 = "f1"
+    COST = "cost"
+
+
 @dataclass(frozen=True)
 class TrainingConfig:
     """Training and holdout configuration."""
@@ -41,6 +54,9 @@ class TrainingConfig:
     random_state: int = 42
     max_iterations: int = 1_000
     regularization: float = 1.0
+    threshold_strategy: ThresholdStrategy = ThresholdStrategy.F1
+    false_positive_cost: float = 1.0
+    false_negative_cost: float = 10.0
 
     def __post_init__(self) -> None:
         if not 0.05 <= self.test_size <= 0.4:
@@ -53,6 +69,15 @@ class TrainingConfig:
             raise ValueError("max_iterations must be at least 100")
         if self.regularization <= 0:
             raise ValueError("regularization must be positive")
+        if not isinstance(self.threshold_strategy, ThresholdStrategy):
+            raise ValueError("threshold_strategy must be 'f1' or 'cost'")
+        if (
+            not np.isfinite(self.false_positive_cost)
+            or not np.isfinite(self.false_negative_cost)
+            or self.false_positive_cost <= 0
+            or self.false_negative_cost <= 0
+        ):
+            raise ValueError("classification costs must be finite and positive")
 
 
 @dataclass
@@ -160,9 +185,18 @@ def train_model(
         pipeline.predict_proba(features_validation)[:, 1],
         dtype=float,
     )
-    threshold = select_f1_threshold(target_validation.to_numpy(), validation_probabilities)
+    validation_target_array = target_validation.to_numpy()
+    if settings.threshold_strategy is ThresholdStrategy.COST:
+        threshold = select_cost_threshold(
+            validation_target_array,
+            validation_probabilities,
+            false_positive_cost=settings.false_positive_cost,
+            false_negative_cost=settings.false_negative_cost,
+        )
+    else:
+        threshold = select_f1_threshold(validation_target_array, validation_probabilities)
     validation_metrics = evaluate_predictions(
-        target_validation.to_numpy(),
+        validation_target_array,
         validation_probabilities,
         threshold=threshold,
     )
@@ -171,6 +205,22 @@ def train_model(
         target_test.to_numpy(),
         test_probabilities,
         threshold=threshold,
+    )
+    validation_metrics_payload = validation_metrics.to_dict()
+    test_metrics_payload = test_metrics.to_dict()
+    validation_metrics_payload["expected_cost_per_transaction"] = expected_classification_cost(
+        validation_target_array,
+        validation_probabilities,
+        threshold=threshold,
+        false_positive_cost=settings.false_positive_cost,
+        false_negative_cost=settings.false_negative_cost,
+    )
+    test_metrics_payload["expected_cost_per_transaction"] = expected_classification_cost(
+        target_test.to_numpy(),
+        test_probabilities,
+        threshold=threshold,
+        false_positive_cost=settings.false_positive_cost,
+        false_negative_cost=settings.false_negative_cost,
     )
 
     metadata: dict[str, Any] = {
@@ -191,8 +241,8 @@ def train_model(
         },
         "training_config": asdict(settings),
         "reference_profile": build_reference_profile(features_train),
-        "validation_metrics": validation_metrics.to_dict(),
-        "test_metrics": test_metrics.to_dict(),
+        "validation_metrics": validation_metrics_payload,
+        "test_metrics": test_metrics_payload,
     }
     return FraudModel(
         pipeline=pipeline,
