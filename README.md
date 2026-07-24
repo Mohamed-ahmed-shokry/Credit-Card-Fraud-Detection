@@ -16,7 +16,7 @@ binary target contains exactly `0` (legitimate) and `1` (fraud).
 
 - **Honest evaluation:** stratified train, validation, and untouched test splits.
 - **Imbalance-aware decisions:** class-balanced logistic regression and a threshold
-  selected on validation F1—not a hard-coded `0.5`.
+  selected on validation F1 or weighted business cost—not a hard-coded `0.5`.
 - **Relevant metrics:** average precision, ROC AUC, precision, recall, F1, balanced
   accuracy, and the complete confusion matrix.
 - **Reproducible artifacts:** dataset fingerprint, dependency version, split sizes,
@@ -87,6 +87,20 @@ must never be committed.
 ```bash
 fraud-detect train Dataset/creditcard.csv --output artifacts/model
 ```
+
+To minimize an explicit business-cost policy on validation data:
+
+```bash
+fraud-detect train Dataset/creditcard.csv \
+  --output artifacts/model \
+  --threshold-strategy cost \
+  --false-positive-cost 1 \
+  --false-negative-cost 25
+```
+
+The costs are relative weights, not currency. For example, `25` says a missed fraud
+is treated as costly as 25 false alerts. The chosen policy and holdout expected cost
+per transaction are persisted in `metadata.json`.
 
 Training writes:
 
@@ -236,7 +250,7 @@ tests/              # unit, integration, CLI, and API tests
 ## Responsible use and limitations
 
 This is a reference implementation, not an autonomous financial decision-maker.
-Real deployments need representative temporal data, cost-based threshold selection,
+Real deployments need representative temporal data, validated business-cost inputs,
 monitoring for data/concept drift, calibration analysis, access controls, audit
 logging, incident response, and human review for consequential decisions.
 
