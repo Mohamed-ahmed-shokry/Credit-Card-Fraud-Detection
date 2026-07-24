@@ -92,6 +92,9 @@ must never be committed.
 fraud-detect train Dataset/creditcard.csv --output artifacts/model
 ```
 
+Training refuses to replace a non-empty artifact directory. Pass `--overwrite` only
+after confirming the existing model can be replaced.
+
 The default split is reproducible and stratified. When the data includes transaction
 order, evaluate chronologically to train on the past and test on the newest window:
 

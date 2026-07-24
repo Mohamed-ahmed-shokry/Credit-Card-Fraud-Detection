@@ -18,6 +18,7 @@ All notable changes to this project are documented here. The format follows
   and safeguards against single-class windows.
 - API request correlation, processing-time response headers, and structured
   completion/failure log fields.
+- CLI overwrite protection for non-empty model artifact directories.
 
 ### Changed
 
