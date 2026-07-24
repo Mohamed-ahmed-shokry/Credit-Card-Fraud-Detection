@@ -29,6 +29,7 @@ def test_evaluate_predictions_returns_complete_metrics() -> None:
     assert metrics.precision == pytest.approx(2 / 3)
     assert metrics.recall == 1.0
     assert metrics.f1 == pytest.approx(0.8)
+    assert metrics.brier_score == pytest.approx(0.205)
     assert metrics.balanced_accuracy == pytest.approx(0.75)
     assert (
         metrics.true_negatives,
