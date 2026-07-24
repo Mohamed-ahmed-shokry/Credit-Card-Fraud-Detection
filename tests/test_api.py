@@ -8,6 +8,8 @@ from fastapi.testclient import TestClient
 
 from fraud_detection.api import (
     MODEL_PATH_ENVIRONMENT_VARIABLE,
+    PROCESS_TIME_HEADER,
+    REQUEST_ID_HEADER,
     app_from_environment,
     create_app,
 )
@@ -94,6 +96,22 @@ def test_openapi_describes_versioned_prediction_endpoint(client: TestClient) -> 
 
     assert document["info"]["version"] == "0.1.0"
     assert "/v1/predict" in document["paths"]
+
+
+def test_request_context_propagates_safe_correlation_id(client: TestClient) -> None:
+    response = client.get("/health", headers={REQUEST_ID_HEADER: "audit-request_123"})
+
+    assert response.headers[REQUEST_ID_HEADER] == "audit-request_123"
+    assert float(response.headers[PROCESS_TIME_HEADER]) >= 0
+
+
+def test_request_context_replaces_unsafe_correlation_id(client: TestClient) -> None:
+    response = client.get("/health", headers={REQUEST_ID_HEADER: "unsafe id value"})
+
+    generated_request_id = response.headers[REQUEST_ID_HEADER]
+    assert generated_request_id != "unsafe id value"
+    assert len(generated_request_id) == 32
+    assert generated_request_id.isalnum()
 
 
 def test_environment_factory_loads_persisted_model(

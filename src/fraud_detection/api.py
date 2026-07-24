@@ -2,21 +2,31 @@
 
 from __future__ import annotations
 
+import logging
 import os
+import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
+from time import perf_counter
 from typing import Annotated, cast
+from uuid import uuid4
 
 import pandas as pd
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
+from starlette.middleware.base import RequestResponseEndpoint
+from starlette.responses import Response
 
 from fraud_detection import __version__
 from fraud_detection.model import FraudModel, ModelArtifactError, load_model
 
 MODEL_PATH_ENVIRONMENT_VARIABLE = "FRAUD_MODEL_PATH"
+REQUEST_ID_HEADER = "X-Request-ID"
+PROCESS_TIME_HEADER = "X-Process-Time-Ms"
+_REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+logger = logging.getLogger(__name__)
 
 
 class PredictionRequest(BaseModel):
@@ -84,6 +94,46 @@ def create_app(
         docs_url="/docs",
         redoc_url="/redoc",
     )
+
+    @application.middleware("http")
+    async def request_context(
+        request: Request,
+        call_next: RequestResponseEndpoint,
+    ) -> Response:
+        supplied_request_id = request.headers.get(REQUEST_ID_HEADER)
+        request_id = (
+            supplied_request_id
+            if supplied_request_id is not None
+            and _REQUEST_ID_PATTERN.fullmatch(supplied_request_id)
+            else uuid4().hex
+        )
+        request.state.request_id = request_id
+        started_at = perf_counter()
+        try:
+            response = await call_next(request)
+        except Exception:
+            duration_ms = (perf_counter() - started_at) * 1_000
+            logger.exception(
+                "request_failed method=%s path=%s duration_ms=%.3f request_id=%s",
+                request.method,
+                request.url.path,
+                duration_ms,
+                request_id,
+            )
+            raise
+
+        duration_ms = (perf_counter() - started_at) * 1_000
+        response.headers[REQUEST_ID_HEADER] = request_id
+        response.headers[PROCESS_TIME_HEADER] = f"{duration_ms:.3f}"
+        logger.info(
+            "request_completed method=%s path=%s status_code=%d duration_ms=%.3f request_id=%s",
+            request.method,
+            request.url.path,
+            response.status_code,
+            duration_ms,
+            request_id,
+        )
+        return response
 
     @application.exception_handler(ModelArtifactError)
     async def model_artifact_error_handler(
