@@ -185,7 +185,7 @@ def predict_command(
         frame = pd.read_csv(data)
         features = frame.drop(columns=target, errors="ignore")
         probabilities = model.predict_probabilities(features)
-        predictions = model.predict(features)
+        predictions = (probabilities >= model.threshold).astype("int8")
     except (OSError, pd.errors.ParserError, ModelArtifactError) as exc:
         _abort(str(exc))
 
