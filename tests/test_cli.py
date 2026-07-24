@@ -39,6 +39,7 @@ def test_cli_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     assert generated_summary["rows"] == 800
     assert data_path.is_file()
 
+    artifact_path.mkdir()
     trained = runner.invoke(
         app,
         [
@@ -130,6 +131,13 @@ def test_cli_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     assert served.exit_code == 0, served.output
     assert server_call["host"] == "0.0.0.0"
     assert server_call["port"] == 9000
+
+    protected = runner.invoke(
+        app,
+        ["train", str(data_path), "--output", str(artifact_path)],
+    )
+    assert protected.exit_code == 2
+    assert "Pass --overwrite" in protected.stderr
 
 
 def test_generate_data_protects_existing_file(tmp_path: Path) -> None:

@@ -122,8 +122,18 @@ def train_command(
         str,
         typer.Option(help="Ordering feature used when --split-strategy temporal."),
     ] = "Time",
+    overwrite: Annotated[
+        bool,
+        typer.Option(help="Replace an existing model artifact."),
+    ] = False,
 ) -> None:
     """Train, tune on validation data, evaluate on test data, and save."""
+    output_has_content = output.is_file() or (
+        output.is_dir() and next(output.iterdir(), None) is not None
+    )
+    if output_has_content and not overwrite:
+        _abort(f"Output already exists: {output}. Pass --overwrite to replace it.")
+
     try:
         dataset = load_csv(data, target_column=target)
         config = TrainingConfig(
