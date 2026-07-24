@@ -1,0 +1,15 @@
+.git
+.github
+.venv
+Dataset
+artifacts
+build
+data
+dist
+htmlcov
+tests
+*.egg-info
+*.py[cod]
+__pycache__
+.coverage
+.env*

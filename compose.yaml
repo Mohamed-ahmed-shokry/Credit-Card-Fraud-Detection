@@ -1,0 +1,19 @@
+services:
+  fraud-api:
+    build:
+      context: .
+    image: credit-card-fraud-detection:local
+    environment:
+      FRAUD_MODEL_PATH: /app/artifacts/model
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./artifacts/model:/app/artifacts/model:ro
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
