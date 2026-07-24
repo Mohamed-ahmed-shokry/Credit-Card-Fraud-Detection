@@ -252,9 +252,7 @@ def load_model(path: Path | str) -> FraudModel:
 def _dataset_fingerprint(dataset: ValidatedDataset) -> str:
     digest = hashlib.sha256()
     digest.update("\0".join(dataset.feature_names).encode())
-    feature_hash = pd.util.hash_pandas_object(dataset.features, index=True).to_numpy(
-        dtype="uint64"
-    )
+    feature_hash = pd.util.hash_pandas_object(dataset.features, index=True).to_numpy(dtype="uint64")
     target_hash = pd.util.hash_pandas_object(dataset.target, index=True).to_numpy(dtype="uint64")
     digest.update(cast(np.ndarray, feature_hash).tobytes())
     digest.update(cast(np.ndarray, target_hash).tobytes())
