@@ -13,6 +13,7 @@ dist/
 .mypy_cache/
 .ruff_cache/
 .coverage
+.coverage.*
 htmlcov/
 
 # Environments and local configuration
