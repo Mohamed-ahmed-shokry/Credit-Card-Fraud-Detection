@@ -3,7 +3,12 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from fraud_detection.evaluation import evaluate_predictions, select_f1_threshold
+from fraud_detection.evaluation import (
+    evaluate_predictions,
+    expected_classification_cost,
+    select_cost_threshold,
+    select_f1_threshold,
+)
 
 
 def test_select_f1_threshold_finds_best_operating_point() -> None:
@@ -32,6 +37,55 @@ def test_evaluate_predictions_returns_complete_metrics() -> None:
         metrics.true_positives,
     ) == (1, 1, 0, 2)
     assert metrics.to_dict()["threshold"] == 0.5
+
+
+def test_cost_threshold_minimizes_weighted_validation_mistakes() -> None:
+    y_true = np.array([0, 0, 0, 1])
+    probabilities = np.array([0.1, 0.4, 0.8, 0.7])
+
+    threshold = select_cost_threshold(
+        y_true,
+        probabilities,
+        false_positive_cost=1,
+        false_negative_cost=10,
+    )
+
+    assert threshold == pytest.approx(0.7)
+    assert expected_classification_cost(
+        y_true,
+        probabilities,
+        threshold=threshold,
+        false_positive_cost=1,
+        false_negative_cost=10,
+    ) == pytest.approx(0.25)
+
+
+def test_cost_threshold_changes_with_business_costs() -> None:
+    threshold = select_cost_threshold(
+        np.array([0, 0, 0, 1]),
+        np.array([0.1, 0.4, 0.8, 0.7]),
+        false_positive_cost=10,
+        false_negative_cost=1,
+    )
+
+    assert threshold == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize(
+    ("false_positive_cost", "false_negative_cost"),
+    [(0, 1), (1, 0), (-1, 1), (1, np.inf)],
+)
+def test_cost_functions_reject_invalid_costs(
+    false_positive_cost: float,
+    false_negative_cost: float,
+) -> None:
+    with pytest.raises(ValueError, match="costs"):
+        select_cost_threshold(
+            np.array([0, 1]),
+            np.array([0.1, 0.9]),
+            false_positive_cost=false_positive_cost,
+            false_negative_cost=false_negative_cost,
+        )
 
 
 @pytest.mark.parametrize("threshold", [-0.1, 1.1])

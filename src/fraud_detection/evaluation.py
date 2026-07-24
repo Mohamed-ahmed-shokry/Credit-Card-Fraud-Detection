@@ -14,6 +14,7 @@ from sklearn.metrics import (
     precision_score,
     recall_score,
     roc_auc_score,
+    roc_curve,
 )
 
 
@@ -59,6 +60,72 @@ def select_f1_threshold(y_true: np.ndarray, probabilities: np.ndarray) -> float:
     return float(thresholds[int(np.argmax(f1_scores))])
 
 
+def select_cost_threshold(
+    y_true: np.ndarray,
+    probabilities: np.ndarray,
+    *,
+    false_positive_cost: float,
+    false_negative_cost: float,
+) -> float:
+    """Choose the validation threshold with the lowest expected mistake cost.
+
+    Costs are relative business weights. Ties favor higher recall so equally
+    costly policies miss fewer fraudulent transactions.
+    """
+    _validate_vectors(y_true, probabilities)
+    _validate_costs(false_positive_cost, false_negative_cost)
+
+    false_positive_rates, true_positive_rates, thresholds = roc_curve(
+        y_true,
+        probabilities,
+        drop_intermediate=False,
+    )
+    negative_count = int(np.sum(y_true == 0))
+    positive_count = int(np.sum(y_true == 1))
+    false_positives = false_positive_rates * negative_count
+    false_negatives = (1.0 - true_positive_rates) * positive_count
+    costs = (
+        false_positives * false_positive_cost + false_negatives * false_negative_cost
+    ) / y_true.size
+
+    finite = np.isfinite(thresholds) & (thresholds <= 1.0)
+    candidate_indices = np.flatnonzero(finite)
+    candidate_costs = costs[candidate_indices]
+    minimum_cost = float(np.min(candidate_costs))
+    all_negative_cost = positive_count * false_negative_cost / y_true.size
+    if probabilities.max() < 1.0 and all_negative_cost < minimum_cost:
+        return 1.0
+    tied_indices = candidate_indices[np.isclose(candidate_costs, minimum_cost)]
+    best_index = tied_indices[int(np.argmax(true_positive_rates[tied_indices]))]
+    return float(thresholds[best_index])
+
+
+def expected_classification_cost(
+    y_true: np.ndarray,
+    probabilities: np.ndarray,
+    *,
+    threshold: float,
+    false_positive_cost: float,
+    false_negative_cost: float,
+) -> float:
+    """Return average weighted mistake cost per transaction."""
+    _validate_vectors(y_true, probabilities)
+    _validate_costs(false_positive_cost, false_negative_cost)
+    if not 0.0 <= threshold <= 1.0:
+        raise ValueError("threshold must be between 0 and 1")
+
+    predictions = probabilities >= threshold
+    false_positives = int(np.sum((predictions == 1) & (y_true == 0)))
+    false_negatives = int(np.sum((predictions == 0) & (y_true == 1)))
+    return float(
+        (
+            false_positives * false_positive_cost
+            + false_negatives * false_negative_cost
+        )
+        / y_true.size
+    )
+
+
 def evaluate_predictions(
     y_true: np.ndarray,
     probabilities: np.ndarray,
@@ -98,3 +165,13 @@ def _validate_vectors(y_true: np.ndarray, probabilities: np.ndarray) -> None:
         raise ValueError("probabilities must be finite")
     if np.any((probabilities < 0) | (probabilities > 1)):
         raise ValueError("probabilities must be between 0 and 1")
+
+
+def _validate_costs(false_positive_cost: float, false_negative_cost: float) -> None:
+    if (
+        not np.isfinite(false_positive_cost)
+        or not np.isfinite(false_negative_cost)
+        or false_positive_cost <= 0
+        or false_negative_cost <= 0
+    ):
+        raise ValueError("false-positive and false-negative costs must be finite and positive")
