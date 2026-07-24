@@ -52,6 +52,10 @@ def test_cli_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
             "cost",
             "--false-negative-cost",
             "20",
+            "--calibration-method",
+            "sigmoid",
+            "--calibration-folds",
+            "4",
         ],
     )
     assert trained.exit_code == 0, trained.output
@@ -62,6 +66,7 @@ def test_cli_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     metadata = json.loads((artifact_path / METADATA_FILENAME).read_text(encoding="utf-8"))
     assert metadata["training_config"]["threshold_strategy"] == "cost"
     assert metadata["training_config"]["false_negative_cost"] == 20
+    assert metadata["calibration"] == {"method": "sigmoid", "folds": 4}
 
     inspected = runner.invoke(app, ["inspect", str(artifact_path)])
     assert inspected.exit_code == 0, inspected.output

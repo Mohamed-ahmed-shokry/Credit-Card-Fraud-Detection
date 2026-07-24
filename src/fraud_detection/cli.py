@@ -18,6 +18,7 @@ from fraud_detection.data import (
 )
 from fraud_detection.drift import DriftError, assess_drift
 from fraud_detection.model import (
+    CalibrationMethod,
     ModelArtifactError,
     ThresholdStrategy,
     TrainingConfig,
@@ -104,6 +105,14 @@ def train_command(
         float,
         typer.Option(min=0.000001, help="Relative cost of missing a fraudulent transaction."),
     ] = 10.0,
+    calibration_method: Annotated[
+        CalibrationMethod,
+        typer.Option(help="Probability calibration policy fitted within training data."),
+    ] = CalibrationMethod.SIGMOID,
+    calibration_folds: Annotated[
+        int,
+        typer.Option(min=2, max=10, help="Cross-validation folds used for calibration."),
+    ] = 3,
 ) -> None:
     """Train, tune on validation data, evaluate on test data, and save."""
     try:
@@ -115,6 +124,8 @@ def train_command(
             threshold_strategy=threshold_strategy,
             false_positive_cost=false_positive_cost,
             false_negative_cost=false_negative_cost,
+            calibration_method=calibration_method,
+            calibration_folds=calibration_folds,
         )
         model = train_model(dataset, config=config)
         model_path = save_model(model, output)
