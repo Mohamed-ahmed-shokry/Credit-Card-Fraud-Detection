@@ -14,7 +14,8 @@ binary target contains exactly `0` (legitimate) and `1` (fraud).
 
 ## Why this project is different
 
-- **Honest evaluation:** stratified train, validation, and untouched test splits.
+- **Honest evaluation:** stratified or chronological train, validation, and untouched
+  test splits.
 - **Imbalance-aware decisions:** class-balanced logistic regression and a threshold
   selected on validation F1 or weighted business cost—not a hard-coded `0.5`.
 - **Relevant metrics:** average precision, ROC AUC, precision, recall, F1, balanced
@@ -35,9 +36,9 @@ binary target contains exactly `0` (legitimate) and `1` (fraud).
 ```mermaid
 flowchart LR
     A[CSV transactions] --> B[Schema and value validation]
-    B --> C[Stratified train split]
-    B --> D[Validation split]
-    B --> E[Untouched test split]
+    B --> C[Past or stratified train split]
+    B --> D[Next validation window]
+    B --> E[Untouched newest test window]
     C --> F[Scale + class-balanced logistic regression]
     F --> G[Select F1 threshold on validation]
     G --> H[Evaluate once on test]
@@ -90,6 +91,20 @@ must never be committed.
 ```bash
 fraud-detect train Dataset/creditcard.csv --output artifacts/model
 ```
+
+The default split is reproducible and stratified. When the data includes transaction
+order, evaluate chronologically to train on the past and test on the newest window:
+
+```bash
+fraud-detect train Dataset/creditcard.csv \
+  --output artifacts/model \
+  --split-strategy temporal \
+  --time-column Time
+```
+
+Chronological training records each split's minimum and maximum time in the model
+card. Every window must contain legitimate and fraudulent examples; otherwise
+training stops with an actionable error rather than publishing invalid metrics.
 
 To minimize an explicit business-cost policy on validation data:
 

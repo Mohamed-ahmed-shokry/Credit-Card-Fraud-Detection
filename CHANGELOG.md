@@ -14,6 +14,8 @@ All notable changes to this project are documented here. The format follows
   and holdout Brier-score reporting.
 - Persisted, ranked standardized feature effects and an `explain` CLI for global
   model interpretation.
+- Optional chronological train/validation/test evaluation with persisted time ranges
+  and safeguards against single-class windows.
 
 ### Changed
 
