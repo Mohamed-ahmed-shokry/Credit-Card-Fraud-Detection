@@ -72,6 +72,12 @@ def test_cli_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     assert inspected.exit_code == 0, inspected.output
     assert json.loads(inspected.stdout)["row_count"] == 800
 
+    explained = runner.invoke(app, ["explain", str(artifact_path), "--top", "5"])
+    assert explained.exit_code == 0, explained.output
+    explanation = json.loads(explained.stdout)
+    assert len(explanation["effects"]) == 5
+    assert [effect["rank"] for effect in explanation["effects"]] == [1, 2, 3, 4, 5]
+
     drifted = runner.invoke(
         app,
         [

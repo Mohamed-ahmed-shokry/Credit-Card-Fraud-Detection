@@ -209,6 +209,37 @@ def inspect_command(
     typer.echo(json.dumps(model.metadata, indent=2, sort_keys=True))
 
 
+@app.command("explain")
+def explain_command(
+    model_path: Annotated[
+        Path,
+        typer.Argument(exists=True, readable=True, help="Model file or artifact directory."),
+    ],
+    top: Annotated[
+        int,
+        typer.Option(min=1, max=100, help="Number of ranked feature effects to show."),
+    ] = 10,
+) -> None:
+    """Show the strongest global standardized feature effects."""
+    try:
+        model = load_model(model_path)
+        effects = model.metadata.get("feature_effects")
+        if not isinstance(effects, list):
+            raise ModelArtifactError("Model artifact does not contain feature effects.")
+    except ModelArtifactError as exc:
+        _abort(str(exc))
+
+    typer.echo(
+        json.dumps(
+            {
+                "model_version": str(model.metadata["dataset_fingerprint"])[:12],
+                "effects": effects[:top],
+            },
+            indent=2,
+        )
+    )
+
+
 @app.command("drift")
 def drift_command(
     model_path: Annotated[
