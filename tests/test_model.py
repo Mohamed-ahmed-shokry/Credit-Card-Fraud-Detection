@@ -10,9 +10,11 @@ import pytest
 
 from fraud_detection.data import ValidatedDataset, generate_synthetic_data, validate_frame
 from fraud_detection.model import (
+    ARTIFACT_VERSION,
     MANIFEST_FILENAME,
     METADATA_FILENAME,
     MODEL_FILENAME,
+    CalibrationMethod,
     FraudModel,
     ModelArtifactError,
     ThresholdStrategy,
@@ -41,6 +43,9 @@ def test_train_model_produces_reproducible_model_card(
     assert sum(model.metadata["splits"].values()) == 1_500
     assert model.metadata["test_metrics"]["roc_auc"] > 0.7
     assert "expected_cost_per_transaction" in model.metadata["test_metrics"]
+    assert "brier_score" in model.metadata["test_metrics"]
+    assert model.metadata["calibration"] == {"method": "sigmoid", "folds": 3}
+    assert model.artifact_version == ARTIFACT_VERSION
     assert len(model.metadata["dataset_fingerprint"]) == 64
     assert len(model.metadata["reference_profile"]) == 30
 
@@ -159,6 +164,9 @@ def test_load_model_requires_valid_integrity_manifest(
         {"threshold_strategy": "unknown"},
         {"false_positive_cost": 0},
         {"false_negative_cost": float("inf")},
+        {"calibration_method": "unknown"},
+        {"calibration_folds": 1},
+        {"calibration_folds": 11},
     ],
 )
 def test_training_config_rejects_invalid_values(
@@ -188,3 +196,15 @@ def test_train_model_supports_cost_sensitive_thresholds() -> None:
 
     assert model.metadata["training_config"]["threshold_strategy"] == "cost"
     assert model.metadata["training_config"]["false_negative_cost"] == 25
+
+
+def test_train_model_can_disable_probability_calibration() -> None:
+    dataset = validate_frame(generate_synthetic_data(rows=500, fraud_rate=0.1))
+
+    model = train_model(
+        dataset,
+        config=TrainingConfig(calibration_method=CalibrationMethod.NONE),
+    )
+
+    assert model.metadata["estimator"] == "LogisticRegression"
+    assert model.metadata["calibration"] == {"method": "none", "folds": None}

@@ -14,6 +14,7 @@ import joblib
 import numpy as np
 import pandas as pd
 import sklearn
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
@@ -28,7 +29,7 @@ from fraud_detection.evaluation import (
     select_f1_threshold,
 )
 
-ARTIFACT_VERSION = 1
+ARTIFACT_VERSION = 2
 MODEL_FILENAME = "model.joblib"
 METADATA_FILENAME = "metadata.json"
 MANIFEST_FILENAME = "manifest.json"
@@ -45,6 +46,14 @@ class ThresholdStrategy(StrEnum):
     COST = "cost"
 
 
+class CalibrationMethod(StrEnum):
+    """Supported probability-calibration policies."""
+
+    NONE = "none"
+    SIGMOID = "sigmoid"
+    ISOTONIC = "isotonic"
+
+
 @dataclass(frozen=True)
 class TrainingConfig:
     """Training and holdout configuration."""
@@ -57,6 +66,8 @@ class TrainingConfig:
     threshold_strategy: ThresholdStrategy = ThresholdStrategy.F1
     false_positive_cost: float = 1.0
     false_negative_cost: float = 10.0
+    calibration_method: CalibrationMethod = CalibrationMethod.SIGMOID
+    calibration_folds: int = 3
 
     def __post_init__(self) -> None:
         if not 0.05 <= self.test_size <= 0.4:
@@ -78,13 +89,17 @@ class TrainingConfig:
             or self.false_negative_cost <= 0
         ):
             raise ValueError("classification costs must be finite and positive")
+        if not isinstance(self.calibration_method, CalibrationMethod):
+            raise ValueError("calibration_method must be 'none', 'sigmoid', or 'isotonic'")
+        if not 2 <= self.calibration_folds <= 10:
+            raise ValueError("calibration_folds must be between 2 and 10")
 
 
 @dataclass
 class FraudModel:
     """A fitted fraud classifier plus its decision policy and model card data."""
 
-    pipeline: Pipeline
+    estimator: Any
     threshold: float
     feature_names: tuple[str, ...]
     metadata: dict[str, Any]
@@ -95,7 +110,7 @@ class FraudModel:
         ordered = self.validate_features(features)
         probabilities = cast(
             np.ndarray,
-            np.asarray(self.pipeline.predict_proba(ordered)[:, 1], dtype=float),
+            np.asarray(self.estimator.predict_proba(ordered)[:, 1], dtype=float),
         )
         if probabilities.shape != (len(ordered),):
             raise ModelArtifactError("Model returned probabilities with an invalid shape.")
@@ -164,7 +179,7 @@ def train_model(
         stratify=target_train_validation,
     )
 
-    pipeline = Pipeline(
+    base_estimator = Pipeline(
         steps=[
             ("scale", StandardScaler()),
             (
@@ -179,10 +194,24 @@ def train_model(
             ),
         ]
     )
-    pipeline.fit(features_train, target_train)
+    if settings.calibration_method is CalibrationMethod.NONE:
+        estimator: Any = base_estimator
+    else:
+        minimum_training_class = int(target_train.value_counts().min())
+        if minimum_training_class < settings.calibration_folds:
+            raise ValueError(
+                "Each training class needs at least as many rows as calibration_folds."
+            )
+        estimator = CalibratedClassifierCV(
+            estimator=base_estimator,
+            method=settings.calibration_method.value,
+            cv=settings.calibration_folds,
+            n_jobs=-1,
+        )
+    estimator.fit(features_train, target_train)
 
     validation_probabilities = np.asarray(
-        pipeline.predict_proba(features_validation)[:, 1],
+        estimator.predict_proba(features_validation)[:, 1],
         dtype=float,
     )
     validation_target_array = target_validation.to_numpy()
@@ -200,7 +229,7 @@ def train_model(
         validation_probabilities,
         threshold=threshold,
     )
-    test_probabilities = np.asarray(pipeline.predict_proba(features_test)[:, 1], dtype=float)
+    test_probabilities = np.asarray(estimator.predict_proba(features_test)[:, 1], dtype=float)
     test_metrics = evaluate_predictions(
         target_test.to_numpy(),
         test_probabilities,
@@ -226,7 +255,19 @@ def train_model(
     metadata: dict[str, Any] = {
         "artifact_version": ARTIFACT_VERSION,
         "created_at": datetime.now(UTC).isoformat(),
-        "estimator": "LogisticRegression",
+        "estimator": (
+            "LogisticRegression"
+            if settings.calibration_method is CalibrationMethod.NONE
+            else "CalibratedClassifierCV(LogisticRegression)"
+        ),
+        "calibration": {
+            "method": settings.calibration_method.value,
+            "folds": (
+                settings.calibration_folds
+                if settings.calibration_method is not CalibrationMethod.NONE
+                else None
+            ),
+        },
         "scikit_learn_version": sklearn.__version__,
         "feature_names": list(dataset.feature_names),
         "feature_count": len(dataset.feature_names),
@@ -245,7 +286,7 @@ def train_model(
         "test_metrics": test_metrics_payload,
     }
     return FraudModel(
-        pipeline=pipeline,
+        estimator=estimator,
         threshold=threshold,
         feature_names=dataset.feature_names,
         metadata=metadata,
