@@ -1,0 +1,104 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pandas as pd
+from typer.testing import CliRunner
+
+from fraud_detection.cli import app
+from fraud_detection.model import METADATA_FILENAME, MODEL_FILENAME
+
+runner = CliRunner()
+
+
+def test_cli_end_to_end(tmp_path: Path) -> None:
+    data_path = tmp_path / "transactions.csv"
+    artifact_path = tmp_path / "artifact"
+    predictions_path = tmp_path / "predictions.csv"
+
+    generated = runner.invoke(
+        app,
+        [
+            "generate-data",
+            "--output",
+            str(data_path),
+            "--rows",
+            "800",
+            "--fraud-rate",
+            "0.08",
+            "--seed",
+            "9",
+        ],
+    )
+    assert generated.exit_code == 0, generated.output
+    generated_summary = json.loads(generated.stdout)
+    assert generated_summary["rows"] == 800
+    assert data_path.is_file()
+
+    trained = runner.invoke(
+        app,
+        ["train", str(data_path), "--output", str(artifact_path), "--seed", "9"],
+    )
+    assert trained.exit_code == 0, trained.output
+    training_summary = json.loads(trained.stdout)
+    assert training_summary["test_metrics"]["roc_auc"] > 0.7
+    assert (artifact_path / MODEL_FILENAME).is_file()
+    assert (artifact_path / METADATA_FILENAME).is_file()
+
+    inspected = runner.invoke(app, ["inspect", str(artifact_path)])
+    assert inspected.exit_code == 0, inspected.output
+    assert json.loads(inspected.stdout)["row_count"] == 800
+
+    predicted = runner.invoke(
+        app,
+        [
+            "predict",
+            str(artifact_path),
+            str(data_path),
+            "--output",
+            str(predictions_path),
+        ],
+    )
+    assert predicted.exit_code == 0, predicted.output
+    prediction_summary = json.loads(predicted.stdout)
+    assert prediction_summary["rows"] == 800
+    scored = pd.read_csv(predictions_path)
+    assert {"fraud_probability", "is_fraud"}.issubset(scored.columns)
+
+
+def test_generate_data_protects_existing_file(tmp_path: Path) -> None:
+    output = tmp_path / "existing.csv"
+    output.write_text("keep me", encoding="utf-8")
+
+    result = runner.invoke(app, ["generate-data", "--output", str(output)])
+
+    assert result.exit_code == 2
+    assert "Pass --overwrite" in result.stderr
+    assert output.read_text(encoding="utf-8") == "keep me"
+
+
+def test_predict_reports_schema_error(tmp_path: Path) -> None:
+    data_path = tmp_path / "training.csv"
+    artifact_path = tmp_path / "artifact"
+    invalid_path = tmp_path / "invalid.csv"
+    runner.invoke(
+        app,
+        [
+            "generate-data",
+            "--output",
+            str(data_path),
+            "--rows",
+            "600",
+            "--fraud-rate",
+            "0.1",
+        ],
+    )
+    trained = runner.invoke(app, ["train", str(data_path), "--output", str(artifact_path)])
+    assert trained.exit_code == 0, trained.output
+    pd.DataFrame({"wrong": [1.0]}).to_csv(invalid_path, index=False)
+
+    result = runner.invoke(app, ["predict", str(artifact_path), str(invalid_path)])
+
+    assert result.exit_code == 2
+    assert "Input schema does not match" in result.stderr
