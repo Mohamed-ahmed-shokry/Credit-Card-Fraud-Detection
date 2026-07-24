@@ -56,6 +56,8 @@ def test_cli_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
             "sigmoid",
             "--calibration-folds",
             "4",
+            "--split-strategy",
+            "temporal",
         ],
     )
     assert trained.exit_code == 0, trained.output
@@ -67,6 +69,11 @@ def test_cli_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     assert metadata["training_config"]["threshold_strategy"] == "cost"
     assert metadata["training_config"]["false_negative_cost"] == 20
     assert metadata["calibration"] == {"method": "sigmoid", "folds": 4}
+    assert metadata["training_config"]["split_strategy"] == "temporal"
+    assert (
+        metadata["split_time_ranges"]["train"]["maximum"]
+        <= metadata["split_time_ranges"]["validation"]["minimum"]
+    )
 
     inspected = runner.invoke(app, ["inspect", str(artifact_path)])
     assert inspected.exit_code == 0, inspected.output

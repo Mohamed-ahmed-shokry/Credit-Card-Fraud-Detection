@@ -20,6 +20,7 @@ from fraud_detection.drift import DriftError, assess_drift
 from fraud_detection.model import (
     CalibrationMethod,
     ModelArtifactError,
+    SplitStrategy,
     ThresholdStrategy,
     TrainingConfig,
     load_model,
@@ -113,6 +114,14 @@ def train_command(
         int,
         typer.Option(min=2, max=10, help="Cross-validation folds used for calibration."),
     ] = 3,
+    split_strategy: Annotated[
+        SplitStrategy,
+        typer.Option(help="Random stratified or chronological dataset partitioning."),
+    ] = SplitStrategy.STRATIFIED,
+    time_column: Annotated[
+        str,
+        typer.Option(help="Ordering feature used when --split-strategy temporal."),
+    ] = "Time",
 ) -> None:
     """Train, tune on validation data, evaluate on test data, and save."""
     try:
@@ -126,6 +135,8 @@ def train_command(
             false_negative_cost=false_negative_cost,
             calibration_method=calibration_method,
             calibration_folds=calibration_folds,
+            split_strategy=split_strategy,
+            time_column=time_column,
         )
         model = train_model(dataset, config=config)
         model_path = save_model(model, output)
