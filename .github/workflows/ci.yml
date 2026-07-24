@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.14"]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install project
+        run: python -m pip install --upgrade pip && python -m pip install -e ".[dev]"
+
+      - name: Check formatting
+        run: python -m ruff format --check src tests
+
+      - name: Lint
+        run: python -m ruff check src tests
+
+      - name: Type check
+        run: python -m mypy src
+
+      - name: Test with branch coverage
+        run: python -m pytest --cov=fraud_detection --cov-report=term-missing
+
+      - name: Build distributions
+        run: python -m build
