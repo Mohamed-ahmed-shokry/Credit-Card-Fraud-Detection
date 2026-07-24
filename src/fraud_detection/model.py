@@ -24,6 +24,7 @@ from fraud_detection.evaluation import evaluate_predictions, select_f1_threshold
 ARTIFACT_VERSION = 1
 MODEL_FILENAME = "model.joblib"
 METADATA_FILENAME = "metadata.json"
+MANIFEST_FILENAME = "manifest.json"
 
 
 class ModelArtifactError(ValueError):
@@ -199,13 +200,15 @@ def train_model(
 
 
 def save_model(model: FraudModel, output_directory: Path | str) -> Path:
-    """Persist a model and readable metadata, replacing files atomically."""
+    """Persist a model, metadata, and integrity manifest with atomic file swaps."""
     destination = Path(output_directory)
     destination.mkdir(parents=True, exist_ok=True)
     model_path = destination / MODEL_FILENAME
     metadata_path = destination / METADATA_FILENAME
+    manifest_path = destination / MANIFEST_FILENAME
     temporary_model = destination / f".{MODEL_FILENAME}.tmp"
     temporary_metadata = destination / f".{METADATA_FILENAME}.tmp"
+    temporary_manifest = destination / f".{MANIFEST_FILENAME}.tmp"
 
     try:
         joblib.dump(model, temporary_model)
@@ -213,11 +216,25 @@ def save_model(model: FraudModel, output_directory: Path | str) -> Path:
             json.dumps(model.metadata, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
+        manifest = {
+            "artifact_version": model.artifact_version,
+            "files": {
+                MODEL_FILENAME: _file_sha256(temporary_model),
+                METADATA_FILENAME: _file_sha256(temporary_metadata),
+            },
+            "hash_algorithm": "sha256",
+        }
+        temporary_manifest.write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
         temporary_model.replace(model_path)
         temporary_metadata.replace(metadata_path)
+        temporary_manifest.replace(manifest_path)
     finally:
         temporary_model.unlink(missing_ok=True)
         temporary_metadata.unlink(missing_ok=True)
+        temporary_manifest.unlink(missing_ok=True)
     return model_path
 
 
@@ -227,9 +244,11 @@ def load_model(path: Path | str) -> FraudModel:
     Joblib artifacts can execute code while loading. Only load artifacts produced
     by a trusted training process.
     """
-    artifact_path = Path(path)
-    if artifact_path.is_dir():
-        artifact_path = artifact_path / MODEL_FILENAME
+    requested_path = Path(path)
+    artifact_path = requested_path
+    if requested_path.is_dir():
+        _verify_manifest(requested_path)
+        artifact_path = requested_path / MODEL_FILENAME
     if not artifact_path.is_file():
         raise ModelArtifactError(f"Model artifact does not exist: {artifact_path}")
 
@@ -247,6 +266,39 @@ def load_model(path: Path | str) -> FraudModel:
     if not 0.0 <= candidate.threshold <= 1.0:
         raise ModelArtifactError("Artifact contains an invalid decision threshold.")
     return candidate
+
+
+def _verify_manifest(directory: Path) -> None:
+    manifest_path = directory / MANIFEST_FILENAME
+    if not manifest_path.is_file():
+        raise ModelArtifactError(f"Artifact integrity manifest does not exist: {manifest_path}")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        expected_files = manifest["files"]
+        if (
+            manifest["hash_algorithm"] != "sha256"
+            or manifest["artifact_version"] != ARTIFACT_VERSION
+            or not isinstance(expected_files, dict)
+        ):
+            raise ValueError("unsupported manifest")
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+        raise ModelArtifactError(f"Artifact integrity manifest is invalid: {exc}") from exc
+
+    for filename in (MODEL_FILENAME, METADATA_FILENAME):
+        file_path = directory / filename
+        expected_digest = expected_files.get(filename)
+        if not file_path.is_file() or not isinstance(expected_digest, str):
+            raise ModelArtifactError(f"Artifact integrity entry is missing for {filename}.")
+        if _file_sha256(file_path) != expected_digest:
+            raise ModelArtifactError(f"Artifact integrity check failed for {filename}.")
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file_handle:
+        for chunk in iter(lambda: file_handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _dataset_fingerprint(dataset: ValidatedDataset) -> str:

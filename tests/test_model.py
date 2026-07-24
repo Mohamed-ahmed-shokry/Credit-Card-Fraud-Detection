@@ -10,7 +10,9 @@ import pytest
 
 from fraud_detection.data import ValidatedDataset, generate_synthetic_data, validate_frame
 from fraud_detection.model import (
+    MANIFEST_FILENAME,
     METADATA_FILENAME,
+    MODEL_FILENAME,
     FraudModel,
     ModelArtifactError,
     TrainingConfig,
@@ -91,6 +93,9 @@ def test_save_and_load_model_round_trip(
     restored = load_model(model_path.parent)
 
     assert model_path.is_file()
+    manifest = json.loads((model_path.parent / MANIFEST_FILENAME).read_text(encoding="utf-8"))
+    assert set(manifest["files"]) == {MODEL_FILENAME, METADATA_FILENAME}
+    assert all(len(digest) == 64 for digest in manifest["files"].values())
     metadata = json.loads((model_path.parent / METADATA_FILENAME).read_text(encoding="utf-8"))
     assert metadata["dataset_fingerprint"] == model.metadata["dataset_fingerprint"]
     np.testing.assert_allclose(
@@ -107,6 +112,20 @@ def test_load_model_rejects_invalid_artifacts(tmp_path: Path) -> None:
     joblib.dump({"not": "a model"}, invalid_path)
     with pytest.raises(ModelArtifactError, match="FraudModel"):
         load_model(invalid_path)
+
+
+def test_load_model_detects_artifact_tampering(
+    tmp_path: Path,
+    trained_model: tuple[FraudModel, ValidatedDataset],
+) -> None:
+    model, _ = trained_model
+    artifact_directory = tmp_path / "artifact"
+    save_model(model, artifact_directory)
+    metadata_path = artifact_directory / METADATA_FILENAME
+    metadata_path.write_text("{}\n", encoding="utf-8")
+
+    with pytest.raises(ModelArtifactError, match="integrity check failed"):
+        load_model(artifact_directory)
 
 
 @pytest.mark.parametrize(

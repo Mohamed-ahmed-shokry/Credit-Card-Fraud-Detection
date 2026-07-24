@@ -91,6 +91,7 @@ Training writes:
 
 ```text
 artifacts/model/
+├── manifest.json   # SHA-256 integrity hashes for the artifact files
 ├── metadata.json   # readable model card, metrics, fingerprint, and schema
 └── model.joblib    # fitted preprocessing/model pipeline and threshold
 ```
