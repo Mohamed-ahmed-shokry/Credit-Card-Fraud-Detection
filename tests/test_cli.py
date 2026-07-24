@@ -41,13 +41,27 @@ def test_cli_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
 
     trained = runner.invoke(
         app,
-        ["train", str(data_path), "--output", str(artifact_path), "--seed", "9"],
+        [
+            "train",
+            str(data_path),
+            "--output",
+            str(artifact_path),
+            "--seed",
+            "9",
+            "--threshold-strategy",
+            "cost",
+            "--false-negative-cost",
+            "20",
+        ],
     )
     assert trained.exit_code == 0, trained.output
     training_summary = json.loads(trained.stdout)
     assert training_summary["test_metrics"]["roc_auc"] > 0.7
     assert (artifact_path / MODEL_FILENAME).is_file()
     assert (artifact_path / METADATA_FILENAME).is_file()
+    metadata = json.loads((artifact_path / METADATA_FILENAME).read_text(encoding="utf-8"))
+    assert metadata["training_config"]["threshold_strategy"] == "cost"
+    assert metadata["training_config"]["false_negative_cost"] == 20
 
     inspected = runner.invoke(app, ["inspect", str(artifact_path)])
     assert inspected.exit_code == 0, inspected.output

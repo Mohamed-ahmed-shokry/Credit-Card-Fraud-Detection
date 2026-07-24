@@ -19,6 +19,7 @@ from fraud_detection.data import (
 from fraud_detection.drift import DriftError, assess_drift
 from fraud_detection.model import (
     ModelArtifactError,
+    ThresholdStrategy,
     TrainingConfig,
     load_model,
     save_model,
@@ -91,6 +92,18 @@ def train_command(
         typer.Option(min=0.05, max=0.4, help="Threshold-tuning validation fraction."),
     ] = 0.2,
     seed: Annotated[int, typer.Option(help="Random seed.")] = 42,
+    threshold_strategy: Annotated[
+        ThresholdStrategy,
+        typer.Option(help="Validation objective: maximize F1 or minimize weighted mistake cost."),
+    ] = ThresholdStrategy.F1,
+    false_positive_cost: Annotated[
+        float,
+        typer.Option(min=0.000001, help="Relative cost of flagging a legitimate transaction."),
+    ] = 1.0,
+    false_negative_cost: Annotated[
+        float,
+        typer.Option(min=0.000001, help="Relative cost of missing a fraudulent transaction."),
+    ] = 10.0,
 ) -> None:
     """Train, tune on validation data, evaluate on test data, and save."""
     try:
@@ -99,6 +112,9 @@ def train_command(
             test_size=test_size,
             validation_size=validation_size,
             random_state=seed,
+            threshold_strategy=threshold_strategy,
+            false_positive_cost=false_positive_cost,
+            false_negative_cost=false_negative_cost,
         )
         model = train_model(dataset, config=config)
         model_path = save_model(model, output)
