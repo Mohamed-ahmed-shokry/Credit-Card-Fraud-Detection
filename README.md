@@ -72,6 +72,7 @@ Run the complete workflow without downloading private data:
 fraud-detect generate-data --output data/demo.csv --rows 5000
 fraud-detect train data/demo.csv --output artifacts/model
 fraud-detect inspect artifacts/model
+fraud-detect drift artifacts/model data/demo.csv
 fraud-detect predict artifacts/model data/demo.csv --output predictions.csv
 ```
 
@@ -176,6 +177,24 @@ Example response:
 
 The service accepts at most 1,000 transactions per request.
 
+## Monitor feature drift
+
+Compare recent transactions with the training distribution:
+
+```bash
+fraud-detect drift artifacts/model recent_transactions.csv \
+  --output reports/drift.json
+```
+
+The report ranks every feature by Population Stability Index (PSI):
+
+- `stable`: PSI below `0.10`
+- `warning`: PSI from `0.10` to below `0.25`
+- `drifted`: PSI `0.25` or higher
+
+PSI is a diagnostic signal, not proof that model quality changed. Investigate alerts
+alongside label-based performance, calibration, traffic changes, and business context.
+
 ## Container deployment
 
 Train the model on the host first, then mount it read-only:
@@ -208,6 +227,7 @@ src/fraud_detection/
 ├── api.py          # versioned online prediction service
 ├── cli.py          # generate, train, inspect, predict, and serve workflows
 ├── data.py         # ingestion, schema validation, and synthetic data
+├── drift.py        # training profiles and PSI drift reporting
 ├── evaluation.py   # threshold tuning and imbalance-aware metrics
 └── model.py        # training, model card, inference, and persistence
 tests/              # unit, integration, CLI, and API tests

@@ -16,6 +16,7 @@ def test_cli_end_to_end(tmp_path: Path) -> None:
     data_path = tmp_path / "transactions.csv"
     artifact_path = tmp_path / "artifact"
     predictions_path = tmp_path / "predictions.csv"
+    drift_path = tmp_path / "reports" / "drift.json"
 
     generated = runner.invoke(
         app,
@@ -49,6 +50,22 @@ def test_cli_end_to_end(tmp_path: Path) -> None:
     inspected = runner.invoke(app, ["inspect", str(artifact_path)])
     assert inspected.exit_code == 0, inspected.output
     assert json.loads(inspected.stdout)["row_count"] == 800
+
+    drifted = runner.invoke(
+        app,
+        [
+            "drift",
+            str(artifact_path),
+            str(data_path),
+            "--output",
+            str(drift_path),
+        ],
+    )
+    assert drifted.exit_code == 0, drifted.output
+    drift_summary = json.loads(drifted.stdout)
+    assert drift_summary["rows"] == 800
+    assert len(drift_summary["features"]) == 30
+    assert json.loads(drift_path.read_text(encoding="utf-8")) == drift_summary
 
     predicted = runner.invoke(
         app,

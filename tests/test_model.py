@@ -40,6 +40,7 @@ def test_train_model_produces_reproducible_model_card(
     assert sum(model.metadata["splits"].values()) == 1_500
     assert model.metadata["test_metrics"]["roc_auc"] > 0.7
     assert len(model.metadata["dataset_fingerprint"]) == 64
+    assert len(model.metadata["reference_profile"]) == 30
 
     repeated = train_model(dataset)
     assert repeated.threshold == pytest.approx(model.threshold)
@@ -125,6 +126,23 @@ def test_load_model_detects_artifact_tampering(
     metadata_path.write_text("{}\n", encoding="utf-8")
 
     with pytest.raises(ModelArtifactError, match="integrity check failed"):
+        load_model(artifact_directory)
+
+
+def test_load_model_requires_valid_integrity_manifest(
+    tmp_path: Path,
+    trained_model: tuple[FraudModel, ValidatedDataset],
+) -> None:
+    model, _ = trained_model
+    artifact_directory = tmp_path / "artifact"
+    save_model(model, artifact_directory)
+    manifest_path = artifact_directory / MANIFEST_FILENAME
+    manifest_path.unlink()
+    with pytest.raises(ModelArtifactError, match="manifest does not exist"):
+        load_model(artifact_directory)
+
+    manifest_path.write_text("{}\n", encoding="utf-8")
+    with pytest.raises(ModelArtifactError, match="manifest is invalid"):
         load_model(artifact_directory)
 
 

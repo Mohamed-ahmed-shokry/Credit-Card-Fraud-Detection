@@ -19,6 +19,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
 from fraud_detection.data import ValidatedDataset
+from fraud_detection.drift import build_reference_profile
 from fraud_detection.evaluation import evaluate_predictions, select_f1_threshold
 
 ARTIFACT_VERSION = 1
@@ -66,7 +67,7 @@ class FraudModel:
 
     def predict_probabilities(self, features: pd.DataFrame) -> np.ndarray:
         """Return fraud probabilities after enforcing the training schema."""
-        ordered = self._prepare_features(features)
+        ordered = self.validate_features(features)
         probabilities = cast(
             np.ndarray,
             np.asarray(self.pipeline.predict_proba(ordered)[:, 1], dtype=float),
@@ -82,7 +83,8 @@ class FraudModel:
             (self.predict_probabilities(features) >= self.threshold).astype("int8"),
         )
 
-    def _prepare_features(self, features: pd.DataFrame) -> pd.DataFrame:
+    def validate_features(self, features: pd.DataFrame) -> pd.DataFrame:
+        """Validate and reorder transaction features to the training schema."""
         if features.empty:
             raise ModelArtifactError("At least one transaction is required.")
         if not features.columns.is_unique:
@@ -188,6 +190,7 @@ def train_model(
             "test": len(target_test),
         },
         "training_config": asdict(settings),
+        "reference_profile": build_reference_profile(features_train),
         "validation_metrics": validation_metrics.to_dict(),
         "test_metrics": test_metrics.to_dict(),
     }

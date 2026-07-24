@@ -16,6 +16,7 @@ from fraud_detection.data import (
     generate_synthetic_data,
     load_csv,
 )
+from fraud_detection.drift import DriftError, assess_drift
 from fraud_detection.model import (
     ModelArtifactError,
     TrainingConfig,
@@ -179,6 +180,43 @@ def inspect_command(
     except ModelArtifactError as exc:
         _abort(str(exc))
     typer.echo(json.dumps(model.metadata, indent=2, sort_keys=True))
+
+
+@app.command("drift")
+def drift_command(
+    model_path: Annotated[
+        Path,
+        typer.Argument(exists=True, readable=True, help="Model file or artifact directory."),
+    ],
+    data: Annotated[
+        Path,
+        typer.Argument(exists=True, dir_okay=False, readable=True, help="Current transactions."),
+    ],
+    target: Annotated[
+        str,
+        typer.Option(help="Optional label column to exclude from feature analysis."),
+    ] = DEFAULT_TARGET,
+    output: Annotated[
+        Path | None,
+        typer.Option("--output", "-o", help="Optional JSON report destination."),
+    ] = None,
+) -> None:
+    """Compare current feature distributions with the training baseline."""
+    try:
+        model = load_model(model_path)
+        frame = pd.read_csv(data).drop(columns=target, errors="ignore")
+        features = model.validate_features(frame)
+        profile = model.metadata.get("reference_profile")
+        if not isinstance(profile, dict):
+            raise DriftError("Model artifact does not contain a reference profile.")
+        report_json = json.dumps(assess_drift(profile, features).to_dict(), indent=2)
+    except (OSError, pd.errors.ParserError, ModelArtifactError, DriftError) as exc:
+        _abort(str(exc))
+
+    if output is not None:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(report_json + "\n", encoding="utf-8")
+    typer.echo(report_json)
 
 
 @app.command("serve")
