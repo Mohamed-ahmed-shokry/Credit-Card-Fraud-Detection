@@ -54,6 +54,13 @@ class CalibrationMethod(StrEnum):
     ISOTONIC = "isotonic"
 
 
+class SplitStrategy(StrEnum):
+    """Supported dataset partitioning policies."""
+
+    STRATIFIED = "stratified"
+    TEMPORAL = "temporal"
+
+
 @dataclass(frozen=True)
 class TrainingConfig:
     """Training and holdout configuration."""
@@ -68,6 +75,8 @@ class TrainingConfig:
     false_negative_cost: float = 10.0
     calibration_method: CalibrationMethod = CalibrationMethod.SIGMOID
     calibration_folds: int = 3
+    split_strategy: SplitStrategy = SplitStrategy.STRATIFIED
+    time_column: str = "Time"
 
     def __post_init__(self) -> None:
         if not 0.05 <= self.test_size <= 0.4:
@@ -93,6 +102,10 @@ class TrainingConfig:
             raise ValueError("calibration_method must be 'none', 'sigmoid', or 'isotonic'")
         if not 2 <= self.calibration_folds <= 10:
             raise ValueError("calibration_folds must be between 2 and 10")
+        if not isinstance(self.split_strategy, SplitStrategy):
+            raise ValueError("split_strategy must be 'stratified' or 'temporal'")
+        if not self.time_column.strip():
+            raise ValueError("time_column must not be empty")
 
 
 @dataclass
@@ -160,23 +173,16 @@ def train_model(
     """Fit and evaluate a deterministic fraud model with untouched test data."""
     settings = config or TrainingConfig()
     _ensure_split_capacity(dataset.target, settings)
-
-    features_train_validation, features_test, target_train_validation, target_test = (
-        train_test_split(
-            dataset.features,
-            dataset.target,
-            test_size=settings.test_size,
-            random_state=settings.random_state,
-            stratify=dataset.target,
-        )
-    )
-    relative_validation_size = settings.validation_size / (1.0 - settings.test_size)
-    features_train, features_validation, target_train, target_validation = train_test_split(
-        features_train_validation,
-        target_train_validation,
-        test_size=relative_validation_size,
-        random_state=settings.random_state,
-        stratify=target_train_validation,
+    (
+        features_train,
+        features_validation,
+        features_test,
+        target_train,
+        target_validation,
+        target_test,
+    ) = _split_dataset(
+        dataset,
+        settings,
     )
 
     base_estimator = Pipeline(
@@ -285,6 +291,12 @@ def train_model(
             "validation": len(target_validation),
             "test": len(target_test),
         },
+        "split_time_ranges": _split_time_ranges(
+            features_train,
+            features_validation,
+            features_test,
+            settings,
+        ),
         "training_config": asdict(settings),
         "reference_profile": build_reference_profile(features_train),
         "feature_effects": feature_effects,
@@ -445,6 +457,108 @@ def _extract_feature_effects(
         }
         for rank, (feature, coefficient) in enumerate(ranked, start=1)
     ]
+
+
+def _split_dataset(
+    dataset: ValidatedDataset,
+    settings: TrainingConfig,
+) -> tuple[
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.Series,
+    pd.Series,
+    pd.Series,
+]:
+    if settings.split_strategy is SplitStrategy.TEMPORAL:
+        if settings.time_column not in dataset.features.columns:
+            raise ValueError(
+                f"Temporal splitting requires feature column {settings.time_column!r}."
+            )
+        order = np.argsort(
+            dataset.features[settings.time_column].to_numpy(dtype=float),
+            kind="stable",
+        )
+        ordered_features = dataset.features.iloc[order].reset_index(drop=True)
+        ordered_target = dataset.target.iloc[order].reset_index(drop=True)
+        test_count = max(1, round(len(ordered_target) * settings.test_size))
+        validation_count = max(1, round(len(ordered_target) * settings.validation_size))
+        train_end = len(ordered_target) - validation_count - test_count
+        validation_end = len(ordered_target) - test_count
+        if train_end <= 0:
+            raise ValueError("Temporal split leaves no training rows.")
+
+        features_train = ordered_features.iloc[:train_end]
+        features_validation = ordered_features.iloc[train_end:validation_end]
+        features_test = ordered_features.iloc[validation_end:]
+        target_train = ordered_target.iloc[:train_end]
+        target_validation = ordered_target.iloc[train_end:validation_end]
+        target_test = ordered_target.iloc[validation_end:]
+        for split_name, split_target in (
+            ("training", target_train),
+            ("validation", target_validation),
+            ("test", target_test),
+        ):
+            if set(split_target.unique().tolist()) != {0, 1}:
+                raise ValueError(
+                    f"Temporal {split_name} split must contain both target classes; "
+                    "use more data or stratified splitting."
+                )
+        return (
+            features_train,
+            features_validation,
+            features_test,
+            target_train,
+            target_validation,
+            target_test,
+        )
+
+    features_train_validation, features_test, target_train_validation, target_test = (
+        train_test_split(
+            dataset.features,
+            dataset.target,
+            test_size=settings.test_size,
+            random_state=settings.random_state,
+            stratify=dataset.target,
+        )
+    )
+    relative_validation_size = settings.validation_size / (1.0 - settings.test_size)
+    features_train, features_validation, target_train, target_validation = train_test_split(
+        features_train_validation,
+        target_train_validation,
+        test_size=relative_validation_size,
+        random_state=settings.random_state,
+        stratify=target_train_validation,
+    )
+    return (
+        features_train,
+        features_validation,
+        features_test,
+        target_train,
+        target_validation,
+        target_test,
+    )
+
+
+def _split_time_ranges(
+    features_train: pd.DataFrame,
+    features_validation: pd.DataFrame,
+    features_test: pd.DataFrame,
+    settings: TrainingConfig,
+) -> dict[str, dict[str, float]] | None:
+    if settings.split_strategy is not SplitStrategy.TEMPORAL:
+        return None
+    return {
+        split_name: {
+            "minimum": float(features[settings.time_column].min()),
+            "maximum": float(features[settings.time_column].max()),
+        }
+        for split_name, features in (
+            ("train", features_train),
+            ("validation", features_validation),
+            ("test", features_test),
+        )
+    }
 
 
 def _ensure_split_capacity(target: pd.Series, config: TrainingConfig) -> None:

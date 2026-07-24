@@ -17,6 +17,7 @@ from fraud_detection.model import (
     CalibrationMethod,
     FraudModel,
     ModelArtifactError,
+    SplitStrategy,
     ThresholdStrategy,
     TrainingConfig,
     load_model,
@@ -178,6 +179,8 @@ def test_load_model_requires_valid_integrity_manifest(
         {"calibration_method": "unknown"},
         {"calibration_folds": 1},
         {"calibration_folds": 11},
+        {"split_strategy": "unknown"},
+        {"time_column": " "},
     ],
 )
 def test_training_config_rejects_invalid_values(
@@ -219,3 +222,44 @@ def test_train_model_can_disable_probability_calibration() -> None:
 
     assert model.metadata["estimator"] == "LogisticRegression"
     assert model.metadata["calibration"] == {"method": "none", "folds": None}
+
+
+def test_train_model_supports_chronological_evaluation() -> None:
+    dataset = validate_frame(generate_synthetic_data(rows=1_000, fraud_rate=0.1))
+
+    model = train_model(
+        dataset,
+        config=TrainingConfig(
+            split_strategy=SplitStrategy.TEMPORAL,
+            calibration_method=CalibrationMethod.NONE,
+        ),
+    )
+
+    ranges = model.metadata["split_time_ranges"]
+    assert ranges["train"]["maximum"] <= ranges["validation"]["minimum"]
+    assert ranges["validation"]["maximum"] <= ranges["test"]["minimum"]
+    assert model.metadata["training_config"]["split_strategy"] == "temporal"
+
+
+def test_temporal_split_requires_time_feature() -> None:
+    dataset = validate_frame(generate_synthetic_data(rows=500, fraud_rate=0.1).drop(columns="Time"))
+
+    with pytest.raises(ValueError, match="requires feature column"):
+        train_model(
+            dataset,
+            config=TrainingConfig(split_strategy=SplitStrategy.TEMPORAL),
+        )
+
+
+def test_temporal_split_rejects_single_class_windows() -> None:
+    features = pd.DataFrame({"Time": range(100), "amount": range(100)})
+    target = pd.Series([0] * 90 + [1] * 10, name="Class", dtype="int8")
+
+    with pytest.raises(ValueError, match="must contain both target classes"):
+        train_model(
+            ValidatedDataset(features, target),
+            config=TrainingConfig(
+                split_strategy=SplitStrategy.TEMPORAL,
+                calibration_method=CalibrationMethod.NONE,
+            ),
+        )
