@@ -114,6 +114,10 @@ def train_command(
         int,
         typer.Option(min=2, max=10, help="Cross-validation folds used for calibration."),
     ] = 3,
+    calibration_jobs: Annotated[
+        int,
+        typer.Option(help="Calibration workers: 1 is conservative; -1 uses all processors."),
+    ] = 1,
     split_strategy: Annotated[
         SplitStrategy,
         typer.Option(help="Random stratified or chronological dataset partitioning."),
@@ -145,6 +149,7 @@ def train_command(
             false_negative_cost=false_negative_cost,
             calibration_method=calibration_method,
             calibration_folds=calibration_folds,
+            calibration_jobs=calibration_jobs,
             split_strategy=split_strategy,
             time_column=time_column,
         )

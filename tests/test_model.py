@@ -49,7 +49,12 @@ def test_train_model_produces_reproducible_model_card(
     assert model.metadata["test_metrics"]["roc_auc"] > 0.7
     assert "expected_cost_per_transaction" in model.metadata["test_metrics"]
     assert "brier_score" in model.metadata["test_metrics"]
-    assert model.metadata["calibration"] == {"method": "sigmoid", "folds": 3}
+    assert model.metadata["calibration"] == {
+        "method": "sigmoid",
+        "folds": 3,
+        "jobs": 1,
+    }
+    assert model.estimator.n_jobs == 1
     assert model.artifact_version == ARTIFACT_VERSION
     assert len(model.metadata["dataset_fingerprint"]) == 64
     assert len(model.metadata["reference_profile"]) == 30
@@ -372,6 +377,8 @@ def test_load_model_rejects_nonstandard_metadata_json(
         {"calibration_method": "unknown"},
         {"calibration_folds": 1},
         {"calibration_folds": 11},
+        {"calibration_jobs": 0},
+        {"calibration_jobs": -2},
         {"split_strategy": "unknown"},
         {"time_column": " "},
     ],
@@ -397,12 +404,15 @@ def test_train_model_supports_cost_sensitive_thresholds() -> None:
         threshold_strategy=ThresholdStrategy.COST,
         false_positive_cost=1,
         false_negative_cost=25,
+        calibration_jobs=-1,
     )
 
     model = train_model(dataset, config=config)
 
     assert model.metadata["training_config"]["threshold_strategy"] == "cost"
     assert model.metadata["training_config"]["false_negative_cost"] == 25
+    assert model.metadata["calibration"]["jobs"] == -1
+    assert model.estimator.n_jobs == -1
 
 
 def test_train_model_can_disable_probability_calibration() -> None:
@@ -414,7 +424,11 @@ def test_train_model_can_disable_probability_calibration() -> None:
     )
 
     assert model.metadata["estimator"] == "LogisticRegression"
-    assert model.metadata["calibration"] == {"method": "none", "folds": None}
+    assert model.metadata["calibration"] == {
+        "method": "none",
+        "folds": None,
+        "jobs": None,
+    }
 
 
 def test_train_model_supports_chronological_evaluation() -> None:

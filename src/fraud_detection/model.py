@@ -77,6 +77,7 @@ class TrainingConfig:
     false_negative_cost: float = 10.0
     calibration_method: CalibrationMethod = CalibrationMethod.SIGMOID
     calibration_folds: int = 3
+    calibration_jobs: int = 1
     split_strategy: SplitStrategy = SplitStrategy.STRATIFIED
     time_column: str = "Time"
 
@@ -104,6 +105,8 @@ class TrainingConfig:
             raise ValueError("calibration_method must be 'none', 'sigmoid', or 'isotonic'")
         if not 2 <= self.calibration_folds <= 10:
             raise ValueError("calibration_folds must be between 2 and 10")
+        if self.calibration_jobs == 0 or self.calibration_jobs < -1:
+            raise ValueError("calibration_jobs must be -1 or a positive integer")
         if not isinstance(self.split_strategy, SplitStrategy):
             raise ValueError("split_strategy must be 'stratified' or 'temporal'")
         if not self.time_column.strip():
@@ -226,7 +229,7 @@ def train_model(
             estimator=base_estimator,
             method=settings.calibration_method.value,
             cv=settings.calibration_folds,
-            n_jobs=-1,
+            n_jobs=settings.calibration_jobs,
         )
     estimator.fit(features_train, target_train)
 
@@ -289,6 +292,11 @@ def train_model(
             "method": settings.calibration_method.value,
             "folds": (
                 settings.calibration_folds
+                if settings.calibration_method is not CalibrationMethod.NONE
+                else None
+            ),
+            "jobs": (
+                settings.calibration_jobs
                 if settings.calibration_method is not CalibrationMethod.NONE
                 else None
             ),
