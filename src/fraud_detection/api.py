@@ -26,7 +26,9 @@ from fraud_detection.model import FraudModel, ModelArtifactError, load_model
 MODEL_PATH_ENVIRONMENT_VARIABLE = "FRAUD_MODEL_PATH"
 REQUEST_ID_HEADER = "X-Request-ID"
 PROCESS_TIME_HEADER = "X-Process-Time-Ms"
+MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024
 _REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+_BODY_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 logger = logging.getLogger(__name__)
 
 TransactionValue = Annotated[float, Field(strict=True, allow_inf_nan=False)]
@@ -113,7 +115,9 @@ def create_app(
         request.state.request_id = request_id
         started_at = perf_counter()
         try:
-            response = await call_next(request)
+            response: Response | None = await _request_body_error(request)
+            if response is None:
+                response = await call_next(request)
         except Exception:
             duration_ms = (perf_counter() - started_at) * 1_000
             logger.exception(
@@ -192,6 +196,37 @@ def create_app(
         )
 
     return application
+
+
+async def _request_body_error(request: Request) -> JSONResponse | None:
+    if request.method not in _BODY_METHODS:
+        return None
+
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            declared_length = int(content_length)
+        except ValueError:
+            return JSONResponse(status_code=400, content={"detail": "Invalid Content-Length."})
+        if declared_length < 0:
+            return JSONResponse(status_code=400, content={"detail": "Invalid Content-Length."})
+        if declared_length > MAX_REQUEST_BODY_BYTES:
+            return _request_too_large_response()
+
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(body) + len(chunk) > MAX_REQUEST_BODY_BYTES:
+            return _request_too_large_response()
+        body.extend(chunk)
+    request._body = bytes(body)
+    return None
+
+
+def _request_too_large_response() -> JSONResponse:
+    return JSONResponse(
+        status_code=413,
+        content={"detail": f"Request body exceeds the {MAX_REQUEST_BODY_BYTES}-byte limit."},
+    )
 
 
 def _model_from_request(request: Request) -> FraudModel:

@@ -8,6 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from fraud_detection.api import (
+    MAX_REQUEST_BODY_BYTES,
     MODEL_PATH_ENVIRONMENT_VARIABLE,
     PROCESS_TIME_HEADER,
     REQUEST_ID_HEADER,
@@ -114,6 +115,40 @@ def test_predict_rejects_invalid_request_shape(client: TestClient, payload: obje
     response = client.post("/v1/predict", json=payload)
 
     assert response.status_code == 422
+
+
+def test_api_rejects_declared_oversized_body_with_request_context(
+    client: TestClient,
+) -> None:
+    response = client.post(
+        "/v1/predict",
+        content=b"{}",
+        headers={
+            "Content-Length": str(MAX_REQUEST_BODY_BYTES + 1),
+            "Content-Type": "application/json",
+            REQUEST_ID_HEADER: "oversized-request",
+        },
+    )
+
+    assert response.status_code == 413
+    assert response.json()["detail"].endswith("-byte limit.")
+    assert response.headers[REQUEST_ID_HEADER] == "oversized-request"
+    assert float(response.headers[PROCESS_TIME_HEADER]) >= 0
+
+
+def test_api_rejects_chunked_body_that_crosses_limit(client: TestClient) -> None:
+    def oversized_body() -> Iterator[bytes]:
+        yield b'{"transactions":[{"x":"'
+        yield b"x" * MAX_REQUEST_BODY_BYTES
+        yield b'"}]}'
+
+    response = client.post(
+        "/v1/predict",
+        content=oversized_body(),
+        headers={"Content-Type": "application/json"},
+    )
+
+    assert response.status_code == 413
 
 
 def test_openapi_describes_versioned_prediction_endpoint(client: TestClient) -> None:
