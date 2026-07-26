@@ -14,6 +14,7 @@ from uuid import uuid4
 
 import pandas as pd
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.middleware.base import RequestResponseEndpoint
@@ -28,6 +29,8 @@ PROCESS_TIME_HEADER = "X-Process-Time-Ms"
 _REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 logger = logging.getLogger(__name__)
 
+TransactionValue = Annotated[float, Field(strict=True, allow_inf_nan=False)]
+
 
 class PredictionRequest(BaseModel):
     """Bounded batch of numeric transaction feature mappings."""
@@ -35,7 +38,7 @@ class PredictionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     transactions: Annotated[
-        list[dict[str, float]],
+        list[dict[str, TransactionValue]],
         Field(min_length=1, max_length=1_000),
     ]
 
@@ -134,6 +137,21 @@ def create_app(
             request_id,
         )
         return response
+
+    @application.exception_handler(RequestValidationError)
+    async def request_validation_error_handler(
+        _request: Request,
+        exception: RequestValidationError,
+    ) -> JSONResponse:
+        sanitized_errors = [
+            {
+                "type": error["type"],
+                "loc": error["loc"],
+                "msg": error["msg"],
+            }
+            for error in exception.errors()
+        ]
+        return JSONResponse(status_code=422, content={"detail": sanitized_errors})
 
     @application.exception_handler(ModelArtifactError)
     async def model_artifact_error_handler(

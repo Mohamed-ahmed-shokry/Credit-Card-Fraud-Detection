@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -74,6 +75,30 @@ def test_predict_returns_actionable_schema_error(client: TestClient) -> None:
 
     assert response.status_code == 422
     assert "Input schema does not match" in response.json()["detail"]
+
+
+@pytest.mark.parametrize("invalid_value", ["1.25", True, float("inf")])
+def test_predict_rejects_coerced_or_non_finite_feature_values(
+    client: TestClient,
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+    invalid_value: object,
+) -> None:
+    _, _, dataset = api_context
+    transaction = dataset.features.iloc[0].to_dict()
+    transaction["V1"] = invalid_value
+
+    payload = {"transactions": [transaction]}
+    if invalid_value == float("inf"):
+        response = client.post(
+            "/v1/predict",
+            content=json.dumps(payload),
+            headers={"Content-Type": "application/json"},
+        )
+    else:
+        response = client.post("/v1/predict", json=payload)
+
+    assert response.status_code == 422
+    assert all("input" not in error for error in response.json()["detail"])
 
 
 @pytest.mark.parametrize(
