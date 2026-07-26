@@ -137,6 +137,14 @@ Calibration is learned only from training folds. Brier score is reported on
 validation and untouched test data; lower is better. Calibration improves probability
 interpretation but cannot correct unrepresentative or shifted data.
 
+Calibration folds use one worker by default to avoid multiplying memory use,
+especially on Windows. A resource-controlled training host can opt into all
+processors explicitly:
+
+```bash
+fraud-detect train Dataset/creditcard.csv --calibration-jobs -1
+```
+
 Training writes:
 
 ```text
@@ -145,6 +153,10 @@ artifacts/model/
 ├── metadata.json   # readable model card, metrics, fingerprint, and schema
 └── model.joblib    # fitted preprocessing/model pipeline and threshold
 ```
+
+The loader requires the artifact's recorded scikit-learn version to exactly match
+the serving runtime. Cross-version pickle/joblib loading is unsupported; retrain the
+model after dependency upgrades instead of bypassing this check.
 
 Use a different target name when needed:
 

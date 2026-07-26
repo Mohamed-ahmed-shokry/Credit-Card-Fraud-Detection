@@ -40,6 +40,11 @@ JSON metadata, and agreement between `metadata.json` and the model's embedded
 metadata. This prevents a structurally inconsistent trusted artifact from becoming
 a latent serving failure.
 
+Directory artifacts are checked for an exact scikit-learn runtime match before
+deserialization. Direct-file loading converts scikit-learn version warnings into
+errors. Retrain artifacts after dependency upgrades; do not suppress compatibility
+checks for production serving.
+
 ### Transaction data
 
 Raw datasets, generated predictions, and trained artifacts are excluded by

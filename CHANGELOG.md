@@ -37,6 +37,10 @@ All notable changes to this project are documented here. The format follows
 - CLI training reports artifact-destination filesystem failures without a traceback.
 - Drift calculation validates normalized feature names, numeric profile statistics,
   bin ordering, and baseline probability distributions before calculating PSI.
+- Artifact loading rejects mismatched scikit-learn runtimes before directory-based
+  deserialization and converts scikit-learn inconsistency warnings into model errors.
+- Calibration uses one worker by default, persists its worker policy, and supports
+  explicit `--calibration-jobs -1` opt-in for all processors.
 
 ## [0.1.0] - 2026-07-24
 
