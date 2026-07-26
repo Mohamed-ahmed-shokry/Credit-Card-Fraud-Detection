@@ -41,6 +41,10 @@ All notable changes to this project are documented here. The format follows
   deserialization and converts scikit-learn inconsistency warnings into model errors.
 - Calibration uses one worker by default, persists its worker policy, and supports
   explicit `--calibration-jobs -1` opt-in for all processors.
+- API requests are bounded to 2 MiB for both declared and streamed bodies while
+  preserving correlation and timing headers on `413` responses.
+- Model cards record Python, joblib, NumPy, pandas, scikit-learn, and SciPy versions
+  needed to reconstruct the training runtime.
 
 ## [0.1.0] - 2026-07-24
 

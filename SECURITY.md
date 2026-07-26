@@ -60,3 +60,7 @@ the rejected transaction value.
 The supplied container runs without root privileges or Linux capabilities and uses
 a read-only filesystem. Those controls are defense in depth, not a substitute for
 an authenticated gateway and a private service network.
+
+The application rejects declared or streamed request bodies larger than 2 MiB.
+Production gateways should still enforce their own request-size, rate, and
+concurrency limits before traffic reaches the service.

@@ -154,9 +154,11 @@ artifacts/model/
 └── model.joblib    # fitted preprocessing/model pipeline and threshold
 ```
 
-The loader requires the artifact's recorded scikit-learn version to exactly match
-the serving runtime. Cross-version pickle/joblib loading is unsupported; retrain the
-model after dependency upgrades instead of bypassing this check.
+Model cards record the Python, joblib, NumPy, pandas, scikit-learn, and SciPy
+versions used for training. The loader requires the recorded scikit-learn version
+to exactly match the serving runtime. Cross-version pickle/joblib loading is
+unsupported; retrain the model after dependency upgrades instead of bypassing this
+check.
 
 Use a different target name when needed:
 
@@ -252,7 +254,9 @@ Example response:
 }
 ```
 
-The service accepts at most 1,000 transactions per request.
+The service accepts at most 1,000 transactions and 2 MiB of request body data per
+request. Both declared and streamed/chunked oversized bodies receive `413` before
+schema validation.
 Feature values must be finite JSON numbers; numeric strings and booleans are not
 coerced. Validation errors describe the failing location and rule without echoing
 the submitted transaction value.
