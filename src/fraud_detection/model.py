@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import warnings
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -15,6 +16,7 @@ import numpy as np
 import pandas as pd
 import sklearn
 from sklearn.calibration import CalibratedClassifierCV
+from sklearn.exceptions import InconsistentVersionWarning
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
@@ -372,12 +374,20 @@ def load_model(path: Path | str) -> FraudModel:
     persisted_metadata: dict[str, Any] | None = None
     if requested_path.is_dir():
         persisted_metadata = _verify_manifest(requested_path)
+        _validate_sklearn_compatibility(persisted_metadata)
         artifact_path = requested_path / MODEL_FILENAME
     if not artifact_path.is_file():
         raise ModelArtifactError(f"Model artifact does not exist: {artifact_path}")
 
     try:
-        candidate = joblib.load(artifact_path)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", InconsistentVersionWarning)
+            candidate = joblib.load(artifact_path)
+    except InconsistentVersionWarning as exc:
+        raise ModelArtifactError(
+            "Model artifact was created by an incompatible scikit-learn version; "
+            "retrain it in the current runtime."
+        ) from exc
     except Exception as exc:
         raise ModelArtifactError(f"Could not load model artifact: {exc}") from exc
     if not isinstance(candidate, FraudModel):
@@ -424,6 +434,7 @@ def _validate_loaded_model(candidate: FraudModel) -> None:
         raise ModelArtifactError("Artifact estimator must use the binary class order [0, 1].")
     if not isinstance(candidate.metadata, dict):
         raise ModelArtifactError("Artifact metadata must be a mapping.")
+    _validate_sklearn_compatibility(candidate.metadata)
 
     required_metadata = {
         "artifact_version": candidate.artifact_version,
@@ -446,6 +457,20 @@ def _validate_loaded_model(candidate: FraudModel) -> None:
     ):
         raise ModelArtifactError(
             "Artifact metadata field 'dataset_fingerprint' is missing or invalid."
+        )
+
+
+def _validate_sklearn_compatibility(metadata: dict[str, Any]) -> None:
+    artifact_version = metadata.get("scikit_learn_version")
+    if not isinstance(artifact_version, str) or not artifact_version:
+        raise ModelArtifactError(
+            "Artifact metadata field 'scikit_learn_version' is missing or invalid."
+        )
+    if artifact_version != sklearn.__version__:
+        raise ModelArtifactError(
+            "Model artifact scikit-learn version mismatch: "
+            f"artifact={artifact_version!r}, runtime={sklearn.__version__!r}. "
+            "Retrain the model with the current runtime."
         )
 
 

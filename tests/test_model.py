@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import warnings
 from copy import deepcopy
 from hashlib import sha256
 from pathlib import Path
@@ -9,6 +10,7 @@ import joblib
 import numpy as np
 import pandas as pd
 import pytest
+import sklearn
 
 from fraud_detection.data import ValidatedDataset, generate_synthetic_data, validate_frame
 from fraud_detection.model import (
@@ -243,6 +245,10 @@ def test_load_model_requires_valid_integrity_manifest(
             "dataset_fingerprint",
         ),
         (
+            lambda model: model.metadata.update({"scikit_learn_version": "0.0"}),
+            "version mismatch",
+        ),
+        (
             lambda model: model.metadata["test_metrics"].update({"roc_auc": float("nan")}),
             "finite JSON-compatible",
         ),
@@ -282,6 +288,56 @@ def test_load_model_rejects_metadata_that_disagrees_with_model(
 
     with pytest.raises(ModelArtifactError, match="does not match"):
         load_model(artifact_directory)
+
+
+def test_load_model_rejects_directory_version_mismatch_before_deserialization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    trained_model: tuple[FraudModel, ValidatedDataset],
+) -> None:
+    model, _ = trained_model
+    artifact_directory = tmp_path / "artifact"
+    save_model(model, artifact_directory)
+    metadata_path = artifact_directory / METADATA_FILENAME
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["scikit_learn_version"] = "0.0"
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+    manifest_path = artifact_directory / MANIFEST_FILENAME
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["files"][METADATA_FILENAME] = sha256(metadata_path.read_bytes()).hexdigest()
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    def fail_if_deserialized(_path: Path) -> object:
+        raise AssertionError("joblib.load must not run after a preflight mismatch")
+
+    monkeypatch.setattr(joblib, "load", fail_if_deserialized)
+
+    with pytest.raises(ModelArtifactError, match="version mismatch"):
+        load_model(artifact_directory)
+
+
+def test_load_model_converts_sklearn_version_warning_to_artifact_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact_path = tmp_path / "model.joblib"
+    artifact_path.write_bytes(b"placeholder")
+
+    def warn_about_version(_path: Path) -> object:
+        warnings.warn(
+            sklearn.exceptions.InconsistentVersionWarning(
+                estimator_name="LogisticRegression",
+                current_sklearn_version=sklearn.__version__,
+                original_sklearn_version="0.0",
+            ),
+            stacklevel=2,
+        )
+        raise AssertionError("warning should have been converted to an error")
+
+    monkeypatch.setattr(joblib, "load", warn_about_version)
+
+    with pytest.raises(ModelArtifactError, match="incompatible scikit-learn"):
+        load_model(artifact_path)
 
 
 def test_load_model_rejects_nonstandard_metadata_json(
