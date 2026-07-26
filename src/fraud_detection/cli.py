@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Annotated, NoReturn
+from uuid import uuid4
 
 import pandas as pd
 import typer
@@ -56,10 +57,9 @@ def generate_data_command(
 
     try:
         frame = generate_synthetic_data(rows=rows, fraud_rate=fraud_rate, random_state=seed)
-    except ValueError as exc:
+        _atomic_write_csv(frame, output)
+    except (OSError, ValueError) as exc:
         _abort(str(exc))
-    output.parent.mkdir(parents=True, exist_ok=True)
-    frame.to_csv(output, index=False)
     typer.echo(
         json.dumps(
             {
@@ -196,14 +196,17 @@ def predict_command(
         features = frame.drop(columns=target, errors="ignore")
         probabilities = model.predict_probabilities(features)
         predictions = (probabilities >= model.threshold).astype("int8")
-    except (OSError, pd.errors.ParserError, ModelArtifactError) as exc:
+        scored = frame.copy()
+        scored["fraud_probability"] = probabilities
+        scored["is_fraud"] = predictions
+        _atomic_write_csv(scored, output)
+    except (
+        OSError,
+        UnicodeDecodeError,
+        pd.errors.ParserError,
+        ModelArtifactError,
+    ) as exc:
         _abort(str(exc))
-
-    scored = frame.copy()
-    scored["fraud_probability"] = probabilities
-    scored["is_fraud"] = predictions
-    output.parent.mkdir(parents=True, exist_ok=True)
-    scored.to_csv(output, index=False)
     typer.echo(
         json.dumps(
             {
@@ -289,12 +292,17 @@ def drift_command(
         if not isinstance(profile, dict):
             raise DriftError("Model artifact does not contain a reference profile.")
         report_json = json.dumps(assess_drift(profile, features).to_dict(), indent=2)
-    except (OSError, pd.errors.ParserError, ModelArtifactError, DriftError) as exc:
+        if output is not None:
+            _atomic_write_text(report_json + "\n", output)
+    except (
+        OSError,
+        UnicodeDecodeError,
+        pd.errors.ParserError,
+        ModelArtifactError,
+        DriftError,
+    ) as exc:
         _abort(str(exc))
 
-    if output is not None:
-        output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_text(report_json + "\n", encoding="utf-8")
     typer.echo(report_json)
 
 
@@ -320,6 +328,26 @@ def serve_command(
 def _abort(message: str) -> NoReturn:
     typer.echo(f"Error: {message}", err=True)
     raise typer.Exit(code=2)
+
+
+def _atomic_write_csv(frame: pd.DataFrame, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f".{destination.name}.{uuid4().hex}.tmp")
+    try:
+        frame.to_csv(temporary, index=False)
+        temporary.replace(destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _atomic_write_text(content: str, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f".{destination.name}.{uuid4().hex}.tmp")
+    try:
+        temporary.write_text(content, encoding="utf-8")
+        temporary.replace(destination)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

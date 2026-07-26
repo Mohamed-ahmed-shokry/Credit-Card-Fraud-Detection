@@ -151,6 +151,36 @@ def test_generate_data_protects_existing_file(tmp_path: Path) -> None:
     assert output.read_text(encoding="utf-8") == "keep me"
 
 
+def test_generate_data_preserves_existing_file_when_atomic_write_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = tmp_path / "existing.csv"
+    output.write_text("keep me", encoding="utf-8")
+
+    def fail_after_partial_write(
+        _frame: pd.DataFrame,
+        path: Path,
+        *,
+        index: bool,
+    ) -> None:
+        assert index is False
+        path.write_text("partial output", encoding="utf-8")
+        raise OSError("simulated disk failure")
+
+    monkeypatch.setattr(pd.DataFrame, "to_csv", fail_after_partial_write)
+
+    result = runner.invoke(
+        app,
+        ["generate-data", "--output", str(output), "--overwrite"],
+    )
+
+    assert result.exit_code == 2
+    assert "simulated disk failure" in result.stderr
+    assert output.read_text(encoding="utf-8") == "keep me"
+    assert list(tmp_path.glob(".*.tmp")) == []
+
+
 def test_predict_reports_schema_error(tmp_path: Path) -> None:
     data_path = tmp_path / "training.csv"
     artifact_path = tmp_path / "artifact"
