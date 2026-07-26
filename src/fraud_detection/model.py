@@ -358,8 +358,9 @@ def load_model(path: Path | str) -> FraudModel:
     """
     requested_path = Path(path)
     artifact_path = requested_path
+    persisted_metadata: dict[str, Any] | None = None
     if requested_path.is_dir():
-        _verify_manifest(requested_path)
+        persisted_metadata = _verify_manifest(requested_path)
         artifact_path = requested_path / MODEL_FILENAME
     if not artifact_path.is_file():
         raise ModelArtifactError(f"Model artifact does not exist: {artifact_path}")
@@ -370,17 +371,70 @@ def load_model(path: Path | str) -> FraudModel:
         raise ModelArtifactError(f"Could not load model artifact: {exc}") from exc
     if not isinstance(candidate, FraudModel):
         raise ModelArtifactError("Artifact does not contain a FraudModel.")
+    _validate_loaded_model(candidate)
+    if persisted_metadata is not None:
+        try:
+            embedded_metadata = json.loads(json.dumps(candidate.metadata))
+        except (TypeError, ValueError) as exc:
+            raise ModelArtifactError("Artifact metadata is not JSON-compatible.") from exc
+        if embedded_metadata != persisted_metadata:
+            raise ModelArtifactError(
+                "Persisted metadata does not match the metadata embedded in the model."
+            )
+    return candidate
+
+
+def _validate_loaded_model(candidate: FraudModel) -> None:
+    """Validate the runtime structure required by every artifact consumer."""
     if candidate.artifact_version != ARTIFACT_VERSION:
         raise ModelArtifactError(
             f"Unsupported artifact version {candidate.artifact_version}; "
             f"expected {ARTIFACT_VERSION}."
         )
-    if not 0.0 <= candidate.threshold <= 1.0:
+    if (
+        isinstance(candidate.threshold, bool)
+        or not isinstance(candidate.threshold, int | float)
+        or not np.isfinite(candidate.threshold)
+        or not 0.0 <= candidate.threshold <= 1.0
+    ):
         raise ModelArtifactError("Artifact contains an invalid decision threshold.")
-    return candidate
+    if (
+        not isinstance(candidate.feature_names, tuple)
+        or not candidate.feature_names
+        or any(not isinstance(feature, str) or not feature for feature in candidate.feature_names)
+        or len(set(candidate.feature_names)) != len(candidate.feature_names)
+    ):
+        raise ModelArtifactError("Artifact contains an invalid feature schema.")
+    if not callable(getattr(candidate.estimator, "predict_proba", None)):
+        raise ModelArtifactError("Artifact estimator does not support probability prediction.")
+    if not isinstance(candidate.metadata, dict):
+        raise ModelArtifactError("Artifact metadata must be a mapping.")
+
+    required_metadata = {
+        "artifact_version": candidate.artifact_version,
+        "feature_names": list(candidate.feature_names),
+        "feature_count": len(candidate.feature_names),
+    }
+    for field, expected_value in required_metadata.items():
+        if candidate.metadata.get(field) != expected_value:
+            raise ModelArtifactError(
+                f"Artifact metadata field {field!r} is missing or inconsistent."
+            )
+    created_at = candidate.metadata.get("created_at")
+    if not isinstance(created_at, str) or not created_at:
+        raise ModelArtifactError("Artifact metadata field 'created_at' is missing or invalid.")
+    fingerprint = candidate.metadata.get("dataset_fingerprint")
+    if (
+        not isinstance(fingerprint, str)
+        or len(fingerprint) != 64
+        or any(character not in "0123456789abcdef" for character in fingerprint)
+    ):
+        raise ModelArtifactError(
+            "Artifact metadata field 'dataset_fingerprint' is missing or invalid."
+        )
 
 
-def _verify_manifest(directory: Path) -> None:
+def _verify_manifest(directory: Path) -> dict[str, Any]:
     manifest_path = directory / MANIFEST_FILENAME
     if not manifest_path.is_file():
         raise ModelArtifactError(f"Artifact integrity manifest does not exist: {manifest_path}")
@@ -403,6 +457,15 @@ def _verify_manifest(directory: Path) -> None:
             raise ModelArtifactError(f"Artifact integrity entry is missing for {filename}.")
         if _file_sha256(file_path) != expected_digest:
             raise ModelArtifactError(f"Artifact integrity check failed for {filename}.")
+
+    metadata_path = directory / METADATA_FILENAME
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ModelArtifactError(f"Artifact metadata is invalid: {exc}") from exc
+    if not isinstance(metadata, dict):
+        raise ModelArtifactError("Artifact metadata must be a JSON object.")
+    return metadata
 
 
 def _file_sha256(path: Path) -> str:

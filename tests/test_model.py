@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
+from hashlib import sha256
 from pathlib import Path
 
 import joblib
@@ -162,6 +164,54 @@ def test_load_model_requires_valid_integrity_manifest(
 
     manifest_path.write_text("{}\n", encoding="utf-8")
     with pytest.raises(ModelArtifactError, match="manifest is invalid"):
+        load_model(artifact_directory)
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (lambda model: setattr(model, "threshold", float("nan")), "decision threshold"),
+        (lambda model: setattr(model, "feature_names", ("V1", "V1")), "feature schema"),
+        (lambda model: setattr(model, "estimator", object()), "probability prediction"),
+        (
+            lambda model: model.metadata.pop("dataset_fingerprint"),
+            "dataset_fingerprint",
+        ),
+    ],
+)
+def test_load_model_rejects_structurally_invalid_models(
+    tmp_path: Path,
+    trained_model: tuple[FraudModel, ValidatedDataset],
+    mutate: object,
+    message: str,
+) -> None:
+    model, _ = trained_model
+    invalid_model = deepcopy(model)
+    mutate(invalid_model)  # type: ignore[operator]
+    artifact_path = tmp_path / "invalid.joblib"
+    joblib.dump(invalid_model, artifact_path)
+
+    with pytest.raises(ModelArtifactError, match=message):
+        load_model(artifact_path)
+
+
+def test_load_model_rejects_metadata_that_disagrees_with_model(
+    tmp_path: Path,
+    trained_model: tuple[FraudModel, ValidatedDataset],
+) -> None:
+    model, _ = trained_model
+    artifact_directory = tmp_path / "artifact"
+    save_model(model, artifact_directory)
+    metadata_path = artifact_directory / METADATA_FILENAME
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["created_at"] = "changed-after-model-save"
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+    manifest_path = artifact_directory / MANIFEST_FILENAME
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["files"][METADATA_FILENAME] = sha256(metadata_path.read_bytes()).hexdigest()
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ModelArtifactError, match="does not match"):
         load_model(artifact_directory)
 
 
