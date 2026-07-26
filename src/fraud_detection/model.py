@@ -121,12 +121,24 @@ class FraudModel:
     def predict_probabilities(self, features: pd.DataFrame) -> np.ndarray:
         """Return fraud probabilities after enforcing the training schema."""
         ordered = self.validate_features(features)
-        probabilities = cast(
-            np.ndarray,
-            np.asarray(self.estimator.predict_proba(ordered)[:, 1], dtype=float),
-        )
-        if probabilities.shape != (len(ordered),):
-            raise ModelArtifactError("Model returned probabilities with an invalid shape.")
+        try:
+            probability_matrix = np.asarray(
+                self.estimator.predict_proba(ordered),
+                dtype=float,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ModelArtifactError("Model returned non-numeric probabilities.") from exc
+        if probability_matrix.shape != (len(ordered), 2):
+            raise ModelArtifactError(
+                "Model returned probabilities with an invalid binary-class shape."
+            )
+        probabilities = cast(np.ndarray, probability_matrix[:, 1])
+        if not np.isfinite(probabilities).all() or np.any(
+            (probabilities < 0.0) | (probabilities > 1.0)
+        ):
+            raise ModelArtifactError(
+                "Model returned fraud probabilities outside the finite range from 0 to 1."
+            )
         return probabilities
 
     def predict(self, features: pd.DataFrame) -> np.ndarray:
@@ -404,6 +416,12 @@ def _validate_loaded_model(candidate: FraudModel) -> None:
         raise ModelArtifactError("Artifact contains an invalid feature schema.")
     if not callable(getattr(candidate.estimator, "predict_proba", None)):
         raise ModelArtifactError("Artifact estimator does not support probability prediction.")
+    estimator_classes = np.asarray(getattr(candidate.estimator, "classes_", None))
+    if estimator_classes.shape != (2,) or not np.array_equal(
+        estimator_classes,
+        np.array([0, 1]),
+    ):
+        raise ModelArtifactError("Artifact estimator must use the binary class order [0, 1].")
     if not isinstance(candidate.metadata, dict):
         raise ModelArtifactError("Artifact metadata must be a mapping.")
 

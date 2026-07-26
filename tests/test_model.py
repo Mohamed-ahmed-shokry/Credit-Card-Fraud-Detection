@@ -83,6 +83,36 @@ def test_predictions_apply_threshold_and_accept_reordered_columns(
     np.testing.assert_array_equal(predictions, probabilities >= model.threshold)
 
 
+class _InvalidProbabilityEstimator:
+    def __init__(self, output: object) -> None:
+        self.output = output
+
+    def predict_proba(self, _features: pd.DataFrame) -> object:
+        return self.output
+
+
+@pytest.mark.parametrize(
+    ("output", "message"),
+    [
+        ([["invalid", "values"]], "non-numeric"),
+        (np.array([0.1, 0.9]), "binary-class shape"),
+        (np.array([[0.1, np.nan]]), "finite range"),
+        (np.array([[-0.1, 1.1]]), "finite range"),
+    ],
+)
+def test_predictions_reject_invalid_estimator_outputs(
+    trained_model: tuple[FraudModel, ValidatedDataset],
+    output: object,
+    message: str,
+) -> None:
+    model, dataset = trained_model
+    invalid_model = deepcopy(model)
+    invalid_model.estimator = _InvalidProbabilityEstimator(output)
+
+    with pytest.raises(ModelArtifactError, match=message):
+        invalid_model.predict_probabilities(dataset.features.iloc[:1])
+
+
 @pytest.mark.parametrize(
     ("mutate", "message"),
     [
@@ -204,6 +234,10 @@ def test_load_model_requires_valid_integrity_manifest(
         (lambda model: setattr(model, "threshold", float("nan")), "decision threshold"),
         (lambda model: setattr(model, "feature_names", ("V1", "V1")), "feature schema"),
         (lambda model: setattr(model, "estimator", object()), "probability prediction"),
+        (
+            lambda model: setattr(model.estimator, "classes_", np.array([1, 0])),
+            "binary class order",
+        ),
         (
             lambda model: model.metadata.pop("dataset_fingerprint"),
             "dataset_fingerprint",
