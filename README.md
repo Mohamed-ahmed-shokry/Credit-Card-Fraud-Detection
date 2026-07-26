@@ -262,6 +262,11 @@ fraud-detect drift artifacts/model recent_transactions.csv \
   --output reports/drift.json
 ```
 
+Existing report files are protected by default; pass `--overwrite` only after
+confirming the report can be replaced. Generated datasets, prediction CSVs, and
+drift reports use same-directory atomic replacement so a failed write does not
+truncate the previous output.
+
 The report ranks every feature by Population Stability Index (PSI):
 
 - `stable`: PSI below `0.10`
@@ -270,6 +275,8 @@ The report ranks every feature by Population Stability Index (PSI):
 
 PSI is a diagnostic signal, not proof that model quality changed. Investigate alerts
 alongside label-based performance, calibration, traffic changes, and business context.
+Malformed reference profiles are rejected before PSI calculation, including invalid
+bin ordering, proportions, feature names, and non-finite statistics.
 
 ## Container deployment
 

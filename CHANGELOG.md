@@ -32,6 +32,11 @@ All notable changes to this project are documented here. The format follows
   non-numeric scores, or non-finite and out-of-range probabilities.
 - The API requires strict finite JSON numbers and sanitizes validation responses so
   rejected transaction values are not echoed or rendered as invalid JSON.
+- Generated datasets, predictions, and drift reports now use atomic replacement;
+  drift reports also require explicit `--overwrite` before replacing a file.
+- CLI training reports artifact-destination filesystem failures without a traceback.
+- Drift calculation validates normalized feature names, numeric profile statistics,
+  bin ordering, and baseline probability distributions before calculating PSI.
 
 ## [0.1.0] - 2026-07-24
 
