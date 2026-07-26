@@ -282,8 +282,15 @@ def drift_command(
         Path | None,
         typer.Option("--output", "-o", help="Optional JSON report destination."),
     ] = None,
+    overwrite: Annotated[
+        bool,
+        typer.Option(help="Replace an existing report file."),
+    ] = False,
 ) -> None:
     """Compare current feature distributions with the training baseline."""
+    if output is not None and output.exists() and not overwrite:
+        _abort(f"Output already exists: {output}. Pass --overwrite to replace it.")
+
     try:
         model = load_model(model_path)
         frame = pd.read_csv(data).drop(columns=target, errors="ignore")

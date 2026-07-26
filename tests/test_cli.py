@@ -181,6 +181,30 @@ def test_generate_data_preserves_existing_file_when_atomic_write_fails(
     assert list(tmp_path.glob(".*.tmp")) == []
 
 
+def test_drift_protects_existing_report(tmp_path: Path) -> None:
+    model_path = tmp_path / "model.joblib"
+    data_path = tmp_path / "transactions.csv"
+    output = tmp_path / "drift.json"
+    model_path.write_bytes(b"placeholder")
+    data_path.write_text("x\n1\n", encoding="utf-8")
+    output.write_text("keep me", encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        [
+            "drift",
+            str(model_path),
+            str(data_path),
+            "--output",
+            str(output),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "Pass --overwrite" in result.stderr
+    assert output.read_text(encoding="utf-8") == "keep me"
+
+
 def test_predict_reports_schema_error(tmp_path: Path) -> None:
     data_path = tmp_path / "training.csv"
     artifact_path = tmp_path / "artifact"
