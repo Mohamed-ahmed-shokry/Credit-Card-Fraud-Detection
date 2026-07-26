@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import csv
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -36,8 +38,12 @@ def load_csv(path: Path | str, *, target_column: str = DEFAULT_TARGET) -> Valida
         raise DataValidationError(f"Dataset does not exist or is not a file: {csv_path}")
 
     try:
+        with csv_path.open(encoding="utf-8-sig", newline="") as file_handle:
+            header = next(csv.reader(file_handle), None)
+        if header is not None:
+            _reject_duplicate_names(header, context="CSV columns")
         frame = pd.read_csv(csv_path)
-    except (OSError, pd.errors.ParserError, UnicodeDecodeError) as exc:
+    except (OSError, csv.Error, pd.errors.ParserError, UnicodeDecodeError) as exc:
         raise DataValidationError(f"Could not read dataset {csv_path}: {exc}") from exc
 
     return validate_frame(frame, target_column=target_column)
@@ -64,6 +70,11 @@ def validate_frame(
     features = frame.drop(columns=target_column).copy()
     if features.shape[1] == 0:
         raise DataValidationError("Dataset must contain at least one feature column.")
+    feature_names = [str(column) for column in features.columns]
+    if any(not name for name in feature_names):
+        raise DataValidationError("Feature names must not be empty.")
+    _reject_duplicate_names(feature_names, context="Feature names after string conversion")
+    features.columns = feature_names
 
     non_numeric = features.select_dtypes(exclude=np.number).columns.tolist()
     if non_numeric:
@@ -91,8 +102,13 @@ def validate_frame(
 
     target = raw_target.astype("int8").copy()
     target.name = target_column
-    features.columns = features.columns.astype(str)
     return ValidatedDataset(features=features, target=target)
+
+
+def _reject_duplicate_names(names: list[str], *, context: str) -> None:
+    duplicates = sorted(name for name, count in Counter(names).items() if count > 1)
+    if duplicates:
+        raise DataValidationError(f"{context} must be unique; duplicates: {duplicates}")
 
 
 def generate_synthetic_data(

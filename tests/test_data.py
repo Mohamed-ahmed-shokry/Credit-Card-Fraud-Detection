@@ -59,6 +59,16 @@ def test_load_csv_rejects_missing_file(tmp_path: Path) -> None:
         load_csv(tmp_path / "missing.csv")
 
 
+def test_load_csv_rejects_duplicate_headers_before_pandas_mangles_them(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "duplicate_headers.csv"
+    path.write_text("amount,amount,Class\n10,20,0\n30,40,1\n", encoding="utf-8")
+
+    with pytest.raises(DataValidationError, match="CSV columns must be unique"):
+        load_csv(path)
+
+
 @pytest.mark.parametrize(
     ("frame", "message"),
     [
@@ -81,4 +91,18 @@ def test_validate_frame_rejects_duplicate_columns() -> None:
     frame = pd.DataFrame([[1, 2, 0], [3, 4, 1]], columns=["x", "x", "Class"])
 
     with pytest.raises(DataValidationError, match="Duplicate"):
+        validate_frame(frame)
+
+
+def test_validate_frame_rejects_feature_names_that_collide_as_strings() -> None:
+    frame = pd.DataFrame([[1, 2, 0], [3, 4, 1]], columns=[1, "1", "Class"])
+
+    with pytest.raises(DataValidationError, match="after string conversion"):
+        validate_frame(frame)
+
+
+def test_validate_frame_rejects_empty_feature_names() -> None:
+    frame = pd.DataFrame([[1, 0], [2, 1]], columns=["", "Class"])
+
+    with pytest.raises(DataValidationError, match="must not be empty"):
         validate_frame(frame)
