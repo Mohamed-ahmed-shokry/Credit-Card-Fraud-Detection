@@ -28,6 +28,8 @@ All notable changes to this project are documented here. The format follows
   finite JSON metadata, and agreement between the embedded and readable model cards.
 - Dataset validation rejects duplicate CSV headers and feature names that become
   ambiguous when normalized to the persisted string schema.
+- Inference rejects estimators with reversed class labels, malformed binary output,
+  non-numeric scores, or non-finite and out-of-range probabilities.
 
 ## [0.1.0] - 2026-07-24
 
