@@ -24,8 +24,8 @@ All notable changes to this project are documented here. The format follows
 ### Changed
 
 - Model artifacts now use format version 2 for the calibrated estimator contract.
-- Model loading validates the estimator, feature schema, decision threshold, required
-  metadata, and agreement between the embedded and readable model cards.
+- Model saving and loading validate the estimator, feature schema, decision threshold,
+  finite JSON metadata, and agreement between the embedded and readable model cards.
 - Dataset validation rejects duplicate CSV headers and feature names that become
   ambiguous when normalized to the persisted string schema.
 

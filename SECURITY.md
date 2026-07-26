@@ -34,10 +34,11 @@ These hashes detect accidental or unauthorized modification, but they are not a
 digital signature. Store artifacts in access-controlled, immutable storage and add
 signature verification when crossing a trust boundary.
 
-After deserialization, the loader also validates the estimator interface, decision
-threshold, feature schema, required metadata, and agreement between `metadata.json`
-and the model's embedded metadata. This prevents a structurally inconsistent trusted
-artifact from becoming a latent serving failure.
+Before publication and after deserialization, artifact handling also validates the
+estimator interface, decision threshold, feature schema, finite standards-compliant
+JSON metadata, and agreement between `metadata.json` and the model's embedded
+metadata. This prevents a structurally inconsistent trusted artifact from becoming
+a latent serving failure.
 
 ### Transaction data
 
