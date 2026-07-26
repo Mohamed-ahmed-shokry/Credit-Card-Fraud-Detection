@@ -126,6 +126,33 @@ def test_save_and_load_model_round_trip(
     )
 
 
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (lambda model: setattr(model, "threshold", float("nan")), "decision threshold"),
+        (
+            lambda model: model.metadata["test_metrics"].update({"roc_auc": float("nan")}),
+            "finite JSON-compatible",
+        ),
+    ],
+)
+def test_save_model_rejects_invalid_artifact_before_creating_directory(
+    tmp_path: Path,
+    trained_model: tuple[FraudModel, ValidatedDataset],
+    mutate: object,
+    message: str,
+) -> None:
+    model, _ = trained_model
+    invalid_model = deepcopy(model)
+    mutate(invalid_model)  # type: ignore[operator]
+    artifact_directory = tmp_path / "artifact"
+
+    with pytest.raises(ModelArtifactError, match=message):
+        save_model(invalid_model, artifact_directory)
+
+    assert not artifact_directory.exists()
+
+
 def test_load_model_rejects_invalid_artifacts(tmp_path: Path) -> None:
     with pytest.raises(ModelArtifactError, match="does not exist"):
         load_model(tmp_path / "missing")
@@ -166,6 +193,10 @@ def test_load_model_requires_valid_integrity_manifest(
     with pytest.raises(ModelArtifactError, match="manifest is invalid"):
         load_model(artifact_directory)
 
+    manifest_path.write_text('{"artifact_version": NaN}\n', encoding="utf-8")
+    with pytest.raises(ModelArtifactError, match="non-standard JSON"):
+        load_model(artifact_directory)
+
 
 @pytest.mark.parametrize(
     ("mutate", "message"),
@@ -176,6 +207,10 @@ def test_load_model_requires_valid_integrity_manifest(
         (
             lambda model: model.metadata.pop("dataset_fingerprint"),
             "dataset_fingerprint",
+        ),
+        (
+            lambda model: model.metadata["test_metrics"].update({"roc_auc": float("nan")}),
+            "finite JSON-compatible",
         ),
     ],
 )
@@ -212,6 +247,24 @@ def test_load_model_rejects_metadata_that_disagrees_with_model(
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
     with pytest.raises(ModelArtifactError, match="does not match"):
+        load_model(artifact_directory)
+
+
+def test_load_model_rejects_nonstandard_metadata_json(
+    tmp_path: Path,
+    trained_model: tuple[FraudModel, ValidatedDataset],
+) -> None:
+    model, _ = trained_model
+    artifact_directory = tmp_path / "artifact"
+    save_model(model, artifact_directory)
+    metadata_path = artifact_directory / METADATA_FILENAME
+    metadata_path.write_text('{"invalid_number": NaN}\n', encoding="utf-8")
+    manifest_path = artifact_directory / MANIFEST_FILENAME
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["files"][METADATA_FILENAME] = sha256(metadata_path.read_bytes()).hexdigest()
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ModelArtifactError, match="non-standard JSON"):
         load_model(artifact_directory)
 
 

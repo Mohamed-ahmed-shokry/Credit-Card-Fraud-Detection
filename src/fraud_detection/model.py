@@ -313,6 +313,8 @@ def train_model(
 
 def save_model(model: FraudModel, output_directory: Path | str) -> Path:
     """Persist a model, metadata, and integrity manifest with atomic file swaps."""
+    _validate_loaded_model(model)
+    metadata_json = _serialize_metadata(model.metadata)
     destination = Path(output_directory)
     destination.mkdir(parents=True, exist_ok=True)
     model_path = destination / MODEL_FILENAME
@@ -324,10 +326,7 @@ def save_model(model: FraudModel, output_directory: Path | str) -> Path:
 
     try:
         joblib.dump(model, temporary_model)
-        temporary_metadata.write_text(
-            json.dumps(model.metadata, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
+        temporary_metadata.write_text(metadata_json, encoding="utf-8")
         manifest = {
             "artifact_version": model.artifact_version,
             "files": {
@@ -337,7 +336,7 @@ def save_model(model: FraudModel, output_directory: Path | str) -> Path:
             "hash_algorithm": "sha256",
         }
         temporary_manifest.write_text(
-            json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+            json.dumps(manifest, allow_nan=False, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
         temporary_model.replace(model_path)
@@ -372,11 +371,9 @@ def load_model(path: Path | str) -> FraudModel:
     if not isinstance(candidate, FraudModel):
         raise ModelArtifactError("Artifact does not contain a FraudModel.")
     _validate_loaded_model(candidate)
+    embedded_metadata_json = _serialize_metadata(candidate.metadata)
     if persisted_metadata is not None:
-        try:
-            embedded_metadata = json.loads(json.dumps(candidate.metadata))
-        except (TypeError, ValueError) as exc:
-            raise ModelArtifactError("Artifact metadata is not JSON-compatible.") from exc
+        embedded_metadata = json.loads(embedded_metadata_json)
         if embedded_metadata != persisted_metadata:
             raise ModelArtifactError(
                 "Persisted metadata does not match the metadata embedded in the model."
@@ -434,12 +431,28 @@ def _validate_loaded_model(candidate: FraudModel) -> None:
         )
 
 
+def _serialize_metadata(metadata: dict[str, Any]) -> str:
+    try:
+        return json.dumps(metadata, allow_nan=False, indent=2, sort_keys=True) + "\n"
+    except (TypeError, ValueError) as exc:
+        raise ModelArtifactError(
+            "Artifact metadata must contain only finite JSON-compatible values."
+        ) from exc
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"non-standard JSON numeric constant {value!r}")
+
+
 def _verify_manifest(directory: Path) -> dict[str, Any]:
     manifest_path = directory / MANIFEST_FILENAME
     if not manifest_path.is_file():
         raise ModelArtifactError(f"Artifact integrity manifest does not exist: {manifest_path}")
     try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest = json.loads(
+            manifest_path.read_text(encoding="utf-8"),
+            parse_constant=_reject_json_constant,
+        )
         expected_files = manifest["files"]
         if (
             manifest["hash_algorithm"] != "sha256"
@@ -460,8 +473,11 @@ def _verify_manifest(directory: Path) -> dict[str, Any]:
 
     metadata_path = directory / METADATA_FILENAME
     try:
-        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        metadata = json.loads(
+            metadata_path.read_text(encoding="utf-8"),
+            parse_constant=_reject_json_constant,
+        )
+    except (OSError, ValueError) as exc:
         raise ModelArtifactError(f"Artifact metadata is invalid: {exc}") from exc
     if not isinstance(metadata, dict):
         raise ModelArtifactError("Artifact metadata must be a JSON object.")
