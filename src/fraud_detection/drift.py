@@ -58,22 +58,34 @@ def build_reference_profile(
     if bins < 2 or bins > 50:
         raise DriftError("bins must be between 2 and 50")
 
+    column_lookup = _normalized_column_lookup(features, context="Reference")
     profile: dict[str, dict[str, Any]] = {}
-    for column in features.columns:
-        values = features[column].to_numpy(dtype=float)
+    for feature, column in column_lookup.items():
+        values = _numeric_feature_values(features, column, context="Reference")
         if not np.isfinite(values).all():
-            raise DriftError(f"Reference feature {column!r} contains non-finite values.")
+            raise DriftError(f"Reference feature {feature!r} contains non-finite values.")
 
         quantiles = np.linspace(0.0, 1.0, bins + 1)[1:-1]
-        interior_edges = np.unique(np.quantile(values, quantiles))
+        with np.errstate(invalid="ignore", over="ignore"):
+            interior_edges = np.unique(np.quantile(values, quantiles))
+            mean = float(np.mean(values))
+            standard_deviation = float(np.std(values))
+        if (
+            not np.isfinite(interior_edges).all()
+            or not np.isfinite(mean)
+            or not np.isfinite(standard_deviation)
+        ):
+            raise DriftError(
+                f"Reference feature {feature!r} cannot be profiled without numeric overflow."
+            )
         edges = np.concatenate(([-np.inf], interior_edges, [np.inf]))
         counts, _ = np.histogram(values, bins=edges)
         proportions = counts / counts.sum()
-        profile[str(column)] = {
+        profile[feature] = {
             "edges": [None, *[float(edge) for edge in interior_edges], None],
             "proportions": [float(value) for value in proportions],
-            "mean": float(np.mean(values)),
-            "standard_deviation": float(np.std(values)),
+            "mean": mean,
+            "standard_deviation": standard_deviation,
         }
     return profile
 
@@ -86,8 +98,13 @@ def assess_drift(
     if features.empty:
         raise DriftError("Current features must not be empty.")
 
+    if not reference_profile or any(
+        not isinstance(feature, str) or not feature for feature in reference_profile
+    ):
+        raise DriftError("Reference profile must use non-empty string feature names.")
+    column_lookup = _normalized_column_lookup(features, context="Current")
     expected = set(reference_profile)
-    provided = set(features.columns)
+    provided = set(column_lookup)
     if expected != provided:
         missing = sorted(expected - provided)
         unexpected = sorted(provided - expected)
@@ -98,7 +115,11 @@ def assess_drift(
 
     results: list[FeatureDrift] = []
     for feature, baseline in reference_profile.items():
-        values = features[feature].to_numpy(dtype=float)
+        values = _numeric_feature_values(
+            features,
+            column_lookup[feature],
+            context="Current",
+        )
         if not np.isfinite(values).all():
             raise DriftError(f"Current feature {feature!r} contains non-finite values.")
         try:
@@ -110,23 +131,35 @@ def assess_drift(
                 or serialized_edges[-1] is not None
             ):
                 raise ValueError("invalid open-ended bins")
-            edges = np.asarray(
-                [-np.inf, *serialized_edges[1:-1], np.inf],
+            interior_edges: np.ndarray = np.asarray(
+                serialized_edges[1:-1],
                 dtype=float,
             )
             expected_proportions = np.asarray(baseline["proportions"], dtype=float)
+            if not np.isfinite(interior_edges).all() or np.any(np.diff(interior_edges) <= 0):
+                raise ValueError("bin edges must be finite and strictly increasing")
+            if (
+                expected_proportions.ndim != 1
+                or expected_proportions.shape != (len(serialized_edges) - 1,)
+                or not np.isfinite(expected_proportions).all()
+                or np.any(expected_proportions < 0)
+                or not np.isclose(float(expected_proportions.sum()), 1.0)
+            ):
+                raise ValueError("bin proportions must be finite, non-negative, and sum to 1")
+            edges = np.concatenate(([-np.inf], interior_edges, [np.inf]))
         except (KeyError, TypeError, ValueError) as exc:
             raise DriftError(f"Reference profile for {feature!r} is invalid.") from exc
 
         actual_counts, _ = np.histogram(values, bins=edges)
         actual_proportions = actual_counts / actual_counts.sum()
-        if actual_proportions.shape != expected_proportions.shape:
-            raise DriftError(f"Reference profile for {feature!r} has inconsistent bins.")
-        psi = float(
-            np.sum(
-                (actual_proportions - expected_proportions)
-                * np.log((actual_proportions + _EPSILON) / (expected_proportions + _EPSILON))
-            )
+        psi = max(
+            0.0,
+            float(
+                np.sum(
+                    (actual_proportions - expected_proportions)
+                    * np.log((actual_proportions + _EPSILON) / (expected_proportions + _EPSILON))
+                )
+            ),
         )
         results.append(FeatureDrift(feature=feature, psi=psi, status=_status(psi)))
 
@@ -148,3 +181,30 @@ def _status(psi: float) -> str:
     if psi < DRIFT_THRESHOLD:
         return "warning"
     return "drifted"
+
+
+def _normalized_column_lookup(
+    features: pd.DataFrame,
+    *,
+    context: str,
+) -> dict[str, object]:
+    if not features.columns.is_unique:
+        raise DriftError(f"{context} feature names must be unique.")
+    names = [str(column) for column in features.columns]
+    if any(not name for name in names):
+        raise DriftError(f"{context} feature names must not be empty.")
+    if len(set(names)) != len(names):
+        raise DriftError(f"{context} feature names must remain unique after string conversion.")
+    return dict(zip(names, features.columns, strict=True))
+
+
+def _numeric_feature_values(
+    features: pd.DataFrame,
+    column: object,
+    *,
+    context: str,
+) -> np.ndarray:
+    try:
+        return cast(np.ndarray, features[column].to_numpy(dtype=float))
+    except (TypeError, ValueError) as exc:
+        raise DriftError(f"{context} feature {column!r} must be numeric.") from exc

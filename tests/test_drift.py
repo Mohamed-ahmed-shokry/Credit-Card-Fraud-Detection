@@ -78,6 +78,11 @@ def test_drift_rejects_empty_frames() -> None:
         {"x": {"edges": [0, None], "proportions": [1.0]}},
         {"x": {"edges": [None, 0, None]}},
         {"x": {"edges": [None, 0, None], "proportions": [1.0]}},
+        {"x": {"edges": [None, 1, 0, None], "proportions": [0.3, 0.3, 0.4]}},
+        {"x": {"edges": [None, float("inf"), None], "proportions": [0.5, 0.5]}},
+        {"x": {"edges": [None, 0, None], "proportions": [-0.1, 1.1]}},
+        {"x": {"edges": [None, 0, None], "proportions": [0.2, 0.2]}},
+        {"x": {"edges": [None, 0, None], "proportions": [float("nan"), 0.0]}},
     ],
 )
 def test_drift_rejects_malformed_reference_profile(
@@ -94,3 +99,41 @@ def test_drift_can_report_warning_level() -> None:
     report = assess_drift(profile, current)
 
     assert report.overall_status == "warning"
+
+
+def test_drift_normalizes_non_string_feature_names() -> None:
+    frame = pd.DataFrame({1: [0.0, 1.0, 2.0, 3.0]})
+
+    report = assess_drift(build_reference_profile(frame), frame)
+
+    assert report.features[0].feature == "1"
+    assert report.max_psi == pytest.approx(0.0)
+
+
+@pytest.mark.parametrize(
+    "columns",
+    [
+        ["x", "x"],
+        [1, "1"],
+        ["", "x"],
+    ],
+)
+def test_reference_profile_rejects_ambiguous_feature_names(
+    columns: list[object],
+) -> None:
+    frame = pd.DataFrame([[1.0, 2.0], [3.0, 4.0]], columns=columns)
+
+    with pytest.raises(DriftError, match="feature names"):
+        build_reference_profile(frame)
+
+
+def test_drift_rejects_non_numeric_features_with_domain_error() -> None:
+    with pytest.raises(DriftError, match="must be numeric"):
+        build_reference_profile(pd.DataFrame({"x": ["not", "numeric"]}))
+
+
+def test_reference_profile_rejects_numeric_overflow() -> None:
+    frame = pd.DataFrame({"x": [-1e308, 1e308] * 10})
+
+    with pytest.raises(DriftError, match="numeric overflow"):
+        build_reference_profile(frame)
