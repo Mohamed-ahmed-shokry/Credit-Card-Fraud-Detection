@@ -205,6 +205,44 @@ def test_drift_protects_existing_report(tmp_path: Path) -> None:
     assert output.read_text(encoding="utf-8") == "keep me"
 
 
+def test_train_reports_invalid_output_directory_without_replacing_file(
+    tmp_path: Path,
+) -> None:
+    data_path = tmp_path / "transactions.csv"
+    output = tmp_path / "model"
+    output.write_text("keep me", encoding="utf-8")
+    generated = runner.invoke(
+        app,
+        [
+            "generate-data",
+            "--output",
+            str(data_path),
+            "--rows",
+            "300",
+            "--fraud-rate",
+            "0.1",
+        ],
+    )
+    assert generated.exit_code == 0, generated.output
+
+    result = runner.invoke(
+        app,
+        [
+            "train",
+            str(data_path),
+            "--output",
+            str(output),
+            "--overwrite",
+            "--calibration-method",
+            "none",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "Error:" in result.stderr
+    assert output.read_text(encoding="utf-8") == "keep me"
+
+
 def test_predict_reports_schema_error(tmp_path: Path) -> None:
     data_path = tmp_path / "training.csv"
     artifact_path = tmp_path / "artifact"

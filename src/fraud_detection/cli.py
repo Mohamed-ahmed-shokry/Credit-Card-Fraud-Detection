@@ -150,7 +150,7 @@ def train_command(
         )
         model = train_model(dataset, config=config)
         model_path = save_model(model, output)
-    except (DataValidationError, ModelArtifactError, ValueError) as exc:
+    except (OSError, DataValidationError, ModelArtifactError, ValueError) as exc:
         _abort(str(exc))
 
     typer.echo(
