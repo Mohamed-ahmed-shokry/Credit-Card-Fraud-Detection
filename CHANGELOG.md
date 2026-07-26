@@ -30,6 +30,8 @@ All notable changes to this project are documented here. The format follows
   ambiguous when normalized to the persisted string schema.
 - Inference rejects estimators with reversed class labels, malformed binary output,
   non-numeric scores, or non-finite and out-of-range probabilities.
+- The API requires strict finite JSON numbers and sanitizes validation responses so
+  rejected transaction values are not echoed or rendered as invalid JSON.
 
 ## [0.1.0] - 2026-07-24
 

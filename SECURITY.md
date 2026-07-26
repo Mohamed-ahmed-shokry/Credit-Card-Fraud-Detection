@@ -47,6 +47,9 @@ Raw datasets, generated predictions, and trained artifacts are excluded by
 Use encrypted storage and transport, minimize retention, and follow the rules that
 apply in the deployment jurisdiction.
 
+API validation responses report the failing field location and rule without echoing
+the rejected transaction value.
+
 ### API deployment
 
 The supplied container runs without root privileges or Linux capabilities and uses

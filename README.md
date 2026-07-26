@@ -241,6 +241,9 @@ Example response:
 ```
 
 The service accepts at most 1,000 transactions per request.
+Feature values must be finite JSON numbers; numeric strings and booleans are not
+coerced. Validation errors describe the failing location and rule without echoing
+the submitted transaction value.
 
 Every HTTP response includes:
 
