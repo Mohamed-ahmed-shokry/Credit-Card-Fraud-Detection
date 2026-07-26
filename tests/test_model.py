@@ -54,6 +54,16 @@ def test_train_model_produces_reproducible_model_card(
         "folds": 3,
         "jobs": 1,
     }
+    assert model.metadata["runtime_versions"]["scikit_learn"] == sklearn.__version__
+    assert set(model.metadata["runtime_versions"]) == {
+        "python",
+        "joblib",
+        "numpy",
+        "pandas",
+        "scikit_learn",
+        "scipy",
+    }
+    assert all(model.metadata["runtime_versions"].values())
     assert model.estimator.n_jobs == 1
     assert model.artifact_version == ARTIFACT_VERSION
     assert len(model.metadata["dataset_fingerprint"]) == 64

@@ -8,7 +8,9 @@ import warnings
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
+from importlib.metadata import version as distribution_version
 from pathlib import Path
+from platform import python_version
 from typing import Any, cast
 
 import joblib
@@ -300,6 +302,14 @@ def train_model(
                 if settings.calibration_method is not CalibrationMethod.NONE
                 else None
             ),
+        },
+        "runtime_versions": {
+            "python": python_version(),
+            "joblib": distribution_version("joblib"),
+            "numpy": distribution_version("numpy"),
+            "pandas": distribution_version("pandas"),
+            "scikit_learn": sklearn.__version__,
+            "scipy": distribution_version("scipy"),
         },
         "scikit_learn_version": sklearn.__version__,
         "feature_names": list(dataset.feature_names),
