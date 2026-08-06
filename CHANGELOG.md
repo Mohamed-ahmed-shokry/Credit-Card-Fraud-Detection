@@ -45,6 +45,9 @@ All notable changes to this project are documented here. The format follows
   preserving correlation and timing headers on `413` responses.
 - Model cards record Python, joblib, NumPy, pandas, scikit-learn, and SciPy versions
   needed to reconstruct the training runtime.
+- The API now configures root logging on startup so request correlation and timing
+  logs are emitted by default under `fraud-detect serve` and the container entrypoint,
+  not only when a caller separately configures logging.
 
 ## [0.1.0] - 2026-07-24
 
