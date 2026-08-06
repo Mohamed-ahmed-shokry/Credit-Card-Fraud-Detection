@@ -76,6 +76,7 @@ def create_app(
     model_path: Path | str | None = None,
 ) -> FastAPI:
     """Create an application using an injected model or a trusted artifact path."""
+    logging.basicConfig(level=logging.INFO)
 
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
