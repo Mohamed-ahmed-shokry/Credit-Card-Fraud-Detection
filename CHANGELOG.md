@@ -20,6 +20,9 @@ All notable changes to this project are documented here. The format follows
   completion/failure log fields.
 - CLI overwrite protection for non-empty model artifact directories.
 - CI dependency vulnerability auditing and a patched pytest 9 requirement.
+- CI now trains a demo model and runs the built container image against a live
+  `/health` check instead of only building it, catching startup regressions in the
+  serving path.
 
 ### Changed
 
