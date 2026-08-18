@@ -86,6 +86,17 @@ def test_train_model_produces_reproducible_model_card(
     assert repeated.metadata["test_metrics"] == model.metadata["test_metrics"]
 
 
+def test_prediction_rejects_duplicate_feature_names(
+    trained_model: tuple[FraudModel, ValidatedDataset],
+) -> None:
+    model, dataset = trained_model
+    duplicated = dataset.features.iloc[:2].copy()
+    duplicated.columns = [duplicated.columns[0]] * len(duplicated.columns)
+
+    with pytest.raises(ModelArtifactError, match="must be unique"):
+        model.predict_probabilities(duplicated)
+
+
 def test_predictions_apply_threshold_and_accept_reordered_columns(
     trained_model: tuple[FraudModel, ValidatedDataset],
 ) -> None:
@@ -406,6 +417,16 @@ def test_train_model_rejects_too_few_fraud_rows() -> None:
 
     with pytest.raises(ValueError, match="at least 6"):
         train_model(ValidatedDataset(features, target))
+
+
+def test_train_model_rejects_calibration_folds_exceeding_minority_class_size() -> None:
+    rng = np.random.default_rng(0)
+    features = pd.DataFrame({"x": rng.normal(size=100)})
+    target = pd.Series([0] * 90 + [1] * 10, name="Class", dtype="int8")
+    config = TrainingConfig(calibration_folds=10)
+
+    with pytest.raises(ValueError, match="at least as many rows as calibration_folds"):
+        train_model(ValidatedDataset(features, target), config=config)
 
 
 def test_train_model_supports_cost_sensitive_thresholds() -> None:
