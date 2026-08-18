@@ -102,6 +102,10 @@ def test_cli_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     assert len(drift_summary["features"]) == 30
     assert json.loads(drift_path.read_text(encoding="utf-8")) == drift_summary
 
+    drifted_without_output = runner.invoke(app, ["drift", str(artifact_path), str(data_path)])
+    assert drifted_without_output.exit_code == 0, drifted_without_output.output
+    assert json.loads(drifted_without_output.stdout) == drift_summary
+
     predicted = runner.invoke(
         app,
         [
