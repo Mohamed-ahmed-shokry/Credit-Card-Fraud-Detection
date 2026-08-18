@@ -144,6 +144,17 @@ def test_cli_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     assert "Pass --overwrite" in protected.stderr
 
 
+@pytest.mark.parametrize("command", ["inspect", "explain", "serve"])
+def test_commands_report_invalid_artifact_errors(tmp_path: Path, command: str) -> None:
+    empty_artifact = tmp_path / "empty_artifact"
+    empty_artifact.mkdir()
+
+    result = runner.invoke(app, [command, str(empty_artifact)])
+
+    assert result.exit_code == 2
+    assert "Error:" in result.stderr
+
+
 def test_generate_data_protects_existing_file(tmp_path: Path) -> None:
     output = tmp_path / "existing.csv"
     output.write_text("keep me", encoding="utf-8")
