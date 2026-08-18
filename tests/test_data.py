@@ -77,6 +77,7 @@ def test_load_csv_rejects_duplicate_headers_before_pandas_mangles_them(
         (pd.DataFrame({"Class": [0, 1]}), "at least one feature"),
         (pd.DataFrame({"x": ["a", "b"], "Class": [0, 1]}), "must be numeric"),
         (pd.DataFrame({"x": [1.0, np.nan], "Class": [0, 1]}), "missing values"),
+        (pd.DataFrame({"x": [1.0, 2.0], "Class": [0, np.nan]}), "Target column contains"),
         (pd.DataFrame({"x": [1.0, np.inf], "Class": [0, 1]}), "infinite values"),
         (pd.DataFrame({"x": [1, 2], "Class": [0, 0]}), "exactly the labels"),
         (pd.DataFrame({"x": [1, 2], "Class": ["clean", "fraud"]}), "must be numeric"),
