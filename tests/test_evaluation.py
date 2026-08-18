@@ -99,6 +99,18 @@ def test_evaluate_predictions_rejects_invalid_threshold(threshold: float) -> Non
         )
 
 
+@pytest.mark.parametrize("threshold", [-0.1, 1.1])
+def test_expected_classification_cost_rejects_invalid_threshold(threshold: float) -> None:
+    with pytest.raises(ValueError, match="threshold"):
+        expected_classification_cost(
+            np.array([0, 1]),
+            np.array([0.1, 0.9]),
+            threshold=threshold,
+            false_positive_cost=1,
+            false_negative_cost=1,
+        )
+
+
 @pytest.mark.parametrize(
     ("y_true", "probabilities", "message"),
     [
