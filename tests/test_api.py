@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Iterator
 from pathlib import Path
+from typing import cast
 
 import pytest
 from fastapi.testclient import TestClient
@@ -134,6 +136,49 @@ def test_api_rejects_declared_oversized_body_with_request_context(
     assert response.json()["detail"].endswith("-byte limit.")
     assert response.headers[REQUEST_ID_HEADER] == "oversized-request"
     assert float(response.headers[PROCESS_TIME_HEADER]) >= 0
+
+
+@pytest.mark.parametrize("content_length", ["not-a-number", "-1"])
+def test_api_rejects_malformed_content_length_header(
+    client: TestClient,
+    content_length: str,
+) -> None:
+    response = client.post(
+        "/v1/predict",
+        content=b"{}",
+        headers={"Content-Length": content_length, "Content-Type": "application/json"},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Invalid Content-Length."
+
+
+def test_api_logs_and_reraises_unhandled_errors(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _, model, dataset = api_context
+
+    class _BrokenModel:
+        feature_names = model.feature_names
+        threshold = model.threshold
+        metadata = model.metadata
+
+        def predict_probabilities(self, _features: object) -> None:
+            raise RuntimeError("boom")
+
+    broken_app = create_app(model=cast(FraudModel, _BrokenModel()))
+    with (
+        caplog.at_level(logging.ERROR, logger="fraud_detection.api"),
+        TestClient(broken_app, raise_server_exceptions=False) as broken_client,
+    ):
+        response = broken_client.post(
+            "/v1/predict",
+            json={"transactions": dataset.features.iloc[:1].to_dict(orient="records")},
+        )
+
+    assert response.status_code == 500
+    assert "request_failed" in caplog.text
 
 
 def test_api_rejects_chunked_body_that_crosses_limit(client: TestClient) -> None:
