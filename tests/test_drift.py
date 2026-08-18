@@ -72,6 +72,15 @@ def test_drift_rejects_empty_frames() -> None:
         assess_drift({}, pd.DataFrame())
 
 
+def test_drift_rejects_empty_or_invalid_reference_profile_names() -> None:
+    current = pd.DataFrame({"x": [1.0, 2.0]})
+
+    with pytest.raises(DriftError, match="non-empty string feature names"):
+        assess_drift({}, current)
+    with pytest.raises(DriftError, match="non-empty string feature names"):
+        assess_drift({"": {"edges": [None, 0, None], "proportions": [0.5, 0.5]}}, current)
+
+
 @pytest.mark.parametrize(
     "profile",
     [
