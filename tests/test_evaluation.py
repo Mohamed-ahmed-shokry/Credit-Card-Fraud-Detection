@@ -20,6 +20,22 @@ def test_select_f1_threshold_finds_best_operating_point() -> None:
     assert threshold == pytest.approx(0.45)
 
 
+def test_select_f1_threshold_falls_back_when_curve_has_no_thresholds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def empty_curve(
+        _y_true: np.ndarray,
+        _probabilities: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        return np.array([]), np.array([]), np.array([])
+
+    monkeypatch.setattr("fraud_detection.evaluation.precision_recall_curve", empty_curve)
+
+    threshold = select_f1_threshold(np.array([0, 1]), np.array([0.1, 0.9]))
+
+    assert threshold == 0.5
+
+
 def test_evaluate_predictions_returns_complete_metrics() -> None:
     y_true = np.array([0, 0, 1, 1])
     probabilities = np.array([0.1, 0.8, 0.6, 0.9])
