@@ -220,6 +220,11 @@ def test_load_model_rejects_invalid_artifacts(tmp_path: Path) -> None:
     with pytest.raises(ModelArtifactError, match="FraudModel"):
         load_model(invalid_path)
 
+    corrupted_path = tmp_path / "corrupted.joblib"
+    corrupted_path.write_bytes(b"not a pickle stream")
+    with pytest.raises(ModelArtifactError, match="Could not load model artifact"):
+        load_model(corrupted_path)
+
 
 def test_load_model_detects_artifact_tampering(
     tmp_path: Path,
@@ -255,6 +260,41 @@ def test_load_model_requires_valid_integrity_manifest(
     with pytest.raises(ModelArtifactError, match="non-standard JSON"):
         load_model(artifact_directory)
 
+    manifest = {
+        "artifact_version": ARTIFACT_VERSION,
+        "hash_algorithm": "md5",
+        "files": {MODEL_FILENAME: "0" * 64, METADATA_FILENAME: "0" * 64},
+    }
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ModelArtifactError, match="manifest is invalid"):
+        load_model(artifact_directory)
+
+    model_path = artifact_directory / MODEL_FILENAME
+    manifest["hash_algorithm"] = "sha256"
+    manifest["files"][MODEL_FILENAME] = sha256(model_path.read_bytes()).hexdigest()
+    del manifest["files"][METADATA_FILENAME]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ModelArtifactError, match="integrity entry is missing"):
+        load_model(artifact_directory)
+
+
+def test_load_model_rejects_metadata_that_is_not_a_json_object(
+    tmp_path: Path,
+    trained_model: tuple[FraudModel, ValidatedDataset],
+) -> None:
+    model, _ = trained_model
+    artifact_directory = tmp_path / "artifact"
+    save_model(model, artifact_directory)
+    metadata_path = artifact_directory / METADATA_FILENAME
+    metadata_path.write_text("[]\n", encoding="utf-8")
+    manifest_path = artifact_directory / MANIFEST_FILENAME
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["files"][METADATA_FILENAME] = sha256(metadata_path.read_bytes()).hexdigest()
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ModelArtifactError, match="must be a JSON object"):
+        load_model(artifact_directory)
+
 
 @pytest.mark.parametrize(
     ("mutate", "message"),
@@ -265,6 +305,20 @@ def test_load_model_requires_valid_integrity_manifest(
         (
             lambda model: setattr(model.estimator, "classes_", np.array([1, 0])),
             "binary class order",
+        ),
+        (lambda model: setattr(model, "artifact_version", 999), "artifact version"),
+        (lambda model: setattr(model, "metadata", "not a mapping"), "must be a mapping"),
+        (
+            lambda model: model.metadata.update({"feature_count": 0}),
+            "feature_count",
+        ),
+        (
+            lambda model: model.metadata.pop("created_at"),
+            "created_at",
+        ),
+        (
+            lambda model: model.metadata.pop("scikit_learn_version"),
+            "scikit_learn_version",
         ),
         (
             lambda model: model.metadata.pop("dataset_fingerprint"),
@@ -417,6 +471,16 @@ def test_train_model_rejects_too_few_fraud_rows() -> None:
 
     with pytest.raises(ValueError, match="at least 6"):
         train_model(ValidatedDataset(features, target))
+
+
+def test_train_model_rejects_minority_class_too_small_for_splits() -> None:
+    rng = np.random.default_rng(1)
+    features = pd.DataFrame({"x": rng.normal(size=120)})
+    target = pd.Series([0] * 114 + [1] * 6, name="Class", dtype="int8")
+    config = TrainingConfig(test_size=0.05, validation_size=0.05)
+
+    with pytest.raises(ValueError, match="too small for the configured"):
+        train_model(ValidatedDataset(features, target), config=config)
 
 
 def test_train_model_rejects_calibration_folds_exceeding_minority_class_size() -> None:
