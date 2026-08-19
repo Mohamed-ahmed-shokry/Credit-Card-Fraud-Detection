@@ -209,6 +209,7 @@ def predict_command(
         OSError,
         UnicodeDecodeError,
         pd.errors.ParserError,
+        pd.errors.EmptyDataError,
         ModelArtifactError,
     ) as exc:
         _abort(str(exc))
@@ -310,6 +311,7 @@ def drift_command(
         OSError,
         UnicodeDecodeError,
         pd.errors.ParserError,
+        pd.errors.EmptyDataError,
         ModelArtifactError,
         DriftError,
     ) as exc:

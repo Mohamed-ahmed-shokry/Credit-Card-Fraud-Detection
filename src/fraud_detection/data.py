@@ -43,7 +43,13 @@ def load_csv(path: Path | str, *, target_column: str = DEFAULT_TARGET) -> Valida
         if header is not None:
             _reject_duplicate_names(header, context="CSV columns")
         frame = pd.read_csv(csv_path)
-    except (OSError, csv.Error, pd.errors.ParserError, UnicodeDecodeError) as exc:
+    except (
+        OSError,
+        csv.Error,
+        pd.errors.ParserError,
+        pd.errors.EmptyDataError,
+        UnicodeDecodeError,
+    ) as exc:
         raise DataValidationError(f"Could not read dataset {csv_path}: {exc}") from exc
 
     return validate_frame(frame, target_column=target_column)
