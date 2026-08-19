@@ -52,6 +52,12 @@ All notable changes to this project are documented here. The format follows
   logs are emitted by default under `fraud-detect serve` and the container entrypoint,
   not only when a caller separately configures logging.
 
+### Fixed
+
+- `load_csv`, `fraud-detect predict`, and `fraud-detect drift` now report an empty
+  transactions CSV as an actionable error instead of leaking an unhandled
+  `pandas.errors.EmptyDataError` traceback.
+
 ## [0.1.0] - 2026-07-24
 
 ### Added
