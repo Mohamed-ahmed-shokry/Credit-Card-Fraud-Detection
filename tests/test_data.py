@@ -59,6 +59,14 @@ def test_load_csv_rejects_missing_file(tmp_path: Path) -> None:
         load_csv(tmp_path / "missing.csv")
 
 
+def test_load_csv_rejects_empty_file(tmp_path: Path) -> None:
+    path = tmp_path / "empty.csv"
+    path.write_text("", encoding="utf-8")
+
+    with pytest.raises(DataValidationError, match="Could not read dataset"):
+        load_csv(path)
+
+
 def test_load_csv_rejects_duplicate_headers_before_pandas_mangles_them(
     tmp_path: Path,
 ) -> None:

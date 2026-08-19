@@ -9,9 +9,19 @@ import pytest
 from typer.testing import CliRunner
 
 from fraud_detection.cli import app
-from fraud_detection.model import METADATA_FILENAME, MODEL_FILENAME
+from fraud_detection.data import generate_synthetic_data, validate_frame
+from fraud_detection.model import METADATA_FILENAME, MODEL_FILENAME, save_model, train_model
 
 runner = CliRunner()
+
+
+@pytest.fixture(scope="module")
+def trained_artifact(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    dataset = validate_frame(generate_synthetic_data(rows=300, random_state=3))
+    model = train_model(dataset)
+    artifact_directory = tmp_path_factory.mktemp("artifact")
+    save_model(model, artifact_directory)
+    return artifact_directory
 
 
 def test_cli_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -194,6 +204,21 @@ def test_generate_data_preserves_existing_file_when_atomic_write_fails(
     assert "simulated disk failure" in result.stderr
     assert output.read_text(encoding="utf-8") == "keep me"
     assert list(tmp_path.glob(".*.tmp")) == []
+
+
+@pytest.mark.parametrize("command", ["predict", "drift"])
+def test_predict_and_drift_report_empty_transactions_file(
+    tmp_path: Path,
+    trained_artifact: Path,
+    command: str,
+) -> None:
+    empty_csv = tmp_path / "empty.csv"
+    empty_csv.write_text("", encoding="utf-8")
+
+    result = runner.invoke(app, [command, str(trained_artifact), str(empty_csv)])
+
+    assert result.exit_code == 2
+    assert "No columns to parse from file" in result.stderr
 
 
 def test_drift_protects_existing_report(tmp_path: Path) -> None:
