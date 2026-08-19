@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -10,17 +11,27 @@ from typer.testing import CliRunner
 
 from fraud_detection.cli import app
 from fraud_detection.data import generate_synthetic_data, validate_frame
-from fraud_detection.model import METADATA_FILENAME, MODEL_FILENAME, save_model, train_model
+from fraud_detection.model import (
+    METADATA_FILENAME,
+    MODEL_FILENAME,
+    FraudModel,
+    save_model,
+    train_model,
+)
 
 runner = CliRunner()
 
 
 @pytest.fixture(scope="module")
-def trained_artifact(tmp_path_factory: pytest.TempPathFactory) -> Path:
+def trained_model() -> FraudModel:
     dataset = validate_frame(generate_synthetic_data(rows=300, random_state=3))
-    model = train_model(dataset)
+    return train_model(dataset)
+
+
+@pytest.fixture(scope="module")
+def trained_artifact(tmp_path_factory: pytest.TempPathFactory, trained_model: FraudModel) -> Path:
     artifact_directory = tmp_path_factory.mktemp("artifact")
-    save_model(model, artifact_directory)
+    save_model(trained_model, artifact_directory)
     return artifact_directory
 
 
@@ -152,6 +163,61 @@ def test_cli_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     )
     assert protected.exit_code == 2
     assert "Pass --overwrite" in protected.stderr
+
+
+def _save_model_missing_metadata_key(
+    model: FraudModel,
+    destination: Path,
+    remove_key: str,
+) -> Path:
+    mutated = deepcopy(model)
+    del mutated.metadata[remove_key]
+    save_model(mutated, destination)
+    return destination
+
+
+def test_predict_protects_existing_output(tmp_path: Path, trained_artifact: Path) -> None:
+    data_path = tmp_path / "transactions.csv"
+    output = tmp_path / "predictions.csv"
+    data_path.write_text("x\n1\n", encoding="utf-8")
+    output.write_text("keep me", encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        ["predict", str(trained_artifact), str(data_path), "--output", str(output)],
+    )
+
+    assert result.exit_code == 2
+    assert "Pass --overwrite" in result.stderr
+    assert output.read_text(encoding="utf-8") == "keep me"
+
+
+def test_explain_reports_missing_feature_effects(tmp_path: Path, trained_model: FraudModel) -> None:
+    artifact = _save_model_missing_metadata_key(
+        trained_model,
+        tmp_path / "artifact",
+        remove_key="feature_effects",
+    )
+
+    result = runner.invoke(app, ["explain", str(artifact)])
+
+    assert result.exit_code == 2
+    assert "does not contain feature effects" in result.stderr
+
+
+def test_drift_reports_missing_reference_profile(tmp_path: Path, trained_model: FraudModel) -> None:
+    artifact = _save_model_missing_metadata_key(
+        trained_model,
+        tmp_path / "artifact",
+        remove_key="reference_profile",
+    )
+    data_path = tmp_path / "transactions.csv"
+    generate_synthetic_data(rows=200, random_state=4).to_csv(data_path, index=False)
+
+    result = runner.invoke(app, ["drift", str(artifact), str(data_path)])
+
+    assert result.exit_code == 2
+    assert "does not contain a reference profile" in result.stderr
 
 
 @pytest.mark.parametrize("command", ["inspect", "explain", "serve"])
