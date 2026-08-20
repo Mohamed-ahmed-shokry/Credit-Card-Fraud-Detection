@@ -57,6 +57,8 @@ All notable changes to this project are documented here. The format follows
 - `load_csv`, `fraud-detect predict`, and `fraud-detect drift` now report an empty
   transactions CSV as an actionable error instead of leaking an unhandled
   `pandas.errors.EmptyDataError` traceback.
+- CI now actually enforces flake8-bandit (`S`) lint rules; the rule set was never
+  selected, so a pre-existing `S101` per-file ignore for tests was silently a no-op.
 
 ## [0.1.0] - 2026-07-24
 
