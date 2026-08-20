@@ -1,0 +1,3 @@
+# Normalize all text files to LF line endings in the repository regardless
+# of a contributor's local core.autocrlf setting, matching .editorconfig.
+* text=auto eol=lf
