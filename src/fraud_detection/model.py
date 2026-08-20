@@ -150,10 +150,7 @@ class FraudModel:
 
     def predict(self, features: pd.DataFrame) -> np.ndarray:
         """Return binary decisions using the artifact's tuned threshold."""
-        return cast(
-            np.ndarray,
-            (self.predict_probabilities(features) >= self.threshold).astype("int8"),
-        )
+        return (self.predict_probabilities(features) >= self.threshold).astype("int8")
 
     def validate_features(self, features: pd.DataFrame) -> pd.DataFrame:
         """Validate and reorder transaction features to the training schema."""
