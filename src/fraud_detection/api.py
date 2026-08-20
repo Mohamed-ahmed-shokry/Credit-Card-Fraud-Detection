@@ -219,7 +219,9 @@ async def _request_body_error(request: Request) -> JSONResponse | None:
         if len(body) + len(chunk) > MAX_REQUEST_BODY_BYTES:
             return _request_too_large_response()
         body.extend(chunk)
-    request._body = bytes(body)
+    # Starlette has no public API to seed the body cache; without this, the
+    # stream we just consumed above would appear empty to route handlers.
+    request._body = bytes(body)  # noqa: SLF001
     return None
 
 
