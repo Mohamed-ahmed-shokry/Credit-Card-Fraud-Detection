@@ -29,7 +29,7 @@ binary target contains exactly `0` (legitimate) and `1` (fraud).
 - **Two serving modes:** batch CSV scoring through the CLI and bounded online batches
   through FastAPI.
 - **Quality gates:** formatting, linting, strict type checking, branch coverage of at
-  least 90%, package builds, and Python 3.12/3.14 CI.
+  least 97%, package builds, and Python 3.12/3.14 CI.
 
 ## Architecture
 

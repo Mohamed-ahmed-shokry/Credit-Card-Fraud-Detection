@@ -39,7 +39,7 @@ python -m pytest --cov=fraud_detection --cov-report=term-missing
 python -m build
 ```
 
-Branch coverage must remain at or above 90%. Tests should cover failure behavior,
+Branch coverage must remain at or above 97%. Tests should cover failure behavior,
 not only the successful path. The CI matrix runs on Python 3.12 and 3.14.
 
 ## Commit and pull request guidance
