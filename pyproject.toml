@@ -117,6 +117,12 @@ python_version = "3.12"
 strict = true
 packages = ["fraud_detection"]
 warn_unreachable = true
+enable_error_code = [
+  "ignore-without-code",
+  "possibly-undefined",
+  "truthy-bool",
+  "unused-awaitable",
+]
 
 [[tool.mypy.overrides]]
 module = ["joblib.*", "sklearn.*"]
