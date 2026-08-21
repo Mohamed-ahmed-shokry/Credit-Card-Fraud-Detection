@@ -23,6 +23,12 @@ All notable changes to this project are documented here. The format follows
 - CI now trains a demo model and runs the built container image against a live
   `/health` check instead of only building it, catching startup regressions in the
   serving path.
+- Dependabot now tracks the Docker base image alongside Python dependencies and
+  GitHub Actions.
+- CI enforces several additional zero-finding ruff rule categories and stricter
+  mypy error codes as permanent quality gates, and the required branch coverage
+  floor is raised from 90% to 97% to match what the test suite now actually
+  achieves.
 
 ### Changed
 
@@ -59,6 +65,13 @@ All notable changes to this project are documented here. The format follows
   `pandas.errors.EmptyDataError` traceback.
 - CI now actually enforces flake8-bandit (`S`) lint rules; the rule set was never
   selected, so a pre-existing `S101` per-file ignore for tests was silently a no-op.
+- The package version is now derived from a single source (`fraud_detection.__version__`)
+  instead of also being hardcoded separately in `pyproject.toml`, where the two could
+  previously drift out of agreement.
+- mypy no longer skips numpy imports; the skip was a stale workaround, and removing
+  it surfaced (and let us remove) an unnecessary `cast()` in `FraudModel.predict()`.
+- The container CI job's `setup-python` step now matches the version used by the
+  main quality job.
 
 ## [0.1.0] - 2026-07-24
 
