@@ -55,6 +55,13 @@ apply in the deployment jurisdiction.
 API validation responses report the failing field location and rule without echoing
 the rejected transaction value.
 
+### Repository safeguards
+
+GitHub secret scanning and push protection are enabled on this repository and block
+pushes that contain a recognizable credential or API key. `pip-audit` runs in CI
+against every change, and Dependabot opens pull requests both for routine dependency
+updates and for advisories against dependencies already in use.
+
 ### API deployment
 
 The supplied container runs without root privileges or Linux capabilities and uses
