@@ -34,6 +34,10 @@ All notable changes to this project are documented here. The format follows
 - Enabled GitHub private vulnerability reporting, secret scanning with push
   protection, Dependabot security updates, and branch protection on `main`
   requiring the CI status checks to pass before a pull request can merge.
+- A `CODE_OF_CONDUCT.md` and a bug-report issue template (with a security-advisory
+  contact link instead of a public-issue path), closing the gaps in GitHub's
+  community-standards checklist.
+- A `--version` CLI flag.
 
 ### Changed
 
