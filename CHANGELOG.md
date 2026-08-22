@@ -31,6 +31,9 @@ All notable changes to this project are documented here. The format follows
   achieves.
 - A `.python-version` file pins local development to Python 3.12, matching the
   Dockerfile's runtime.
+- Enabled GitHub private vulnerability reporting, secret scanning with push
+  protection, Dependabot security updates, and branch protection on `main`
+  requiring the CI status checks to pass before a pull request can merge.
 
 ### Changed
 
@@ -72,6 +75,8 @@ All notable changes to this project are documented here. The format follows
   previously drift out of agreement.
 - mypy no longer skips numpy imports; the skip was a stale workaround, and removing
   it surfaced (and let us remove) an unnecessary `cast()` in `FraudModel.predict()`.
+- SECURITY.md's instruction to use GitHub's private vulnerability reporting now
+  actually works; the feature was disabled on the repository itself.
 - The container CI job's `setup-python` step now matches the version used by the
   main quality job.
 
