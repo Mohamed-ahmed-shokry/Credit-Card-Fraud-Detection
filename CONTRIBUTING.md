@@ -55,6 +55,9 @@ docs: explain artifact trust boundaries
 Pull requests should state the problem, approach, verification commands, operational
 or model-risk impact, and any migration needed for existing artifacts.
 
+`main` requires both CI jobs (the Python quality matrix and the container smoke
+test) to pass before a pull request can merge.
+
 ## Security
 
 Report suspected vulnerabilities privately as described in
