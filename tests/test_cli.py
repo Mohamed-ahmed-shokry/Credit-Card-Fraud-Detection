@@ -9,6 +9,7 @@ import pandas as pd
 import pytest
 from typer.testing import CliRunner
 
+from fraud_detection import __version__
 from fraud_detection.cli import app
 from fraud_detection.data import generate_synthetic_data, validate_frame
 from fraud_detection.model import (
@@ -33,6 +34,13 @@ def trained_artifact(tmp_path_factory: pytest.TempPathFactory, trained_model: Fr
     artifact_directory = tmp_path_factory.mktemp("artifact")
     save_model(trained_model, artifact_directory)
     return artifact_directory
+
+
+def test_version_flag_prints_installed_version_and_exits() -> None:
+    result = runner.invoke(app, ["--version"])
+
+    assert result.exit_code == 0
+    assert result.stdout.strip() == __version__
 
 
 def test_cli_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

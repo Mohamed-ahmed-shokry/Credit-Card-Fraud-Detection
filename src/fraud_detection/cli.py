@@ -11,6 +11,7 @@ import pandas as pd
 import typer
 import uvicorn
 
+from fraud_detection import __version__
 from fraud_detection.data import (
     DEFAULT_TARGET,
     DataValidationError,
@@ -35,6 +36,27 @@ app = typer.Typer(
     no_args_is_help=True,
     pretty_exceptions_show_locals=False,
 )
+
+
+def _version_callback(show_version: bool) -> None:
+    if show_version:
+        typer.echo(__version__)
+        raise typer.Exit()
+
+
+@app.callback()
+def _main(
+    version: Annotated[
+        bool,
+        typer.Option(
+            "--version",
+            callback=_version_callback,
+            is_eager=True,
+            help="Show the installed version and exit.",
+        ),
+    ] = False,
+) -> None:
+    """Train, inspect, and run a credit-card fraud detector."""
 
 
 @app.command("generate-data")
