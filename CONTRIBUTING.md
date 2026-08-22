@@ -2,6 +2,8 @@
 
 Thank you for improving the project. Contributions should keep the training and
 inference paths reproducible, reviewable, and safe for imbalanced financial data.
+Participation in this project is governed by our
+[Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## Set up the development environment
 
