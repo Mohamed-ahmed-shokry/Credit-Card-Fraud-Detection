@@ -29,6 +29,8 @@ All notable changes to this project are documented here. The format follows
   mypy error codes as permanent quality gates, and the required branch coverage
   floor is raised from 90% to 97% to match what the test suite now actually
   achieves.
+- A `.python-version` file pins local development to Python 3.12, matching the
+  Dockerfile's runtime.
 
 ### Changed
 
