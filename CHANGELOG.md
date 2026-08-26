@@ -29,8 +29,8 @@ All notable changes to this project are documented here. The format follows
   mypy error codes as permanent quality gates, and the required branch coverage
   floor is raised from 90% to 97% to match what the test suite now actually
   achieves.
-- A `.python-version` file pins local development to Python 3.12, matching the
-  Dockerfile's runtime.
+- A `.python-version` file pins local development to the same Python version as
+  the Dockerfile's runtime.
 - Enabled GitHub private vulnerability reporting, secret scanning with push
   protection, Dependabot security updates, and branch protection on `main`
   requiring the CI status checks to pass before a pull request can merge.
@@ -66,6 +66,7 @@ All notable changes to this project are documented here. The format follows
 - The API now configures root logging on startup so request correlation and timing
   logs are emitted by default under `fraud-detect serve` and the container entrypoint,
   not only when a caller separately configures logging.
+- The container base image moves from `python:3.12-slim` to `python:3.14-slim`.
 
 ### Fixed
 
