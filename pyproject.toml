@@ -53,6 +53,7 @@ fraud-detect = "fraud_detection.cli:app"
 Homepage = "https://github.com/Mohamed-ahmed-shokry/Credit-Card-Fraud-Detection"
 Issues = "https://github.com/Mohamed-ahmed-shokry/Credit-Card-Fraud-Detection/issues"
 Repository = "https://github.com/Mohamed-ahmed-shokry/Credit-Card-Fraud-Detection.git"
+Changelog = "https://github.com/Mohamed-ahmed-shokry/Credit-Card-Fraud-Detection/blob/main/CHANGELOG.md"
 
 [tool.hatch.version]
 path = "src/fraud_detection/__init__.py"
