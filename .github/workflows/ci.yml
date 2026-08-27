@@ -52,6 +52,9 @@ jobs:
       - name: Build distributions
         run: python -m build
 
+      - name: Check package metadata
+        run: python -m twine check dist/*
+
   container:
     name: Container
     runs-on: ubuntu-latest
