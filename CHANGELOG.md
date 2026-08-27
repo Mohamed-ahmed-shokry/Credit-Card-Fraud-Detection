@@ -38,6 +38,9 @@ All notable changes to this project are documented here. The format follows
   contact link instead of a public-issue path), closing the gaps in GitHub's
   community-standards checklist.
 - A `--version` CLI flag.
+- CI validates the built wheel and sdist with `twine check` so a PyPI-metadata
+  regression (for example, a malformed long description) fails the build instead
+  of only surfacing at publish time.
 
 ### Changed
 
