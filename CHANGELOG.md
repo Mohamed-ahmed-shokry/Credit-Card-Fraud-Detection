@@ -41,6 +41,10 @@ All notable changes to this project are documented here. The format follows
 - CI validates the built wheel and sdist with `twine check` so a PyPI-metadata
   regression (for example, a malformed long description) fails the build instead
   of only surfacing at publish time.
+- `ROADMAP.md`, laying out phased next steps beyond `v0.1.0`.
+- A PyPI publishing workflow, scaffolded to run on GitHub Release via trusted
+  publishing; dormant until the maintainer links the trusted publisher on
+  pypi.org.
 
 ### Changed
 
