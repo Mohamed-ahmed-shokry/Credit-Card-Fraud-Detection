@@ -18,6 +18,7 @@ import numpy as np
 import pandas as pd
 import sklearn
 from sklearn.calibration import CalibratedClassifierCV
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.exceptions import InconsistentVersionWarning
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
@@ -65,6 +66,24 @@ class SplitStrategy(StrEnum):
     TEMPORAL = "temporal"
 
 
+class EstimatorType(StrEnum):
+    """Supported base classifiers.
+
+    Logistic regression is the default: an interpretable, well-calibrated
+    linear baseline. Random forest is an opt-in, more expressive alternative
+    for callers who have validated it outperforms the baseline on their data.
+    """
+
+    LOGISTIC_REGRESSION = "logistic_regression"
+    RANDOM_FOREST = "random_forest"
+
+
+_ESTIMATOR_CLASS_NAMES: dict[EstimatorType, str] = {
+    EstimatorType.LOGISTIC_REGRESSION: "LogisticRegression",
+    EstimatorType.RANDOM_FOREST: "RandomForestClassifier",
+}
+
+
 @dataclass(frozen=True)
 class TrainingConfig:
     """Training and holdout configuration."""
@@ -72,6 +91,7 @@ class TrainingConfig:
     test_size: float = 0.2
     validation_size: float = 0.2
     random_state: int = 42
+    estimator: EstimatorType = EstimatorType.LOGISTIC_REGRESSION
     max_iterations: int = 1_000
     regularization: float = 1.0
     threshold_strategy: ThresholdStrategy = ThresholdStrategy.F1
@@ -90,6 +110,8 @@ class TrainingConfig:
             raise ValueError("validation_size must be between 0.05 and 0.4")
         if self.test_size + self.validation_size > 0.6:
             raise ValueError("test_size and validation_size must sum to at most 0.6")
+        if not isinstance(self.estimator, EstimatorType):
+            raise ValueError("estimator must be 'logistic_regression' or 'random_forest'")
         if self.max_iterations < 100:
             raise ValueError("max_iterations must be at least 100")
         if self.regularization <= 0:
@@ -201,21 +223,7 @@ def train_model(
         settings,
     )
 
-    base_estimator = Pipeline(
-        steps=[
-            ("scale", StandardScaler()),
-            (
-                "classifier",
-                LogisticRegression(
-                    C=settings.regularization,
-                    class_weight="balanced",
-                    max_iter=settings.max_iterations,
-                    random_state=settings.random_state,
-                    solver="lbfgs",
-                ),
-            ),
-        ]
-    )
+    base_estimator = _build_base_estimator(settings)
     if settings.calibration_method is CalibrationMethod.NONE:
         estimator: Any = base_estimator
     else:
@@ -283,9 +291,9 @@ def train_model(
         "artifact_version": ARTIFACT_VERSION,
         "created_at": datetime.now(UTC).isoformat(),
         "estimator": (
-            "LogisticRegression"
+            _ESTIMATOR_CLASS_NAMES[settings.estimator]
             if settings.calibration_method is CalibrationMethod.NONE
-            else "CalibratedClassifierCV(LogisticRegression)"
+            else f"CalibratedClassifierCV({_ESTIMATOR_CLASS_NAMES[settings.estimator]})"
         ),
         "calibration": {
             "method": settings.calibration_method.value,
@@ -560,12 +568,42 @@ def _dataset_fingerprint(dataset: ValidatedDataset) -> str:
     return digest.hexdigest()
 
 
+def _build_base_estimator(settings: TrainingConfig) -> Pipeline:
+    if settings.estimator is EstimatorType.RANDOM_FOREST:
+        return Pipeline(
+            steps=[
+                (
+                    "classifier",
+                    RandomForestClassifier(
+                        class_weight="balanced",
+                        random_state=settings.random_state,
+                    ),
+                ),
+            ]
+        )
+    return Pipeline(
+        steps=[
+            ("scale", StandardScaler()),
+            (
+                "classifier",
+                LogisticRegression(
+                    C=settings.regularization,
+                    class_weight="balanced",
+                    max_iter=settings.max_iterations,
+                    random_state=settings.random_state,
+                    solver="lbfgs",
+                ),
+            ),
+        ]
+    )
+
+
 def _extract_feature_effects(
     estimator: Any,
     feature_names: tuple[str, ...],
     *,
     calibration_method: CalibrationMethod,
-) -> list[dict[str, str | float | int]]:
+) -> list[dict[str, str | float | int | None]]:
     if calibration_method is CalibrationMethod.NONE:
         fitted_pipelines = [estimator]
     else:
@@ -574,13 +612,19 @@ def _extract_feature_effects(
             for calibrated_classifier in estimator.calibrated_classifiers_
         ]
 
-    coefficient_rows = [
-        np.asarray(pipeline.named_steps["classifier"].coef_[0], dtype=float)
-        for pipeline in fitted_pipelines
-    ]
-    mean_coefficients = np.mean(np.vstack(coefficient_rows), axis=0)
+    classifiers = [pipeline.named_steps["classifier"] for pipeline in fitted_pipelines]
+    if hasattr(classifiers[0], "coef_"):
+        method = "standardized_coefficient"
+        rows = [np.asarray(classifier.coef_[0], dtype=float) for classifier in classifiers]
+    else:
+        method = "feature_importance"
+        rows = [
+            np.asarray(classifier.feature_importances_, dtype=float) for classifier in classifiers
+        ]
+
+    mean_values = np.mean(np.vstack(rows), axis=0)
     ranked = sorted(
-        zip(feature_names, mean_coefficients, strict=True),
+        zip(feature_names, mean_values, strict=True),
         key=lambda item: abs(item[1]),
         reverse=True,
     )
@@ -588,11 +632,16 @@ def _extract_feature_effects(
         {
             "rank": rank,
             "feature": feature,
-            "coefficient": float(coefficient),
-            "absolute_effect": float(abs(coefficient)),
-            "direction": ("higher_fraud_risk" if coefficient >= 0 else "lower_fraud_risk"),
+            "coefficient": float(value),
+            "absolute_effect": float(abs(value)),
+            "direction": (
+                ("higher_fraud_risk" if value >= 0 else "lower_fraud_risk")
+                if method == "standardized_coefficient"
+                else None
+            ),
+            "method": method,
         }
-        for rank, (feature, coefficient) in enumerate(ranked, start=1)
+        for rank, (feature, value) in enumerate(ranked, start=1)
     ]
 
 

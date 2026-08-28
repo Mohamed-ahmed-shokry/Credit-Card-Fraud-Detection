@@ -21,6 +21,7 @@ from fraud_detection.data import (
 from fraud_detection.drift import DriftError, assess_drift
 from fraud_detection.model import (
     CalibrationMethod,
+    EstimatorType,
     ModelArtifactError,
     SplitStrategy,
     ThresholdStrategy,
@@ -116,6 +117,13 @@ def train_command(
         typer.Option(min=0.05, max=0.4, help="Threshold-tuning validation fraction."),
     ] = 0.2,
     seed: Annotated[int, typer.Option(help="Random seed.")] = 42,
+    estimator: Annotated[
+        EstimatorType,
+        typer.Option(
+            help="Base classifier: the interpretable logistic-regression baseline, "
+            "or an opt-in random forest."
+        ),
+    ] = EstimatorType.LOGISTIC_REGRESSION,
     threshold_strategy: Annotated[
         ThresholdStrategy,
         typer.Option(help="Validation objective: maximize F1 or minimize weighted mistake cost."),
@@ -166,6 +174,7 @@ def train_command(
             test_size=test_size,
             validation_size=validation_size,
             random_state=seed,
+            estimator=estimator,
             threshold_strategy=threshold_strategy,
             false_positive_cost=false_positive_cost,
             false_negative_cost=false_negative_cost,
@@ -184,6 +193,7 @@ def train_command(
         json.dumps(
             {
                 "model": str(model_path),
+                "estimator": model.metadata["estimator"],
                 "threshold": model.threshold,
                 "test_metrics": model.metadata["test_metrics"],
             },
