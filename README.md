@@ -319,6 +319,7 @@ python -m mypy src
 python -m pip_audit --skip-editable
 python -m pytest --cov=fraud_detection --cov-report=term-missing
 python -m build
+python -m twine check dist/*
 ```
 
 Project layout:
@@ -347,6 +348,12 @@ production performance.
 
 Joblib uses Python pickle semantics and can execute code during loading. **Only load
 model artifacts produced by a trusted training process.**
+
+## Roadmap
+
+See [ROADMAP.md](ROADMAP.md) for what's planned beyond `v0.1.0`, including
+alternative estimators, PyPI publishing, and optional reference hardening
+patterns.
 
 ## License
 
