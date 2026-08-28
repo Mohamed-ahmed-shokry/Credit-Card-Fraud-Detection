@@ -19,6 +19,7 @@ from fraud_detection.model import (
     METADATA_FILENAME,
     MODEL_FILENAME,
     CalibrationMethod,
+    EstimatorType,
     FraudModel,
     ModelArtifactError,
     SplitStrategy,
@@ -444,6 +445,7 @@ def test_load_model_rejects_nonstandard_metadata_json(
         {"test_size": 0.01},
         {"validation_size": 0.9},
         {"test_size": 0.4, "validation_size": 0.3},
+        {"estimator": "unknown"},
         {"max_iterations": 10},
         {"regularization": 0},
         {"threshold_strategy": "unknown"},
@@ -524,6 +526,49 @@ def test_train_model_can_disable_probability_calibration() -> None:
         "folds": None,
         "jobs": None,
     }
+
+
+def test_train_model_supports_random_forest_estimator() -> None:
+    dataset = validate_frame(generate_synthetic_data(rows=800, fraud_rate=0.1))
+
+    model = train_model(
+        dataset,
+        config=TrainingConfig(
+            estimator=EstimatorType.RANDOM_FOREST,
+            calibration_method=CalibrationMethod.NONE,
+        ),
+    )
+
+    assert model.metadata["estimator"] == "RandomForestClassifier"
+    assert model.metadata["training_config"]["estimator"] == "random_forest"
+    assert 0.0 <= model.threshold <= 1.0
+    probabilities = model.predict_probabilities(dataset.features.iloc[:10])
+    assert np.all((probabilities >= 0.0) & (probabilities <= 1.0))
+
+    effects = model.metadata["feature_effects"]
+    assert len(effects) == 30
+    assert all(effect["method"] == "feature_importance" for effect in effects)
+    assert all(effect["direction"] is None for effect in effects)
+    assert all(effect["coefficient"] >= 0.0 for effect in effects)
+    assert [effect["rank"] for effect in effects] == list(range(1, 31))
+    assert all(
+        effects[index]["absolute_effect"] >= effects[index + 1]["absolute_effect"]
+        for index in range(len(effects) - 1)
+    )
+
+
+def test_train_model_supports_calibrated_random_forest(tmp_path: Path) -> None:
+    dataset = validate_frame(generate_synthetic_data(rows=800, fraud_rate=0.1))
+
+    model = train_model(dataset, config=TrainingConfig(estimator=EstimatorType.RANDOM_FOREST))
+
+    assert model.metadata["estimator"] == "CalibratedClassifierCV(RandomForestClassifier)"
+    model_path = save_model(model, tmp_path / "artifact")
+    restored = load_model(model_path.parent)
+    np.testing.assert_allclose(
+        restored.predict_probabilities(dataset.features.iloc[:5]),
+        model.predict_probabilities(dataset.features.iloc[:5]),
+    )
 
 
 def test_train_model_supports_chronological_evaluation() -> None:
