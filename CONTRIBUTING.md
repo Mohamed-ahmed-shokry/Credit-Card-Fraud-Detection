@@ -30,6 +30,9 @@ split owns model-selection decisions; the test split is for final evaluation onl
 Use precision/recall-oriented metrics for imbalanced behavior rather than accuracy
 alone.
 
+Looking for something to work on? [ROADMAP.md](ROADMAP.md) lists scoped, proposed
+next steps by phase.
+
 ## Run the quality gates
 
 ```bash
@@ -39,6 +42,7 @@ python -m mypy src
 python -m pip_audit --skip-editable
 python -m pytest --cov=fraud_detection --cov-report=term-missing
 python -m build
+python -m twine check dist/*
 ```
 
 Branch coverage must remain at or above 97%. Tests should cover failure behavior,
