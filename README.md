@@ -96,6 +96,22 @@ fraud-detect train Dataset/creditcard.csv --output artifacts/model
 Training refuses to replace a non-empty artifact directory. Pass `--overwrite` only
 after confirming the existing model can be replaced.
 
+The default estimator is class-balanced logistic regression: interpretable and
+well-calibrated. An opt-in random forest is available for callers who have
+validated it outperforms the baseline on their data; it shares the same
+leakage-safe split, calibration, and threshold-selection pipeline:
+
+```bash
+fraud-detect train Dataset/creditcard.csv \
+  --output artifacts/model \
+  --estimator random_forest
+```
+
+`explain` reports feature importances instead of standardized coefficients for a
+random forest: non-negative magnitudes with no `direction`, unlike the signed
+coefficients a logistic regression reports. The model card's `feature_effects`
+entries record which kind of value they hold in a `method` field.
+
 The default split is reproducible and stratified. When the data includes transaction
 order, evaluate chronologically to train on the past and test on the newest window:
 
@@ -172,15 +188,18 @@ and `1`, with enough examples of each class for all three stratified splits.
 
 ## Explain global feature effects
 
-Show the strongest standardized logistic-regression effects:
+Show the strongest global feature effects:
 
 ```bash
 fraud-detect explain artifacts/model --top 10
 ```
 
-The report ranks coefficients by absolute magnitude and labels whether increasing a
-feature is associated with higher or lower fraud risk. For calibrated models,
-coefficients are averaged across the fitted calibration folds.
+The report ranks features by absolute magnitude. For the default logistic
+regression, that is a standardized coefficient, and each entry labels whether
+increasing the feature is associated with higher or lower fraud risk. For an
+opt-in random forest, it is a non-negative feature importance with no direction.
+Each entry's `method` field says which kind of value it holds. For calibrated
+models, values are averaged across the fitted calibration folds.
 
 These are global associations, not causal claims or explanations of an individual
 transaction. In the common anonymized dataset, `V1`…`V28` are transformed components,
