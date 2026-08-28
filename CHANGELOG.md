@@ -8,6 +8,11 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- An opt-in `--estimator random_forest` training option alongside the default
+  logistic regression, sharing the same leakage-safe split, calibration, and
+  threshold-selection pipeline. `explain` reports feature importances instead of
+  standardized coefficients for it, distinguished by a new `method` field on each
+  `feature_effects` entry.
 - Validation-only cost-sensitive threshold selection with configurable false-positive
   and false-negative weights plus holdout expected-cost reporting.
 - Cross-validated sigmoid or isotonic probability calibration, optional raw scores,
