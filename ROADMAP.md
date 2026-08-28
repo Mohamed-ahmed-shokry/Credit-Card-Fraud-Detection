@@ -37,10 +37,12 @@ The trained model is a class-balanced logistic regression by design — an
 honest, interpretable baseline. That should stay the default, but power users
 training on their own data may want more expressive options.
 
-- **Opt-in alternative estimators** (`Proposed`) — a `--estimator` training
-  option (for example, gradient-boosted trees) alongside the existing
-  logistic regression, sharing the same leakage-safe split, calibration, and
-  threshold-selection pipeline. The default does not change.
+- **Opt-in alternative estimators** (`Done`) — `--estimator random_forest`
+  alongside the default logistic regression, sharing the same leakage-safe
+  split, calibration, and threshold-selection pipeline. `explain` reports
+  feature importances instead of standardized coefficients for it. Further
+  estimators (for example, gradient-boosted trees) can follow the same
+  pattern established here.
 - **Model comparison** (`Proposed`) — a CLI command that trains multiple
   configurations against the same split and reports their validation and test
   metrics side by side, so a choice between estimators or hyperparameters is
