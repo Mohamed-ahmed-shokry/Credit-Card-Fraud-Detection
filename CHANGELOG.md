@@ -8,6 +8,9 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- A `GET /metrics` endpoint reporting Prometheus-format request counts, request
+  duration, and scored-transaction decision counts. Each app instance gets its own
+  isolated metrics registry.
 - An opt-in `--estimator random_forest` training option alongside the default
   logistic regression, sharing the same leakage-safe split, calibration, and
   threshold-selection pipeline. `explain` reports feature importances instead of
