@@ -16,6 +16,13 @@ import pandas as pd
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from prometheus_client import (
+    CONTENT_TYPE_LATEST,
+    CollectorRegistry,
+    Counter,
+    Histogram,
+    generate_latest,
+)
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.middleware.base import RequestResponseEndpoint
 from starlette.responses import Response
@@ -78,6 +85,26 @@ def create_app(
     """Create an application using an injected model or a trusted artifact path."""
     logging.basicConfig(level=logging.INFO)
 
+    metrics_registry = CollectorRegistry()
+    request_counter = Counter(
+        "http_requests_total",
+        "Total HTTP requests handled.",
+        ["method", "path", "status_code"],
+        registry=metrics_registry,
+    )
+    request_duration = Histogram(
+        "http_request_duration_seconds",
+        "HTTP request duration in seconds.",
+        ["method", "path"],
+        registry=metrics_registry,
+    )
+    prediction_counter = Counter(
+        "fraud_predictions_total",
+        "Total scored transactions by decision.",
+        ["is_fraud"],
+        registry=metrics_registry,
+    )
+
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         loaded_model = model
@@ -120,17 +147,33 @@ def create_app(
             if response is None:
                 response = await call_next(request)
         except Exception:
-            duration_ms = (perf_counter() - started_at) * 1_000
+            duration_seconds = perf_counter() - started_at
+            request_counter.labels(
+                method=request.method,
+                path=request.url.path,
+                status_code="500",
+            ).inc()
+            request_duration.labels(method=request.method, path=request.url.path).observe(
+                duration_seconds
+            )
             logger.exception(
                 "request_failed method=%s path=%s duration_ms=%.3f request_id=%s",
                 request.method,
                 request.url.path,
-                duration_ms,
+                duration_seconds * 1_000,
                 request_id,
             )
             raise
 
         duration_ms = (perf_counter() - started_at) * 1_000
+        request_counter.labels(
+            method=request.method,
+            path=request.url.path,
+            status_code=str(response.status_code),
+        ).inc()
+        request_duration.labels(method=request.method, path=request.url.path).observe(
+            duration_ms / 1_000
+        )
         response.headers[REQUEST_ID_HEADER] = request_id
         response.headers[PROCESS_TIME_HEADER] = f"{duration_ms:.3f}"
         logger.info(
@@ -190,10 +233,19 @@ def create_app(
             PredictionResult(fraud_probability=float(probability), is_fraud=bool(decision))
             for probability, decision in zip(probabilities, decisions, strict=True)
         ]
+        prediction_counter.labels(is_fraud="true").inc(int(decisions.sum()))
+        prediction_counter.labels(is_fraud="false").inc(int((~decisions).sum()))
         return PredictionResponse(
             model_version=str(loaded.metadata["dataset_fingerprint"])[:12],
             threshold=loaded.threshold,
             predictions=results,
+        )
+
+    @application.get("/metrics", tags=["operations"])
+    async def metrics() -> Response:
+        return Response(
+            content=generate_latest(metrics_registry),
+            media_type=CONTENT_TYPE_LATEST,
         )
 
     return application
