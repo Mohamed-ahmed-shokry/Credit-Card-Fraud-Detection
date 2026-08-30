@@ -71,3 +71,9 @@ an authenticated gateway and a private service network.
 The application rejects declared or streamed request bodies larger than 2 MiB.
 Production gateways should still enforce their own request-size, rate, and
 concurrency limits before traffic reaches the service.
+
+`GET /metrics` and `GET /health` are unauthenticated, like most Prometheus
+exposition endpoints. They report counts, labels, and timing only, never
+transaction values, but should still be reachable only from a trusted scrape
+network rather than exposed publicly, the same as any other operational
+endpoint.
