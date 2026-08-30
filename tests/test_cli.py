@@ -195,6 +195,59 @@ def test_train_and_explain_support_random_forest_estimator(tmp_path: Path) -> No
     assert all(effect["direction"] is None for effect in effects)
 
 
+def test_compare_defaults_to_every_estimator_on_the_same_split(tmp_path: Path) -> None:
+    data_path = tmp_path / "transactions.csv"
+    generate_synthetic_data(rows=1200, fraud_rate=0.08, random_state=6).to_csv(
+        data_path, index=False
+    )
+
+    compared = runner.invoke(app, ["compare", str(data_path)])
+
+    assert compared.exit_code == 0, compared.output
+    results = json.loads(compared.stdout)["results"]
+    assert {result["estimator"] for result in results} == {
+        "CalibratedClassifierCV(LogisticRegression)",
+        "CalibratedClassifierCV(RandomForestClassifier)",
+    }
+    actual_positives = {
+        result["test_metrics"]["true_positives"] + result["test_metrics"]["false_negatives"]
+        for result in results
+    }
+    actual_negatives = {
+        result["test_metrics"]["true_negatives"] + result["test_metrics"]["false_positives"]
+        for result in results
+    }
+    assert len(actual_positives) == 1, "every estimator must see the same test split"
+    assert len(actual_negatives) == 1, "every estimator must see the same test split"
+
+
+def test_compare_reports_dataset_errors(tmp_path: Path) -> None:
+    data_path = tmp_path / "transactions.csv"
+    generate_synthetic_data(rows=300, fraud_rate=0.1, random_state=8).to_csv(data_path, index=False)
+
+    result = runner.invoke(app, ["compare", str(data_path), "--target", "missing_column"])
+
+    assert result.exit_code == 2
+    assert "missing_column" in result.stderr
+
+
+def test_compare_supports_selecting_specific_estimators(tmp_path: Path) -> None:
+    data_path = tmp_path / "transactions.csv"
+    generate_synthetic_data(rows=500, fraud_rate=0.08, random_state=7).to_csv(
+        data_path, index=False
+    )
+
+    compared = runner.invoke(
+        app,
+        ["compare", str(data_path), "--estimator", "logistic_regression"],
+    )
+
+    assert compared.exit_code == 0, compared.output
+    results = json.loads(compared.stdout)["results"]
+    assert len(results) == 1
+    assert results[0]["estimator"] == "CalibratedClassifierCV(LogisticRegression)"
+
+
 def _save_model_missing_metadata_key(
     model: FraudModel,
     destination: Path,
