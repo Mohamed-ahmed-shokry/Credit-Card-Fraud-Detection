@@ -112,6 +112,15 @@ random forest: non-negative magnitudes with no `direction`, unlike the signed
 coefficients a logistic regression reports. The model card's `feature_effects`
 entries record which kind of value they hold in a `method` field.
 
+Gather the evidence for that choice before committing to it. `compare` trains
+every estimator (or a specific subset) on the exact same split and reports
+validation and test metrics side by side without saving anything:
+
+```bash
+fraud-detect compare Dataset/creditcard.csv
+fraud-detect compare Dataset/creditcard.csv --estimator logistic_regression
+```
+
 The default split is reproducible and stratified. When the data includes transaction
 order, evaluate chronologically to train on the past and test on the newest window:
 
@@ -346,7 +355,7 @@ Project layout:
 ```text
 src/fraud_detection/
 ├── api.py          # versioned online prediction service
-├── cli.py          # training, scoring, explanation, drift, and serving workflows
+├── cli.py          # training, comparison, scoring, explanation, drift, and serving
 ├── data.py         # ingestion, schema validation, and synthetic data
 ├── drift.py        # training profiles and PSI drift reporting
 ├── evaluation.py   # threshold tuning and imbalance-aware metrics
