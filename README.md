@@ -222,8 +222,8 @@ Run the service directly:
 fraud-detect serve artifacts/model --host 0.0.0.0 --port 8000
 ```
 
-Interactive OpenAPI documentation is available at
-`http://localhost:8000/docs`, and readiness at `GET /health`.
+Interactive OpenAPI documentation is available at `http://localhost:8000/docs`,
+readiness at `GET /health`, and Prometheus metrics at `GET /metrics`.
 
 Score one or more transactions (all trained features are required):
 
@@ -297,6 +297,12 @@ Every HTTP response includes:
 
 Completion and failure logs carry the same request ID for correlation. Request IDs
 are operational labels only and must not contain cardholder or personal data.
+
+`GET /metrics` reports Prometheus-format counters and a histogram: total requests
+and request duration labeled by method, path, and status code, plus total scored
+transactions labeled by decision. Restrict it to a trusted scrape network like any
+other operational endpoint; it carries counts and labels only, never transaction
+values.
 
 ## Monitor feature drift
 
