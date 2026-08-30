@@ -13,6 +13,9 @@ All notable changes to this project are documented here. The format follows
   threshold-selection pipeline. `explain` reports feature importances instead of
   standardized coefficients for it, distinguished by a new `method` field on each
   `feature_effects` entry.
+- A `compare` CLI command that trains every requested estimator on the exact same
+  split and reports validation/test metrics side by side, without persisting
+  anything, for evidence-based estimator selection before a real `train` run.
 - Validation-only cost-sensitive threshold selection with configurable false-positive
   and false-negative weights plus holdout expected-cost reporting.
 - Cross-validated sigmoid or isotonic probability calibration, optional raw scores,
