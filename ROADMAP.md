@@ -59,11 +59,12 @@ extensions:
   and API) with an optional per-transaction contribution breakdown, so a
   flagged transaction's score is traceable to specific feature values, not
   just the global ranking.
-- **Prometheus-compatible metrics endpoint** (`Proposed`) — the API already
-  computes per-request timing and a fraud/legitimate decision for every
-  scored transaction; exposing request-count, latency, and flag-rate as
-  Prometheus metrics is a small extension of data already being computed,
-  not a new subsystem.
+- **Prometheus-compatible metrics endpoint** (`Done`) — `GET /metrics` reports
+  request counts, request duration, and scored-transaction decision counts,
+  built from data the existing request-logging middleware already computed.
+  Each app instance owns an isolated registry rather than sharing
+  `prometheus_client`'s global default, which would otherwise raise on the
+  second `create_app()` call in the same process.
 
 ## Phase 4 — Optional reference hardening patterns
 
