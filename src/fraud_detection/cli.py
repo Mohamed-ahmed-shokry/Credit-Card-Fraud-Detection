@@ -203,6 +203,107 @@ def train_command(
     )
 
 
+@app.command("compare")
+def compare_command(
+    data: Annotated[
+        Path,
+        typer.Argument(exists=True, dir_okay=False, readable=True, help="Training CSV."),
+    ],
+    target: Annotated[
+        str,
+        typer.Option(help="Binary target column containing 0 and 1."),
+    ] = DEFAULT_TARGET,
+    test_size: Annotated[
+        float,
+        typer.Option(min=0.05, max=0.4, help="Untouched test-set fraction."),
+    ] = 0.2,
+    validation_size: Annotated[
+        float,
+        typer.Option(min=0.05, max=0.4, help="Threshold-tuning validation fraction."),
+    ] = 0.2,
+    seed: Annotated[int, typer.Option(help="Random seed.")] = 42,
+    estimators: Annotated[
+        list[EstimatorType] | None,
+        typer.Option(
+            "--estimator",
+            help="Estimator to include; repeat to compare specific choices. "
+            "Defaults to comparing every supported estimator.",
+        ),
+    ] = None,
+    threshold_strategy: Annotated[
+        ThresholdStrategy,
+        typer.Option(help="Validation objective: maximize F1 or minimize weighted mistake cost."),
+    ] = ThresholdStrategy.F1,
+    false_positive_cost: Annotated[
+        float,
+        typer.Option(min=0.000001, help="Relative cost of flagging a legitimate transaction."),
+    ] = 1.0,
+    false_negative_cost: Annotated[
+        float,
+        typer.Option(min=0.000001, help="Relative cost of missing a fraudulent transaction."),
+    ] = 10.0,
+    calibration_method: Annotated[
+        CalibrationMethod,
+        typer.Option(help="Probability calibration policy fitted within training data."),
+    ] = CalibrationMethod.SIGMOID,
+    calibration_folds: Annotated[
+        int,
+        typer.Option(min=2, max=10, help="Cross-validation folds used for calibration."),
+    ] = 3,
+    calibration_jobs: Annotated[
+        int,
+        typer.Option(help="Calibration workers: 1 is conservative; -1 uses all processors."),
+    ] = 1,
+    split_strategy: Annotated[
+        SplitStrategy,
+        typer.Option(help="Random stratified or chronological dataset partitioning."),
+    ] = SplitStrategy.STRATIFIED,
+    time_column: Annotated[
+        str,
+        typer.Option(help="Ordering feature used when --split-strategy temporal."),
+    ] = "Time",
+) -> None:
+    """Train each estimator on the same split and report metrics side by side.
+
+    Nothing is saved; this is for evidence-based estimator selection before a
+    real `train` run. Every candidate shares the same split, calibration
+    policy, and threshold-selection objective, so only the estimator varies.
+    """
+    chosen_estimators = list(dict.fromkeys(estimators or list(EstimatorType)))
+
+    try:
+        dataset = load_csv(data, target_column=target)
+        results = []
+        for candidate in chosen_estimators:
+            config = TrainingConfig(
+                test_size=test_size,
+                validation_size=validation_size,
+                random_state=seed,
+                estimator=candidate,
+                threshold_strategy=threshold_strategy,
+                false_positive_cost=false_positive_cost,
+                false_negative_cost=false_negative_cost,
+                calibration_method=calibration_method,
+                calibration_folds=calibration_folds,
+                calibration_jobs=calibration_jobs,
+                split_strategy=split_strategy,
+                time_column=time_column,
+            )
+            model = train_model(dataset, config=config)
+            results.append(
+                {
+                    "estimator": model.metadata["estimator"],
+                    "threshold": model.threshold,
+                    "validation_metrics": model.metadata["validation_metrics"],
+                    "test_metrics": model.metadata["test_metrics"],
+                }
+            )
+    except (OSError, DataValidationError, ModelArtifactError, ValueError) as exc:
+        _abort(str(exc))
+
+    typer.echo(json.dumps({"results": results}, indent=2, sort_keys=True))
+
+
 @app.command("predict")
 def predict_command(
     model_path: Annotated[
