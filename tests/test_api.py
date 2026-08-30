@@ -181,6 +181,68 @@ def test_api_logs_and_reraises_unhandled_errors(
     assert "request_failed" in caplog.text
 
 
+def test_metrics_endpoint_reports_request_and_prediction_counters(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, model, dataset = api_context
+    isolated_app = create_app(model=model)
+
+    with TestClient(isolated_app) as isolated_client:
+        isolated_client.get("/health")
+        isolated_client.post(
+            "/v1/predict",
+            json={"transactions": dataset.features.iloc[:5].to_dict(orient="records")},
+        )
+        response = isolated_client.get("/metrics")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/plain")
+    body = response.text
+    assert 'http_requests_total{method="GET",path="/health",status_code="200"} 1.0' in body
+    assert 'http_requests_total{method="POST",path="/v1/predict",status_code="200"} 1.0' in body
+    fraud_count = float(
+        next(
+            line.rsplit(" ", 1)[1]
+            for line in body.splitlines()
+            if line.startswith('fraud_predictions_total{is_fraud="true"}')
+        )
+    )
+    legitimate_count = float(
+        next(
+            line.rsplit(" ", 1)[1]
+            for line in body.splitlines()
+            if line.startswith('fraud_predictions_total{is_fraud="false"}')
+        )
+    )
+    assert fraud_count + legitimate_count == 5
+
+
+def test_metrics_endpoint_records_unhandled_errors_as_500(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, model, dataset = api_context
+
+    class _BrokenModel:
+        feature_names = model.feature_names
+        threshold = model.threshold
+        metadata = model.metadata
+
+        def predict_probabilities(self, _features: object) -> None:
+            raise RuntimeError("boom")
+
+    broken_app = create_app(model=cast(FraudModel, _BrokenModel()))
+    with TestClient(broken_app, raise_server_exceptions=False) as broken_client:
+        broken_client.post(
+            "/v1/predict",
+            json={"transactions": dataset.features.iloc[:1].to_dict(orient="records")},
+        )
+        response = broken_client.get("/metrics")
+
+    assert 'http_requests_total{method="POST",path="/v1/predict",status_code="500"} 1.0' in (
+        response.text
+    )
+
+
 def test_api_rejects_chunked_body_that_crosses_limit(client: TestClient) -> None:
     def oversized_body() -> Iterator[bytes]:
         yield b'{"transactions":[{"x":"'
