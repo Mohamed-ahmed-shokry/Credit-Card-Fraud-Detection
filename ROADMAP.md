@@ -43,10 +43,12 @@ training on their own data may want more expressive options.
   feature importances instead of standardized coefficients for it. Further
   estimators (for example, gradient-boosted trees) can follow the same
   pattern established here.
-- **Model comparison** (`Proposed`) — a CLI command that trains multiple
-  configurations against the same split and reports their validation and test
-  metrics side by side, so a choice between estimators or hyperparameters is
-  evidence-based rather than a single trained artifact taken on faith.
+- **Model comparison** (`Done`) — `compare` trains every requested estimator
+  against the same split and reports validation and test metrics side by
+  side, so a choice between estimators is evidence-based rather than a single
+  trained artifact taken on faith. Comparing hyperparameters within one
+  estimator (not just across estimators) remains open if it turns out to be
+  needed.
 
 ## Phase 3 — Explainability and observability depth
 
