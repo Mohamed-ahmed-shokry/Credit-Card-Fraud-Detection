@@ -291,10 +291,46 @@ def compare_command(
     """
     chosen_estimators = list(dict.fromkeys(estimators or list(EstimatorType)))
 
+    sweepable_parameters: dict[str, tuple[str, set[EstimatorType]]] = {
+        "regularization": ("float", {EstimatorType.LOGISTIC_REGRESSION}),
+        "max_iterations": (
+            "int",
+            {EstimatorType.LOGISTIC_REGRESSION, EstimatorType.HIST_GRADIENT_BOOSTING},
+        ),
+        "n_estimators": ("int", {EstimatorType.RANDOM_FOREST}),
+        "max_depth": (
+            "int",
+            {EstimatorType.RANDOM_FOREST, EstimatorType.HIST_GRADIENT_BOOSTING},
+        ),
+        "learning_rate": ("float", {EstimatorType.HIST_GRADIENT_BOOSTING}),
+        "l2_regularization": ("float", {EstimatorType.HIST_GRADIENT_BOOSTING}),
+        "max_bins": ("int", {EstimatorType.HIST_GRADIENT_BOOSTING}),
+        "calibration_folds": (
+            "int",
+            {
+                EstimatorType.LOGISTIC_REGRESSION,
+                EstimatorType.RANDOM_FOREST,
+                EstimatorType.HIST_GRADIENT_BOOSTING,
+            },
+        ),
+    }
+
     if param_name is not None and param_values is not None:
         if len(chosen_estimators) != 1:
             _abort("--param-name/--param-values requires exactly one estimator via --estimator")
+        if param_name not in sweepable_parameters:
+            _abort(
+                f"Unknown hyperparameter: {param_name}. "
+                f"Supported: {', '.join(sorted(sweepable_parameters))}"
+            )
+        _, supported_estimators = sweepable_parameters[param_name]
+        if chosen_estimators[0] not in supported_estimators:
+            _abort(
+                f"Hyperparameter {param_name!r} does not apply to {chosen_estimators[0].value!r}."
+            )
         param_values_list = [v.strip() for v in param_values.split(",") if v.strip()]
+        if not param_values_list:
+            _abort("--param-values must contain at least one value")
     elif param_name is not None or param_values is not None:
         _abort("Both --param-name and --param-values must be provided together")
     else:
@@ -306,25 +342,17 @@ def compare_command(
 
         if param_values_list is not None:
             # Hyperparameter sweep mode
+            if param_name is None:
+                _abort("Internal error: param_name should not be None in sweep mode")
             candidate = chosen_estimators[0]
             for value_str in param_values_list:
                 # Parse value based on parameter type
-                if param_name in (
-                    "max_iterations",
-                    "calibration_folds",
-                    "max_depth",
-                    "n_estimators",
-                    "max_bins",
-                ):
-                    value: int | float = int(value_str)
-                elif param_name in ("regularization", "learning_rate", "l2_regularization"):
-                    value = float(value_str)
-                else:
-                    # For unknown parameters, pass as string (will be validated by TrainingConfig)
-                    value = value_str  # type: ignore[assignment]
+                kind, _ = sweepable_parameters[param_name]
+                try:
+                    value: int | float = int(value_str) if kind == "int" else float(value_str)
+                except ValueError as exc:
+                    _abort(f"Invalid value {value_str!r} for hyperparameter {param_name!r}: {exc}")
 
-                if param_name is None:
-                    _abort("Internal error: param_name should not be None in sweep mode")
                 # Build config with the hyperparameter value
                 config_kwargs: dict[str, Any] = {
                     "test_size": test_size,
