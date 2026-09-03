@@ -121,9 +121,37 @@ def train_command(
         EstimatorType,
         typer.Option(
             help="Base classifier: the interpretable logistic-regression baseline, "
-            "or an opt-in random forest."
+            "or an opt-in random forest or histogram gradient boosting model."
         ),
     ] = EstimatorType.LOGISTIC_REGRESSION,
+    regularization: Annotated[
+        float,
+        typer.Option(min=0.000001, help="Inverse regularization strength (logistic regression)."),
+    ] = 1.0,
+    max_iterations: Annotated[
+        int,
+        typer.Option(min=100, help="Solver iterations (logistic regression) or trees (boosting)."),
+    ] = 1_000,
+    n_estimators: Annotated[
+        int,
+        typer.Option(min=10, help="Number of trees (random forest)."),
+    ] = 100,
+    max_depth: Annotated[
+        int | None,
+        typer.Option(help="Maximum tree depth for forest/boosting models; omit for unlimited."),
+    ] = None,
+    learning_rate: Annotated[
+        float,
+        typer.Option(min=0.000001, help="Shrinkage step size (histogram gradient boosting)."),
+    ] = 0.1,
+    l2_regularization: Annotated[
+        float,
+        typer.Option(min=0.0, help="L2 regularization (histogram gradient boosting)."),
+    ] = 0.0,
+    max_bins: Annotated[
+        int,
+        typer.Option(min=2, help="Feature bin count (histogram gradient boosting)."),
+    ] = 255,
     threshold_strategy: Annotated[
         ThresholdStrategy,
         typer.Option(help="Validation objective: maximize F1 or minimize weighted mistake cost."),
@@ -175,6 +203,13 @@ def train_command(
             validation_size=validation_size,
             random_state=seed,
             estimator=estimator,
+            max_iterations=max_iterations,
+            regularization=regularization,
+            n_estimators=n_estimators,
+            max_depth=max_depth,
+            learning_rate=learning_rate,
+            l2_regularization=l2_regularization,
+            max_bins=max_bins,
             threshold_strategy=threshold_strategy,
             false_positive_cost=false_positive_cost,
             false_negative_cost=false_negative_cost,
@@ -230,6 +265,34 @@ def compare_command(
             "Defaults to comparing every supported estimator.",
         ),
     ] = None,
+    regularization: Annotated[
+        float,
+        typer.Option(min=0.000001, help="Inverse regularization strength (logistic regression)."),
+    ] = 1.0,
+    max_iterations: Annotated[
+        int,
+        typer.Option(min=100, help="Solver iterations (logistic regression) or trees (boosting)."),
+    ] = 1_000,
+    n_estimators: Annotated[
+        int,
+        typer.Option(min=10, help="Number of trees (random forest)."),
+    ] = 100,
+    max_depth: Annotated[
+        int | None,
+        typer.Option(help="Maximum tree depth for forest/boosting models; omit for unlimited."),
+    ] = None,
+    learning_rate: Annotated[
+        float,
+        typer.Option(min=0.000001, help="Shrinkage step size (histogram gradient boosting)."),
+    ] = 0.1,
+    l2_regularization: Annotated[
+        float,
+        typer.Option(min=0.0, help="L2 regularization (histogram gradient boosting)."),
+    ] = 0.0,
+    max_bins: Annotated[
+        int,
+        typer.Option(min=2, help="Feature bin count (histogram gradient boosting)."),
+    ] = 255,
     threshold_strategy: Annotated[
         ThresholdStrategy,
         typer.Option(help="Validation objective: maximize F1 or minimize weighted mistake cost."),
@@ -359,6 +422,13 @@ def compare_command(
                     "validation_size": validation_size,
                     "random_state": seed,
                     "estimator": candidate,
+                    "max_iterations": max_iterations,
+                    "regularization": regularization,
+                    "n_estimators": n_estimators,
+                    "max_depth": max_depth,
+                    "learning_rate": learning_rate,
+                    "l2_regularization": l2_regularization,
+                    "max_bins": max_bins,
                     "threshold_strategy": threshold_strategy,
                     "false_positive_cost": false_positive_cost,
                     "false_negative_cost": false_negative_cost,
@@ -389,6 +459,13 @@ def compare_command(
                     validation_size=validation_size,
                     random_state=seed,
                     estimator=candidate,
+                    max_iterations=max_iterations,
+                    regularization=regularization,
+                    n_estimators=n_estimators,
+                    max_depth=max_depth,
+                    learning_rate=learning_rate,
+                    l2_regularization=l2_regularization,
+                    max_bins=max_bins,
                     threshold_strategy=threshold_strategy,
                     false_positive_cost=false_positive_cost,
                     false_negative_cost=false_negative_cost,

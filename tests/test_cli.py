@@ -224,6 +224,37 @@ def test_train_and_explain_support_hist_gradient_boosting_estimator(tmp_path: Pa
     assert all(effect["direction"] is None for effect in effects)
 
 
+def test_train_honors_tree_hyperparameters(tmp_path: Path) -> None:
+    data_path = tmp_path / "transactions.csv"
+    artifact_path = tmp_path / "artifact"
+    generate_synthetic_data(rows=600, fraud_rate=0.1, random_state=18).to_csv(
+        data_path, index=False
+    )
+
+    trained = runner.invoke(
+        app,
+        [
+            "train",
+            str(data_path),
+            "--output",
+            str(artifact_path),
+            "--estimator",
+            "random_forest",
+            "--n-estimators",
+            "10",
+            "--max-depth",
+            "3",
+            "--calibration-method",
+            "none",
+        ],
+    )
+
+    assert trained.exit_code == 0, trained.output
+    metadata = json.loads((artifact_path / "metadata.json").read_text(encoding="utf-8"))
+    assert metadata["training_config"]["n_estimators"] == 10
+    assert metadata["training_config"]["max_depth"] == 3
+
+
 def test_compare_defaults_to_every_estimator_on_the_same_split(tmp_path: Path) -> None:
     data_path = tmp_path / "transactions.csv"
     generate_synthetic_data(rows=1200, fraud_rate=0.08, random_state=6).to_csv(
