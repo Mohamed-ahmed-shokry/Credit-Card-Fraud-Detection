@@ -106,6 +106,11 @@ class TrainingConfig:
     calibration_jobs: int = 1
     split_strategy: SplitStrategy = SplitStrategy.STRATIFIED
     time_column: str = "Time"
+    # HistGradientBoostingClassifier specific parameters
+    max_depth: int | None = None
+    learning_rate: float = 0.1
+    l2_regularization: float = 0.0
+    max_bins: int = 255
 
     def __post_init__(self) -> None:
         if not 0.05 <= self.test_size <= 0.4:
@@ -115,7 +120,10 @@ class TrainingConfig:
         if self.test_size + self.validation_size > 0.6:
             raise ValueError("test_size and validation_size must sum to at most 0.6")
         if not isinstance(self.estimator, EstimatorType):
-            raise ValueError("estimator must be 'logistic_regression' or 'random_forest'")
+            raise ValueError(
+                "estimator must be 'logistic_regression', 'random_forest', "
+                "or 'hist_gradient_boosting'"
+            )
         if self.max_iterations < 100:
             raise ValueError("max_iterations must be at least 100")
         if self.regularization <= 0:
@@ -139,6 +147,14 @@ class TrainingConfig:
             raise ValueError("split_strategy must be 'stratified' or 'temporal'")
         if not self.time_column.strip():
             raise ValueError("time_column must not be empty")
+        if self.max_depth is not None and self.max_depth < 1:
+            raise ValueError("max_depth must be positive or None")
+        if self.learning_rate <= 0:
+            raise ValueError("learning_rate must be positive")
+        if self.l2_regularization < 0:
+            raise ValueError("l2_regularization must be non-negative")
+        if self.max_bins < 2:
+            raise ValueError("max_bins must be at least 2")
 
 
 @dataclass
@@ -672,6 +688,11 @@ def _build_base_estimator(settings: TrainingConfig) -> Pipeline:
                     HistGradientBoostingClassifier(
                         class_weight="balanced",
                         random_state=settings.random_state,
+                        max_iter=settings.max_iterations,
+                        learning_rate=settings.learning_rate,
+                        max_depth=settings.max_depth,
+                        l2_regularization=settings.l2_regularization,
+                        max_bins=settings.max_bins,
                     ),
                 ),
             ]

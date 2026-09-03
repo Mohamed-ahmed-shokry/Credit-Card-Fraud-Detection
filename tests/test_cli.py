@@ -278,6 +278,112 @@ def test_compare_supports_selecting_specific_estimators(tmp_path: Path) -> None:
     assert results[0]["estimator"] == "CalibratedClassifierCV(LogisticRegression)"
 
 
+def test_compare_supports_hyperparameter_sweep_logistic_regression(tmp_path: Path) -> None:
+    data_path = tmp_path / "transactions.csv"
+    generate_synthetic_data(rows=800, fraud_rate=0.08, random_state=9).to_csv(
+        data_path, index=False
+    )
+
+    compared = runner.invoke(
+        app,
+        [
+            "compare",
+            str(data_path),
+            "--estimator",
+            "logistic_regression",
+            "--param-name",
+            "regularization",
+            "--param-values",
+            "0.1,1.0,10.0",
+        ],
+    )
+
+    assert compared.exit_code == 0, compared.output
+    results = json.loads(compared.stdout)["results"]
+    assert len(results) == 3
+    for result in results:
+        assert result["estimator"] == "CalibratedClassifierCV(LogisticRegression)"
+        assert "hyperparameter" in result
+        assert "regularization" in result["hyperparameter"]
+
+
+def test_compare_supports_hyperparameter_sweep_hist_gradient_boosting(tmp_path: Path) -> None:
+    data_path = tmp_path / "transactions.csv"
+    generate_synthetic_data(rows=800, fraud_rate=0.08, random_state=10).to_csv(
+        data_path, index=False
+    )
+
+    compared = runner.invoke(
+        app,
+        [
+            "compare",
+            str(data_path),
+            "--estimator",
+            "hist_gradient_boosting",
+            "--param-name",
+            "learning_rate",
+            "--param-values",
+            "0.01,0.1,0.2",
+        ],
+    )
+
+    assert compared.exit_code == 0, compared.output
+    results = json.loads(compared.stdout)["results"]
+    assert len(results) == 3
+    for result in results:
+        assert result["estimator"] == "CalibratedClassifierCV(HistGradientBoostingClassifier)"
+        assert "hyperparameter" in result
+        assert "learning_rate" in result["hyperparameter"]
+
+
+def test_compare_rejects_hyperparameter_sweep_with_multiple_estimators(tmp_path: Path) -> None:
+    data_path = tmp_path / "transactions.csv"
+    generate_synthetic_data(rows=500, fraud_rate=0.08, random_state=11).to_csv(
+        data_path, index=False
+    )
+
+    compared = runner.invoke(
+        app,
+        [
+            "compare",
+            str(data_path),
+            "--estimator",
+            "logistic_regression",
+            "--estimator",
+            "random_forest",
+            "--param-name",
+            "regularization",
+            "--param-values",
+            "0.1,1.0",
+        ],
+    )
+
+    assert compared.exit_code == 2
+    assert "requires exactly one estimator" in compared.stderr
+
+
+def test_compare_rejects_hyperparameter_sweep_with_missing_param(tmp_path: Path) -> None:
+    data_path = tmp_path / "transactions.csv"
+    generate_synthetic_data(rows=500, fraud_rate=0.08, random_state=12).to_csv(
+        data_path, index=False
+    )
+
+    compared = runner.invoke(
+        app,
+        [
+            "compare",
+            str(data_path),
+            "--estimator",
+            "logistic_regression",
+            "--param-name",
+            "regularization",
+        ],
+    )
+
+    assert compared.exit_code == 2
+    assert "Both --param-name and --param-values must be provided" in compared.stderr
+
+
 def _save_model_missing_metadata_key(
     model: FraudModel,
     destination: Path,

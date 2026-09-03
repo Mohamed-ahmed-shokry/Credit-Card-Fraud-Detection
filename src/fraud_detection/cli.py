@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Annotated, NoReturn
+from typing import Annotated, Any, NoReturn
 from uuid import uuid4
 
 import pandas as pd
@@ -262,42 +262,123 @@ def compare_command(
         str,
         typer.Option(help="Ordering feature used when --split-strategy temporal."),
     ] = "Time",
+    param_name: Annotated[
+        str | None,
+        typer.Option(
+            "--param-name",
+            help="Hyperparameter name to sweep (e.g., regularization, max_iterations, max_depth). "
+            "Requires --param-values.",
+        ),
+    ] = None,
+    param_values: Annotated[
+        str | None,
+        typer.Option(
+            "--param-values",
+            help="Comma-separated values for the hyperparameter sweep (e.g., 0.1,1.0,10.0). "
+            "Requires --param-name.",
+        ),
+    ] = None,
 ) -> None:
-    """Train each estimator on the same split and report metrics side by side.
+    """Train each estimator (or hyperparameter configuration) on the same split
+    and report metrics side by side.
 
-    Nothing is saved; this is for evidence-based estimator selection before a
-    real `train` run. Every candidate shares the same split, calibration
-    policy, and threshold-selection objective, so only the estimator varies.
+    Nothing is saved; this is for evidence-based estimator/hyperparameter
+    selection before a real `train` run. Every candidate shares the same split,
+    calibration policy, and threshold-selection objective.
+
+    For hyperparameter sweeps, specify a single estimator with --estimator and
+    use --param-name/--param-values to define the sweep.
     """
     chosen_estimators = list(dict.fromkeys(estimators or list(EstimatorType)))
+
+    if param_name is not None and param_values is not None:
+        if len(chosen_estimators) != 1:
+            _abort("--param-name/--param-values requires exactly one estimator via --estimator")
+        param_values_list = [v.strip() for v in param_values.split(",") if v.strip()]
+    elif param_name is not None or param_values is not None:
+        _abort("Both --param-name and --param-values must be provided together")
+    else:
+        param_values_list = None
 
     try:
         dataset = load_csv(data, target_column=target)
         results = []
-        for candidate in chosen_estimators:
-            config = TrainingConfig(
-                test_size=test_size,
-                validation_size=validation_size,
-                random_state=seed,
-                estimator=candidate,
-                threshold_strategy=threshold_strategy,
-                false_positive_cost=false_positive_cost,
-                false_negative_cost=false_negative_cost,
-                calibration_method=calibration_method,
-                calibration_folds=calibration_folds,
-                calibration_jobs=calibration_jobs,
-                split_strategy=split_strategy,
-                time_column=time_column,
-            )
-            model = train_model(dataset, config=config)
-            results.append(
-                {
-                    "estimator": model.metadata["estimator"],
-                    "threshold": model.threshold,
-                    "validation_metrics": model.metadata["validation_metrics"],
-                    "test_metrics": model.metadata["test_metrics"],
+
+        if param_values_list is not None:
+            # Hyperparameter sweep mode
+            candidate = chosen_estimators[0]
+            for value_str in param_values_list:
+                # Parse value based on parameter type
+                if param_name in (
+                    "max_iterations",
+                    "calibration_folds",
+                    "max_depth",
+                    "n_estimators",
+                    "max_bins",
+                ):
+                    value: int | float = int(value_str)
+                elif param_name in ("regularization", "learning_rate", "l2_regularization"):
+                    value = float(value_str)
+                else:
+                    # For unknown parameters, pass as string (will be validated by TrainingConfig)
+                    value = value_str  # type: ignore[assignment]
+
+                if param_name is None:
+                    _abort("Internal error: param_name should not be None in sweep mode")
+                # Build config with the hyperparameter value
+                config_kwargs: dict[str, Any] = {
+                    "test_size": test_size,
+                    "validation_size": validation_size,
+                    "random_state": seed,
+                    "estimator": candidate,
+                    "threshold_strategy": threshold_strategy,
+                    "false_positive_cost": false_positive_cost,
+                    "false_negative_cost": false_negative_cost,
+                    "calibration_method": calibration_method,
+                    "calibration_folds": calibration_folds,
+                    "calibration_jobs": calibration_jobs,
+                    "split_strategy": split_strategy,
+                    "time_column": time_column,
                 }
-            )
+                config_kwargs[param_name] = value
+                config = TrainingConfig(**config_kwargs)
+
+                model = train_model(dataset, config=config)
+                results.append(
+                    {
+                        "estimator": model.metadata["estimator"],
+                        "hyperparameter": {param_name: value},
+                        "threshold": model.threshold,
+                        "validation_metrics": model.metadata["validation_metrics"],
+                        "test_metrics": model.metadata["test_metrics"],
+                    }
+                )
+        else:
+            # Estimator comparison mode
+            for candidate in chosen_estimators:
+                config = TrainingConfig(
+                    test_size=test_size,
+                    validation_size=validation_size,
+                    random_state=seed,
+                    estimator=candidate,
+                    threshold_strategy=threshold_strategy,
+                    false_positive_cost=false_positive_cost,
+                    false_negative_cost=false_negative_cost,
+                    calibration_method=calibration_method,
+                    calibration_folds=calibration_folds,
+                    calibration_jobs=calibration_jobs,
+                    split_strategy=split_strategy,
+                    time_column=time_column,
+                )
+                model = train_model(dataset, config=config)
+                results.append(
+                    {
+                        "estimator": model.metadata["estimator"],
+                        "threshold": model.threshold,
+                        "validation_metrics": model.metadata["validation_metrics"],
+                        "test_metrics": model.metadata["test_metrics"],
+                    }
+                )
     except (OSError, DataValidationError, ModelArtifactError, ValueError) as exc:
         _abort(str(exc))
 
