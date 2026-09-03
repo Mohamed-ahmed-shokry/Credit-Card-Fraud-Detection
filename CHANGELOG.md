@@ -8,6 +8,30 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- An opt-in `--estimator hist_gradient_boosting` training option alongside
+  logistic regression and random forest, sharing the same leakage-safe split,
+  calibration, and threshold-selection pipeline. Its global effects use
+  deterministic training-data permutation importance (new
+  `permutation_importance` method label) because the pinned scikit-learn
+  runtime exposes no native importance for it.
+- A `compare --param-name/--param-values` hyperparameter sweep for a single
+  estimator on the exact same split, with an allow-list validated per
+  estimator before training (unknown, inapplicable, empty, or unparsable
+  values fail with actionable errors).
+- Settable hyperparameters on `train` and `compare`: `--regularization` and
+  `--max-iterations` (logistic regression), `--n-estimators` and `--max-depth`
+  (random forest), and `--max-iterations`, `--learning-rate`,
+  `--l2-regularization`, `--max-bins`, plus `--max-depth` (histogram gradient
+  boosting), so sweep winners can be reproduced in a real artifact.
+- Per-transaction local explanations: `predict --explain` adds
+  `contrib_<feature>` columns to batch CSV output, and `POST /v1/predict`
+  accepts `"explain": true` to include per-transaction `contributions`.
+- Optional, off-by-default API hardening references: API-key validation via
+  the `X-API-Key` header and per-client-IP fixed-window rate limiting, both
+  configured on `create_app()` and documented as defense in depth, not a
+  replacement for a real gateway.
+- A TestPyPI dry-run publishing workflow on every push to `main`, so
+  packaging regressions surface before a real release.
 - A `GET /metrics` endpoint reporting Prometheus-format request counts, request
   duration, and scored-transaction decision counts. Each app instance gets its own
   isolated metrics registry.
@@ -88,6 +112,10 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- Random-forest training now actually applies the configured `n_estimators` and
+  `max_depth` instead of silently using library defaults.
+- `compare` no longer leaks an unhandled `TypeError` traceback for unknown
+  sweep parameters; they are rejected upfront with the supported list.
 - `load_csv`, `fraud-detect predict`, and `fraud-detect drift` now report an empty
   transactions CSV as an actionable error instead of leaking an unhandled
   `pandas.errors.EmptyDataError` traceback.
