@@ -164,7 +164,7 @@ def assess_drift(
         results.append(FeatureDrift(feature=feature, psi=psi, status=_status(psi)))
 
     ordered = tuple(sorted(results, key=lambda item: item.psi, reverse=True))
-    psi_values = cast(np.ndarray, np.asarray([item.psi for item in ordered], dtype=float))
+    psi_values = np.asarray([item.psi for item in ordered], dtype=float)
     maximum = float(np.max(psi_values))
     return DriftReport(
         rows=len(features),

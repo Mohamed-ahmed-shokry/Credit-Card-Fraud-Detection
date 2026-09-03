@@ -161,7 +161,7 @@ class FraudModel:
             raise ModelArtifactError(
                 "Model returned probabilities with an invalid binary-class shape."
             )
-        probabilities = cast(np.ndarray, probability_matrix[:, 1])
+        probabilities = probability_matrix[:, 1]
         if not np.isfinite(probabilities).all() or np.any(
             (probabilities < 0.0) | (probabilities > 1.0)
         ):
