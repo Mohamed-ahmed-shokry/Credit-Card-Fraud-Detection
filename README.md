@@ -123,20 +123,35 @@ Training refuses to replace a non-empty artifact directory. Pass `--overwrite` o
 after confirming the existing model can be replaced.
 
 The default estimator is class-balanced logistic regression: interpretable and
-well-calibrated. An opt-in random forest is available for callers who have
-validated it outperforms the baseline on their data; it shares the same
-leakage-safe split, calibration, and threshold-selection pipeline:
+well-calibrated. Opt-in random forest and histogram gradient boosting models are
+available for callers who have validated them against the baseline on their own
+data; they share the same leakage-safe split, calibration, and
+threshold-selection pipeline:
 
 ```bash
 fraud-detect train Dataset/creditcard.csv \
   --output artifacts/model \
   --estimator random_forest
+fraud-detect train Dataset/creditcard.csv \
+  --output artifacts/model \
+  --estimator hist_gradient_boosting \
+  --learning-rate 0.05 \
+  --max-depth 5
 ```
 
-`explain` reports feature importances instead of standardized coefficients for a
-random forest: non-negative magnitudes with no `direction`, unlike the signed
-coefficients a logistic regression reports. The model card's `feature_effects`
-entries record which kind of value they hold in a `method` field.
+Tree hyperparameters are settable on `train`: `--regularization` and
+`--max-iterations` for logistic regression, `--n-estimators` and `--max-depth`
+for random forest, and `--max-iterations`, `--learning-rate`,
+`--l2-regularization`, `--max-bins`, plus `--max-depth` for histogram gradient
+boosting.
+
+`explain` reports feature importances instead of standardized coefficients for
+tree models: non-negative magnitudes with no `direction`, unlike the signed
+coefficients a logistic regression reports. Random forest uses native
+importances; histogram gradient boosting uses deterministic training-data
+permutation importance (the pinned scikit-learn runtime exposes no native
+importance for it). The model card's `feature_effects` entries record which
+kind of value they hold in a `method` field.
 
 Gather the evidence for that choice before committing to it. `compare` trains
 every estimator (or a specific subset) on the exact same split and reports
@@ -145,6 +160,17 @@ validation and test metrics side by side without saving anything:
 ```bash
 fraud-detect compare Dataset/creditcard.csv
 fraud-detect compare Dataset/creditcard.csv --estimator logistic_regression
+```
+
+To compare hyperparameters within one estimator on that same split, sweep a
+single allow-listed parameter (the parameter must apply to the chosen
+estimator):
+
+```bash
+fraud-detect compare Dataset/creditcard.csv \
+  --estimator random_forest \
+  --param-name n_estimators \
+  --param-values 50,100,200
 ```
 
 The default split is reproducible and stratified. When the data includes transaction
@@ -231,10 +257,12 @@ fraud-detect explain artifacts/model --top 10
 
 The report ranks features by absolute magnitude. For the default logistic
 regression, that is a standardized coefficient, and each entry labels whether
-increasing the feature is associated with higher or lower fraud risk. For an
-opt-in random forest, it is a non-negative feature importance with no direction.
-Each entry's `method` field says which kind of value it holds. For calibrated
-models, values are averaged across the fitted calibration folds.
+increasing the feature is associated with higher or lower fraud risk. For tree
+models, it is a non-negative importance with no direction: native importances
+for random forest, and training-data permutation importance for histogram
+gradient boosting. Each entry's `method` field says which kind of value it
+holds. For calibrated models, values are averaged across the fitted
+calibration folds.
 
 These are global associations, not causal claims or explanations of an individual
 transaction. In the common anonymized dataset, `V1`…`V28` are transformed components,
