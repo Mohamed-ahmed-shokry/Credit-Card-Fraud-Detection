@@ -20,6 +20,7 @@ import sklearn
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
 from sklearn.exceptions import InconsistentVersionWarning
+from sklearn.inspection import permutation_importance
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
@@ -70,10 +71,9 @@ class EstimatorType(StrEnum):
     """Supported base classifiers.
 
     Logistic regression is the default: an interpretable, well-calibrated
-    linear baseline. Random forest is an opt-in, more expressive alternative
-    for callers who have validated it outperforms the baseline on their data.
-    Histogram-based gradient boosting is a fast, scalable option for larger
-    datasets.
+    linear baseline. Random forest and histogram-based gradient boosting are
+    opt-in, more expressive alternatives for callers who have validated them
+    against the baseline on their own data.
     """
 
     LOGISTIC_REGRESSION = "logistic_regression"
@@ -106,7 +106,9 @@ class TrainingConfig:
     calibration_jobs: int = 1
     split_strategy: SplitStrategy = SplitStrategy.STRATIFIED
     time_column: str = "Time"
-    # HistGradientBoostingClassifier specific parameters
+    # Tree-estimator hyperparameters (random forest uses n_estimators and
+    # max_depth; histogram gradient boosting uses all four below).
+    n_estimators: int = 100
     max_depth: int | None = None
     learning_rate: float = 0.1
     l2_regularization: float = 0.0
@@ -147,6 +149,8 @@ class TrainingConfig:
             raise ValueError("split_strategy must be 'stratified' or 'temporal'")
         if not self.time_column.strip():
             raise ValueError("time_column must not be empty")
+        if self.n_estimators < 10:
+            raise ValueError("n_estimators must be at least 10")
         if self.max_depth is not None and self.max_depth < 1:
             raise ValueError("max_depth must be positive or None")
         if self.learning_rate <= 0:
@@ -226,8 +230,10 @@ class FraudModel:
         """Return per-transaction feature contributions to the fraud score.
 
         For logistic regression, contributions are standardized coefficients multiplied
-        by the scaled feature values (centered by training mean). For random forest,
-        a simplified approximation based on feature importance is used.
+        by the scaled feature values (centered by training mean). For tree
+        estimators, a simplified approximation based on importance weights
+        (native importances, or training-data permutation importance when the
+        estimator exposes none) is used.
         """
         ordered = self.validate_features(features)
         estimator_type = self.metadata.get("training_config", {}).get(
@@ -236,7 +242,7 @@ class FraudModel:
 
         if estimator_type == "logistic_regression":
             return self._explain_local_logistic(ordered)
-        return self._explain_local_forest(ordered)
+        return self._explain_local_importance(ordered)
 
     def _explain_local_logistic(self, ordered: pd.DataFrame) -> list[dict[str, Any]]:
         """Compute local explanations for logistic regression using standardized coefficients."""
@@ -265,8 +271,8 @@ class FraudModel:
             results.append(row_contributions)
         return results
 
-    def _explain_local_forest(self, ordered: pd.DataFrame) -> list[dict[str, Any]]:
-        """Compute local explanations for random forest using feature importance approximation."""
+    def _explain_local_importance(self, ordered: pd.DataFrame) -> list[dict[str, Any]]:
+        """Compute local explanations for tree estimators from importance weights."""
         effects = self.metadata.get("feature_effects", [])
         if not effects:
             raise ModelArtifactError("Feature effects not available for local explanation.")
@@ -372,6 +378,8 @@ def train_model(
         estimator,
         dataset.feature_names,
         calibration_method=settings.calibration_method,
+        permutation_data=(features_train, target_train),
+        random_state=settings.random_state,
     )
 
     scaler_mean = None
@@ -676,6 +684,8 @@ def _build_base_estimator(settings: TrainingConfig) -> Pipeline:
                     RandomForestClassifier(
                         class_weight="balanced",
                         random_state=settings.random_state,
+                        n_estimators=settings.n_estimators,
+                        max_depth=settings.max_depth,
                     ),
                 ),
             ]
@@ -719,6 +729,8 @@ def _extract_feature_effects(
     feature_names: tuple[str, ...],
     *,
     calibration_method: CalibrationMethod,
+    permutation_data: tuple[pd.DataFrame, pd.Series] | None = None,
+    random_state: int = 42,
 ) -> list[dict[str, str | float | int | None]]:
     if calibration_method is CalibrationMethod.NONE:
         fitted_pipelines = [estimator]
@@ -738,8 +750,16 @@ def _extract_feature_effects(
             np.asarray(classifier.feature_importances_, dtype=float) for classifier in classifiers
         ]
     else:
-        method = "feature_importance"
-        rows = [np.zeros(len(feature_names), dtype=float) for _ in classifiers]
+        if permutation_data is None:
+            raise ValueError(
+                "Permutation training data is required for estimators without "
+                "native feature importance."
+            )
+        method = "permutation_importance"
+        rows = [
+            _permutation_effects(pipeline, permutation_data, random_state)
+            for pipeline in fitted_pipelines
+        ]
 
     mean_values = np.mean(np.vstack(rows), axis=0)
     ranked = sorted(
@@ -762,6 +782,31 @@ def _extract_feature_effects(
         }
         for rank, (feature, value) in enumerate(ranked, start=1)
     ]
+
+
+def _permutation_effects(
+    pipeline: Any,
+    permutation_data: tuple[pd.DataFrame, pd.Series],
+    random_state: int,
+) -> np.ndarray:
+    """Measure mean average-precision drop per feature on training data.
+
+    Used only for estimators without native coefficients or importances.
+    Training data is appropriate here because the result is descriptive, not
+    used for threshold tuning or holdout evaluation.
+    """
+    features, target = permutation_data
+    result = permutation_importance(
+        pipeline,
+        features,
+        target,
+        n_repeats=5,
+        random_state=random_state,
+        scoring="average_precision",
+        n_jobs=1,
+    )
+    values = np.asarray(result.importances_mean, dtype=float)
+    return np.asarray(np.clip(values, 0.0, None), dtype=float)
 
 
 def _split_dataset(
