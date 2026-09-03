@@ -18,7 +18,7 @@ import numpy as np
 import pandas as pd
 import sklearn
 from sklearn.calibration import CalibratedClassifierCV
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
 from sklearn.exceptions import InconsistentVersionWarning
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
@@ -72,15 +72,19 @@ class EstimatorType(StrEnum):
     Logistic regression is the default: an interpretable, well-calibrated
     linear baseline. Random forest is an opt-in, more expressive alternative
     for callers who have validated it outperforms the baseline on their data.
+    Histogram-based gradient boosting is a fast, scalable option for larger
+    datasets.
     """
 
     LOGISTIC_REGRESSION = "logistic_regression"
     RANDOM_FOREST = "random_forest"
+    HIST_GRADIENT_BOOSTING = "hist_gradient_boosting"
 
 
 _ESTIMATOR_CLASS_NAMES: dict[EstimatorType, str] = {
     EstimatorType.LOGISTIC_REGRESSION: "LogisticRegression",
     EstimatorType.RANDOM_FOREST: "RandomForestClassifier",
+    EstimatorType.HIST_GRADIENT_BOOSTING: "HistGradientBoostingClassifier",
 }
 
 
@@ -660,6 +664,18 @@ def _build_base_estimator(settings: TrainingConfig) -> Pipeline:
                 ),
             ]
         )
+    if settings.estimator is EstimatorType.HIST_GRADIENT_BOOSTING:
+        return Pipeline(
+            steps=[
+                (
+                    "classifier",
+                    HistGradientBoostingClassifier(
+                        class_weight="balanced",
+                        random_state=settings.random_state,
+                    ),
+                ),
+            ]
+        )
     return Pipeline(
         steps=[
             ("scale", StandardScaler()),
@@ -695,11 +711,14 @@ def _extract_feature_effects(
     if hasattr(classifiers[0], "coef_"):
         method = "standardized_coefficient"
         rows = [np.asarray(classifier.coef_[0], dtype=float) for classifier in classifiers]
-    else:
+    elif hasattr(classifiers[0], "feature_importances_"):
         method = "feature_importance"
         rows = [
             np.asarray(classifier.feature_importances_, dtype=float) for classifier in classifiers
         ]
+    else:
+        method = "feature_importance"
+        rows = [np.zeros(len(feature_names), dtype=float) for _ in classifiers]
 
     mean_values = np.mean(np.vstack(rows), axis=0)
     ranked = sorted(

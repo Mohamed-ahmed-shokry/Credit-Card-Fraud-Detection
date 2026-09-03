@@ -571,6 +571,26 @@ def test_train_model_supports_calibrated_random_forest(tmp_path: Path) -> None:
     )
 
 
+def test_train_model_supports_hist_gradient_boosting(tmp_path: Path) -> None:
+    dataset = validate_frame(generate_synthetic_data(rows=800, fraud_rate=0.1))
+
+    model = train_model(
+        dataset, config=TrainingConfig(estimator=EstimatorType.HIST_GRADIENT_BOOSTING)
+    )
+
+    assert model.metadata["estimator"] == "CalibratedClassifierCV(HistGradientBoostingClassifier)"
+    model_path = save_model(model, tmp_path / "artifact")
+    restored = load_model(model_path.parent)
+    np.testing.assert_allclose(
+        restored.predict_probabilities(dataset.features.iloc[:5]),
+        model.predict_probabilities(dataset.features.iloc[:5]),
+    )
+    effects = model.metadata["feature_effects"]
+    assert len(effects) == 30
+    assert all(effect["method"] == "feature_importance" for effect in effects)
+    assert all(effect["direction"] is None for effect in effects)
+
+
 def test_train_model_supports_chronological_evaluation() -> None:
     dataset = validate_frame(generate_synthetic_data(rows=1_000, fraud_rate=0.1))
 

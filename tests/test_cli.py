@@ -195,6 +195,35 @@ def test_train_and_explain_support_random_forest_estimator(tmp_path: Path) -> No
     assert all(effect["direction"] is None for effect in effects)
 
 
+def test_train_and_explain_support_hist_gradient_boosting_estimator(tmp_path: Path) -> None:
+    data_path = tmp_path / "transactions.csv"
+    artifact_path = tmp_path / "artifact"
+    generate_synthetic_data(rows=800, fraud_rate=0.08, random_state=5).to_csv(
+        data_path, index=False
+    )
+
+    trained = runner.invoke(
+        app,
+        [
+            "train",
+            str(data_path),
+            "--output",
+            str(artifact_path),
+            "--estimator",
+            "hist_gradient_boosting",
+        ],
+    )
+    assert trained.exit_code == 0, trained.output
+    training_summary = json.loads(trained.stdout)
+    assert training_summary["estimator"] == "CalibratedClassifierCV(HistGradientBoostingClassifier)"
+
+    explained = runner.invoke(app, ["explain", str(artifact_path), "--top", "3"])
+    assert explained.exit_code == 0, explained.output
+    effects = json.loads(explained.stdout)["effects"]
+    assert all(effect["method"] == "feature_importance" for effect in effects)
+    assert all(effect["direction"] is None for effect in effects)
+
+
 def test_compare_defaults_to_every_estimator_on_the_same_split(tmp_path: Path) -> None:
     data_path = tmp_path / "transactions.csv"
     generate_synthetic_data(rows=1200, fraud_rate=0.08, random_state=6).to_csv(
@@ -208,6 +237,7 @@ def test_compare_defaults_to_every_estimator_on_the_same_split(tmp_path: Path) -
     assert {result["estimator"] for result in results} == {
         "CalibratedClassifierCV(LogisticRegression)",
         "CalibratedClassifierCV(RandomForestClassifier)",
+        "CalibratedClassifierCV(HistGradientBoostingClassifier)",
     }
     actual_positives = {
         result["test_metrics"]["true_positives"] + result["test_metrics"]["false_negatives"]
