@@ -458,6 +458,11 @@ def test_load_model_rejects_nonstandard_metadata_json(
         {"calibration_jobs": -2},
         {"split_strategy": "unknown"},
         {"time_column": " "},
+        {"n_estimators": 5},
+        {"max_depth": 0},
+        {"learning_rate": 0},
+        {"l2_regularization": -1},
+        {"max_bins": 1},
     ],
 )
 def test_training_config_rejects_invalid_values(
@@ -587,8 +592,27 @@ def test_train_model_supports_hist_gradient_boosting(tmp_path: Path) -> None:
     )
     effects = model.metadata["feature_effects"]
     assert len(effects) == 30
-    assert all(effect["method"] == "feature_importance" for effect in effects)
+    assert all(effect["method"] == "permutation_importance" for effect in effects)
     assert all(effect["direction"] is None for effect in effects)
+    assert sum(effect["coefficient"] for effect in effects) > 0
+
+
+def test_train_model_applies_random_forest_hyperparameters() -> None:
+    dataset = validate_frame(generate_synthetic_data(rows=500, fraud_rate=0.1))
+
+    model = train_model(
+        dataset,
+        config=TrainingConfig(
+            estimator=EstimatorType.RANDOM_FOREST,
+            n_estimators=25,
+            max_depth=4,
+            calibration_method=CalibrationMethod.NONE,
+        ),
+    )
+
+    classifier = model.estimator.named_steps["classifier"]
+    assert classifier.n_estimators == 25
+    assert classifier.max_depth == 4
 
 
 def test_train_model_supports_chronological_evaluation() -> None:
@@ -684,3 +708,7 @@ def test_explain_local_random_forest() -> None:
     assert all(isinstance(exp, dict) for exp in explanations)
     assert all(set(exp.keys()) == set(model.feature_names) for exp in explanations)
     assert all(all(isinstance(v, float) for v in exp.values()) for exp in explanations)
+
+    model.metadata.pop("feature_effects", None)
+    with pytest.raises(ModelArtifactError, match="Feature effects not available"):
+        model.explain_local(features.iloc[:1])

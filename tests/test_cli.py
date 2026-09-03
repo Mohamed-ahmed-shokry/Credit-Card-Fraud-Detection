@@ -220,7 +220,7 @@ def test_train_and_explain_support_hist_gradient_boosting_estimator(tmp_path: Pa
     explained = runner.invoke(app, ["explain", str(artifact_path), "--top", "3"])
     assert explained.exit_code == 0, explained.output
     effects = json.loads(explained.stdout)["effects"]
-    assert all(effect["method"] == "feature_importance" for effect in effects)
+    assert all(effect["method"] == "permutation_importance" for effect in effects)
     assert all(effect["direction"] is None for effect in effects)
 
 
@@ -382,6 +382,131 @@ def test_compare_rejects_hyperparameter_sweep_with_missing_param(tmp_path: Path)
 
     assert compared.exit_code == 2
     assert "Both --param-name and --param-values must be provided" in compared.stderr
+
+
+def test_compare_rejects_empty_hyperparameter_values(tmp_path: Path) -> None:
+    data_path = tmp_path / "transactions.csv"
+    generate_synthetic_data(rows=500, fraud_rate=0.08, random_state=17).to_csv(
+        data_path, index=False
+    )
+
+    compared = runner.invoke(
+        app,
+        [
+            "compare",
+            str(data_path),
+            "--estimator",
+            "logistic_regression",
+            "--param-name",
+            "regularization",
+            "--param-values",
+            " , ",
+        ],
+    )
+
+    assert compared.exit_code == 2
+    assert "at least one value" in compared.stderr
+
+
+def test_compare_rejects_unknown_hyperparameter(tmp_path: Path) -> None:
+    data_path = tmp_path / "transactions.csv"
+    generate_synthetic_data(rows=500, fraud_rate=0.08, random_state=13).to_csv(
+        data_path, index=False
+    )
+
+    compared = runner.invoke(
+        app,
+        [
+            "compare",
+            str(data_path),
+            "--estimator",
+            "logistic_regression",
+            "--param-name",
+            "not_a_param",
+            "--param-values",
+            "1,2",
+        ],
+    )
+
+    assert compared.exit_code == 2
+    assert "Unknown hyperparameter" in compared.stderr
+
+
+def test_compare_rejects_incompatible_hyperparameter(tmp_path: Path) -> None:
+    data_path = tmp_path / "transactions.csv"
+    generate_synthetic_data(rows=500, fraud_rate=0.08, random_state=14).to_csv(
+        data_path, index=False
+    )
+
+    compared = runner.invoke(
+        app,
+        [
+            "compare",
+            str(data_path),
+            "--estimator",
+            "random_forest",
+            "--param-name",
+            "regularization",
+            "--param-values",
+            "0.1,1.0",
+        ],
+    )
+
+    assert compared.exit_code == 2
+    assert "does not apply to" in compared.stderr
+
+
+def test_compare_rejects_invalid_hyperparameter_value(tmp_path: Path) -> None:
+    data_path = tmp_path / "transactions.csv"
+    generate_synthetic_data(rows=500, fraud_rate=0.08, random_state=15).to_csv(
+        data_path, index=False
+    )
+
+    compared = runner.invoke(
+        app,
+        [
+            "compare",
+            str(data_path),
+            "--estimator",
+            "logistic_regression",
+            "--param-name",
+            "regularization",
+            "--param-values",
+            "0.1,not_a_number",
+        ],
+    )
+
+    assert compared.exit_code == 2
+    assert "Invalid value" in compared.stderr
+
+
+def test_compare_supports_hyperparameter_sweep_random_forest(tmp_path: Path) -> None:
+    data_path = tmp_path / "transactions.csv"
+    generate_synthetic_data(rows=800, fraud_rate=0.08, random_state=16).to_csv(
+        data_path, index=False
+    )
+
+    compared = runner.invoke(
+        app,
+        [
+            "compare",
+            str(data_path),
+            "--estimator",
+            "random_forest",
+            "--param-name",
+            "n_estimators",
+            "--param-values",
+            "10,25",
+        ],
+    )
+
+    assert compared.exit_code == 0, compared.output
+    results = json.loads(compared.stdout)["results"]
+    assert len(results) == 2
+    for result in results:
+        assert result["estimator"] == "CalibratedClassifierCV(RandomForestClassifier)"
+        assert "hyperparameter" in result
+        assert "n_estimators" in result["hyperparameter"]
 
 
 def _save_model_missing_metadata_key(
