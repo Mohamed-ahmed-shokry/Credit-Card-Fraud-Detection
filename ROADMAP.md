@@ -38,17 +38,23 @@ honest, interpretable baseline. That should stay the default, but power users
 training on their own data may want more expressive options.
 
 - **Opt-in alternative estimators** (`Done`) — `--estimator random_forest`
-  alongside the default logistic regression, sharing the same leakage-safe
-  split, calibration, and threshold-selection pipeline. `explain` reports
-  feature importances instead of standardized coefficients for it. Further
-  estimators (for example, gradient-boosted trees) can follow the same
-  pattern established here.
+  and `--estimator hist_gradient_boosting` alongside the default logistic
+  regression, sharing the same leakage-safe split, calibration, and
+  threshold-selection pipeline. `explain` reports native feature importances
+  for random forest, and deterministic training-data permutation importance
+  (new `permutation_importance` method label) for histogram gradient boosting,
+  which exposes no native importances in the pinned scikit-learn runtime.
 - **Model comparison** (`Done`) — `compare` trains every requested estimator
   against the same split and reports validation and test metrics side by
   side, so a choice between estimators is evidence-based rather than a single
-  trained artifact taken on faith. Comparing hyperparameters within one
-  estimator (not just across estimators) remains open if it turns out to be
-  needed.
+  trained artifact taken on faith.
+- **Hyperparameter comparison within one estimator** (`Done`) — `compare`
+  accepts `--param-name`/`--param-values` to sweep one hyperparameter for a
+  single estimator on the same split (e.g. `--estimator random_forest
+  --param-name n_estimators --param-values 50,100,200`). Sweepable parameters
+  are allow-listed per estimator and validated before training, and every
+  swept parameter is also settable on `train`, so a sweep winner can be
+  reproduced in a real artifact.
 
 ## Phase 3 — Explainability and observability depth
 
@@ -84,6 +90,26 @@ instead of building it from nothing.
   for request-rate limiting ahead of the existing body-size limit. Enabled via
   `rate_limit_requests` and `rate_limit_window_seconds` parameters in
   `create_app()`. Uses a fixed-window in-memory algorithm keyed by client IP.
+
+## Phase 5 — Calibration and operations depth (next)
+
+Scoped, proposed next steps that stay inside the reference-implementation
+mission:
+
+- **Calibration analysis report** (`Proposed`) — a `calibrate`-style report
+  (reliability curve bins plus Brier-score decomposition) computed from the
+  untouched test split, so operators can judge whether predicted probabilities
+  mean what they say before wiring them to thresholds.
+- **Drift-alert thresholds in the model card** (`Proposed`) — persist the PSI
+  warning/drift cutoffs alongside the reference profile so future tooling can
+  share one source of truth instead of hardcoding `0.10`/`0.25` in two places.
+- **Serving latency benchmark** (`Proposed`) — an offline `benchmark` command
+  that times batch scoring for representative batch sizes and reports
+  throughput, giving operators evidence for capacity planning without touching
+  production traffic.
+- **First PyPI release** (`Proposed`) — link the trusted publisher on pypi.org
+  (see Phase 1), publish a release candidate to TestPyPI, then cut the first
+  real release once the dry-run workflow is green.
 
 ## Contributing to the roadmap
 
