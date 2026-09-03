@@ -27,7 +27,7 @@ publishes it anywhere yet.
   publishing (OIDC) so no long-lived API token has to live in repository
   secrets. Requires the maintainer to link the trusted publisher on pypi.org
   before it can actually run; see the workflow file for the exact steps.
-- **TestPyPI dry run** (`Proposed`) — publish to TestPyPI on every push to
+- **TestPyPI dry run** (`Done`) — publish to TestPyPI on every push to
   `main` so a metadata or packaging regression is visible before it ever
   reaches a real release.
 
@@ -55,10 +55,13 @@ training on their own data may want more expressive options.
 `explain` already reports global, standardized feature effects. Two natural
 extensions:
 
-- **Per-transaction local explanation** (`Proposed`) — extend `predict` (CLI
+- **Per-transaction local explanation** (`Done`) — extend `predict` (CLI
   and API) with an optional per-transaction contribution breakdown, so a
   flagged transaction's score is traceable to specific feature values, not
-  just the global ranking.
+  just the global ranking. The CLI uses `--explain` flag; the API accepts
+  `"explain": true` in the request body. Contributions are included in the
+  output CSV (`contrib_<feature>` columns) or as `contributions` in each
+  prediction object.
 - **Prometheus-compatible metrics endpoint** (`Done`) — `GET /metrics` reports
   request counts, request duration, and scored-transaction decision counts,
   built from data the existing request-logging middleware already computed.
@@ -73,11 +76,14 @@ production operator owns authentication and rate limiting; these exist so
 someone standing this project up has a documented, tested starting point
 instead of building it from nothing.
 
-- **Optional API key middleware** (`Proposed`) — a reference implementation,
+- **Optional API key middleware** (`Done`) — a reference implementation,
   disabled unless configured, documented as defense in depth rather than a
-  substitute for a real authentication layer.
-- **Optional rate-limiting middleware** (`Proposed`) — same framing as above,
-  for request-rate limiting ahead of the existing body-size limit.
+  substitute for a real authentication layer. Enabled via `api_keys` parameter
+  in `create_app()`. Validates the `X-API-Key` header.
+- **Optional rate-limiting middleware** (`Done`) — same framing as above,
+  for request-rate limiting ahead of the existing body-size limit. Enabled via
+  `rate_limit_requests` and `rate_limit_window_seconds` parameters in
+  `create_app()`. Uses a fixed-window in-memory algorithm keyed by client IP.
 
 ## Contributing to the roadmap
 

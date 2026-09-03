@@ -456,3 +456,45 @@ def test_predict_reports_schema_error(tmp_path: Path) -> None:
 
     assert result.exit_code == 2
     assert "Input schema does not match" in result.stderr
+
+
+def test_predict_supports_local_explanation(tmp_path: Path) -> None:
+    data_path = tmp_path / "transactions.csv"
+    artifact_path = tmp_path / "artifact"
+    output_path = tmp_path / "predictions.csv"
+    runner.invoke(
+        app,
+        [
+            "generate-data",
+            "--output",
+            str(data_path),
+            "--rows",
+            "300",
+            "--fraud-rate",
+            "0.1",
+            "--seed",
+            "42",
+        ],
+    )
+    trained = runner.invoke(
+        app, ["train", str(data_path), "--output", str(artifact_path), "--seed", "42"]
+    )
+    assert trained.exit_code == 0, trained.output
+
+    predicted = runner.invoke(
+        app,
+        [
+            "predict",
+            str(artifact_path),
+            str(data_path),
+            "--output",
+            str(output_path),
+            "--explain",
+        ],
+    )
+    assert predicted.exit_code == 0, predicted.output
+
+    scored = pd.read_csv(output_path)
+    assert {"fraud_probability", "is_fraud"}.issubset(scored.columns)
+    contrib_cols = [c for c in scored.columns if c.startswith("contrib_")]
+    assert len(contrib_cols) == 30

@@ -308,3 +308,118 @@ def test_environment_factory_requires_model_configuration(
         TestClient(app_from_environment()),
     ):
         pass
+
+
+def test_predict_endpoint_supports_explain_parameter(
+    client: TestClient,
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, model, dataset = api_context
+    records = dataset.features.iloc[:3].to_dict(orient="records")
+
+    response = client.post("/v1/predict", json={"transactions": records, "explain": True})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body["predictions"]) == 3
+    for prediction in body["predictions"]:
+        assert "contributions" in prediction
+        assert prediction["contributions"] is not None
+        assert isinstance(prediction["contributions"], dict)
+        assert set(prediction["contributions"].keys()) == set(model.feature_names)
+
+
+def test_predict_endpoint_works_without_explain_parameter(
+    client: TestClient,
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, _model, dataset = api_context
+    records = dataset.features.iloc[:3].to_dict(orient="records")
+
+    response = client.post("/v1/predict", json={"transactions": records})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body["predictions"]) == 3
+    for prediction in body["predictions"]:
+        assert "contributions" in prediction
+        assert prediction["contributions"] is None
+
+
+def test_api_key_middleware_allows_valid_key(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, model, dataset = api_context
+    records = dataset.features.iloc[:1].to_dict(orient="records")
+    app = create_app(model=model, api_keys=["valid-key"])
+
+    with TestClient(app) as test_client:
+        response = test_client.post(
+            "/v1/predict",
+            json={"transactions": records},
+            headers={"X-API-Key": "valid-key"},
+        )
+
+    assert response.status_code == 200
+
+
+def test_api_key_middleware_rejects_invalid_key(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, model, dataset = api_context
+    records = dataset.features.iloc[:1].to_dict(orient="records")
+    app = create_app(model=model, api_keys=["valid-key"])
+
+    with TestClient(app) as test_client:
+        response = test_client.post(
+            "/v1/predict",
+            json={"transactions": records},
+            headers={"X-API-Key": "invalid-key"},
+        )
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Invalid or missing API key"
+
+
+def test_api_key_middleware_rejects_missing_key(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, model, dataset = api_context
+    records = dataset.features.iloc[:1].to_dict(orient="records")
+    app = create_app(model=model, api_keys=["valid-key"])
+
+    with TestClient(app) as test_client:
+        response = test_client.post("/v1/predict", json={"transactions": records})
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Invalid or missing API key"
+
+
+def test_rate_limit_middleware_allows_within_limit(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, model, dataset = api_context
+    records = dataset.features.iloc[:1].to_dict(orient="records")
+    app = create_app(model=model, rate_limit_requests=5, rate_limit_window_seconds=60)
+
+    with TestClient(app) as test_client:
+        for _ in range(5):
+            response = test_client.post("/v1/predict", json={"transactions": records})
+            assert response.status_code == 200
+
+
+def test_rate_limit_middleware_rejects_over_limit(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, model, dataset = api_context
+    records = dataset.features.iloc[:1].to_dict(orient="records")
+    app = create_app(model=model, rate_limit_requests=2, rate_limit_window_seconds=60)
+
+    with TestClient(app) as test_client:
+        response1 = test_client.post("/v1/predict", json={"transactions": records})
+        assert response1.status_code == 200
+        response2 = test_client.post("/v1/predict", json={"transactions": records})
+        assert response2.status_code == 200
+        response3 = test_client.post("/v1/predict", json={"transactions": records})
+        assert response3.status_code == 429
+        assert response3.json()["detail"] == "Rate limit exceeded"

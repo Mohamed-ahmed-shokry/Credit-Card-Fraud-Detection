@@ -202,6 +202,73 @@ class FraudModel:
             raise ModelArtifactError("Input features must not contain missing or infinite values.")
         return ordered
 
+    def explain_local(self, features: pd.DataFrame) -> list[dict[str, Any]]:
+        """Return per-transaction feature contributions to the fraud score.
+
+        For logistic regression, contributions are standardized coefficients multiplied
+        by the scaled feature values (centered by training mean). For random forest,
+        a simplified approximation based on feature importance is used.
+        """
+        ordered = self.validate_features(features)
+        estimator_type = self.metadata.get("training_config", {}).get(
+            "estimator", "logistic_regression"
+        )
+
+        if estimator_type == "logistic_regression":
+            return self._explain_local_logistic(ordered)
+        return self._explain_local_forest(ordered)
+
+    def _explain_local_logistic(self, ordered: pd.DataFrame) -> list[dict[str, Any]]:
+        """Compute local explanations for logistic regression using standardized coefficients."""
+        coefficients = self.metadata.get("feature_effects", [])
+        if not coefficients:
+            raise ModelArtifactError("Feature effects not available for local explanation.")
+
+        scaler_mean = self.metadata.get("scaler_mean")
+        scaler_scale = self.metadata.get("scaler_scale")
+        if scaler_mean is None or scaler_scale is None:
+            raise ModelArtifactError("Scaler statistics not available for local explanation.")
+
+        coef_dict = {eff["feature"]: eff["coefficient"] for eff in coefficients}
+        feature_array = ordered.to_numpy(dtype=float)
+
+        centered = feature_array - np.asarray(scaler_mean, dtype=float)
+        scaled = centered / np.asarray(scaler_scale, dtype=float)
+
+        results = []
+        for row_idx in range(len(ordered)):
+            row_scaled = scaled[row_idx]
+            row_contributions = {}
+            for feat_idx, feature in enumerate(self.feature_names):
+                coef = coef_dict.get(feature, 0.0)
+                row_contributions[feature] = float(coef * row_scaled[feat_idx])
+            results.append(row_contributions)
+        return results
+
+    def _explain_local_forest(self, ordered: pd.DataFrame) -> list[dict[str, Any]]:
+        """Compute local explanations for random forest using feature importance approximation."""
+        effects = self.metadata.get("feature_effects", [])
+        if not effects:
+            raise ModelArtifactError("Feature effects not available for local explanation.")
+
+        importance_dict = {eff["feature"]: eff["coefficient"] for eff in effects}
+        total_importance = sum(importance_dict.values()) or 1.0
+
+        feature_array = ordered.to_numpy(dtype=float)
+        feature_means = np.mean(feature_array, axis=0)
+
+        results = []
+        for row_idx in range(len(ordered)):
+            row_values = feature_array[row_idx]
+            row_contributions = {}
+            for feat_idx, feature in enumerate(self.feature_names):
+                importance = importance_dict.get(feature, 0.0)
+                deviation = row_values[feat_idx] - feature_means[feat_idx]
+                normalized_importance = importance / total_importance
+                row_contributions[feature] = float(normalized_importance * deviation)
+            results.append(row_contributions)
+        return results
+
 
 def train_model(
     dataset: ValidatedDataset,
@@ -287,6 +354,16 @@ def train_model(
         calibration_method=settings.calibration_method,
     )
 
+    scaler_mean = None
+    scaler_scale = None
+    if settings.estimator is EstimatorType.LOGISTIC_REGRESSION:
+        if settings.calibration_method is CalibrationMethod.NONE:
+            scaler = estimator.named_steps["scale"]
+        else:
+            scaler = estimator.calibrated_classifiers_[0].estimator.named_steps["scale"]
+        scaler_mean = scaler.mean_.tolist()
+        scaler_scale = scaler.scale_.tolist()
+
     metadata: dict[str, Any] = {
         "artifact_version": ARTIFACT_VERSION,
         "created_at": datetime.now(UTC).isoformat(),
@@ -337,6 +414,8 @@ def train_model(
         "training_config": asdict(settings),
         "reference_profile": build_reference_profile(features_train),
         "feature_effects": feature_effects,
+        "scaler_mean": scaler_mean,
+        "scaler_scale": scaler_scale,
         "validation_metrics": validation_metrics_payload,
         "test_metrics": test_metrics_payload,
     }

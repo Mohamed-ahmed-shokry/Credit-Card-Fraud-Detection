@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -41,6 +42,26 @@ logger = logging.getLogger(__name__)
 TransactionValue = Annotated[float, Field(strict=True, allow_inf_nan=False)]
 
 
+class _RateLimiter:
+    """Simple in-memory rate limiter using fixed window."""
+
+    def __init__(self, max_requests: int, window_seconds: float) -> None:
+        self.max_requests = max_requests
+        self.window_seconds = window_seconds
+        self._requests: dict[str, list[float]] = {}
+
+    def is_allowed(self, key: str) -> bool:
+        now = time.time()
+        window_start = now - self.window_seconds
+        if key not in self._requests:
+            self._requests[key] = []
+        self._requests[key] = [ts for ts in self._requests[key] if ts > window_start]
+        if len(self._requests[key]) >= self.max_requests:
+            return False
+        self._requests[key].append(now)
+        return True
+
+
 class PredictionRequest(BaseModel):
     """Bounded batch of numeric transaction feature mappings."""
 
@@ -50,6 +71,7 @@ class PredictionRequest(BaseModel):
         list[dict[str, TransactionValue]],
         Field(min_length=1, max_length=1_000),
     ]
+    explain: bool = False
 
 
 class PredictionResult(BaseModel):
@@ -57,6 +79,7 @@ class PredictionResult(BaseModel):
 
     fraud_probability: float
     is_fraud: bool
+    contributions: dict[str, float] | None = None
 
 
 class PredictionResponse(BaseModel):
@@ -81,8 +104,21 @@ def create_app(
     *,
     model: FraudModel | None = None,
     model_path: Path | str | None = None,
+    api_keys: list[str] | None = None,
+    rate_limit_requests: int = 0,
+    rate_limit_window_seconds: float = 60.0,
 ) -> FastAPI:
-    """Create an application using an injected model or a trusted artifact path."""
+    """Create an application using an injected model or a trusted artifact path.
+
+    Args:
+        model: Pre-loaded model instance.
+        model_path: Path to model artifact directory.
+        api_keys: Optional list of valid API keys. If provided, enables API key
+            authentication via the `X-API-Key` header.
+        rate_limit_requests: Maximum requests per window. If > 0, enables rate
+            limiting per client IP.
+        rate_limit_window_seconds: Time window for rate limiting in seconds.
+    """
     logging.basicConfig(level=logging.INFO)
 
     metrics_registry = CollectorRegistry()
@@ -104,6 +140,13 @@ def create_app(
         ["is_fraud"],
         registry=metrics_registry,
     )
+
+    rate_limiter = (
+        _RateLimiter(rate_limit_requests, rate_limit_window_seconds)
+        if rate_limit_requests > 0
+        else None
+    )
+    api_key_set = set(api_keys) if api_keys else None
 
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
@@ -127,6 +170,34 @@ def create_app(
         docs_url="/docs",
         redoc_url="/redoc",
     )
+
+    @application.middleware("http")
+    async def rate_limit_middleware(
+        request: Request,
+        call_next: RequestResponseEndpoint,
+    ) -> Response:
+        if rate_limiter is not None:
+            client_ip = request.client.host if request.client else "unknown"
+            if not rate_limiter.is_allowed(client_ip):
+                return JSONResponse(
+                    status_code=429,
+                    content={"detail": "Rate limit exceeded"},
+                )
+        return await call_next(request)
+
+    @application.middleware("http")
+    async def api_key_middleware(
+        request: Request,
+        call_next: RequestResponseEndpoint,
+    ) -> Response:
+        if api_key_set is not None:
+            api_key = request.headers.get("X-API-Key")
+            if api_key not in api_key_set:
+                return JSONResponse(
+                    status_code=401,
+                    content={"detail": "Invalid or missing API key"},
+                )
+        return await call_next(request)
 
     @application.middleware("http")
     async def request_context(
@@ -229,10 +300,24 @@ def create_app(
         frame = pd.DataFrame(payload.transactions)
         probabilities = loaded.predict_probabilities(frame)
         decisions = probabilities >= loaded.threshold
-        results = [
-            PredictionResult(fraud_probability=float(probability), is_fraud=bool(decision))
-            for probability, decision in zip(probabilities, decisions, strict=True)
-        ]
+        results = []
+        if payload.explain:
+            explanations = loaded.explain_local(frame)
+            for probability, decision, contributions in zip(
+                probabilities, decisions, explanations, strict=True
+            ):
+                results.append(
+                    PredictionResult(
+                        fraud_probability=float(probability),
+                        is_fraud=bool(decision),
+                        contributions=contributions,
+                    )
+                )
+        else:
+            for probability, decision in zip(probabilities, decisions, strict=True):
+                results.append(
+                    PredictionResult(fraud_probability=float(probability), is_fraud=bool(decision))
+                )
         prediction_counter.labels(is_fraud="true").inc(int(decisions.sum()))
         prediction_counter.labels(is_fraud="false").inc(int((~decisions).sum()))
         return PredictionResponse(

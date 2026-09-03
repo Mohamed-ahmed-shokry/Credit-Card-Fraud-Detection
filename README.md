@@ -84,6 +84,32 @@ fraud-detect predict artifacts/model data/demo.csv --output predictions.csv
 Synthetic data exists for demos and smoke tests only. It must not be used to claim
 real-world model performance.
 
+## Explain individual predictions
+
+Show per-transaction feature contributions to understand why a specific transaction
+was scored as fraud or legitimate:
+
+```bash
+fraud-detect predict artifacts/model data/demo.csv --output predictions.csv --explain
+```
+
+The output CSV will include `contrib_<feature>` columns showing each feature's
+contribution to the fraud score. For logistic regression, contributions are
+standardized coefficients multiplied by the scaled feature values. For random
+forest, a simplified approximation based on feature importance is used.
+
+Via the API, include `"explain": true` in the request body to receive
+`contributions` in each prediction:
+
+```bash
+curl -X POST http://localhost:8000/v1/predict \
+  -H "Content-Type: application/json" \
+  -d '{
+    "transactions": [{"Time": 12345.0, "V1": -1.2, ...}],
+    "explain": true
+  }'
+```
+
 ## Train on the anonymized dataset
 
 Place the downloaded CSV under the ignored `Dataset/` directory; raw financial data
@@ -283,6 +309,38 @@ Example response:
 }
 ```
 
+To receive per-transaction feature contributions, include `"explain": true`:
+
+```bash
+curl -X POST http://localhost:8000/v1/predict \
+  -H "Content-Type: application/json" \
+  -d '{
+    "transactions": [{"Time": 12345.0, "V1": -1.2, ...}],
+    "explain": true
+  }'
+```
+
+Response with explanations:
+
+```json
+{
+  "model_version": "71dcb1da2d78",
+  "threshold": 0.73,
+  "predictions": [
+    {
+      "fraud_probability": 0.18,
+      "is_fraud": false,
+      "contributions": {
+        "Time": 0.001,
+        "V1": -0.045,
+        "V2": 0.012,
+        "Amount": 0.003
+      }
+    }
+  ]
+}
+```
+
 The service accepts at most 1,000 transactions and 2 MiB of request body data per
 request. Both declared and streamed/chunked oversized bodies receive `413` before
 schema validation.
@@ -303,6 +361,48 @@ and request duration labeled by method, path, and status code, plus total scored
 transactions labeled by decision. Restrict it to a trusted scrape network like any
 other operational endpoint; it carries counts and labels only, never transaction
 values.
+
+### Optional API key authentication
+
+Enable API key validation by configuring the `api_keys` parameter when creating the
+FastAPI app. This is a reference implementation for defense in depth—not a
+substitute for a proper authentication layer at the gateway level.
+
+```python
+from fraud_detection.api import create_app
+from fraud_detection.model import load_model
+
+model = load_model("artifacts/model")
+app = create_app(model=model, api_keys=["your-secret-key-1", "your-secret-key-2"])
+```
+
+Clients must include the `X-API-Key` header:
+
+```bash
+curl -X POST http://localhost:8000/v1/predict \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-secret-key-1" \
+  -d '{"transactions": [...]}'
+```
+
+Invalid or missing keys return `401 Unauthorized`.
+
+### Optional rate limiting
+
+Enable per-client-IP rate limiting with the `rate_limit_requests` and
+`rate_limit_window_seconds` parameters. This is a reference implementation using
+an in-memory fixed-window algorithm—not a substitute for a proper rate limiter at
+the gateway level.
+
+```python
+app = create_app(
+    model=model,
+    rate_limit_requests=100,
+    rate_limit_window_seconds=60.0,  # 100 requests per minute per IP
+)
+```
+
+Excess requests return `429 Too Many Requests`.
 
 ## Monitor feature drift
 

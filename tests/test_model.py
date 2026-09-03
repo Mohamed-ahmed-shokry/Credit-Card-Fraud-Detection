@@ -610,3 +610,57 @@ def test_temporal_split_rejects_single_class_windows() -> None:
                 calibration_method=CalibrationMethod.NONE,
             ),
         )
+
+
+def test_explain_local_returns_per_transaction_contributions(
+    trained_model: tuple[FraudModel, ValidatedDataset],
+) -> None:
+    model, dataset = trained_model
+    features = dataset.features.iloc[:5]
+
+    explanations = model.explain_local(features)
+
+    assert len(explanations) == 5
+    assert all(isinstance(exp, dict) for exp in explanations)
+    assert all(set(exp.keys()) == set(model.feature_names) for exp in explanations)
+    assert all(all(isinstance(v, float) for v in exp.values()) for exp in explanations)
+
+
+def test_explain_local_requires_scaler_stats(
+    trained_model: tuple[FraudModel, ValidatedDataset],
+) -> None:
+    model, dataset = trained_model
+    model.metadata.pop("scaler_mean", None)
+    model.metadata.pop("scaler_scale", None)
+
+    with pytest.raises(ModelArtifactError, match="Scaler statistics not available"):
+        model.explain_local(dataset.features.iloc[:1])
+
+
+def test_explain_local_requires_feature_effects(
+    trained_model: tuple[FraudModel, ValidatedDataset],
+) -> None:
+    model, dataset = trained_model
+    model.metadata.pop("feature_effects", None)
+
+    with pytest.raises(ModelArtifactError, match="Feature effects not available"):
+        model.explain_local(dataset.features.iloc[:1])
+
+
+def test_explain_local_random_forest() -> None:
+    dataset = validate_frame(generate_synthetic_data(rows=500, fraud_rate=0.1, random_state=1))
+    model = train_model(
+        dataset,
+        config=TrainingConfig(
+            estimator=EstimatorType.RANDOM_FOREST,
+            calibration_method=CalibrationMethod.NONE,
+        ),
+    )
+    features = dataset.features.iloc[:3]
+
+    explanations = model.explain_local(features)
+
+    assert len(explanations) == 3
+    assert all(isinstance(exp, dict) for exp in explanations)
+    assert all(set(exp.keys()) == set(model.feature_names) for exp in explanations)
+    assert all(all(isinstance(v, float) for v in exp.values()) for exp in explanations)

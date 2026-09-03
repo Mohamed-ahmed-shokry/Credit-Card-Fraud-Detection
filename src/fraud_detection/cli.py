@@ -322,6 +322,10 @@ def predict_command(
         str,
         typer.Option(help="Optional label column to exclude from model features."),
     ] = DEFAULT_TARGET,
+    explain: Annotated[
+        bool,
+        typer.Option(help="Include per-transaction feature contributions in the output."),
+    ] = False,
     overwrite: Annotated[bool, typer.Option(help="Replace an existing output file.")] = False,
 ) -> None:
     """Batch-score transactions and write probabilities plus binary decisions."""
@@ -337,6 +341,11 @@ def predict_command(
         scored = frame.copy()
         scored["fraud_probability"] = probabilities
         scored["is_fraud"] = predictions
+        if explain:
+            explanations = model.explain_local(features)
+            for idx, expl in enumerate(explanations):
+                for feature, contribution in expl.items():
+                    scored.loc[scored.index[idx], f"contrib_{feature}"] = contribution
         _atomic_write_csv(scored, output)
     except (
         OSError,
