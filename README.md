@@ -215,6 +215,19 @@ The costs are relative weights, not currency. For example, `25` says a missed fr
 is treated as costly as 25 false alerts. The chosen policy and holdout expected cost
 per transaction are persisted in `metadata.json`.
 
+Before accepting the tuned operating point, compare candidates side by side on
+held-out labeled data (never the threshold-tuning validation split):
+
+```bash
+fraud-detect thresholds artifacts/model heldout_transactions.csv \
+  --thresholds 0.3,0.5,0.7,0.9 \
+  --output reports/thresholds.json
+```
+
+The report lists precision, recall, F1, and expected cost per candidate, plus
+the same row for the model's tuned threshold, using the model's training cost
+policy unless `--false-positive-cost`/`--false-negative-cost` override it.
+
 Scores use three-fold sigmoid calibration by default. Larger representative datasets
 can opt into isotonic calibration, while `none` exposes the underlying classifier
 scores:
@@ -251,6 +264,15 @@ versions used for training. The loader requires the recorded scikit-learn versio
 to exactly match the serving runtime. Cross-version pickle/joblib loading is
 unsupported; retrain the model after dependency upgrades instead of bypassing this
 check.
+
+Keep superseded artifact directories (for example `artifacts/model-2026-09-01/`)
+until the replacement has proven itself: reproducible `compare`, `stability`,
+and `drift` runs are only possible while the old model card, reference profile,
+and metrics still exist. A practical policy is to retain the currently serving
+artifact plus the two most recent predecessors, with their reports, and archive
+anything older alongside the dataset fingerprint it was trained on. Never delete
+the serving artifact before its replacement passes the container `/health` smoke
+test.
 
 Use a different target name when needed:
 
@@ -565,8 +587,8 @@ model artifacts produced by a trusted training process.**
 ## Roadmap
 
 See [ROADMAP.md](ROADMAP.md) for what's planned beyond `v0.1.0`, including
-alternative estimators, PyPI publishing, and optional reference hardening
-patterns.
+the PyPI release, the threshold tradeoff report, and the artifact retention
+policy.
 
 ## License
 
