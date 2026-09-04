@@ -121,12 +121,23 @@ mission:
 - **Rate-limit client headers** (`Done`) — `Retry-After`, `X-RateLimit-Limit`,
   and `X-RateLimit-Remaining` on `429` responses (plus limit/remaining on
   allowed responses) so clients can back off before hitting the cap.
-- **Threshold tradeoff report** (`Proposed`) — report precision/recall/F1 and
-  expected cost across candidate thresholds on validation data, so the
-  operating point is chosen with eyes open rather than taken on faith.
-- **Artifact retention policy** (`Proposed`) — document how long to keep
-  superseded model directories and their reports, since reproducible
-  comparisons are only possible while old artifacts exist.
+- **Threshold tradeoff report** (`Done`) — a `thresholds` command scoring
+  candidate thresholds on held-out labeled data, reporting precision/recall/F1
+  and expected cost per candidate next to the model's tuned operating point,
+  with costs defaulting to the training policy.
+- **Artifact retention policy** (`Done`) — documented in the README: keep the
+  serving artifact plus the two most recent predecessors so `compare`,
+  `stability`, and `drift` stay reproducible.
+
+## Phase 7 — Decision-policy flexibility (next)
+
+- **Predict-time threshold override** (`Proposed`) — an opt-in `--threshold`
+  flag on `predict` (and matching API field) for audit and backtest scenarios,
+  recorded in the output so overridden decisions are never confused with the
+  tuned operating point.
+- **Cost-policy presets** (`Proposed`) — named, versioned cost policies in the
+  model card so `thresholds` and retraining runs can reference one shared
+  business-cost definition instead of repeating raw weights.
 
 ## Contributing to the roadmap
 

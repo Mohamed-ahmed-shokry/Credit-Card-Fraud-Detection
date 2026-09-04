@@ -32,6 +32,11 @@ All notable changes to this project are documented here. The format follows
   replacement for a real gateway.
 - A TestPyPI dry-run publishing workflow on every push to `main`, so
   packaging regressions surface before a real release.
+- A `thresholds` CLI command scoring candidate thresholds on held-out labeled
+  data, reporting precision, recall, F1, and expected cost per candidate next
+  to the model's tuned operating point (costs default to the training policy).
+- An artifact retention policy in the README: keep the serving artifact plus
+  the two most recent predecessors so comparisons stay reproducible.
 - A `stability` CLI command repeating training with successive seeds and
   reporting mean and standard deviation per test metric, so split luck is
   visible before trusting a single `train` run.
