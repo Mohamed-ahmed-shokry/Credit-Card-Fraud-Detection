@@ -173,6 +173,20 @@ fraud-detect compare Dataset/creditcard.csv \
   --param-values 50,100,200
 ```
 
+Before trusting one `train` run, measure how sensitive holdout metrics are to
+the random split. `stability` repeats training with successive seeds and
+reports mean and standard deviation per test metric, without saving anything:
+
+```bash
+fraud-detect stability Dataset/creditcard.csv \
+  --estimator logistic_regression \
+  --repeats 5
+```
+
+Wide spreads mean the headline metrics depend on split luck; narrow spreads
+mean the comparison is trustworthy. Repeats are stratified-only, since
+chronological windows are deterministic.
+
 The default split is reproducible and stratified. When the data includes transaction
 order, evaluate chronologically to train on the past and test on the newest window:
 
@@ -430,7 +444,10 @@ app = create_app(
 )
 ```
 
-Excess requests return `429 Too Many Requests`.
+Excess requests return `429 Too Many Requests` with `Retry-After`,
+`X-RateLimit-Limit`, and `X-RateLimit-Remaining` headers. Allowed responses
+carry `X-RateLimit-Limit` and `X-RateLimit-Remaining` so clients can back off
+before hitting the cap.
 
 ## Monitor feature drift
 
