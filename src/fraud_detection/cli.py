@@ -493,6 +493,170 @@ def compare_command(
     typer.echo(json.dumps({"results": results}, indent=2, sort_keys=True))
 
 
+_STABILITY_METRICS = (
+    "roc_auc",
+    "average_precision",
+    "brier_score",
+    "precision",
+    "recall",
+    "f1",
+    "balanced_accuracy",
+)
+
+
+@app.command("stability")
+def stability_command(
+    data: Annotated[
+        Path,
+        typer.Argument(exists=True, dir_okay=False, readable=True, help="Training CSV."),
+    ],
+    target: Annotated[
+        str,
+        typer.Option(help="Binary target column containing 0 and 1."),
+    ] = DEFAULT_TARGET,
+    test_size: Annotated[
+        float,
+        typer.Option(min=0.05, max=0.4, help="Untouched test-set fraction."),
+    ] = 0.2,
+    validation_size: Annotated[
+        float,
+        typer.Option(min=0.05, max=0.4, help="Threshold-tuning validation fraction."),
+    ] = 0.2,
+    seed: Annotated[int, typer.Option(help="Base random seed; repeat N uses seed+N.")] = 42,
+    repeats: Annotated[
+        int,
+        typer.Option(min=2, max=10, help="Repeated train/validate/test runs."),
+    ] = 5,
+    estimators: Annotated[
+        list[EstimatorType] | None,
+        typer.Option(
+            "--estimator",
+            help="Estimator to include; repeat to assess specific choices. "
+            "Defaults to assessing every supported estimator.",
+        ),
+    ] = None,
+    regularization: Annotated[
+        float,
+        typer.Option(min=0.000001, help="Inverse regularization strength (logistic regression)."),
+    ] = 1.0,
+    max_iterations: Annotated[
+        int,
+        typer.Option(min=100, help="Solver iterations (logistic regression) or trees (boosting)."),
+    ] = 1_000,
+    n_estimators: Annotated[
+        int,
+        typer.Option(min=10, help="Number of trees (random forest)."),
+    ] = 100,
+    max_depth: Annotated[
+        int | None,
+        typer.Option(help="Maximum tree depth for forest/boosting models; omit for unlimited."),
+    ] = None,
+    learning_rate: Annotated[
+        float,
+        typer.Option(min=0.000001, help="Shrinkage step size (histogram gradient boosting)."),
+    ] = 0.1,
+    l2_regularization: Annotated[
+        float,
+        typer.Option(min=0.0, help="L2 regularization (histogram gradient boosting)."),
+    ] = 0.0,
+    max_bins: Annotated[
+        int,
+        typer.Option(min=2, help="Feature bin count (histogram gradient boosting)."),
+    ] = 255,
+    threshold_strategy: Annotated[
+        ThresholdStrategy,
+        typer.Option(help="Validation objective: maximize F1 or minimize weighted mistake cost."),
+    ] = ThresholdStrategy.F1,
+    false_positive_cost: Annotated[
+        float,
+        typer.Option(min=0.000001, help="Relative cost of flagging a legitimate transaction."),
+    ] = 1.0,
+    false_negative_cost: Annotated[
+        float,
+        typer.Option(min=0.000001, help="Relative cost of missing a fraudulent transaction."),
+    ] = 10.0,
+    calibration_method: Annotated[
+        CalibrationMethod,
+        typer.Option(help="Probability calibration policy fitted within training data."),
+    ] = CalibrationMethod.SIGMOID,
+    calibration_folds: Annotated[
+        int,
+        typer.Option(min=2, max=10, help="Cross-validation folds used for calibration."),
+    ] = 3,
+    calibration_jobs: Annotated[
+        int,
+        typer.Option(help="Calibration workers: 1 is conservative; -1 uses all processors."),
+    ] = 1,
+) -> None:
+    """Repeat training with successive seeds and report test-metric stability.
+
+    Nothing is saved; this measures how sensitive holdout metrics are to the
+    random split before trusting a single `train` run. Every repeat shares the
+    same configuration and differs only in random seed. Repeats require the
+    stratified split because chronological windows are deterministic.
+    """
+    chosen_estimators = list(dict.fromkeys(estimators or list(EstimatorType)))
+
+    try:
+        dataset = load_csv(data, target_column=target)
+        results = []
+        for candidate in chosen_estimators:
+            runs = []
+            estimator_label = ""
+            for offset in range(repeats):
+                config = TrainingConfig(
+                    test_size=test_size,
+                    validation_size=validation_size,
+                    random_state=seed + offset,
+                    estimator=candidate,
+                    max_iterations=max_iterations,
+                    regularization=regularization,
+                    n_estimators=n_estimators,
+                    max_depth=max_depth,
+                    learning_rate=learning_rate,
+                    l2_regularization=l2_regularization,
+                    max_bins=max_bins,
+                    threshold_strategy=threshold_strategy,
+                    false_positive_cost=false_positive_cost,
+                    false_negative_cost=false_negative_cost,
+                    calibration_method=calibration_method,
+                    calibration_folds=calibration_folds,
+                    calibration_jobs=calibration_jobs,
+                    split_strategy=SplitStrategy.STRATIFIED,
+                    time_column="Time",
+                )
+                model = train_model(dataset, config=config)
+                estimator_label = str(model.metadata["estimator"])
+                runs.append(
+                    {
+                        "seed": seed + offset,
+                        "threshold": model.threshold,
+                        "test_metrics": model.metadata["test_metrics"],
+                    }
+                )
+            means = {
+                metric: statistics.mean(run["test_metrics"][metric] for run in runs)
+                for metric in _STABILITY_METRICS
+            }
+            deviations = {
+                metric: statistics.stdev(run["test_metrics"][metric] for run in runs)
+                for metric in _STABILITY_METRICS
+            }
+            results.append(
+                {
+                    "estimator": estimator_label,
+                    "repeats": repeats,
+                    "test_metrics_mean": means,
+                    "test_metrics_std": deviations,
+                    "runs": runs,
+                }
+            )
+    except (OSError, DataValidationError, ModelArtifactError, ValueError) as exc:
+        _abort(str(exc))
+
+    typer.echo(json.dumps({"results": results}, indent=2, sort_keys=True))
+
+
 @app.command("predict")
 def predict_command(
     model_path: Annotated[

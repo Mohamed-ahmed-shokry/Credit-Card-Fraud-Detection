@@ -753,6 +753,63 @@ def test_calibration_reports_missing_label_column(tmp_path: Path, trained_artifa
     assert "missing_column" in result.stderr
 
 
+def test_stability_reports_metric_spread(tmp_path: Path) -> None:
+    data_path = tmp_path / "transactions.csv"
+    generate_synthetic_data(rows=600, fraud_rate=0.1, random_state=31).to_csv(
+        data_path, index=False
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "stability",
+            str(data_path),
+            "--estimator",
+            "logistic_regression",
+            "--repeats",
+            "2",
+            "--seed",
+            "7",
+            "--calibration-method",
+            "none",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    results = json.loads(result.stdout)["results"]
+    assert len(results) == 1
+    summary = results[0]
+    assert summary["estimator"] == "LogisticRegression"
+    assert summary["repeats"] == 2
+    assert [run["seed"] for run in summary["runs"]] == [7, 8]
+    expected_metrics = {
+        "roc_auc",
+        "average_precision",
+        "brier_score",
+        "precision",
+        "recall",
+        "f1",
+        "balanced_accuracy",
+    }
+    assert set(summary["test_metrics_mean"]) == expected_metrics
+    assert set(summary["test_metrics_std"]) == expected_metrics
+    assert all(value >= 0 for value in summary["test_metrics_std"].values())
+    for run in summary["runs"]:
+        assert set(run["test_metrics"]) >= expected_metrics
+
+
+def test_stability_reports_dataset_errors(tmp_path: Path) -> None:
+    data_path = tmp_path / "transactions.csv"
+    generate_synthetic_data(rows=300, fraud_rate=0.1, random_state=32).to_csv(
+        data_path, index=False
+    )
+
+    result = runner.invoke(app, ["stability", str(data_path), "--target", "missing_column"])
+
+    assert result.exit_code == 2
+    assert "missing_column" in result.stderr
+
+
 def test_benchmark_reports_throughput(tmp_path: Path, trained_artifact: Path) -> None:
     data_path = tmp_path / "transactions.csv"
     report_path = tmp_path / "reports" / "benchmark.json"
