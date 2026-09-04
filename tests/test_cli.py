@@ -753,6 +753,56 @@ def test_calibration_reports_missing_label_column(tmp_path: Path, trained_artifa
     assert "missing_column" in result.stderr
 
 
+def test_benchmark_reports_throughput(tmp_path: Path, trained_artifact: Path) -> None:
+    data_path = tmp_path / "transactions.csv"
+    report_path = tmp_path / "reports" / "benchmark.json"
+    generate_synthetic_data(rows=200, fraud_rate=0.1, random_state=21).to_csv(
+        data_path, index=False
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "benchmark",
+            str(trained_artifact),
+            str(data_path),
+            "--batch-sizes",
+            "2,4",
+            "--repeat",
+            "2",
+            "--output",
+            str(report_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    body = json.loads(result.stdout)
+    assert body["rows_available"] == 200
+    assert body["repeat"] == 2
+    assert [item["batch_size"] for item in body["results"]] == [2, 4]
+    for item in body["results"]:
+        assert item["median_ms"] > 0
+        assert item["ms_per_transaction"] > 0
+        assert item["transactions_per_second"] > 0
+    assert json.loads(report_path.read_text(encoding="utf-8")) == body
+
+
+@pytest.mark.parametrize("batch_sizes", ["0,4", "2,abc", " , ", "200000"])
+def test_benchmark_rejects_invalid_batch_sizes(
+    tmp_path: Path, trained_artifact: Path, batch_sizes: str
+) -> None:
+    data_path = tmp_path / "transactions.csv"
+    generate_synthetic_data(rows=200, random_state=22).to_csv(data_path, index=False)
+
+    result = runner.invoke(
+        app,
+        ["benchmark", str(trained_artifact), str(data_path), "--batch-sizes", batch_sizes],
+    )
+
+    assert result.exit_code == 2
+    assert "batch" in result.stderr.lower()
+
+
 def test_train_reports_invalid_output_directory_without_replacing_file(
     tmp_path: Path,
 ) -> None:

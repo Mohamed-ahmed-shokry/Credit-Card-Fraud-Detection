@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import statistics
+import time
 from pathlib import Path
 from typing import Annotated, Any, NoReturn
 from uuid import uuid4
@@ -551,6 +553,112 @@ def predict_command(
             }
         )
     )
+
+
+@app.command("benchmark")
+def benchmark_command(
+    model_path: Annotated[
+        Path,
+        typer.Argument(exists=True, readable=True, help="Model file or artifact directory."),
+    ],
+    data: Annotated[
+        Path,
+        typer.Argument(exists=True, dir_okay=False, readable=True, help="Transactions CSV."),
+    ],
+    target: Annotated[
+        str,
+        typer.Option(help="Optional label column to exclude from model features."),
+    ] = DEFAULT_TARGET,
+    batch_sizes: Annotated[
+        str,
+        typer.Option(help="Comma-separated scoring batch sizes, e.g. '1,10,100,1000'."),
+    ] = "1,10,100,1000",
+    repeat: Annotated[
+        int,
+        typer.Option(min=1, max=10, help="Timed runs per batch size; the median is reported."),
+    ] = 3,
+    output: Annotated[
+        Path | None,
+        typer.Option("--output", "-o", help="Optional JSON report destination."),
+    ] = None,
+    overwrite: Annotated[
+        bool,
+        typer.Option(help="Replace an existing report file."),
+    ] = False,
+) -> None:
+    """Time offline batch scoring for capacity planning.
+
+    Measures this host only; production throughput also depends on the serving
+    stack, concurrency, and hardware. Nothing is saved except the report.
+    """
+    if output is not None and output.exists() and not overwrite:
+        _abort(f"Output already exists: {output}. Pass --overwrite to replace it.")
+
+    try:
+        sizes = _parse_batch_sizes(batch_sizes)
+        model = load_model(model_path)
+        frame = pd.read_csv(data)
+        features = model.validate_features(frame.drop(columns=target, errors="ignore"))
+    except (
+        OSError,
+        UnicodeDecodeError,
+        pd.errors.ParserError,
+        pd.errors.EmptyDataError,
+        ModelArtifactError,
+        ValueError,
+    ) as exc:
+        _abort(str(exc))
+
+    rows = len(features)
+    results = []
+    for size in sizes:
+        batch = features.iloc[[index % rows for index in range(size)]]
+        model.predict_probabilities(batch)  # warmup, excluded from timing
+        samples = []
+        for _ in range(repeat):
+            started = time.perf_counter()
+            model.predict_probabilities(batch)
+            samples.append((time.perf_counter() - started) * 1_000)
+        median_ms = max(statistics.median(samples), 1e-9)
+        results.append(
+            {
+                "batch_size": size,
+                "median_ms": median_ms,
+                "ms_per_transaction": median_ms / size,
+                "transactions_per_second": 1_000.0 / (median_ms / size),
+            }
+        )
+
+    report_json = json.dumps(
+        {
+            "model_version": str(model.metadata["dataset_fingerprint"])[:12],
+            "rows_available": rows,
+            "repeat": repeat,
+            "results": results,
+        },
+        indent=2,
+    )
+    try:
+        if output is not None:
+            _atomic_write_text(report_json + "\n", output)
+    except OSError as exc:
+        _abort(str(exc))
+
+    typer.echo(report_json)
+
+
+def _parse_batch_sizes(raw: str) -> list[int]:
+    try:
+        sizes = [int(part.strip()) for part in raw.split(",") if part.strip()]
+    except ValueError as exc:
+        raise ValueError(f"Invalid batch_sizes {raw!r}: every entry must be an integer.") from exc
+    if not sizes:
+        raise ValueError("batch_sizes must contain at least one batch size.")
+    if any(size < 1 for size in sizes):
+        raise ValueError("batch_sizes must contain only positive batch sizes.")
+    if any(size > 100_000 for size in sizes):
+        raise ValueError("batch_sizes must not exceed 100,000 per batch.")
+    return sizes
 
 
 @app.command("inspect")
