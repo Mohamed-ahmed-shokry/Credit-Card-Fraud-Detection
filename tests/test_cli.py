@@ -860,6 +860,134 @@ def test_benchmark_rejects_invalid_batch_sizes(
     assert "batch" in result.stderr.lower()
 
 
+def test_thresholds_reports_tradeoffs(tmp_path: Path, trained_artifact: Path) -> None:
+    data_path = tmp_path / "transactions.csv"
+    report_path = tmp_path / "reports" / "thresholds.json"
+    generate_synthetic_data(rows=300, fraud_rate=0.1, random_state=41).to_csv(
+        data_path, index=False
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "thresholds",
+            str(trained_artifact),
+            str(data_path),
+            "--output",
+            str(report_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    body = json.loads(result.stdout)
+    assert body["rows"] == 300
+    assert [row["threshold"] for row in body["detail"]] == [
+        0.1,
+        0.2,
+        0.3,
+        0.4,
+        0.5,
+        0.6,
+        0.7,
+        0.8,
+        0.9,
+    ]
+    assert body["model_threshold_metrics"]["threshold"] == body["model_threshold"]
+    assert body["false_positive_cost"] == 1.0
+    assert body["false_negative_cost"] == 10.0
+    assert json.loads(report_path.read_text(encoding="utf-8")) == body
+
+
+def test_thresholds_supports_custom_candidates_and_costs(
+    tmp_path: Path, trained_artifact: Path
+) -> None:
+    data_path = tmp_path / "transactions.csv"
+    generate_synthetic_data(rows=200, fraud_rate=0.1, random_state=42).to_csv(
+        data_path, index=False
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "thresholds",
+            str(trained_artifact),
+            str(data_path),
+            "--thresholds",
+            "0.8,0.2",
+            "--false-positive-cost",
+            "2",
+            "--false-negative-cost",
+            "5",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    body = json.loads(result.stdout)
+    assert [row["threshold"] for row in body["detail"]] == [0.2, 0.8]
+    assert body["false_positive_cost"] == 2.0
+    assert body["false_negative_cost"] == 5.0
+
+
+@pytest.mark.parametrize(
+    ("thresholds", "message"),
+    [
+        ("0.5", "between 2 and 20"),
+        ("0.2,high", "every entry must be a number"),
+        ("0.2,1.5", "between 0 and 1"),
+    ],
+)
+def test_thresholds_rejects_invalid_candidates(
+    tmp_path: Path, trained_artifact: Path, thresholds: str, message: str
+) -> None:
+    data_path = tmp_path / "transactions.csv"
+    generate_synthetic_data(rows=200, random_state=43).to_csv(data_path, index=False)
+
+    result = runner.invoke(
+        app,
+        ["thresholds", str(trained_artifact), str(data_path), "--thresholds", thresholds],
+    )
+
+    assert result.exit_code == 2
+    assert message in result.stderr
+
+
+def test_thresholds_reports_missing_label_column(tmp_path: Path, trained_artifact: Path) -> None:
+    data_path = tmp_path / "transactions.csv"
+    generate_synthetic_data(rows=200, random_state=44).to_csv(data_path, index=False)
+
+    result = runner.invoke(
+        app,
+        ["thresholds", str(trained_artifact), str(data_path), "--target", "missing_column"],
+    )
+
+    assert result.exit_code == 2
+    assert "missing_column" in result.stderr
+
+
+def test_thresholds_protects_existing_report(tmp_path: Path) -> None:
+    model_path = tmp_path / "model.joblib"
+    data_path = tmp_path / "transactions.csv"
+    output = tmp_path / "thresholds.json"
+    model_path.write_bytes(b"placeholder")
+    data_path.write_text("x\n1\n", encoding="utf-8")
+    output.write_text("keep me", encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        [
+            "thresholds",
+            str(model_path),
+            str(data_path),
+            "--output",
+            str(output),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "Pass --overwrite" in result.stderr
+    assert output.read_text(encoding="utf-8") == "keep me"
+
+
 def test_benchmark_reports_without_output_file(tmp_path: Path, trained_artifact: Path) -> None:
     data_path = tmp_path / "transactions.csv"
     generate_synthetic_data(rows=200, random_state=25).to_csv(data_path, index=False)

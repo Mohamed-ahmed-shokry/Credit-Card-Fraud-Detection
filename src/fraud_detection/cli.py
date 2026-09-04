@@ -21,7 +21,13 @@ from fraud_detection.data import (
     load_csv,
 )
 from fraud_detection.drift import DriftError, assess_drift
-from fraud_detection.evaluation import calibration_report
+from fraud_detection.evaluation import (
+    ThresholdRow,
+    calibration_report,
+    evaluate_predictions,
+    expected_classification_cost,
+    summarize_thresholds,
+)
 from fraud_detection.model import (
     CalibrationMethod,
     EstimatorType,
@@ -985,6 +991,144 @@ def calibration_command(
         _abort(str(exc))
 
     typer.echo(report_json)
+
+
+@app.command("thresholds")
+def thresholds_command(
+    model_path: Annotated[
+        Path,
+        typer.Argument(exists=True, readable=True, help="Model file or artifact directory."),
+    ],
+    data: Annotated[
+        Path,
+        typer.Argument(
+            exists=True, dir_okay=False, readable=True, help="Labeled transactions CSV."
+        ),
+    ],
+    target: Annotated[
+        str,
+        typer.Option(help="Binary label column containing 0 and 1."),
+    ] = DEFAULT_TARGET,
+    thresholds: Annotated[
+        str,
+        typer.Option(help="Comma-separated candidate thresholds, e.g. '0.2,0.5,0.8'."),
+    ] = "0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9",
+    false_positive_cost: Annotated[
+        float | None,
+        typer.Option(help="Override the model's false-positive cost weight."),
+    ] = None,
+    false_negative_cost: Annotated[
+        float | None,
+        typer.Option(help="Override the model's false-negative cost weight."),
+    ] = None,
+    output: Annotated[
+        Path | None,
+        typer.Option("--output", "-o", help="Optional JSON report destination."),
+    ] = None,
+    overwrite: Annotated[
+        bool,
+        typer.Option(help="Replace an existing report file."),
+    ] = False,
+) -> None:
+    """Score candidate thresholds on labeled transactions.
+
+    Reports precision, recall, F1, and expected cost per threshold alongside
+    the model's tuned operating point. Use held-out labeled data (never the
+    threshold-tuning validation split). Costs default to the model's training
+    policy unless overridden.
+    """
+    if output is not None and output.exists() and not overwrite:
+        _abort(f"Output already exists: {output}. Pass --overwrite to replace it.")
+
+    try:
+        model = load_model(model_path)
+        dataset = load_csv(data, target_column=target)
+        probabilities = model.predict_probabilities(dataset.features)
+        candidates = _parse_thresholds(thresholds)
+        fp_cost, fn_cost = _resolve_report_costs(model, false_positive_cost, false_negative_cost)
+        y_true = dataset.target.to_numpy()
+        tradeoff = summarize_thresholds(
+            y_true,
+            probabilities,
+            candidates,
+            false_positive_cost=fp_cost,
+            false_negative_cost=fn_cost,
+        ).to_dict()
+        at_tuned = evaluate_predictions(y_true, probabilities, threshold=model.threshold)
+        tuned_cost = expected_classification_cost(
+            y_true,
+            probabilities,
+            threshold=model.threshold,
+            false_positive_cost=fp_cost,
+            false_negative_cost=fn_cost,
+        )
+        tuned_row = ThresholdRow(
+            threshold=model.threshold,
+            precision=at_tuned.precision,
+            recall=at_tuned.recall,
+            f1=at_tuned.f1,
+            expected_cost_per_transaction=tuned_cost,
+            flagged=at_tuned.false_positives + at_tuned.true_positives,
+            flagged_rate=(at_tuned.false_positives + at_tuned.true_positives) / y_true.size,
+            true_positives=at_tuned.true_positives,
+            false_positives=at_tuned.false_positives,
+        ).to_dict()
+        report_json = json.dumps(
+            {
+                "model_version": str(model.metadata["dataset_fingerprint"])[:12],
+                "model_threshold": model.threshold,
+                "false_positive_cost": fp_cost,
+                "false_negative_cost": fn_cost,
+                "model_threshold_metrics": tuned_row,
+                **tradeoff,
+            },
+            indent=2,
+        )
+        if output is not None:
+            _atomic_write_text(report_json + "\n", output)
+    except (
+        OSError,
+        UnicodeDecodeError,
+        pd.errors.ParserError,
+        pd.errors.EmptyDataError,
+        ModelArtifactError,
+        DataValidationError,
+        ValueError,
+    ) as exc:
+        _abort(str(exc))
+
+    typer.echo(report_json)
+
+
+def _parse_thresholds(raw: str) -> list[float]:
+    try:
+        return [float(part.strip()) for part in raw.split(",") if part.strip()]
+    except ValueError as exc:
+        raise ValueError(f"Invalid thresholds {raw!r}: every entry must be a number.") from exc
+
+
+def _resolve_report_costs(
+    model: object,
+    false_positive_cost: float | None,
+    false_negative_cost: float | None,
+) -> tuple[float, float]:
+    training_config = getattr(model, "metadata", {}).get("training_config", {})
+    if not isinstance(training_config, dict):
+        training_config = {}
+    try:
+        fp_cost = float(
+            false_positive_cost
+            if false_positive_cost is not None
+            else training_config.get("false_positive_cost", 1.0)
+        )
+        fn_cost = float(
+            false_negative_cost
+            if false_negative_cost is not None
+            else training_config.get("false_negative_cost", 10.0)
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid classification costs: {exc}") from exc
+    return (fp_cost, fn_cost)
 
 
 @app.command("serve")
