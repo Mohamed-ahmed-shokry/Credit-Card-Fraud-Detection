@@ -96,20 +96,22 @@ instead of building it from nothing.
 Scoped, proposed next steps that stay inside the reference-implementation
 mission:
 
-- **Calibration analysis report** (`Proposed`) — a `calibrate`-style report
-  (reliability curve bins plus Brier-score decomposition) computed from the
-  untouched test split, so operators can judge whether predicted probabilities
-  mean what they say before wiring them to thresholds.
-- **Drift-alert thresholds in the model card** (`Proposed`) — persist the PSI
-  warning/drift cutoffs alongside the reference profile so future tooling can
-  share one source of truth instead of hardcoding `0.10`/`0.25` in two places.
-- **Serving latency benchmark** (`Proposed`) — an offline `benchmark` command
+- **Calibration analysis report** (`Done`) — a `calibration` command reporting
+  reliability bins plus a Brier-score decomposition for held-out labeled data,
+  so operators can judge whether predicted probabilities mean what they say
+  before wiring them to thresholds.
+- **Drift-alert thresholds in the model card** (`Done`) — the PSI
+  warning/drift cutoffs travel in `drift_thresholds` next to the reference
+  profile, and drift reports honor (and echo) them instead of hardcoding
+  `0.10`/`0.25` in two places.
+- **Serving latency benchmark** (`Done`) — an offline `benchmark` command
   that times batch scoring for representative batch sizes and reports
   throughput, giving operators evidence for capacity planning without touching
   production traffic.
-- **First PyPI release** (`Proposed`) — link the trusted publisher on pypi.org
-  (see Phase 1), publish a release candidate to TestPyPI, then cut the first
-  real release once the dry-run workflow is green.
+- **First PyPI release** (`In progress`) — the TestPyPI dry run is live and a
+  release checklist is documented in `CONTRIBUTING.md`; remaining is a
+  maintainer action: link the trusted publisher on pypi.org (see Phase 1),
+  then cut the first real release once the dry-run workflow is green.
 
 ## Contributing to the roadmap
 

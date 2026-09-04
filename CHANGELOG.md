@@ -32,6 +32,14 @@ All notable changes to this project are documented here. The format follows
   replacement for a real gateway.
 - A TestPyPI dry-run publishing workflow on every push to `main`, so
   packaging regressions surface before a real release.
+- A `calibration` CLI command reporting equal-width reliability bins,
+  expected/maximum calibration errors, and a Brier-score decomposition
+  (reliability, resolution, uncertainty) for held-out labeled transactions.
+- An offline `benchmark` CLI command reporting median batch latency and
+  throughput per batch size for capacity planning.
+- Persisted PSI alert cutoffs (`drift_thresholds`) in every model card, honored
+  by drift reports (older artifacts fall back to the reference defaults).
+- A trusted-publishing release checklist in `CONTRIBUTING.md`.
 - A `GET /metrics` endpoint reporting Prometheus-format request counts, request
   duration, and scored-transaction decision counts. Each app instance gets its own
   isolated metrics registry.
