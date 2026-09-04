@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
 from typing import Annotated, cast
@@ -42,6 +44,15 @@ logger = logging.getLogger(__name__)
 TransactionValue = Annotated[float, Field(strict=True, allow_inf_nan=False)]
 
 
+@dataclass(frozen=True)
+class _RateLimitDecision:
+    """Outcome of one fixed-window rate-limit check."""
+
+    allowed: bool
+    remaining: int
+    retry_after_seconds: int
+
+
 class _RateLimiter:
     """Simple in-memory rate limiter using fixed window."""
 
@@ -50,16 +61,22 @@ class _RateLimiter:
         self.window_seconds = window_seconds
         self._requests: dict[str, list[float]] = {}
 
-    def is_allowed(self, key: str) -> bool:
+    def check(self, key: str) -> _RateLimitDecision:
+        """Record one request and report whether it fits the window."""
         now = time.time()
         window_start = now - self.window_seconds
-        if key not in self._requests:
-            self._requests[key] = []
-        self._requests[key] = [ts for ts in self._requests[key] if ts > window_start]
-        if len(self._requests[key]) >= self.max_requests:
-            return False
-        self._requests[key].append(now)
-        return True
+        timestamps = [ts for ts in self._requests.get(key, []) if ts > window_start]
+        if len(timestamps) >= self.max_requests:
+            self._requests[key] = timestamps
+            retry_after = max(0, math.ceil(timestamps[0] + self.window_seconds - now))
+            return _RateLimitDecision(allowed=False, remaining=0, retry_after_seconds=retry_after)
+        timestamps.append(now)
+        self._requests[key] = timestamps
+        return _RateLimitDecision(
+            allowed=True,
+            remaining=self.max_requests - len(timestamps),
+            retry_after_seconds=0,
+        )
 
 
 class PredictionRequest(BaseModel):
@@ -176,14 +193,24 @@ def create_app(
         request: Request,
         call_next: RequestResponseEndpoint,
     ) -> Response:
-        if rate_limiter is not None:
-            client_ip = request.client.host if request.client else "unknown"
-            if not rate_limiter.is_allowed(client_ip):
-                return JSONResponse(
-                    status_code=429,
-                    content={"detail": "Rate limit exceeded"},
-                )
-        return await call_next(request)
+        if rate_limiter is None:
+            return await call_next(request)
+        client_ip = request.client.host if request.client else "unknown"
+        decision = rate_limiter.check(client_ip)
+        if not decision.allowed:
+            return JSONResponse(
+                status_code=429,
+                content={"detail": "Rate limit exceeded"},
+                headers={
+                    "Retry-After": str(decision.retry_after_seconds),
+                    "X-RateLimit-Limit": str(rate_limiter.max_requests),
+                    "X-RateLimit-Remaining": "0",
+                },
+            )
+        response = await call_next(request)
+        response.headers["X-RateLimit-Limit"] = str(rate_limiter.max_requests)
+        response.headers["X-RateLimit-Remaining"] = str(decision.remaining)
+        return response
 
     @application.middleware("http")
     async def api_key_middleware(

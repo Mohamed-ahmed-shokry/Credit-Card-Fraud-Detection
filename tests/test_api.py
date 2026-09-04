@@ -403,9 +403,11 @@ def test_rate_limit_middleware_allows_within_limit(
     app = create_app(model=model, rate_limit_requests=5, rate_limit_window_seconds=60)
 
     with TestClient(app) as test_client:
-        for _ in range(5):
+        for expected_remaining in (4, 3, 2, 1, 0):
             response = test_client.post("/v1/predict", json={"transactions": records})
             assert response.status_code == 200
+            assert response.headers["X-RateLimit-Limit"] == "5"
+            assert response.headers["X-RateLimit-Remaining"] == str(expected_remaining)
 
 
 def test_rate_limit_middleware_rejects_over_limit(
@@ -423,3 +425,6 @@ def test_rate_limit_middleware_rejects_over_limit(
         response3 = test_client.post("/v1/predict", json={"transactions": records})
         assert response3.status_code == 429
         assert response3.json()["detail"] == "Rate limit exceeded"
+        assert response3.headers["X-RateLimit-Limit"] == "2"
+        assert response3.headers["X-RateLimit-Remaining"] == "0"
+        assert int(response3.headers["Retry-After"]) >= 0
