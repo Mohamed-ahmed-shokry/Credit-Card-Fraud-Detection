@@ -113,6 +113,21 @@ mission:
   maintainer action: link the trusted publisher on pypi.org (see Phase 1),
   then cut the first real release once the dry-run workflow is green.
 
+## Phase 6 — Evaluation rigor and serving polish
+
+- **Repeated-seed stability report** (`Done`) — a `stability` command that
+  repeats training with successive seeds and reports mean/standard-deviation
+  per test metric, so split luck is visible before trusting one `train` run.
+- **Rate-limit client headers** (`Done`) — `Retry-After`, `X-RateLimit-Limit`,
+  and `X-RateLimit-Remaining` on `429` responses (plus limit/remaining on
+  allowed responses) so clients can back off before hitting the cap.
+- **Threshold tradeoff report** (`Proposed`) — report precision/recall/F1 and
+  expected cost across candidate thresholds on validation data, so the
+  operating point is chosen with eyes open rather than taken on faith.
+- **Artifact retention policy** (`Proposed`) — document how long to keep
+  superseded model directories and their reports, since reproducible
+  comparisons are only possible while old artifacts exist.
+
 ## Contributing to the roadmap
 
 Open an issue or a pull request that references the relevant phase item.

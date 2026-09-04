@@ -32,6 +32,12 @@ All notable changes to this project are documented here. The format follows
   replacement for a real gateway.
 - A TestPyPI dry-run publishing workflow on every push to `main`, so
   packaging regressions surface before a real release.
+- A `stability` CLI command repeating training with successive seeds and
+  reporting mean and standard deviation per test metric, so split luck is
+  visible before trusting a single `train` run.
+- `Retry-After`, `X-RateLimit-Limit`, and `X-RateLimit-Remaining` headers on
+  rate-limited (`429`) responses, plus limit/remaining headers on allowed
+  responses when the optional limiter is enabled.
 - A `calibration` CLI command reporting equal-width reliability bins,
   expected/maximum calibration errors, and a Brier-score decomposition
   (reliability, resolution, uncertainty) for held-out labeled transactions.
