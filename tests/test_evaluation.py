@@ -9,6 +9,7 @@ from fraud_detection.evaluation import (
     expected_classification_cost,
     select_cost_threshold,
     select_f1_threshold,
+    summarize_thresholds,
 )
 
 
@@ -176,6 +177,56 @@ def test_calibration_report_matches_brier_decomposition() -> None:
     assert 0.0 <= report.expected_calibration_error <= 1.0
     assert 0.0 <= report.max_calibration_error <= 1.0
     assert report.uncertainty == pytest.approx(0.25, abs=0.06)
+
+
+def test_summarize_thresholds_reports_tradeoffs() -> None:
+    y_true = np.array([0, 0, 0, 0, 1, 1, 1, 1])
+    probabilities = np.array([0.1, 0.2, 0.3, 0.4, 0.6, 0.7, 0.8, 0.9])
+
+    tradeoff = summarize_thresholds(
+        y_true,
+        probabilities,
+        [0.9, 0.5, 0.05],
+        false_positive_cost=1,
+        false_negative_cost=10,
+    )
+
+    assert tradeoff.rows == 8
+    assert [row.threshold for row in tradeoff.detail] == [0.05, 0.5, 0.9]
+    loose, middle, strict = tradeoff.detail
+    assert loose.flagged == 8
+    assert loose.recall == pytest.approx(1.0)
+    assert strict.flagged == 1
+    assert strict.true_positives == 1
+    assert strict.false_positives == 0
+    assert strict.precision == pytest.approx(1.0)
+    assert middle.expected_cost_per_transaction == pytest.approx(0.0)
+    assert middle.to_dict()["threshold"] == 0.5
+    assert tradeoff.to_dict()["rows"] == 8
+
+
+@pytest.mark.parametrize(
+    ("thresholds", "message"),
+    [
+        ([0.5], "between 2 and 20"),
+        ([0.1] * 21, "between 2 and 20"),
+        ([-0.1, 0.5], "between 0 and 1"),
+        ([0.5, 1.5], "between 0 and 1"),
+        ([0.5, "high"], "only numbers"),
+        ([0.5, True], "only numbers"),
+    ],
+)
+def test_summarize_thresholds_rejects_invalid_candidates(
+    thresholds: list[object], message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        summarize_thresholds(
+            np.array([0, 1]),
+            np.array([0.2, 0.8]),
+            thresholds,  # type: ignore[arg-type]
+            false_positive_cost=1,
+            false_negative_cost=1,
+        )
 
 
 @pytest.mark.parametrize("bins", [1, 21])

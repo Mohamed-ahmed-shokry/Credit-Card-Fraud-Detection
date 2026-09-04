@@ -65,6 +65,40 @@ class CalibrationReport:
 
 
 @dataclass(frozen=True)
+class ThresholdRow:
+    """Decision metrics at one candidate threshold."""
+
+    threshold: float
+    precision: float
+    recall: float
+    f1: float
+    expected_cost_per_transaction: float
+    flagged: int
+    flagged_rate: float
+    true_positives: int
+    false_positives: int
+
+    def to_dict(self) -> dict[str, float | int]:
+        """Return a JSON-compatible row mapping."""
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class ThresholdTradeoff:
+    """Per-threshold decision metrics over shared labeled data."""
+
+    rows: int
+    detail: tuple[ThresholdRow, ...]
+
+    def to_dict(self) -> dict[str, object]:
+        """Return a JSON-compatible report mapping."""
+        return {
+            "rows": self.rows,
+            "detail": [item.to_dict() for item in self.detail],
+        }
+
+
+@dataclass(frozen=True)
 class ClassificationMetrics:
     """Serializable binary-classification evaluation results."""
 
@@ -273,6 +307,57 @@ def calibration_report(
         uncertainty=uncertainty,
         detail=tuple(detail),
     )
+
+
+def summarize_thresholds(
+    y_true: np.ndarray,
+    probabilities: np.ndarray,
+    thresholds: list[float],
+    *,
+    false_positive_cost: float,
+    false_negative_cost: float,
+) -> ThresholdTradeoff:
+    """Score candidate thresholds on shared labeled data.
+
+    Reports precision, recall, F1, and weighted expected cost per threshold so
+    the operating point is chosen with eyes open. Use validation (or other
+    held-out labeled) data: the tuned model threshold stays fixed while the
+    candidates are explored.
+    """
+    _validate_vectors(y_true, probabilities)
+    _validate_costs(false_positive_cost, false_negative_cost)
+    if not 2 <= len(thresholds) <= 20:
+        raise ValueError("thresholds must contain between 2 and 20 candidates")
+    for threshold in thresholds:
+        if isinstance(threshold, bool) or not isinstance(threshold, int | float):
+            raise ValueError("thresholds must contain only numbers")
+        if not 0.0 <= threshold <= 1.0:
+            raise ValueError("thresholds must all fall between 0 and 1")
+
+    detail = []
+    for threshold in sorted(thresholds):
+        predictions = (probabilities >= threshold).astype("int8")
+        _, fp, _, tp = confusion_matrix(y_true, predictions, labels=[0, 1]).ravel()
+        detail.append(
+            ThresholdRow(
+                threshold=float(threshold),
+                precision=float(precision_score(y_true, predictions, zero_division=0)),
+                recall=float(recall_score(y_true, predictions, zero_division=0)),
+                f1=float(f1_score(y_true, predictions, zero_division=0)),
+                expected_cost_per_transaction=expected_classification_cost(
+                    y_true,
+                    probabilities,
+                    threshold=float(threshold),
+                    false_positive_cost=false_positive_cost,
+                    false_negative_cost=false_negative_cost,
+                ),
+                flagged=int(fp + tp),
+                flagged_rate=float((fp + tp) / y_true.size),
+                true_positives=int(tp),
+                false_positives=int(fp),
+            )
+        )
+    return ThresholdTradeoff(rows=int(y_true.size), detail=tuple(detail))
 
 
 def _validate_vectors(y_true: np.ndarray, probabilities: np.ndarray) -> None:
