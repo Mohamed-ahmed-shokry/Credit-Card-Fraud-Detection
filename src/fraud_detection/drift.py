@@ -35,6 +35,8 @@ class DriftReport:
     mean_psi: float
     max_psi: float
     features: tuple[FeatureDrift, ...]
+    warning_at: float = STABLE_THRESHOLD
+    drift_at: float = DRIFT_THRESHOLD
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-compatible report mapping."""
@@ -43,8 +45,37 @@ class DriftReport:
             "overall_status": self.overall_status,
             "mean_psi": self.mean_psi,
             "max_psi": self.max_psi,
+            "thresholds": {"warning_at": self.warning_at, "drift_at": self.drift_at},
             "features": [asdict(item) for item in self.features],
         }
+
+
+def default_thresholds() -> dict[str, float]:
+    """Return the reference PSI cutoffs persisted with each model card."""
+    return {"warning_at": STABLE_THRESHOLD, "drift_at": DRIFT_THRESHOLD}
+
+
+def resolve_thresholds(source: object) -> tuple[float, float]:
+    """Validate persisted or caller-supplied PSI cutoffs.
+
+    `None` selects the reference defaults so artifacts trained before cutoffs
+    were persisted keep working. Anything else must map `warning_at` and
+    `drift_at` to finite numbers with `0 <= warning_at < drift_at`.
+    """
+    if source is None:
+        return (STABLE_THRESHOLD, DRIFT_THRESHOLD)
+    if not isinstance(source, dict):
+        raise DriftError("Drift thresholds must be a mapping.")
+    try:
+        warning_at = float(source["warning_at"])
+        drift_at = float(source["drift_at"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise DriftError(
+            "Drift thresholds must define numeric 'warning_at' and 'drift_at'."
+        ) from exc
+    if not np.isfinite(warning_at) or not np.isfinite(drift_at) or not 0.0 <= warning_at < drift_at:
+        raise DriftError("Drift thresholds must satisfy 0 <= warning_at < drift_at.")
+    return (warning_at, drift_at)
 
 
 def build_reference_profile(
@@ -93,8 +124,16 @@ def build_reference_profile(
 def assess_drift(
     reference_profile: dict[str, dict[str, Any]],
     features: pd.DataFrame,
+    *,
+    thresholds: object = None,
 ) -> DriftReport:
-    """Compare current features with the training profile using PSI."""
+    """Compare current features with the training profile using PSI.
+
+    `thresholds` accepts the persisted `drift_thresholds` model-card mapping
+    (or `None` for the reference defaults) so alerting cutoffs travel with the
+    model instead of living only in code.
+    """
+    warning_at, drift_at = resolve_thresholds(thresholds)
     if features.empty:
         raise DriftError("Current features must not be empty.")
 
@@ -161,24 +200,34 @@ def assess_drift(
                 )
             ),
         )
-        results.append(FeatureDrift(feature=feature, psi=psi, status=_status(psi)))
+        results.append(
+            FeatureDrift(
+                feature=feature,
+                psi=psi,
+                status=_status(psi, warning_at=warning_at, drift_at=drift_at),
+            )
+        )
 
     ordered = tuple(sorted(results, key=lambda item: item.psi, reverse=True))
     psi_values = np.asarray([item.psi for item in ordered], dtype=float)
     maximum = float(np.max(psi_values))
     return DriftReport(
         rows=len(features),
-        overall_status=_status(maximum),
+        overall_status=_status(maximum, warning_at=warning_at, drift_at=drift_at),
         mean_psi=float(np.mean(psi_values)),
         max_psi=maximum,
         features=ordered,
+        warning_at=warning_at,
+        drift_at=drift_at,
     )
 
 
-def _status(psi: float) -> str:
-    if psi < STABLE_THRESHOLD:
+def _status(
+    psi: float, *, warning_at: float = STABLE_THRESHOLD, drift_at: float = DRIFT_THRESHOLD
+) -> str:
+    if psi < warning_at:
         return "stable"
-    if psi < DRIFT_THRESHOLD:
+    if psi < drift_at:
         return "warning"
     return "drifted"
 

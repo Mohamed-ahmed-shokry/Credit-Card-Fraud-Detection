@@ -27,7 +27,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
 from fraud_detection.data import ValidatedDataset
-from fraud_detection.drift import build_reference_profile
+from fraud_detection.drift import build_reference_profile, default_thresholds
 from fraud_detection.evaluation import (
     evaluate_predictions,
     expected_classification_cost,
@@ -441,6 +441,7 @@ def train_model(
         ),
         "training_config": asdict(settings),
         "reference_profile": build_reference_profile(features_train),
+        "drift_thresholds": default_thresholds(),
         "feature_effects": feature_effects,
         "scaler_mean": scaler_mean,
         "scaler_scale": scaler_scale,

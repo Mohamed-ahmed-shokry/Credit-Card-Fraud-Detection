@@ -69,6 +69,7 @@ def test_train_model_produces_reproducible_model_card(
     assert model.artifact_version == ARTIFACT_VERSION
     assert len(model.metadata["dataset_fingerprint"]) == 64
     assert len(model.metadata["reference_profile"]) == 30
+    assert model.metadata["drift_thresholds"] == {"warning_at": 0.1, "drift_at": 0.25}
     effects = model.metadata["feature_effects"]
     assert len(effects) == 30
     assert [effect["rank"] for effect in effects] == list(range(1, 31))

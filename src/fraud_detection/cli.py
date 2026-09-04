@@ -633,7 +633,8 @@ def drift_command(
         profile = model.metadata.get("reference_profile")
         if not isinstance(profile, dict):
             raise DriftError("Model artifact does not contain a reference profile.")
-        report_json = json.dumps(assess_drift(profile, features).to_dict(), indent=2)
+        report = assess_drift(profile, features, thresholds=model.metadata.get("drift_thresholds"))
+        report_json = json.dumps(report.to_dict(), indent=2)
         if output is not None:
             _atomic_write_text(report_json + "\n", output)
     except (

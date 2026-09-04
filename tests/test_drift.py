@@ -4,7 +4,15 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from fraud_detection.drift import DriftError, assess_drift, build_reference_profile
+from fraud_detection.drift import (
+    DRIFT_THRESHOLD,
+    STABLE_THRESHOLD,
+    DriftError,
+    assess_drift,
+    build_reference_profile,
+    default_thresholds,
+    resolve_thresholds,
+)
 
 
 def test_identical_distribution_is_stable() -> None:
@@ -108,6 +116,52 @@ def test_drift_can_report_warning_level() -> None:
     report = assess_drift(profile, current)
 
     assert report.overall_status == "warning"
+
+
+def test_default_thresholds_match_reference_cutoffs() -> None:
+    assert default_thresholds() == {
+        "warning_at": STABLE_THRESHOLD,
+        "drift_at": DRIFT_THRESHOLD,
+    }
+
+
+def test_assess_drift_honors_persisted_thresholds() -> None:
+    profile = {"x": {"edges": [None, 0.5, None], "proportions": [0.5, 0.5]}}
+    current = pd.DataFrame({"x": [0.0] * 68 + [1.0] * 32})
+
+    report = assess_drift(profile, current, thresholds={"warning_at": 0.5, "drift_at": 1.0})
+
+    assert report.overall_status == "stable"
+    assert report.to_dict()["thresholds"] == {"warning_at": 0.5, "drift_at": 1.0}
+
+
+def test_assess_drift_reports_default_thresholds() -> None:
+    profile = {"x": {"edges": [None, 0.5, None], "proportions": [0.5, 0.5]}}
+
+    report = assess_drift(profile, pd.DataFrame({"x": [0.0, 1.0]}))
+
+    assert report.to_dict()["thresholds"] == default_thresholds()
+
+
+@pytest.mark.parametrize(
+    "thresholds",
+    [
+        "not-a-mapping",
+        {"warning_at": 0.1},
+        {"warning_at": "high", "drift_at": 0.25},
+        {"warning_at": float("nan"), "drift_at": 0.25},
+        {"warning_at": -0.1, "drift_at": 0.25},
+        {"warning_at": 0.25, "drift_at": 0.25},
+        {"warning_at": 0.5, "drift_at": 0.25},
+    ],
+)
+def test_resolve_thresholds_rejects_invalid_cutoffs(thresholds: object) -> None:
+    with pytest.raises(DriftError, match="hresholds"):
+        resolve_thresholds(thresholds)
+
+
+def test_resolve_thresholds_defaults_to_reference_cutoffs() -> None:
+    assert resolve_thresholds(None) == (STABLE_THRESHOLD, DRIFT_THRESHOLD)
 
 
 def test_drift_normalizes_non_string_feature_names() -> None:
