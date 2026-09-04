@@ -452,10 +452,44 @@ The report ranks every feature by Population Stability Index (PSI):
 - `warning`: PSI from `0.10` to below `0.25`
 - `drifted`: PSI `0.25` or higher
 
+These cutoffs are persisted in each model card (`drift_thresholds`) so reports
+share one source of truth; artifacts trained before they were persisted fall
+back to the same reference defaults.
+
 PSI is a diagnostic signal, not proof that model quality changed. Investigate alerts
 alongside label-based performance, calibration, traffic changes, and business context.
 Malformed reference profiles are rejected before PSI calculation, including invalid
 bin ordering, proportions, feature names, and non-finite statistics.
+
+## Check probability calibration
+
+Judge whether predicted probabilities mean what they say on held-out labeled
+data (never the threshold-tuning validation split):
+
+```bash
+fraud-detect calibration artifacts/model heldout_transactions.csv \
+  --output reports/calibration.json
+```
+
+The report bins predictions into equal-width reliability bins and reports the
+expected and maximum calibration errors plus a Brier-score decomposition
+(reliability, resolution, uncertainty). Lower Brier score, calibration errors,
+and reliability are better; higher resolution is better. A well-calibrated
+model still needs representative, unshifted data — see drift monitoring above.
+
+## Benchmark batch scoring
+
+Time offline batch scoring on this host for capacity planning:
+
+```bash
+fraud-detect benchmark artifacts/model data/demo.csv \
+  --batch-sizes 1,10,100,1000 \
+  --output reports/benchmark.json
+```
+
+The report gives median latency and throughput per batch size. It measures this
+host only; production throughput also depends on the serving stack,
+concurrency, and hardware.
 
 ## Container deployment
 
@@ -489,10 +523,10 @@ Project layout:
 ```text
 src/fraud_detection/
 ├── api.py          # versioned online prediction service
-├── cli.py          # training, comparison, scoring, explanation, drift, and serving
+├── cli.py          # training, comparison, scoring, explanation, drift, calibration, benchmarking, and serving
 ├── data.py         # ingestion, schema validation, and synthetic data
 ├── drift.py        # training profiles and PSI drift reporting
-├── evaluation.py   # threshold tuning and imbalance-aware metrics
+├── evaluation.py   # threshold tuning, imbalance-aware metrics, and calibration reports
 └── model.py        # training, model card, inference, and persistence
 tests/              # unit, integration, CLI, and API tests
 ```
