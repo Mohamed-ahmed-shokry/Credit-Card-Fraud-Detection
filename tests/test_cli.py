@@ -860,6 +860,20 @@ def test_benchmark_rejects_invalid_batch_sizes(
     assert "batch" in result.stderr.lower()
 
 
+def test_benchmark_reports_without_output_file(tmp_path: Path, trained_artifact: Path) -> None:
+    data_path = tmp_path / "transactions.csv"
+    generate_synthetic_data(rows=200, random_state=25).to_csv(data_path, index=False)
+
+    result = runner.invoke(
+        app,
+        ["benchmark", str(trained_artifact), str(data_path), "--batch-sizes", "3"],
+    )
+
+    assert result.exit_code == 0, result.output
+    body = json.loads(result.stdout)
+    assert [item["batch_size"] for item in body["results"]] == [3]
+
+
 def test_benchmark_protects_existing_report(tmp_path: Path) -> None:
     model_path = tmp_path / "model.joblib"
     data_path = tmp_path / "transactions.csv"
