@@ -10,7 +10,7 @@ import pytest
 from typer.testing import CliRunner
 
 from fraud_detection import __version__
-from fraud_detection.cli import app
+from fraud_detection.cli import _resolve_report_costs, app
 from fraud_detection.data import generate_synthetic_data, validate_frame
 from fraud_detection.model import (
     METADATA_FILENAME,
@@ -986,6 +986,27 @@ def test_thresholds_protects_existing_report(tmp_path: Path) -> None:
     assert result.exit_code == 2
     assert "Pass --overwrite" in result.stderr
     assert output.read_text(encoding="utf-8") == "keep me"
+
+
+class _StubModel:
+    def __init__(self, metadata: object) -> None:
+        self.metadata = metadata
+
+
+def test_resolve_report_costs_prefers_overrides() -> None:
+    model = _StubModel({"training_config": {"false_positive_cost": 3.0}})
+
+    assert _resolve_report_costs(model, 2.0, None) == (2.0, 10.0)
+
+
+def test_resolve_report_costs_rejects_malformed_training_config() -> None:
+    with pytest.raises(ValueError, match="training_config is invalid"):
+        _resolve_report_costs(_StubModel({"training_config": "oops"}), None, None)
+
+    with pytest.raises(ValueError, match="Invalid classification costs"):
+        _resolve_report_costs(
+            _StubModel({"training_config": {"false_positive_cost": "high"}}), None, None
+        )
 
 
 def test_benchmark_reports_without_output_file(tmp_path: Path, trained_artifact: Path) -> None:

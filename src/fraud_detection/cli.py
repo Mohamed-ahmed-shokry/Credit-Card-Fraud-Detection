@@ -1113,8 +1113,10 @@ def _resolve_report_costs(
     false_negative_cost: float | None,
 ) -> tuple[float, float]:
     training_config = getattr(model, "metadata", {}).get("training_config", {})
-    if not isinstance(training_config, dict):
+    if training_config is None:
         training_config = {}
+    if not isinstance(training_config, dict):
+        raise ValueError("Model artifact training_config is invalid.")
     try:
         fp_cost = float(
             false_positive_cost
