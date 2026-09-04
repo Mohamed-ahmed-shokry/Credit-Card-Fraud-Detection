@@ -5,6 +5,7 @@ import warnings
 from copy import deepcopy
 from hashlib import sha256
 from pathlib import Path
+from types import SimpleNamespace
 
 import joblib
 import numpy as np
@@ -25,6 +26,7 @@ from fraud_detection.model import (
     SplitStrategy,
     ThresholdStrategy,
     TrainingConfig,
+    _extract_feature_effects,
     load_model,
     save_model,
     train_model,
@@ -713,3 +715,25 @@ def test_explain_local_random_forest() -> None:
     model.metadata.pop("feature_effects", None)
     with pytest.raises(ModelArtifactError, match="Feature effects not available"):
         model.explain_local(features.iloc[:1])
+
+
+def test_load_model_supports_bare_joblib_file(
+    tmp_path: Path, trained_model: tuple[FraudModel, ValidatedDataset]
+) -> None:
+    model, dataset = trained_model
+    artifact_path = tmp_path / "model.joblib"
+    joblib.dump(model, artifact_path)
+
+    restored = load_model(artifact_path)
+
+    np.testing.assert_allclose(
+        restored.predict_probabilities(dataset.features.iloc[:5]),
+        model.predict_probabilities(dataset.features.iloc[:5]),
+    )
+
+
+def test_extract_feature_effects_requires_permutation_data() -> None:
+    stub = SimpleNamespace(named_steps={"classifier": SimpleNamespace()})
+
+    with pytest.raises(ValueError, match="Permutation training data"):
+        _extract_feature_effects(stub, ("x",), calibration_method=CalibrationMethod.NONE)

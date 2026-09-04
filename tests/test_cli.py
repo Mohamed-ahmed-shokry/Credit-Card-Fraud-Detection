@@ -860,6 +860,74 @@ def test_benchmark_rejects_invalid_batch_sizes(
     assert "batch" in result.stderr.lower()
 
 
+def test_benchmark_protects_existing_report(tmp_path: Path) -> None:
+    model_path = tmp_path / "model.joblib"
+    data_path = tmp_path / "transactions.csv"
+    output = tmp_path / "benchmark.json"
+    model_path.write_bytes(b"placeholder")
+    data_path.write_text("x\n1\n", encoding="utf-8")
+    output.write_text("keep me", encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        [
+            "benchmark",
+            str(model_path),
+            str(data_path),
+            "--output",
+            str(output),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "Pass --overwrite" in result.stderr
+    assert output.read_text(encoding="utf-8") == "keep me"
+
+
+def test_benchmark_reports_write_failures(
+    tmp_path: Path, trained_artifact: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data_path = tmp_path / "transactions.csv"
+    generate_synthetic_data(rows=200, random_state=23).to_csv(data_path, index=False)
+
+    def fail_write(_content: str, _destination: Path) -> None:
+        raise OSError("simulated disk failure")
+
+    monkeypatch.setattr("fraud_detection.cli._atomic_write_text", fail_write)
+
+    result = runner.invoke(
+        app,
+        [
+            "benchmark",
+            str(trained_artifact),
+            str(data_path),
+            "--batch-sizes",
+            "2",
+            "--output",
+            str(tmp_path / "benchmark.json"),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "simulated disk failure" in result.stderr
+
+
+def test_calibration_reports_without_output_file(tmp_path: Path, trained_artifact: Path) -> None:
+    data_path = tmp_path / "transactions.csv"
+    generate_synthetic_data(rows=200, fraud_rate=0.1, random_state=24).to_csv(
+        data_path, index=False
+    )
+
+    result = runner.invoke(
+        app, ["calibration", str(trained_artifact), str(data_path), "--bins", "4"]
+    )
+
+    assert result.exit_code == 0, result.output
+    body = json.loads(result.stdout)
+    assert body["rows"] == 200
+    assert len(body["detail"]) == 4
+
+
 def test_train_reports_invalid_output_directory_without_replacing_file(
     tmp_path: Path,
 ) -> None:
