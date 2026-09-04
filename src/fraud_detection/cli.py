@@ -19,6 +19,7 @@ from fraud_detection.data import (
     load_csv,
 )
 from fraud_detection.drift import DriftError, assess_drift
+from fraud_detection.evaluation import calibration_report
 from fraud_detection.model import (
     CalibrationMethod,
     EstimatorType,
@@ -642,6 +643,71 @@ def drift_command(
         pd.errors.EmptyDataError,
         ModelArtifactError,
         DriftError,
+    ) as exc:
+        _abort(str(exc))
+
+    typer.echo(report_json)
+
+
+@app.command("calibration")
+def calibration_command(
+    model_path: Annotated[
+        Path,
+        typer.Argument(exists=True, readable=True, help="Model file or artifact directory."),
+    ],
+    data: Annotated[
+        Path,
+        typer.Argument(
+            exists=True, dir_okay=False, readable=True, help="Labeled transactions CSV."
+        ),
+    ],
+    target: Annotated[
+        str,
+        typer.Option(help="Binary label column containing 0 and 1."),
+    ] = DEFAULT_TARGET,
+    bins: Annotated[
+        int,
+        typer.Option(min=2, max=20, help="Equal-width reliability bins."),
+    ] = 10,
+    output: Annotated[
+        Path | None,
+        typer.Option("--output", "-o", help="Optional JSON report destination."),
+    ] = None,
+    overwrite: Annotated[
+        bool,
+        typer.Option(help="Replace an existing report file."),
+    ] = False,
+) -> None:
+    """Report reliability bins and Brier decomposition for labeled transactions.
+
+    Use held-out labeled data (never the threshold-tuning validation split) to
+    judge whether predicted probabilities mean what they say.
+    """
+    if output is not None and output.exists() and not overwrite:
+        _abort(f"Output already exists: {output}. Pass --overwrite to replace it.")
+
+    try:
+        model = load_model(model_path)
+        dataset = load_csv(data, target_column=target)
+        probabilities = model.predict_probabilities(dataset.features)
+        report = calibration_report(dataset.target.to_numpy(), probabilities, bins=bins).to_dict()
+        report_json = json.dumps(
+            {
+                "model_version": str(model.metadata["dataset_fingerprint"])[:12],
+                **report,
+            },
+            indent=2,
+        )
+        if output is not None:
+            _atomic_write_text(report_json + "\n", output)
+    except (
+        OSError,
+        UnicodeDecodeError,
+        pd.errors.ParserError,
+        pd.errors.EmptyDataError,
+        ModelArtifactError,
+        DataValidationError,
+        ValueError,
     ) as exc:
         _abort(str(exc))
 

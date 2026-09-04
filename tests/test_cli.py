@@ -686,6 +686,73 @@ def test_drift_protects_existing_report(tmp_path: Path) -> None:
     assert output.read_text(encoding="utf-8") == "keep me"
 
 
+def test_calibration_reports_reliability(tmp_path: Path, trained_artifact: Path) -> None:
+    data_path = tmp_path / "transactions.csv"
+    report_path = tmp_path / "reports" / "calibration.json"
+    generate_synthetic_data(rows=300, fraud_rate=0.1, random_state=11).to_csv(
+        data_path, index=False
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "calibration",
+            str(trained_artifact),
+            str(data_path),
+            "--output",
+            str(report_path),
+            "--bins",
+            "5",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    body = json.loads(result.stdout)
+    assert body["rows"] == 300
+    assert body["bins"] == 5
+    assert len(body["detail"]) == 5
+    assert 0.0 <= body["expected_calibration_error"] <= 1.0
+    assert "model_version" in body
+    assert json.loads(report_path.read_text(encoding="utf-8")) == body
+
+
+def test_calibration_protects_existing_report(tmp_path: Path) -> None:
+    model_path = tmp_path / "model.joblib"
+    data_path = tmp_path / "transactions.csv"
+    output = tmp_path / "calibration.json"
+    model_path.write_bytes(b"placeholder")
+    data_path.write_text("x\n1\n", encoding="utf-8")
+    output.write_text("keep me", encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        [
+            "calibration",
+            str(model_path),
+            str(data_path),
+            "--output",
+            str(output),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "Pass --overwrite" in result.stderr
+    assert output.read_text(encoding="utf-8") == "keep me"
+
+
+def test_calibration_reports_missing_label_column(tmp_path: Path, trained_artifact: Path) -> None:
+    data_path = tmp_path / "transactions.csv"
+    generate_synthetic_data(rows=200, random_state=12).to_csv(data_path, index=False)
+
+    result = runner.invoke(
+        app,
+        ["calibration", str(trained_artifact), str(data_path), "--target", "missing_column"],
+    )
+
+    assert result.exit_code == 2
+    assert "missing_column" in result.stderr
+
+
 def test_train_reports_invalid_output_directory_without_replacing_file(
     tmp_path: Path,
 ) -> None:
