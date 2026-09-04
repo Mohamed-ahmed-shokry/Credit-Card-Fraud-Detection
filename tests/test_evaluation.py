@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 from fraud_detection.evaluation import (
+    calibration_report,
     evaluate_predictions,
     expected_classification_cost,
     select_cost_threshold,
@@ -125,6 +126,62 @@ def test_expected_classification_cost_rejects_invalid_threshold(threshold: float
             false_positive_cost=1,
             false_negative_cost=1,
         )
+
+
+def test_calibration_report_measures_reliability() -> None:
+    y_true = np.array([0, 0, 0, 0, 1, 1, 1, 1])
+    probabilities = np.array([0.1, 0.2, 0.3, 0.4, 0.6, 0.7, 0.8, 0.9])
+
+    report = calibration_report(y_true, probabilities, bins=2)
+
+    assert report.rows == 8
+    assert report.bins == 2
+    assert len(report.detail) == 2
+    assert [item.count for item in report.detail] == [4, 4]
+    assert report.detail[0].fraction_positive == pytest.approx(0.0)
+    assert report.detail[1].fraction_positive == pytest.approx(1.0)
+    assert report.detail[0].mean_predicted == pytest.approx(0.25)
+    assert report.detail[1].mean_predicted == pytest.approx(0.75)
+    assert report.expected_calibration_error == pytest.approx(0.25)
+    assert report.max_calibration_error == pytest.approx(0.25)
+    assert report.to_dict()["rows"] == 8
+    serialized_detail = report.to_dict()["detail"]
+    assert isinstance(serialized_detail, list) and len(serialized_detail) == 2
+
+
+def test_calibration_report_handles_empty_bins() -> None:
+    report = calibration_report(np.array([0, 1]), np.array([0.05, 0.95]), bins=4)
+
+    assert sum(item.count for item in report.detail) == 2
+    assert report.expected_calibration_error >= 0.0
+    assert report.brier_score == pytest.approx(
+        report.reliability - report.resolution + report.uncertainty
+    )
+
+
+def test_calibration_report_matches_brier_decomposition() -> None:
+    rng = np.random.default_rng(3)
+    probabilities = rng.uniform(0.0, 1.0, size=200)
+    y_true = (rng.uniform(0.0, 1.0, size=200) < probabilities).astype(int)
+    if set(np.unique(y_true).tolist()) != {0, 1}:
+        y_true[0], y_true[1] = 0, 1
+
+    report = calibration_report(y_true, probabilities, bins=10)
+
+    # Murphy's identity holds up to within-bin forecast variance, which
+    # shrinks as bins narrow; 10 bins over 200 rows keeps it small.
+    assert report.brier_score == pytest.approx(
+        report.reliability - report.resolution + report.uncertainty, abs=0.01
+    )
+    assert 0.0 <= report.expected_calibration_error <= 1.0
+    assert 0.0 <= report.max_calibration_error <= 1.0
+    assert report.uncertainty == pytest.approx(0.25, abs=0.06)
+
+
+@pytest.mark.parametrize("bins", [1, 21])
+def test_calibration_report_rejects_invalid_bin_count(bins: int) -> None:
+    with pytest.raises(ValueError, match="bins"):
+        calibration_report(np.array([0, 1]), np.array([0.2, 0.8]), bins=bins)
 
 
 @pytest.mark.parametrize(

@@ -20,6 +20,51 @@ from sklearn.metrics import (
 
 
 @dataclass(frozen=True)
+class CalibrationBin:
+    """One equal-width reliability bin of a calibration report."""
+
+    bin_index: int
+    lower: float
+    upper: float
+    count: int
+    mean_predicted: float
+    fraction_positive: float
+
+    def to_dict(self) -> dict[str, float | int]:
+        """Return a JSON-compatible bin mapping."""
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class CalibrationReport:
+    """Serializable reliability analysis for predicted probabilities."""
+
+    rows: int
+    bins: int
+    brier_score: float
+    expected_calibration_error: float
+    max_calibration_error: float
+    reliability: float
+    resolution: float
+    uncertainty: float
+    detail: tuple[CalibrationBin, ...]
+
+    def to_dict(self) -> dict[str, object]:
+        """Return a JSON-compatible report mapping."""
+        return {
+            "rows": self.rows,
+            "bins": self.bins,
+            "brier_score": self.brier_score,
+            "expected_calibration_error": self.expected_calibration_error,
+            "max_calibration_error": self.max_calibration_error,
+            "reliability": self.reliability,
+            "resolution": self.resolution,
+            "uncertainty": self.uncertainty,
+            "detail": [item.to_dict() for item in self.detail],
+        }
+
+
+@dataclass(frozen=True)
 class ClassificationMetrics:
     """Serializable binary-classification evaluation results."""
 
@@ -151,6 +196,82 @@ def evaluate_predictions(
         false_positives=int(fp),
         false_negatives=int(fn),
         true_positives=int(tp),
+    )
+
+
+def calibration_report(
+    y_true: np.ndarray,
+    probabilities: np.ndarray,
+    *,
+    bins: int = 10,
+) -> CalibrationReport:
+    """Summarize reliability with equal-width bins plus a Brier decomposition.
+
+    Reports the reliability curve (per-bin mean predicted probability against
+    observed fraud fraction), the expected and maximum calibration errors, and
+    Murphy's Brier-score decomposition (reliability, resolution, uncertainty)
+    computed on the same bins. Lower Brier score, calibration errors, and
+    reliability are better; higher resolution is better.
+    """
+    _validate_vectors(y_true, probabilities)
+    if not 2 <= bins <= 20:
+        raise ValueError("bins must be between 2 and 20")
+
+    outcomes = y_true.astype(float)
+    edges = np.linspace(0.0, 1.0, bins + 1)
+    assignments = np.clip(np.digitize(probabilities, edges[1:-1], right=False), 0, bins - 1)
+    base_rate = float(np.mean(outcomes))
+    detail: list[CalibrationBin] = []
+    gaps: list[float] = []
+    weights: list[float] = []
+    for index in range(bins):
+        mask = assignments == index
+        count = int(np.sum(mask))
+        if count == 0:
+            detail.append(
+                CalibrationBin(
+                    bin_index=index,
+                    lower=float(edges[index]),
+                    upper=float(edges[index + 1]),
+                    count=0,
+                    mean_predicted=float((edges[index] + edges[index + 1]) / 2),
+                    fraction_positive=0.0,
+                )
+            )
+            gaps.append(0.0)
+            weights.append(0.0)
+            continue
+        mean_predicted = float(np.mean(probabilities[mask]))
+        fraction_positive = float(np.mean(outcomes[mask]))
+        detail.append(
+            CalibrationBin(
+                bin_index=index,
+                lower=float(edges[index]),
+                upper=float(edges[index + 1]),
+                count=count,
+                mean_predicted=mean_predicted,
+                fraction_positive=fraction_positive,
+            )
+        )
+        gaps.append(abs(fraction_positive - mean_predicted))
+        weights.append(count / y_true.size)
+
+    weights_array = np.asarray(weights, dtype=float)
+    gaps_array = np.asarray(gaps, dtype=float)
+    fractions = np.asarray([item.fraction_positive for item in detail], dtype=float)
+    reliability = float(np.sum(weights_array * gaps_array**2))
+    resolution = float(np.sum(weights_array * (fractions - base_rate) ** 2))
+    uncertainty = float(base_rate * (1.0 - base_rate))
+    return CalibrationReport(
+        rows=int(y_true.size),
+        bins=bins,
+        brier_score=float(brier_score_loss(y_true, probabilities)),
+        expected_calibration_error=float(np.sum(weights_array * gaps_array)),
+        max_calibration_error=float(np.max(gaps_array)),
+        reliability=reliability,
+        resolution=resolution,
+        uncertainty=uncertainty,
+        detail=tuple(detail),
     )
 
 
