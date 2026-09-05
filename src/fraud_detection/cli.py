@@ -47,6 +47,121 @@ app = typer.Typer(
     pretty_exceptions_show_locals=False,
 )
 
+TestSizeOption = Annotated[
+    float, typer.Option(min=0.05, max=0.4, help="Untouched test-set fraction.")
+]
+ValidationSizeOption = Annotated[
+    float, typer.Option(min=0.05, max=0.4, help="Threshold-tuning validation fraction.")
+]
+SeedOption = Annotated[int, typer.Option(help="Random seed.")]
+RegularizationOption = Annotated[
+    float,
+    typer.Option(min=0.000001, help="Inverse regularization strength (logistic regression)."),
+]
+MaxIterationsOption = Annotated[
+    int,
+    typer.Option(min=100, help="Solver iterations (logistic regression) or trees (boosting)."),
+]
+NEstimatorsOption = Annotated[int, typer.Option(min=10, help="Number of trees (random forest).")]
+MaxDepthOption = Annotated[
+    int | None,
+    typer.Option(help="Maximum tree depth for forest/boosting models; omit for unlimited."),
+]
+LearningRateOption = Annotated[
+    float,
+    typer.Option(min=0.000001, help="Shrinkage step size (histogram gradient boosting)."),
+]
+L2RegularizationOption = Annotated[
+    float, typer.Option(min=0.0, help="L2 regularization (histogram gradient boosting).")
+]
+MaxBinsOption = Annotated[
+    int, typer.Option(min=2, help="Feature bin count (histogram gradient boosting).")
+]
+ThresholdStrategyOption = Annotated[
+    ThresholdStrategy,
+    typer.Option(help="Validation objective: maximize F1 or minimize weighted mistake cost."),
+]
+CostPolicyOption = Annotated[
+    str, typer.Option(help="Name of the business-cost policy recorded in the model card.")
+]
+FalsePositiveCostOption = Annotated[
+    float,
+    typer.Option(min=0.000001, help="Relative cost of flagging a legitimate transaction."),
+]
+FalseNegativeCostOption = Annotated[
+    float,
+    typer.Option(min=0.000001, help="Relative cost of missing a fraudulent transaction."),
+]
+CalibrationMethodOption = Annotated[
+    CalibrationMethod,
+    typer.Option(help="Probability calibration policy fitted within training data."),
+]
+CalibrationFoldsOption = Annotated[
+    int, typer.Option(min=2, max=10, help="Cross-validation folds used for calibration.")
+]
+CalibrationJobsOption = Annotated[
+    int, typer.Option(help="Calibration workers: 1 is conservative; -1 uses all processors.")
+]
+SplitStrategyOption = Annotated[
+    SplitStrategy,
+    typer.Option(help="Random stratified or chronological dataset partitioning."),
+]
+TimeColumnOption = Annotated[
+    str, typer.Option(help="Ordering feature used when --split-strategy temporal.")
+]
+
+
+def _training_config(
+    *,
+    test_size: float,
+    validation_size: float,
+    random_state: int,
+    estimator: EstimatorType,
+    max_iterations: int,
+    regularization: float,
+    n_estimators: int,
+    max_depth: int | None,
+    learning_rate: float,
+    l2_regularization: float,
+    max_bins: int,
+    threshold_strategy: ThresholdStrategy,
+    cost_policy: str,
+    false_positive_cost: float,
+    false_negative_cost: float,
+    calibration_method: CalibrationMethod,
+    calibration_folds: int,
+    calibration_jobs: int,
+    split_strategy: SplitStrategy,
+    time_column: str,
+    overrides: dict[str, Any] | None = None,
+) -> TrainingConfig:
+    """Assemble the shared training configuration for train, compare, and stability."""
+    kwargs: dict[str, Any] = {
+        "test_size": test_size,
+        "validation_size": validation_size,
+        "random_state": random_state,
+        "estimator": estimator,
+        "max_iterations": max_iterations,
+        "regularization": regularization,
+        "n_estimators": n_estimators,
+        "max_depth": max_depth,
+        "learning_rate": learning_rate,
+        "l2_regularization": l2_regularization,
+        "max_bins": max_bins,
+        "threshold_strategy": threshold_strategy,
+        "cost_policy": cost_policy,
+        "false_positive_cost": false_positive_cost,
+        "false_negative_cost": false_negative_cost,
+        "calibration_method": calibration_method,
+        "calibration_folds": calibration_folds,
+        "calibration_jobs": calibration_jobs,
+        "split_strategy": split_strategy,
+        "time_column": time_column,
+    }
+    if overrides:
+        kwargs.update(overrides)
+    return TrainingConfig(**kwargs)
+
 
 def _version_callback(show_version: bool) -> None:
     if show_version:
@@ -117,15 +232,9 @@ def train_command(
         str,
         typer.Option(help="Binary target column containing 0 and 1."),
     ] = DEFAULT_TARGET,
-    test_size: Annotated[
-        float,
-        typer.Option(min=0.05, max=0.4, help="Untouched test-set fraction."),
-    ] = 0.2,
-    validation_size: Annotated[
-        float,
-        typer.Option(min=0.05, max=0.4, help="Threshold-tuning validation fraction."),
-    ] = 0.2,
-    seed: Annotated[int, typer.Option(help="Random seed.")] = 42,
+    test_size: TestSizeOption = 0.2,
+    validation_size: ValidationSizeOption = 0.2,
+    seed: SeedOption = 42,
     estimator: Annotated[
         EstimatorType,
         typer.Option(
@@ -133,66 +242,22 @@ def train_command(
             "or an opt-in random forest or histogram gradient boosting model."
         ),
     ] = EstimatorType.LOGISTIC_REGRESSION,
-    regularization: Annotated[
-        float,
-        typer.Option(min=0.000001, help="Inverse regularization strength (logistic regression)."),
-    ] = 1.0,
-    max_iterations: Annotated[
-        int,
-        typer.Option(min=100, help="Solver iterations (logistic regression) or trees (boosting)."),
-    ] = 1_000,
-    n_estimators: Annotated[
-        int,
-        typer.Option(min=10, help="Number of trees (random forest)."),
-    ] = 100,
-    max_depth: Annotated[
-        int | None,
-        typer.Option(help="Maximum tree depth for forest/boosting models; omit for unlimited."),
-    ] = None,
-    learning_rate: Annotated[
-        float,
-        typer.Option(min=0.000001, help="Shrinkage step size (histogram gradient boosting)."),
-    ] = 0.1,
-    l2_regularization: Annotated[
-        float,
-        typer.Option(min=0.0, help="L2 regularization (histogram gradient boosting)."),
-    ] = 0.0,
-    max_bins: Annotated[
-        int,
-        typer.Option(min=2, help="Feature bin count (histogram gradient boosting)."),
-    ] = 255,
-    threshold_strategy: Annotated[
-        ThresholdStrategy,
-        typer.Option(help="Validation objective: maximize F1 or minimize weighted mistake cost."),
-    ] = ThresholdStrategy.F1,
-    false_positive_cost: Annotated[
-        float,
-        typer.Option(min=0.000001, help="Relative cost of flagging a legitimate transaction."),
-    ] = 1.0,
-    false_negative_cost: Annotated[
-        float,
-        typer.Option(min=0.000001, help="Relative cost of missing a fraudulent transaction."),
-    ] = 10.0,
-    calibration_method: Annotated[
-        CalibrationMethod,
-        typer.Option(help="Probability calibration policy fitted within training data."),
-    ] = CalibrationMethod.SIGMOID,
-    calibration_folds: Annotated[
-        int,
-        typer.Option(min=2, max=10, help="Cross-validation folds used for calibration."),
-    ] = 3,
-    calibration_jobs: Annotated[
-        int,
-        typer.Option(help="Calibration workers: 1 is conservative; -1 uses all processors."),
-    ] = 1,
-    split_strategy: Annotated[
-        SplitStrategy,
-        typer.Option(help="Random stratified or chronological dataset partitioning."),
-    ] = SplitStrategy.STRATIFIED,
-    time_column: Annotated[
-        str,
-        typer.Option(help="Ordering feature used when --split-strategy temporal."),
-    ] = "Time",
+    regularization: RegularizationOption = 1.0,
+    max_iterations: MaxIterationsOption = 1_000,
+    n_estimators: NEstimatorsOption = 100,
+    max_depth: MaxDepthOption = None,
+    learning_rate: LearningRateOption = 0.1,
+    l2_regularization: L2RegularizationOption = 0.0,
+    max_bins: MaxBinsOption = 255,
+    threshold_strategy: ThresholdStrategyOption = ThresholdStrategy.F1,
+    cost_policy: CostPolicyOption = "default",
+    false_positive_cost: FalsePositiveCostOption = 1.0,
+    false_negative_cost: FalseNegativeCostOption = 10.0,
+    calibration_method: CalibrationMethodOption = CalibrationMethod.SIGMOID,
+    calibration_folds: CalibrationFoldsOption = 3,
+    calibration_jobs: CalibrationJobsOption = 1,
+    split_strategy: SplitStrategyOption = SplitStrategy.STRATIFIED,
+    time_column: TimeColumnOption = "Time",
     overwrite: Annotated[
         bool,
         typer.Option(help="Replace an existing model artifact."),
@@ -207,7 +272,7 @@ def train_command(
 
     try:
         dataset = load_csv(data, target_column=target)
-        config = TrainingConfig(
+        config = _training_config(
             test_size=test_size,
             validation_size=validation_size,
             random_state=seed,
@@ -220,6 +285,7 @@ def train_command(
             l2_regularization=l2_regularization,
             max_bins=max_bins,
             threshold_strategy=threshold_strategy,
+            cost_policy=cost_policy,
             false_positive_cost=false_positive_cost,
             false_negative_cost=false_negative_cost,
             calibration_method=calibration_method,
@@ -257,15 +323,9 @@ def compare_command(
         str,
         typer.Option(help="Binary target column containing 0 and 1."),
     ] = DEFAULT_TARGET,
-    test_size: Annotated[
-        float,
-        typer.Option(min=0.05, max=0.4, help="Untouched test-set fraction."),
-    ] = 0.2,
-    validation_size: Annotated[
-        float,
-        typer.Option(min=0.05, max=0.4, help="Threshold-tuning validation fraction."),
-    ] = 0.2,
-    seed: Annotated[int, typer.Option(help="Random seed.")] = 42,
+    test_size: TestSizeOption = 0.2,
+    validation_size: ValidationSizeOption = 0.2,
+    seed: SeedOption = 42,
     estimators: Annotated[
         list[EstimatorType] | None,
         typer.Option(
@@ -274,66 +334,22 @@ def compare_command(
             "Defaults to comparing every supported estimator.",
         ),
     ] = None,
-    regularization: Annotated[
-        float,
-        typer.Option(min=0.000001, help="Inverse regularization strength (logistic regression)."),
-    ] = 1.0,
-    max_iterations: Annotated[
-        int,
-        typer.Option(min=100, help="Solver iterations (logistic regression) or trees (boosting)."),
-    ] = 1_000,
-    n_estimators: Annotated[
-        int,
-        typer.Option(min=10, help="Number of trees (random forest)."),
-    ] = 100,
-    max_depth: Annotated[
-        int | None,
-        typer.Option(help="Maximum tree depth for forest/boosting models; omit for unlimited."),
-    ] = None,
-    learning_rate: Annotated[
-        float,
-        typer.Option(min=0.000001, help="Shrinkage step size (histogram gradient boosting)."),
-    ] = 0.1,
-    l2_regularization: Annotated[
-        float,
-        typer.Option(min=0.0, help="L2 regularization (histogram gradient boosting)."),
-    ] = 0.0,
-    max_bins: Annotated[
-        int,
-        typer.Option(min=2, help="Feature bin count (histogram gradient boosting)."),
-    ] = 255,
-    threshold_strategy: Annotated[
-        ThresholdStrategy,
-        typer.Option(help="Validation objective: maximize F1 or minimize weighted mistake cost."),
-    ] = ThresholdStrategy.F1,
-    false_positive_cost: Annotated[
-        float,
-        typer.Option(min=0.000001, help="Relative cost of flagging a legitimate transaction."),
-    ] = 1.0,
-    false_negative_cost: Annotated[
-        float,
-        typer.Option(min=0.000001, help="Relative cost of missing a fraudulent transaction."),
-    ] = 10.0,
-    calibration_method: Annotated[
-        CalibrationMethod,
-        typer.Option(help="Probability calibration policy fitted within training data."),
-    ] = CalibrationMethod.SIGMOID,
-    calibration_folds: Annotated[
-        int,
-        typer.Option(min=2, max=10, help="Cross-validation folds used for calibration."),
-    ] = 3,
-    calibration_jobs: Annotated[
-        int,
-        typer.Option(help="Calibration workers: 1 is conservative; -1 uses all processors."),
-    ] = 1,
-    split_strategy: Annotated[
-        SplitStrategy,
-        typer.Option(help="Random stratified or chronological dataset partitioning."),
-    ] = SplitStrategy.STRATIFIED,
-    time_column: Annotated[
-        str,
-        typer.Option(help="Ordering feature used when --split-strategy temporal."),
-    ] = "Time",
+    regularization: RegularizationOption = 1.0,
+    max_iterations: MaxIterationsOption = 1_000,
+    n_estimators: NEstimatorsOption = 100,
+    max_depth: MaxDepthOption = None,
+    learning_rate: LearningRateOption = 0.1,
+    l2_regularization: L2RegularizationOption = 0.0,
+    max_bins: MaxBinsOption = 255,
+    threshold_strategy: ThresholdStrategyOption = ThresholdStrategy.F1,
+    cost_policy: CostPolicyOption = "default",
+    false_positive_cost: FalsePositiveCostOption = 1.0,
+    false_negative_cost: FalseNegativeCostOption = 10.0,
+    calibration_method: CalibrationMethodOption = CalibrationMethod.SIGMOID,
+    calibration_folds: CalibrationFoldsOption = 3,
+    calibration_jobs: CalibrationJobsOption = 1,
+    split_strategy: SplitStrategyOption = SplitStrategy.STRATIFIED,
+    time_column: TimeColumnOption = "Time",
     param_name: Annotated[
         str | None,
         typer.Option(
@@ -426,29 +442,29 @@ def compare_command(
                     _abort(f"Invalid value {value_str!r} for hyperparameter {param_name!r}: {exc}")
 
                 # Build config with the hyperparameter value
-                config_kwargs: dict[str, Any] = {
-                    "test_size": test_size,
-                    "validation_size": validation_size,
-                    "random_state": seed,
-                    "estimator": candidate,
-                    "max_iterations": max_iterations,
-                    "regularization": regularization,
-                    "n_estimators": n_estimators,
-                    "max_depth": max_depth,
-                    "learning_rate": learning_rate,
-                    "l2_regularization": l2_regularization,
-                    "max_bins": max_bins,
-                    "threshold_strategy": threshold_strategy,
-                    "false_positive_cost": false_positive_cost,
-                    "false_negative_cost": false_negative_cost,
-                    "calibration_method": calibration_method,
-                    "calibration_folds": calibration_folds,
-                    "calibration_jobs": calibration_jobs,
-                    "split_strategy": split_strategy,
-                    "time_column": time_column,
-                }
-                config_kwargs[param_name] = value
-                config = TrainingConfig(**config_kwargs)
+                config = _training_config(
+                    test_size=test_size,
+                    validation_size=validation_size,
+                    random_state=seed,
+                    estimator=candidate,
+                    max_iterations=max_iterations,
+                    regularization=regularization,
+                    n_estimators=n_estimators,
+                    max_depth=max_depth,
+                    learning_rate=learning_rate,
+                    l2_regularization=l2_regularization,
+                    max_bins=max_bins,
+                    threshold_strategy=threshold_strategy,
+                    cost_policy=cost_policy,
+                    false_positive_cost=false_positive_cost,
+                    false_negative_cost=false_negative_cost,
+                    calibration_method=calibration_method,
+                    calibration_folds=calibration_folds,
+                    calibration_jobs=calibration_jobs,
+                    split_strategy=split_strategy,
+                    time_column=time_column,
+                    overrides={param_name: value},
+                )
 
                 model = train_model(dataset, config=config)
                 results.append(
@@ -463,7 +479,7 @@ def compare_command(
         else:
             # Estimator comparison mode
             for candidate in chosen_estimators:
-                config = TrainingConfig(
+                config = _training_config(
                     test_size=test_size,
                     validation_size=validation_size,
                     random_state=seed,
@@ -476,6 +492,7 @@ def compare_command(
                     l2_regularization=l2_regularization,
                     max_bins=max_bins,
                     threshold_strategy=threshold_strategy,
+                    cost_policy=cost_policy,
                     false_positive_cost=false_positive_cost,
                     false_negative_cost=false_negative_cost,
                     calibration_method=calibration_method,
@@ -520,14 +537,8 @@ def stability_command(
         str,
         typer.Option(help="Binary target column containing 0 and 1."),
     ] = DEFAULT_TARGET,
-    test_size: Annotated[
-        float,
-        typer.Option(min=0.05, max=0.4, help="Untouched test-set fraction."),
-    ] = 0.2,
-    validation_size: Annotated[
-        float,
-        typer.Option(min=0.05, max=0.4, help="Threshold-tuning validation fraction."),
-    ] = 0.2,
+    test_size: TestSizeOption = 0.2,
+    validation_size: ValidationSizeOption = 0.2,
     seed: Annotated[int, typer.Option(help="Base random seed; repeat N uses seed+N.")] = 42,
     repeats: Annotated[
         int,
@@ -541,58 +552,20 @@ def stability_command(
             "Defaults to assessing every supported estimator.",
         ),
     ] = None,
-    regularization: Annotated[
-        float,
-        typer.Option(min=0.000001, help="Inverse regularization strength (logistic regression)."),
-    ] = 1.0,
-    max_iterations: Annotated[
-        int,
-        typer.Option(min=100, help="Solver iterations (logistic regression) or trees (boosting)."),
-    ] = 1_000,
-    n_estimators: Annotated[
-        int,
-        typer.Option(min=10, help="Number of trees (random forest)."),
-    ] = 100,
-    max_depth: Annotated[
-        int | None,
-        typer.Option(help="Maximum tree depth for forest/boosting models; omit for unlimited."),
-    ] = None,
-    learning_rate: Annotated[
-        float,
-        typer.Option(min=0.000001, help="Shrinkage step size (histogram gradient boosting)."),
-    ] = 0.1,
-    l2_regularization: Annotated[
-        float,
-        typer.Option(min=0.0, help="L2 regularization (histogram gradient boosting)."),
-    ] = 0.0,
-    max_bins: Annotated[
-        int,
-        typer.Option(min=2, help="Feature bin count (histogram gradient boosting)."),
-    ] = 255,
-    threshold_strategy: Annotated[
-        ThresholdStrategy,
-        typer.Option(help="Validation objective: maximize F1 or minimize weighted mistake cost."),
-    ] = ThresholdStrategy.F1,
-    false_positive_cost: Annotated[
-        float,
-        typer.Option(min=0.000001, help="Relative cost of flagging a legitimate transaction."),
-    ] = 1.0,
-    false_negative_cost: Annotated[
-        float,
-        typer.Option(min=0.000001, help="Relative cost of missing a fraudulent transaction."),
-    ] = 10.0,
-    calibration_method: Annotated[
-        CalibrationMethod,
-        typer.Option(help="Probability calibration policy fitted within training data."),
-    ] = CalibrationMethod.SIGMOID,
-    calibration_folds: Annotated[
-        int,
-        typer.Option(min=2, max=10, help="Cross-validation folds used for calibration."),
-    ] = 3,
-    calibration_jobs: Annotated[
-        int,
-        typer.Option(help="Calibration workers: 1 is conservative; -1 uses all processors."),
-    ] = 1,
+    regularization: RegularizationOption = 1.0,
+    max_iterations: MaxIterationsOption = 1_000,
+    n_estimators: NEstimatorsOption = 100,
+    max_depth: MaxDepthOption = None,
+    learning_rate: LearningRateOption = 0.1,
+    l2_regularization: L2RegularizationOption = 0.0,
+    max_bins: MaxBinsOption = 255,
+    threshold_strategy: ThresholdStrategyOption = ThresholdStrategy.F1,
+    cost_policy: CostPolicyOption = "default",
+    false_positive_cost: FalsePositiveCostOption = 1.0,
+    false_negative_cost: FalseNegativeCostOption = 10.0,
+    calibration_method: CalibrationMethodOption = CalibrationMethod.SIGMOID,
+    calibration_folds: CalibrationFoldsOption = 3,
+    calibration_jobs: CalibrationJobsOption = 1,
 ) -> None:
     """Repeat training with successive seeds and report test-metric stability.
 
@@ -610,7 +583,7 @@ def stability_command(
             runs = []
             estimator_label = ""
             for offset in range(repeats):
-                config = TrainingConfig(
+                config = _training_config(
                     test_size=test_size,
                     validation_size=validation_size,
                     random_state=seed + offset,
@@ -623,6 +596,7 @@ def stability_command(
                     l2_regularization=l2_regularization,
                     max_bins=max_bins,
                     threshold_strategy=threshold_strategy,
+                    cost_policy=cost_policy,
                     false_positive_cost=false_positive_cost,
                     false_negative_cost=false_negative_cost,
                     calibration_method=calibration_method,
@@ -1058,7 +1032,9 @@ def thresholds_command(
         dataset = load_csv(data, target_column=target)
         probabilities = model.predict_probabilities(dataset.features)
         candidates = _parse_thresholds(thresholds)
-        fp_cost, fn_cost = _resolve_report_costs(model, false_positive_cost, false_negative_cost)
+        policy_name, fp_cost, fn_cost = _resolve_report_costs(
+            model, false_positive_cost, false_negative_cost
+        )
         y_true = dataset.target.to_numpy()
         tradeoff = summarize_thresholds(
             y_true,
@@ -1090,6 +1066,11 @@ def thresholds_command(
             {
                 "model_version": str(model.metadata["dataset_fingerprint"])[:12],
                 "model_threshold": model.threshold,
+                "cost_policy": {
+                    "name": policy_name,
+                    "false_positive_cost": fp_cost,
+                    "false_negative_cost": fn_cost,
+                },
                 "false_positive_cost": fp_cost,
                 "false_negative_cost": fn_cost,
                 "model_threshold_metrics": tuned_row,
@@ -1124,26 +1105,41 @@ def _resolve_report_costs(
     model: object,
     false_positive_cost: float | None,
     false_negative_cost: float | None,
-) -> tuple[float, float]:
-    training_config = getattr(model, "metadata", {}).get("training_config", {})
+) -> tuple[str, float, float]:
+    """Resolve the effective named cost policy for a report.
+
+    Without overrides the model's persisted policy applies; any override
+    produces a policy named "custom" so ad-hoc weights are never confused
+    with a recorded business-cost definition.
+    """
+    metadata = getattr(model, "metadata", {})
+    if not isinstance(metadata, dict):
+        raise ValueError("Model artifact metadata is invalid.")
+    policy = metadata.get("cost_policy", {})
+    if policy is None:
+        policy = {}
+    if not isinstance(policy, dict):
+        raise ValueError("Model artifact cost_policy is invalid.")
+    training_config = metadata.get("training_config", {})
     if training_config is None:
         training_config = {}
     if not isinstance(training_config, dict):
         raise ValueError("Model artifact training_config is invalid.")
+    policy_name = policy.get("name", "default")
+    if not isinstance(policy_name, str) or not policy_name.strip():
+        raise ValueError("Model artifact cost_policy name is invalid.")
+    base_fp = policy.get("false_positive_cost", training_config.get("false_positive_cost", 1.0))
+    base_fn = policy.get("false_negative_cost", training_config.get("false_negative_cost", 10.0))
+    raw_fp: Any = base_fp if false_positive_cost is None else false_positive_cost
+    raw_fn: Any = base_fn if false_negative_cost is None else false_negative_cost
     try:
-        fp_cost = float(
-            false_positive_cost
-            if false_positive_cost is not None
-            else training_config.get("false_positive_cost", 1.0)
-        )
-        fn_cost = float(
-            false_negative_cost
-            if false_negative_cost is not None
-            else training_config.get("false_negative_cost", 10.0)
-        )
+        fp_cost = float(raw_fp)
+        fn_cost = float(raw_fn)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"Invalid classification costs: {exc}") from exc
-    return (fp_cost, fn_cost)
+    if false_positive_cost is None and false_negative_cost is None:
+        return (policy_name, fp_cost, fn_cost)
+    return ("custom", fp_cost, fn_cost)
 
 
 @app.command("serve")
