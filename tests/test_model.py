@@ -461,6 +461,8 @@ def test_load_model_rejects_nonstandard_metadata_json(
         {"calibration_jobs": -2},
         {"split_strategy": "unknown"},
         {"time_column": " "},
+        {"cost_policy": ""},
+        {"cost_policy": "  "},
         {"n_estimators": 5},
         {"max_depth": 0},
         {"learning_rate": 0},

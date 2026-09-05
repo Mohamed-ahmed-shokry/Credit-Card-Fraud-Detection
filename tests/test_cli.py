@@ -895,6 +895,11 @@ def test_thresholds_reports_tradeoffs(tmp_path: Path, trained_artifact: Path) ->
     assert body["model_threshold_metrics"]["threshold"] == body["model_threshold"]
     assert body["false_positive_cost"] == 1.0
     assert body["false_negative_cost"] == 10.0
+    assert body["cost_policy"] == {
+        "name": "default",
+        "false_positive_cost": 1.0,
+        "false_negative_cost": 10.0,
+    }
     assert json.loads(report_path.read_text(encoding="utf-8")) == body
 
 
@@ -926,6 +931,40 @@ def test_thresholds_supports_custom_candidates_and_costs(
     assert [row["threshold"] for row in body["detail"]] == [0.2, 0.8]
     assert body["false_positive_cost"] == 2.0
     assert body["false_negative_cost"] == 5.0
+    assert body["cost_policy"]["name"] == "custom"
+
+
+def test_train_records_named_cost_policy(tmp_path: Path) -> None:
+    data_path = tmp_path / "transactions.csv"
+    artifact_path = tmp_path / "artifact"
+    generate_synthetic_data(rows=600, fraud_rate=0.1, random_state=61).to_csv(
+        data_path, index=False
+    )
+
+    trained = runner.invoke(
+        app,
+        [
+            "train",
+            str(data_path),
+            "--output",
+            str(artifact_path),
+            "--cost-policy",
+            "strict-recall",
+            "--false-negative-cost",
+            "25",
+            "--calibration-method",
+            "none",
+        ],
+    )
+
+    assert trained.exit_code == 0, trained.output
+    metadata = json.loads((artifact_path / "metadata.json").read_text(encoding="utf-8"))
+    assert metadata["training_config"]["cost_policy"] == "strict-recall"
+    assert metadata["cost_policy"] == {
+        "name": "strict-recall",
+        "false_positive_cost": 1.0,
+        "false_negative_cost": 25.0,
+    }
 
 
 @pytest.mark.parametrize(
@@ -996,7 +1035,40 @@ class _StubModel:
 def test_resolve_report_costs_prefers_overrides() -> None:
     model = _StubModel({"training_config": {"false_positive_cost": 3.0}})
 
-    assert _resolve_report_costs(model, 2.0, None) == (2.0, 10.0)
+    assert _resolve_report_costs(model, 2.0, None) == ("custom", 2.0, 10.0)
+
+
+def test_resolve_report_costs_reads_named_policy() -> None:
+    model = _StubModel(
+        {
+            "cost_policy": {
+                "name": "strict-recall",
+                "false_positive_cost": 1,
+                "false_negative_cost": 25,
+            }
+        }
+    )
+
+    assert _resolve_report_costs(model, None, None) == ("strict-recall", 1.0, 25.0)
+
+
+def test_resolve_report_costs_falls_back_to_training_config() -> None:
+    model = _StubModel({"training_config": {"false_positive_cost": 2, "false_negative_cost": 7}})
+
+    assert _resolve_report_costs(model, None, None) == ("default", 2.0, 7.0)
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"cost_policy": "oops"},
+        {"cost_policy": {"name": " ", "false_positive_cost": 1}},
+        "oops",
+    ],
+)
+def test_resolve_report_costs_rejects_malformed_policy(metadata: object) -> None:
+    with pytest.raises(ValueError, match="artifact"):
+        _resolve_report_costs(_StubModel(metadata), None, None)
 
 
 def test_resolve_report_costs_rejects_malformed_training_config() -> None:
