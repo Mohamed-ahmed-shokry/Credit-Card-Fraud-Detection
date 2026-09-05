@@ -99,6 +99,7 @@ class TrainingConfig:
     max_iterations: int = 1_000
     regularization: float = 1.0
     threshold_strategy: ThresholdStrategy = ThresholdStrategy.F1
+    cost_policy: str = "default"
     false_positive_cost: float = 1.0
     false_negative_cost: float = 10.0
     calibration_method: CalibrationMethod = CalibrationMethod.SIGMOID
@@ -132,6 +133,8 @@ class TrainingConfig:
             raise ValueError("regularization must be positive")
         if not isinstance(self.threshold_strategy, ThresholdStrategy):
             raise ValueError("threshold_strategy must be 'f1' or 'cost'")
+        if not isinstance(self.cost_policy, str) or not self.cost_policy.strip():
+            raise ValueError("cost_policy must be a non-empty name")
         if (
             not np.isfinite(self.false_positive_cost)
             or not np.isfinite(self.false_negative_cost)
@@ -440,6 +443,11 @@ def train_model(
             settings,
         ),
         "training_config": asdict(settings),
+        "cost_policy": {
+            "name": settings.cost_policy,
+            "false_positive_cost": settings.false_positive_cost,
+            "false_negative_cost": settings.false_negative_cost,
+        },
         "reference_profile": build_reference_profile(features_train),
         "drift_thresholds": default_thresholds(),
         "feature_effects": feature_effects,
