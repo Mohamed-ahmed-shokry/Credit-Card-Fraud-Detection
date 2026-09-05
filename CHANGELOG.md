@@ -8,6 +8,12 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- A `predict --threshold` override (CLI) and `threshold` request field (API)
+  for audit/backtest scoring, always recorded next to the tuned
+  `model_threshold` so overridden decisions are never confused with it.
+- Named business-cost policies: `train`/`compare`/`stability` accept
+  `--cost-policy`, persisted as a `cost_policy` block in the model card and
+  echoed by the `thresholds` report (`"custom"` when overridden ad hoc).
 - An opt-in `--estimator hist_gradient_boosting` training option alongside
   logistic regression and random forest, sharing the same leakage-safe split,
   calibration, and threshold-selection pipeline. Its global effects use

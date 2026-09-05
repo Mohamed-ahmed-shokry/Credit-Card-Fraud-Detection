@@ -129,15 +129,28 @@ mission:
   serving artifact plus the two most recent predecessors so `compare`,
   `stability`, and `drift` stay reproducible.
 
-## Phase 7 — Decision-policy flexibility (next)
+## Phase 7 — Decision-policy flexibility
 
-- **Predict-time threshold override** (`Proposed`) — an opt-in `--threshold`
+- **Predict-time threshold override** (`Done`) — an opt-in `--threshold`
   flag on `predict` (and matching API field) for audit and backtest scenarios,
-  recorded in the output so overridden decisions are never confused with the
-  tuned operating point.
-- **Cost-policy presets** (`Proposed`) — named, versioned cost policies in the
-  model card so `thresholds` and retraining runs can reference one shared
-  business-cost definition instead of repeating raw weights.
+  recorded next to the tuned `model_threshold` in the CLI summary and API
+  response so the two are never confused.
+- **Cost-policy presets** (`Done`) — a named cost policy (`--cost-policy`)
+  recorded as a `cost_policy` block in the model card, so `train`, `compare`,
+  `stability`, and `thresholds` can reference one shared business-cost
+  definition instead of repeating raw weights. Ad-hoc overrides are labeled
+  `"custom"` in reports.
+
+## Phase 8 — Operations runbook and temporal rigor (next)
+
+- **Retraining runbook** (`Proposed`) — document cadence triggers (drift
+  status, calibration degradation, data volume), the promotion checklist
+  (`compare` → `stability` → `calibration` → `thresholds`), and rollback to
+  retained artifacts.
+- **Rolling-origin temporal evaluation** (`Proposed`) — extend chronological
+  evaluation from a single past/validation/test cut to multiple rolling
+  origins, reporting metric spread across origins the way `stability` does
+  for random splits.
 
 ## Contributing to the roadmap
 
