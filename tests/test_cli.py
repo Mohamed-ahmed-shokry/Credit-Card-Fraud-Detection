@@ -1052,6 +1052,12 @@ def test_resolve_report_costs_reads_named_policy() -> None:
     assert _resolve_report_costs(model, None, None) == ("strict-recall", 1.0, 25.0)
 
 
+def test_resolve_report_costs_tolerates_null_metadata_blocks() -> None:
+    model = _StubModel({"cost_policy": None, "training_config": None})
+
+    assert _resolve_report_costs(model, None, None) == ("default", 1.0, 10.0)
+
+
 def test_resolve_report_costs_falls_back_to_training_config() -> None:
     model = _StubModel({"training_config": {"false_positive_cost": 2, "false_negative_cost": 7}})
 
