@@ -110,6 +110,23 @@ curl -X POST http://localhost:8000/v1/predict \
   }'
 ```
 
+## Override the decision threshold for audits
+
+For audit and backtest scoring, both the CLI and the API accept an explicit
+threshold instead of the model's tuned one. The override is always recorded
+next to the tuned value so the two are never confused:
+
+```bash
+fraud-detect predict artifacts/model data/demo.csv \
+  --output predictions.csv \
+  --threshold 0.5
+```
+
+The summary reports the applied `threshold`, the tuned `model_threshold`, and
+whether `threshold_overridden` is true. Via the API, include `"threshold": 0.5`
+in the request body; the response carries the applied `threshold` plus the
+unchanged `model_threshold`.
+
 ## Train on the anonymized dataset
 
 Place the downloaded CSV under the ignored `Dataset/` directory; raw financial data
@@ -214,6 +231,23 @@ fraud-detect train Dataset/creditcard.csv \
 The costs are relative weights, not currency. For example, `25` says a missed fraud
 is treated as costly as 25 false alerts. The chosen policy and holdout expected cost
 per transaction are persisted in `metadata.json`.
+
+Give the policy a name so retraining runs and reports can reference one shared
+business-cost definition instead of repeating raw weights:
+
+```bash
+fraud-detect train Dataset/creditcard.csv \
+  --output artifacts/model \
+  --threshold-strategy cost \
+  --cost-policy strict-recall \
+  --false-positive-cost 1 \
+  --false-negative-cost 25
+```
+
+The model card records the policy as `cost_policy` (name plus both weights).
+The `thresholds` report echoes the effective policy — the recorded one by
+default, or `"custom"` when `--false-positive-cost`/`--false-negative-cost`
+override it ad hoc.
 
 Before accepting the tuned operating point, compare candidates side by side on
 held-out labeled data (never the threshold-tuning validation split):
@@ -364,6 +398,7 @@ Example response:
 {
   "model_version": "71dcb1da2d78",
   "threshold": 0.73,
+  "model_threshold": 0.73,
   "predictions": [
     {
       "fraud_probability": 0.18,
@@ -372,6 +407,10 @@ Example response:
   ]
 }
 ```
+
+`threshold` is the operating point actually applied; `model_threshold` is the
+tuned value from training. They differ only when the request overrides the
+threshold explicitly (see audit scoring above).
 
 To receive per-transaction feature contributions, include `"explain": true`:
 
@@ -390,6 +429,7 @@ Response with explanations:
 {
   "model_version": "71dcb1da2d78",
   "threshold": 0.73,
+  "model_threshold": 0.73,
   "predictions": [
     {
       "fraud_probability": 0.18,
