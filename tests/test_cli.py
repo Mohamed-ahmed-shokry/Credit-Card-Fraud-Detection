@@ -1155,6 +1155,57 @@ def test_predict_reports_schema_error(tmp_path: Path) -> None:
     assert "Input schema does not match" in result.stderr
 
 
+def test_predict_supports_threshold_override(tmp_path: Path, trained_artifact: Path) -> None:
+    data_path = tmp_path / "transactions.csv"
+    generate_synthetic_data(rows=200, fraud_rate=0.1, random_state=51).to_csv(
+        data_path, index=False
+    )
+
+    baseline = runner.invoke(
+        app,
+        ["predict", str(trained_artifact), str(data_path), "--output", str(tmp_path / "b.csv")],
+    )
+    assert baseline.exit_code == 0, baseline.output
+    baseline_summary = json.loads(baseline.stdout)
+    assert baseline_summary["threshold_overridden"] is False
+    assert baseline_summary["threshold"] == baseline_summary["model_threshold"]
+
+    overridden = runner.invoke(
+        app,
+        [
+            "predict",
+            str(trained_artifact),
+            str(data_path),
+            "--output",
+            str(tmp_path / "o.csv"),
+            "--threshold",
+            "0.0",
+        ],
+    )
+    assert overridden.exit_code == 0, overridden.output
+    override_summary = json.loads(overridden.stdout)
+    assert override_summary["threshold"] == 0.0
+    assert override_summary["model_threshold"] == baseline_summary["model_threshold"]
+    assert override_summary["threshold_overridden"] is True
+    assert override_summary["flagged"] == override_summary["rows"]
+    assert override_summary["flagged"] >= baseline_summary["flagged"]
+
+
+def test_predict_rejects_invalid_threshold_override(tmp_path: Path) -> None:
+    model_path = tmp_path / "model.joblib"
+    data_path = tmp_path / "transactions.csv"
+    model_path.write_bytes(b"placeholder")
+    data_path.write_text("x\n1\n", encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        ["predict", str(model_path), str(data_path), "--threshold", "1.5"],
+    )
+
+    assert result.exit_code == 2
+    assert "between 0 and 1" in result.stderr
+
+
 def test_predict_supports_local_explanation(tmp_path: Path) -> None:
     data_path = tmp_path / "transactions.csv"
     artifact_path = tmp_path / "artifact"

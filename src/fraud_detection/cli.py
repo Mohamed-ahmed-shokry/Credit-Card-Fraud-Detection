@@ -685,18 +685,28 @@ def predict_command(
         bool,
         typer.Option(help="Include per-transaction feature contributions in the output."),
     ] = False,
+    threshold: Annotated[
+        float | None,
+        typer.Option(
+            help="Override the model's tuned threshold for audit/backtest scoring. "
+            "Both thresholds are reported in the summary."
+        ),
+    ] = None,
     overwrite: Annotated[bool, typer.Option(help="Replace an existing output file.")] = False,
 ) -> None:
     """Batch-score transactions and write probabilities plus binary decisions."""
     if output.exists() and not overwrite:
         _abort(f"Output already exists: {output}. Pass --overwrite to replace it.")
+    if threshold is not None and (isinstance(threshold, bool) or not 0.0 <= threshold <= 1.0):
+        _abort(f"Invalid threshold {threshold!r}: must fall between 0 and 1.")
 
     try:
         model = load_model(model_path)
         frame = pd.read_csv(data)
         features = frame.drop(columns=target, errors="ignore")
         probabilities = model.predict_probabilities(features)
-        predictions = (probabilities >= model.threshold).astype("int8")
+        applied_threshold = model.threshold if threshold is None else threshold
+        predictions = (probabilities >= applied_threshold).astype("int8")
         scored = frame.copy()
         scored["fraud_probability"] = probabilities
         scored["is_fraud"] = predictions
@@ -720,6 +730,9 @@ def predict_command(
                 "output": str(output),
                 "rows": len(scored),
                 "flagged": int(predictions.sum()),
+                "threshold": applied_threshold,
+                "model_threshold": model.threshold,
+                "threshold_overridden": threshold is not None,
             }
         )
     )
