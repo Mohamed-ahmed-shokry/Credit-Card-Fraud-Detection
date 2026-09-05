@@ -73,6 +73,51 @@ def test_predict_scores_ordered_batch(
     assert all(isinstance(item["is_fraud"], bool) for item in body["predictions"])
 
 
+def test_predict_defaults_to_tuned_threshold(
+    client: TestClient,
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, model, dataset = api_context
+    records = dataset.features.iloc[:3].to_dict(orient="records")
+
+    response = client.post("/v1/predict", json={"transactions": records})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["threshold"] == model.threshold
+    assert body["model_threshold"] == model.threshold
+
+
+def test_predict_supports_threshold_override(
+    client: TestClient,
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, model, dataset = api_context
+    records = dataset.features.iloc[:3].to_dict(orient="records")
+
+    response = client.post("/v1/predict", json={"transactions": records, "threshold": 0.0})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["threshold"] == 0.0
+    assert body["model_threshold"] == model.threshold
+    assert all(item["is_fraud"] for item in body["predictions"])
+
+
+@pytest.mark.parametrize("threshold", [-0.1, 1.5, "high"])
+def test_predict_rejects_invalid_threshold_override(
+    client: TestClient,
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+    threshold: object,
+) -> None:
+    _, _, dataset = api_context
+    records = dataset.features.iloc[:1].to_dict(orient="records")
+
+    response = client.post("/v1/predict", json={"transactions": records, "threshold": threshold})
+
+    assert response.status_code == 422
+
+
 def test_predict_returns_actionable_schema_error(client: TestClient) -> None:
     response = client.post("/v1/predict", json={"transactions": [{"wrong": 1.0}]})
 

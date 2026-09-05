@@ -89,6 +89,7 @@ class PredictionRequest(BaseModel):
         Field(min_length=1, max_length=1_000),
     ]
     explain: bool = False
+    threshold: float | None = Field(default=None, ge=0.0, le=1.0)
 
 
 class PredictionResult(BaseModel):
@@ -104,6 +105,7 @@ class PredictionResponse(BaseModel):
 
     model_version: str
     threshold: float
+    model_threshold: float
     predictions: list[PredictionResult]
 
 
@@ -326,7 +328,8 @@ def create_app(
         loaded = _model_from_request(request)
         frame = pd.DataFrame(payload.transactions)
         probabilities = loaded.predict_probabilities(frame)
-        decisions = probabilities >= loaded.threshold
+        applied_threshold = loaded.threshold if payload.threshold is None else payload.threshold
+        decisions = probabilities >= applied_threshold
         results = []
         if payload.explain:
             explanations = loaded.explain_local(frame)
@@ -349,7 +352,8 @@ def create_app(
         prediction_counter.labels(is_fraud="false").inc(int((~decisions).sum()))
         return PredictionResponse(
             model_version=str(loaded.metadata["dataset_fingerprint"])[:12],
-            threshold=loaded.threshold,
+            threshold=applied_threshold,
+            model_threshold=loaded.threshold,
             predictions=results,
         )
 
