@@ -141,16 +141,26 @@ mission:
   definition instead of repeating raw weights. Ad-hoc overrides are labeled
   `"custom"` in reports.
 
-## Phase 8 — Operations runbook and temporal rigor (next)
+## Phase 8 — Operations runbook and temporal rigor
 
-- **Retraining runbook** (`Proposed`) — document cadence triggers (drift
-  status, calibration degradation, data volume), the promotion checklist
-  (`compare` → `stability` → `calibration` → `thresholds`), and rollback to
+- **Retraining runbook** (`Done`) — documented in the README: drift and
+  calibration triggers, the promotion checklist (`compare` → `stability` or
+  `rolling` → `calibration` → `thresholds` → `benchmark`), and rollback to
   retained artifacts.
-- **Rolling-origin temporal evaluation** (`Proposed`) — extend chronological
-  evaluation from a single past/validation/test cut to multiple rolling
-  origins, reporting metric spread across origins the way `stability` does
-  for random splits.
+- **Rolling-origin temporal evaluation** (`Done`) — a `rolling` command that
+  trains, tunes, and tests on expanding chronological prefixes, reporting
+  metric spread across origins the way `stability` does for random splits.
+
+## Phase 9 — Promotion evidence and surveillance (next)
+
+- **Promotion bundle** (`Proposed`) — one command assembling the
+  `compare`/`stability` (or `rolling`), `calibration`, `thresholds`, and
+  `drift` reports for a challenger model into a single reviewable JSON
+  document, matching the runbook's promotion checklist.
+- **Drift surveillance exit codes** (`Proposed`) — an opt-in `drift` flag
+  (e.g. `--fail-on drifted`) returning a non-zero exit status when the
+  overall status reaches the cutoff, for cron and scheduled-job alerting
+  without parsing JSON.
 
 ## Contributing to the roadmap
 

@@ -38,6 +38,15 @@ All notable changes to this project are documented here. The format follows
   replacement for a real gateway.
 - A TestPyPI dry-run publishing workflow on every push to `main`, so
   packaging regressions surface before a real release.
+- A `rolling` CLI command evaluating expanding chronological prefixes and
+  reporting test-metric spread across origins, for ordered data where
+  `stability` does not apply.
+- A retraining runbook in the README: drift/calibration triggers, a promotion
+  checklist (`compare` → `stability`/`rolling` → `calibration` →
+  `thresholds` → `benchmark`), and rollback to retained artifacts.
+- Shared output-guard/report-emit helpers across the `drift`, `calibration`,
+  `thresholds`, and `benchmark` commands, removing four copies of the
+  protect-write-print sequence.
 - A `thresholds` CLI command scoring candidate thresholds on held-out labeled
   data, reporting precision, recall, F1, and expected cost per candidate next
   to the model's tuned operating point (costs default to the training policy).
