@@ -570,6 +570,49 @@ The report gives median latency and throughput per batch size. It measures this
 host only; production throughput also depends on the serving stack,
 concurrency, and hardware.
 
+## Evaluate rolling time prefixes
+
+When transactions carry order, check how holdout quality evolves as history
+grows. `rolling` trains, tunes, and tests on expanding chronological prefixes
+and reports metric spread across origins, without saving anything:
+
+```bash
+fraud-detect rolling Dataset/creditcard.csv \
+  --estimator logistic_regression \
+  --origins 3
+```
+
+Later origins strictly extend earlier ones. Degrading recent origins suggest
+the fraud pattern is shifting and the model should be retrained on newer data
+rather than trusted on age alone.
+
+## Retraining runbook
+
+Retrain when any of these fire:
+
+- `drift` reports `drifted` overall status on recent traffic.
+- `calibration` on recent labeled data shows materially worse expected
+  calibration error or Brier score than the model card's test metrics.
+- Fraud rate, volume, or feature mix moved well outside the training window.
+- Runtime dependencies changed (the loader pins the training scikit-learn
+  version, so upgrades require retraining anyway).
+
+Promote a challenger in order, keeping every report:
+
+1. `train` the challenger into a new directory (never overwrite serving).
+2. `compare` and `stability` (or `rolling` for ordered data) for evidence the
+   challenger beats the incumbent off-sample.
+3. `calibration` and `thresholds` on held-out labeled data to confirm the
+   probabilities and the operating point still hold.
+4. `benchmark` if traffic or batch sizes changed.
+5. Swap the container's read-only model volume to the challenger and confirm
+   `/health` plus `GET /metrics` before sending traffic.
+
+Roll back by re-pointing the volume at the retained artifact from the previous
+step (see the retention policy under training) and re-running the `/health`
+smoke test. Keep the losing challenger's reports: they document why the
+decision was made.
+
 ## Container deployment
 
 Train the model on the host first, then mount it read-only:
