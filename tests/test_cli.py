@@ -1087,6 +1087,76 @@ def test_resolve_report_costs_rejects_malformed_training_config() -> None:
         )
 
 
+def test_rolling_reports_metric_spread_over_prefixes(tmp_path: Path) -> None:
+    data_path = tmp_path / "transactions.csv"
+    generate_synthetic_data(rows=800, fraud_rate=0.1, random_state=71).to_csv(
+        data_path, index=False
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "rolling",
+            str(data_path),
+            "--estimator",
+            "logistic_regression",
+            "--origins",
+            "2",
+            "--calibration-method",
+            "none",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    results = json.loads(result.stdout)["results"]
+    assert len(results) == 1
+    summary = results[0]
+    assert summary["estimator"] == "LogisticRegression"
+    assert summary["origins"] == 2
+    assert [run["origin"] for run in summary["runs"]] == [0, 1]
+    assert [run["rows"] for run in summary["runs"]] == [600, 800]
+    assert (
+        summary["runs"][0]["test_time_range"]["maximum"]
+        <= summary["runs"][1]["test_time_range"]["maximum"]
+    )
+    expected_metrics = {
+        "roc_auc",
+        "average_precision",
+        "brier_score",
+        "precision",
+        "recall",
+        "f1",
+        "balanced_accuracy",
+    }
+    assert set(summary["test_metrics_mean"]) == expected_metrics
+    assert set(summary["test_metrics_std"]) == expected_metrics
+    assert all(value >= 0 for value in summary["test_metrics_std"].values())
+
+
+def test_rolling_requires_time_feature(tmp_path: Path) -> None:
+    data_path = tmp_path / "transactions.csv"
+    generate_synthetic_data(rows=500, fraud_rate=0.1, random_state=72).drop(columns="Time").to_csv(
+        data_path, index=False
+    )
+
+    result = runner.invoke(app, ["rolling", str(data_path)])
+
+    assert result.exit_code == 2
+    assert "requires feature column" in result.stderr
+
+
+def test_rolling_reports_dataset_errors(tmp_path: Path) -> None:
+    data_path = tmp_path / "transactions.csv"
+    generate_synthetic_data(rows=300, fraud_rate=0.1, random_state=73).to_csv(
+        data_path, index=False
+    )
+
+    result = runner.invoke(app, ["rolling", str(data_path), "--target", "missing_column"])
+
+    assert result.exit_code == 2
+    assert "missing_column" in result.stderr
+
+
 def test_benchmark_reports_without_output_file(tmp_path: Path, trained_artifact: Path) -> None:
     data_path = tmp_path / "transactions.csv"
     generate_synthetic_data(rows=200, random_state=25).to_csv(data_path, index=False)

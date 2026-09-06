@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Annotated, Any, NoReturn
 from uuid import uuid4
 
+import numpy as np
 import pandas as pd
 import typer
 import uvicorn
@@ -17,6 +18,7 @@ from fraud_detection import __version__
 from fraud_detection.data import (
     DEFAULT_TARGET,
     DataValidationError,
+    ValidatedDataset,
     generate_synthetic_data,
     load_csv,
 )
@@ -626,6 +628,134 @@ def stability_command(
                 {
                     "estimator": estimator_label,
                     "repeats": repeats,
+                    "test_metrics_mean": means,
+                    "test_metrics_std": deviations,
+                    "runs": runs,
+                }
+            )
+    except (OSError, DataValidationError, ModelArtifactError, ValueError) as exc:
+        _abort(str(exc))
+
+    typer.echo(json.dumps({"results": results}, indent=2, sort_keys=True))
+
+
+@app.command("rolling")
+def rolling_command(
+    data: Annotated[
+        Path,
+        typer.Argument(exists=True, dir_okay=False, readable=True, help="Training CSV."),
+    ],
+    target: Annotated[
+        str,
+        typer.Option(help="Binary target column containing 0 and 1."),
+    ] = DEFAULT_TARGET,
+    time_column: Annotated[
+        str,
+        typer.Option(help="Ordering feature for chronological prefixes."),
+    ] = "Time",
+    origins: Annotated[
+        int,
+        typer.Option(min=2, max=5, help="Rolling time prefixes to evaluate."),
+    ] = 3,
+    test_size: TestSizeOption = 0.2,
+    validation_size: ValidationSizeOption = 0.2,
+    seed: SeedOption = 42,
+    estimators: Annotated[
+        list[EstimatorType] | None,
+        typer.Option(
+            "--estimator",
+            help="Estimator to include; repeat to assess specific choices. "
+            "Defaults to assessing every supported estimator.",
+        ),
+    ] = None,
+    regularization: RegularizationOption = 1.0,
+    max_iterations: MaxIterationsOption = 1_000,
+    n_estimators: NEstimatorsOption = 100,
+    max_depth: MaxDepthOption = None,
+    learning_rate: LearningRateOption = 0.1,
+    l2_regularization: L2RegularizationOption = 0.0,
+    max_bins: MaxBinsOption = 255,
+    threshold_strategy: ThresholdStrategyOption = ThresholdStrategy.F1,
+    cost_policy: CostPolicyOption = "default",
+    false_positive_cost: FalsePositiveCostOption = 1.0,
+    false_negative_cost: FalseNegativeCostOption = 10.0,
+    calibration_method: CalibrationMethodOption = CalibrationMethod.SIGMOID,
+    calibration_folds: CalibrationFoldsOption = 3,
+    calibration_jobs: CalibrationJobsOption = 1,
+) -> None:
+    """Evaluate rolling chronological prefixes and report metric spread.
+
+    Nothing is saved; this measures how holdout metrics evolve as more history
+    becomes available. Origin N trains, tunes, and tests on the first
+    (N+3)/(origins+2) of time-ordered rows using the same temporal split as
+    `train`, so later origins strictly extend earlier ones. Every time window
+    must contain both classes or the run stops with an actionable error.
+    """
+    chosen_estimators = list(dict.fromkeys(estimators or list(EstimatorType)))
+
+    try:
+        dataset = load_csv(data, target_column=target)
+        if time_column not in dataset.features.columns:
+            raise ValueError(f"Rolling evaluation requires feature column {time_column!r}.")
+        order = np.argsort(dataset.features[time_column].to_numpy(dtype=float), kind="stable")
+        ordered_features = dataset.features.iloc[order].reset_index(drop=True)
+        ordered_target = dataset.target.iloc[order].reset_index(drop=True)
+        results = []
+        for candidate in chosen_estimators:
+            runs = []
+            estimator_label = ""
+            for index in range(origins):
+                prefix_rows = max(1, round(len(ordered_target) * (index + 3) / (origins + 2)))
+                prefix = ValidatedDataset(
+                    features=ordered_features.iloc[:prefix_rows],
+                    target=ordered_target.iloc[:prefix_rows],
+                )
+                config = _training_config(
+                    test_size=test_size,
+                    validation_size=validation_size,
+                    random_state=seed,
+                    estimator=candidate,
+                    max_iterations=max_iterations,
+                    regularization=regularization,
+                    n_estimators=n_estimators,
+                    max_depth=max_depth,
+                    learning_rate=learning_rate,
+                    l2_regularization=l2_regularization,
+                    max_bins=max_bins,
+                    threshold_strategy=threshold_strategy,
+                    cost_policy=cost_policy,
+                    false_positive_cost=false_positive_cost,
+                    false_negative_cost=false_negative_cost,
+                    calibration_method=calibration_method,
+                    calibration_folds=calibration_folds,
+                    calibration_jobs=calibration_jobs,
+                    split_strategy=SplitStrategy.TEMPORAL,
+                    time_column=time_column,
+                )
+                model = train_model(prefix, config=config)
+                estimator_label = str(model.metadata["estimator"])
+                time_ranges = model.metadata["split_time_ranges"]
+                runs.append(
+                    {
+                        "origin": index,
+                        "rows": prefix_rows,
+                        "threshold": model.threshold,
+                        "test_metrics": model.metadata["test_metrics"],
+                        "test_time_range": time_ranges["test"],
+                    }
+                )
+            means = {
+                metric: statistics.mean(run["test_metrics"][metric] for run in runs)
+                for metric in _STABILITY_METRICS
+            }
+            deviations = {
+                metric: statistics.stdev(run["test_metrics"][metric] for run in runs)
+                for metric in _STABILITY_METRICS
+            }
+            results.append(
+                {
+                    "estimator": estimator_label,
+                    "origins": origins,
                     "test_metrics_mean": means,
                     "test_metrics_std": deviations,
                     "runs": runs,
