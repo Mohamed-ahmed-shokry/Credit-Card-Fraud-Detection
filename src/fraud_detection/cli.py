@@ -878,8 +878,7 @@ def benchmark_command(
     Measures this host only; production throughput also depends on the serving
     stack, concurrency, and hardware. Nothing is saved except the report.
     """
-    if output is not None and output.exists() and not overwrite:
-        _abort(f"Output already exists: {output}. Pass --overwrite to replace it.")
+    _guard_output(output, overwrite)
 
     try:
         sizes = _parse_batch_sizes(batch_sizes)
@@ -926,12 +925,9 @@ def benchmark_command(
         indent=2,
     )
     try:
-        if output is not None:
-            _atomic_write_text(report_json + "\n", output)
+        _emit_report(report_json, output)
     except OSError as exc:
         _abort(str(exc))
-
-    typer.echo(report_json)
 
 
 def _parse_batch_sizes(raw: str) -> list[int]:
@@ -1018,8 +1014,7 @@ def drift_command(
     ] = False,
 ) -> None:
     """Compare current feature distributions with the training baseline."""
-    if output is not None and output.exists() and not overwrite:
-        _abort(f"Output already exists: {output}. Pass --overwrite to replace it.")
+    _guard_output(output, overwrite)
 
     try:
         model = load_model(model_path)
@@ -1030,8 +1025,7 @@ def drift_command(
             raise DriftError("Model artifact does not contain a reference profile.")
         report = assess_drift(profile, features, thresholds=model.metadata.get("drift_thresholds"))
         report_json = json.dumps(report.to_dict(), indent=2)
-        if output is not None:
-            _atomic_write_text(report_json + "\n", output)
+        _emit_report(report_json, output)
     except (
         OSError,
         UnicodeDecodeError,
@@ -1041,8 +1035,6 @@ def drift_command(
         DriftError,
     ) as exc:
         _abort(str(exc))
-
-    typer.echo(report_json)
 
 
 @app.command("calibration")
@@ -1079,8 +1071,7 @@ def calibration_command(
     Use held-out labeled data (never the threshold-tuning validation split) to
     judge whether predicted probabilities mean what they say.
     """
-    if output is not None and output.exists() and not overwrite:
-        _abort(f"Output already exists: {output}. Pass --overwrite to replace it.")
+    _guard_output(output, overwrite)
 
     try:
         model = load_model(model_path)
@@ -1094,8 +1085,7 @@ def calibration_command(
             },
             indent=2,
         )
-        if output is not None:
-            _atomic_write_text(report_json + "\n", output)
+        _emit_report(report_json, output)
     except (
         OSError,
         UnicodeDecodeError,
@@ -1106,8 +1096,6 @@ def calibration_command(
         ValueError,
     ) as exc:
         _abort(str(exc))
-
-    typer.echo(report_json)
 
 
 @app.command("thresholds")
@@ -1154,8 +1142,7 @@ def thresholds_command(
     threshold-tuning validation split). Costs default to the model's training
     policy unless overridden.
     """
-    if output is not None and output.exists() and not overwrite:
-        _abort(f"Output already exists: {output}. Pass --overwrite to replace it.")
+    _guard_output(output, overwrite)
 
     try:
         model = load_model(model_path)
@@ -1208,8 +1195,7 @@ def thresholds_command(
             },
             indent=2,
         )
-        if output is not None:
-            _atomic_write_text(report_json + "\n", output)
+        _emit_report(report_json, output)
     except (
         OSError,
         UnicodeDecodeError,
@@ -1220,8 +1206,6 @@ def thresholds_command(
         ValueError,
     ) as exc:
         _abort(str(exc))
-
-    typer.echo(report_json)
 
 
 def _parse_thresholds(raw: str) -> list[float]:
@@ -1294,6 +1278,19 @@ def serve_command(
 def _abort(message: str) -> NoReturn:
     typer.echo(f"Error: {message}", err=True)
     raise typer.Exit(code=2)
+
+
+def _guard_output(output: Path | None, overwrite: bool) -> None:
+    """Refuse to replace an existing report file without explicit opt-in."""
+    if output is not None and output.exists() and not overwrite:
+        _abort(f"Output already exists: {output}. Pass --overwrite to replace it.")
+
+
+def _emit_report(report_json: str, output: Path | None) -> None:
+    """Atomically persist a JSON report when requested, then print it."""
+    if output is not None:
+        _atomic_write_text(report_json + "\n", output)
+    typer.echo(report_json)
 
 
 def _atomic_write_csv(frame: pd.DataFrame, destination: Path) -> None:
