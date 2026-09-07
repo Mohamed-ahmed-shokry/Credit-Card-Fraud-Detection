@@ -151,16 +151,26 @@ mission:
   trains, tunes, and tests on expanding chronological prefixes, reporting
   metric spread across origins the way `stability` does for random splits.
 
-## Phase 9 — Promotion evidence and surveillance (next)
+## Phase 9 — Promotion evidence and surveillance
 
-- **Promotion bundle** (`Proposed`) — one command assembling the
-  `compare`/`stability` (or `rolling`), `calibration`, `thresholds`, and
-  `drift` reports for a challenger model into a single reviewable JSON
-  document, matching the runbook's promotion checklist.
-- **Drift surveillance exit codes** (`Proposed`) — an opt-in `drift` flag
-  (e.g. `--fail-on drifted`) returning a non-zero exit status when the
-  overall status reaches the cutoff, for cron and scheduled-job alerting
-  without parsing JSON.
+- **Promotion bundle** (`Done`) — a `promote` command assembling the
+  `calibration`, `thresholds`, `drift`, and `benchmark` evidence plus the
+  model card summary into a single reviewable JSON document, matching the
+  runbook's promotion checklist. Built on shared payload builders so the
+  bundle and the standalone commands cannot drift apart.
+- **Drift surveillance exit codes** (`Done`) — an opt-in `drift --fail-on`
+  flag returning exit status 1 when the overall status reaches `warning` or
+  `drifted`, for cron and scheduled-job alerting without parsing JSON (the
+  report is still printed first).
+
+## Phase 10 — Release hardening (next)
+
+- **Release SBOM** (`Proposed`) — attach a CycloneDX software bill of
+  materials to GitHub releases from the existing dependency set, so
+  downstream auditors can inventory exactly what shipped.
+- **Signed container images** (`Proposed`) — sign the published API image
+  (e.g. Sigstore/cosign keyless signing in CI) so deployers can verify
+  provenance before pulling.
 
 ## Contributing to the roadmap
 

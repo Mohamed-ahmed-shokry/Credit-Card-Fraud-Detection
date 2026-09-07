@@ -8,6 +8,14 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- A `promote` CLI command assembling calibration, threshold, drift, and
+  benchmark evidence plus the model card summary into one reviewable
+  promotion bundle (assessment only: it states facts, not a verdict).
+- A `drift --fail-on warning|drifted` flag exiting 1 when the overall status
+  reaches the cutoff, for cron and scheduled-job alerting without parsing
+  JSON (the report is still printed first).
+- Shared thresholds/benchmark payload builders used by both the standalone
+  commands and `promote`, removing a duplicated scoring pass.
 - A `predict --threshold` override (CLI) and `threshold` request field (API)
   for audit/backtest scoring, always recorded next to the tuned
   `model_threshold` so overridden decisions are never confused with it.
