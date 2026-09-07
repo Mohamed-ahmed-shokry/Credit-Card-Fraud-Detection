@@ -222,6 +222,23 @@ def assess_drift(
     )
 
 
+_SURVEILLANCE_SEVERITY = {"stable": 0, "warning": 1, "drifted": 2}
+
+
+def surveillance_tripped(overall_status: str, fail_on: str | None) -> bool:
+    """Report whether a drift status meets a surveillance cutoff.
+
+    `None` disables surveillance. Unknown levels raise so scheduled jobs fail
+    loudly instead of silently watching nothing.
+    """
+    if fail_on is None:
+        return False
+    try:
+        return _SURVEILLANCE_SEVERITY[overall_status] >= _SURVEILLANCE_SEVERITY[fail_on]
+    except KeyError as exc:
+        raise DriftError(f"Unknown drift surveillance level: {exc}") from exc
+
+
 def _status(
     psi: float, *, warning_at: float = STABLE_THRESHOLD, drift_at: float = DRIFT_THRESHOLD
 ) -> str:

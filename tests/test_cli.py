@@ -11,7 +11,11 @@ from typer.testing import CliRunner
 
 from fraud_detection import __version__
 from fraud_detection.cli import _resolve_report_costs, app
-from fraud_detection.data import generate_synthetic_data, validate_frame
+from fraud_detection.data import (
+    DEFAULT_TARGET,
+    generate_synthetic_data,
+    validate_frame,
+)
 from fraud_detection.model import (
     METADATA_FILENAME,
     MODEL_FILENAME,
@@ -660,6 +664,55 @@ def test_predict_and_drift_report_empty_transactions_file(
 
     assert result.exit_code == 2
     assert "No columns to parse from file" in result.stderr
+
+
+def _shifted_transactions(rows: int = 200, random_state: int = 91) -> pd.DataFrame:
+    frame = generate_synthetic_data(rows=rows, fraud_rate=0.1, random_state=random_state)
+    shifted = frame.copy()
+    shifted[frame.columns.drop(DEFAULT_TARGET)] += 10.0
+    return shifted
+
+
+def test_drift_fail_on_trips_on_shifted_data(tmp_path: Path, trained_artifact: Path) -> None:
+    data_path = tmp_path / "recent.csv"
+    _shifted_transactions().to_csv(data_path, index=False)
+
+    tripped = runner.invoke(
+        app, ["drift", str(trained_artifact), str(data_path), "--fail-on", "drifted"]
+    )
+
+    assert tripped.exit_code == 1
+    assert json.loads(tripped.stdout)["overall_status"] == "drifted"
+    assert "tripped" in tripped.stderr
+
+    silent = runner.invoke(app, ["drift", str(trained_artifact), str(data_path)])
+
+    assert silent.exit_code == 0
+    assert json.loads(silent.stdout)["overall_status"] == "drifted"
+
+
+def test_drift_fail_on_passes_on_stable_data(tmp_path: Path, trained_artifact: Path) -> None:
+    data_path = tmp_path / "recent.csv"
+    generate_synthetic_data(rows=300, random_state=3).to_csv(data_path, index=False)
+
+    result = runner.invoke(
+        app, ["drift", str(trained_artifact), str(data_path), "--fail-on", "drifted"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["overall_status"] == "stable"
+
+
+def test_drift_fail_on_rejects_unknown_level(tmp_path: Path, trained_artifact: Path) -> None:
+    data_path = tmp_path / "recent.csv"
+    generate_synthetic_data(rows=200, random_state=92).to_csv(data_path, index=False)
+
+    result = runner.invoke(
+        app, ["drift", str(trained_artifact), str(data_path), "--fail-on", "bogus"]
+    )
+
+    assert result.exit_code == 2
+    assert "surveillance level" in result.stderr
 
 
 def test_drift_protects_existing_report(tmp_path: Path) -> None:

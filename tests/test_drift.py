@@ -12,6 +12,7 @@ from fraud_detection.drift import (
     build_reference_profile,
     default_thresholds,
     resolve_thresholds,
+    surveillance_tripped,
 )
 
 
@@ -162,6 +163,30 @@ def test_resolve_thresholds_rejects_invalid_cutoffs(thresholds: object) -> None:
 
 def test_resolve_thresholds_defaults_to_reference_cutoffs() -> None:
     assert resolve_thresholds(None) == (STABLE_THRESHOLD, DRIFT_THRESHOLD)
+
+
+@pytest.mark.parametrize(
+    ("overall_status", "fail_on", "tripped"),
+    [
+        ("stable", None, False),
+        ("stable", "warning", False),
+        ("stable", "drifted", False),
+        ("warning", "warning", True),
+        ("warning", "drifted", False),
+        ("drifted", "warning", True),
+        ("drifted", "drifted", True),
+    ],
+)
+def test_surveillance_tripped_compares_severity(
+    overall_status: str, fail_on: str | None, tripped: bool
+) -> None:
+    assert surveillance_tripped(overall_status, fail_on) is tripped
+
+
+@pytest.mark.parametrize("fail_on", ["bogus", ""])
+def test_surveillance_tripped_rejects_unknown_levels(fail_on: str) -> None:
+    with pytest.raises(DriftError, match="surveillance level"):
+        surveillance_tripped("drifted", fail_on)
 
 
 def test_drift_normalizes_non_string_feature_names() -> None:

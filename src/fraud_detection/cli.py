@@ -22,7 +22,7 @@ from fraud_detection.data import (
     generate_synthetic_data,
     load_csv,
 )
-from fraud_detection.drift import DriftError, assess_drift
+from fraud_detection.drift import DriftError, assess_drift, surveillance_tripped
 from fraud_detection.evaluation import (
     ThresholdRow,
     calibration_report,
@@ -992,6 +992,13 @@ def drift_command(
         bool,
         typer.Option(help="Replace an existing report file."),
     ] = False,
+    fail_on: Annotated[
+        str | None,
+        typer.Option(
+            help="Exit 1 when the overall status reaches 'warning' or 'drifted', "
+            "for scheduled surveillance."
+        ),
+    ] = None,
 ) -> None:
     """Compare current feature distributions with the training baseline."""
     _guard_output(output, overwrite)
@@ -1006,6 +1013,7 @@ def drift_command(
         report = assess_drift(profile, features, thresholds=model.metadata.get("drift_thresholds"))
         report_json = json.dumps(report.to_dict(), indent=2)
         _emit_report(report_json, output)
+        tripped = surveillance_tripped(report.overall_status, fail_on)
     except (
         OSError,
         UnicodeDecodeError,
@@ -1015,6 +1023,14 @@ def drift_command(
         DriftError,
     ) as exc:
         _abort(str(exc))
+
+    if tripped:
+        typer.echo(
+            f"Drift surveillance tripped: overall_status={report.overall_status} "
+            f"meets --fail-on {fail_on}.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
 
 
 @app.command("calibration")
