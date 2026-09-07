@@ -33,6 +33,7 @@ from fraud_detection.evaluation import (
 from fraud_detection.model import (
     CalibrationMethod,
     EstimatorType,
+    FraudModel,
     ModelArtifactError,
     SplitStrategy,
     ThresholdStrategy,
@@ -895,32 +896,11 @@ def benchmark_command(
     ) as exc:
         _abort(str(exc))
 
-    rows = len(features)
-    results = []
-    for size in sizes:
-        batch = features.iloc[[index % rows for index in range(size)]]
-        model.predict_probabilities(batch)  # warmup, excluded from timing
-        samples = []
-        for _ in range(repeat):
-            started = time.perf_counter()
-            model.predict_probabilities(batch)
-            samples.append((time.perf_counter() - started) * 1_000)
-        median_ms = max(statistics.median(samples), 1e-9)
-        results.append(
-            {
-                "batch_size": size,
-                "median_ms": median_ms,
-                "ms_per_transaction": median_ms / size,
-                "transactions_per_second": 1_000.0 / (median_ms / size),
-            }
-        )
-
+    payload = _benchmark_payload(model, features, sizes, repeat)
     report_json = json.dumps(
         {
             "model_version": str(model.metadata["dataset_fingerprint"])[:12],
-            "rows_available": rows,
-            "repeat": repeat,
-            "results": results,
+            **payload,
         },
         indent=2,
     )
@@ -1147,51 +1127,15 @@ def thresholds_command(
     try:
         model = load_model(model_path)
         dataset = load_csv(data, target_column=target)
-        probabilities = model.predict_probabilities(dataset.features)
         candidates = _parse_thresholds(thresholds)
         policy_name, fp_cost, fn_cost = _resolve_report_costs(
             model, false_positive_cost, false_negative_cost
         )
-        y_true = dataset.target.to_numpy()
-        tradeoff = summarize_thresholds(
-            y_true,
-            probabilities,
-            candidates,
-            false_positive_cost=fp_cost,
-            false_negative_cost=fn_cost,
-        ).to_dict()
-        at_tuned = evaluate_predictions(y_true, probabilities, threshold=model.threshold)
-        tuned_cost = expected_classification_cost(
-            y_true,
-            probabilities,
-            threshold=model.threshold,
-            false_positive_cost=fp_cost,
-            false_negative_cost=fn_cost,
-        )
-        tuned_row = ThresholdRow(
-            threshold=model.threshold,
-            precision=at_tuned.precision,
-            recall=at_tuned.recall,
-            f1=at_tuned.f1,
-            expected_cost_per_transaction=tuned_cost,
-            flagged=at_tuned.false_positives + at_tuned.true_positives,
-            flagged_rate=(at_tuned.false_positives + at_tuned.true_positives) / y_true.size,
-            true_positives=at_tuned.true_positives,
-            false_positives=at_tuned.false_positives,
-        ).to_dict()
+        payload = _thresholds_payload(model, dataset, candidates, policy_name, fp_cost, fn_cost)
         report_json = json.dumps(
             {
                 "model_version": str(model.metadata["dataset_fingerprint"])[:12],
-                "model_threshold": model.threshold,
-                "cost_policy": {
-                    "name": policy_name,
-                    "false_positive_cost": fp_cost,
-                    "false_negative_cost": fn_cost,
-                },
-                "false_positive_cost": fp_cost,
-                "false_negative_cost": fn_cost,
-                "model_threshold_metrics": tuned_row,
-                **tradeoff,
+                **payload,
             },
             indent=2,
         )
@@ -1206,6 +1150,86 @@ def thresholds_command(
         ValueError,
     ) as exc:
         _abort(str(exc))
+
+
+def _thresholds_payload(
+    model: FraudModel,
+    dataset: ValidatedDataset,
+    candidates: list[float],
+    policy_name: str,
+    false_positive_cost: float,
+    false_negative_cost: float,
+) -> dict[str, Any]:
+    """Score candidate thresholds plus the tuned operating point on labeled data."""
+    probabilities = model.predict_probabilities(dataset.features)
+    y_true = dataset.target.to_numpy()
+    tradeoff = summarize_thresholds(
+        y_true,
+        probabilities,
+        candidates,
+        false_positive_cost=false_positive_cost,
+        false_negative_cost=false_negative_cost,
+    ).to_dict()
+    at_tuned = evaluate_predictions(y_true, probabilities, threshold=model.threshold)
+    tuned_cost = expected_classification_cost(
+        y_true,
+        probabilities,
+        threshold=model.threshold,
+        false_positive_cost=false_positive_cost,
+        false_negative_cost=false_negative_cost,
+    )
+    tuned_row = ThresholdRow(
+        threshold=model.threshold,
+        precision=at_tuned.precision,
+        recall=at_tuned.recall,
+        f1=at_tuned.f1,
+        expected_cost_per_transaction=tuned_cost,
+        flagged=at_tuned.false_positives + at_tuned.true_positives,
+        flagged_rate=(at_tuned.false_positives + at_tuned.true_positives) / y_true.size,
+        true_positives=at_tuned.true_positives,
+        false_positives=at_tuned.false_positives,
+    ).to_dict()
+    return {
+        "model_threshold": model.threshold,
+        "cost_policy": {
+            "name": policy_name,
+            "false_positive_cost": false_positive_cost,
+            "false_negative_cost": false_negative_cost,
+        },
+        "false_positive_cost": false_positive_cost,
+        "false_negative_cost": false_negative_cost,
+        "model_threshold_metrics": tuned_row,
+        **tradeoff,
+    }
+
+
+def _benchmark_payload(
+    model: FraudModel,
+    features: pd.DataFrame,
+    sizes: list[int],
+    repeat: int,
+) -> dict[str, Any]:
+    """Time offline batch scoring and report latency plus throughput."""
+    rows = len(features)
+    results = []
+    for size in sizes:
+        batch = features.iloc[[index % rows for index in range(size)]]
+        model.predict_probabilities(batch)  # warmup, excluded from timing
+        samples = []
+        for _ in range(repeat):
+            started = time.perf_counter()
+            model.predict_probabilities(batch)
+            samples.append((time.perf_counter() - started) * 1_000)
+        median_ms = max(statistics.median(samples), 1e-9)
+        results.append(
+            {
+                "batch_size": size,
+                "median_ms": median_ms,
+                "ms_per_transaction": median_ms / size,
+                "transactions_per_second": 1_000.0 / (median_ms / size),
+            }
+        )
+    return {"rows_available": rows, "repeat": repeat, "results": results}
 
 
 def _parse_thresholds(raw: str) -> list[float]:
