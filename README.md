@@ -540,6 +540,15 @@ alongside label-based performance, calibration, traffic changes, and business co
 Malformed reference profiles are rejected before PSI calculation, including invalid
 bin ordering, proportions, feature names, and non-finite statistics.
 
+For scheduled surveillance, `--fail-on warning` (or `drifted`) exits 1 once the
+overall status reaches that level, so cron jobs can alert without parsing JSON:
+
+```bash
+fraud-detect drift artifacts/model recent_transactions.csv --fail-on drifted
+```
+
+The JSON report is still printed to stdout before the non-zero exit.
+
 ## Check probability calibration
 
 Judge whether predicted probabilities mean what they say on held-out labeled
@@ -612,6 +621,19 @@ Roll back by re-pointing the volume at the retained artifact from the previous
 step (see the retention policy under training) and re-running the `/health`
 smoke test. Keep the losing challenger's reports: they document why the
 decision was made.
+
+Assemble the promotion evidence for a challenger into one reviewable document
+with `promote`, which runs calibration, threshold, drift, and benchmark
+evidence and packs them with the model card summary:
+
+```bash
+fraud-detect promote artifacts/challenger heldout_transactions.csv \
+  recent_transactions.csv \
+  --output reports/promotion.json
+```
+
+The bundle states facts, not a verdict: promoting stays a human decision
+against the runbook checklist above.
 
 ## Container deployment
 
