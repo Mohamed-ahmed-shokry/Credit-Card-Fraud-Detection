@@ -1157,6 +1157,118 @@ def test_rolling_reports_dataset_errors(tmp_path: Path) -> None:
     assert "missing_column" in result.stderr
 
 
+def test_promote_assembles_evidence_bundle(tmp_path: Path, trained_artifact: Path) -> None:
+    heldout_path = tmp_path / "heldout.csv"
+    recent_path = tmp_path / "recent.csv"
+    bundle_path = tmp_path / "reports" / "promotion.json"
+    generate_synthetic_data(rows=200, fraud_rate=0.1, random_state=81).to_csv(
+        heldout_path, index=False
+    )
+    generate_synthetic_data(rows=200, fraud_rate=0.1, random_state=82).to_csv(
+        recent_path, index=False
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "promote",
+            str(trained_artifact),
+            str(heldout_path),
+            str(recent_path),
+            "--thresholds",
+            "0.2,0.8",
+            "--bins",
+            "4",
+            "--batch-sizes",
+            "2",
+            "--output",
+            str(bundle_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    body = json.loads(result.stdout)
+    assert set(body) == {
+        "model_version",
+        "model",
+        "calibration",
+        "thresholds",
+        "drift",
+        "benchmark",
+    }
+    assert body["model"]["cost_policy"]["name"] == "default"
+    assert len(body["calibration"]["detail"]) == 4
+    assert [row["threshold"] for row in body["thresholds"]["detail"]] == [0.2, 0.8]
+    assert body["drift"]["rows"] == 200
+    assert [item["batch_size"] for item in body["benchmark"]["results"]] == [2]
+    assert json.loads(bundle_path.read_text(encoding="utf-8")) == body
+
+
+def test_promote_reports_missing_heldout_label(tmp_path: Path, trained_artifact: Path) -> None:
+    heldout_path = tmp_path / "heldout.csv"
+    recent_path = tmp_path / "recent.csv"
+    generate_synthetic_data(rows=200, random_state=83).to_csv(heldout_path, index=False)
+    generate_synthetic_data(rows=200, random_state=84).to_csv(recent_path, index=False)
+
+    result = runner.invoke(
+        app,
+        [
+            "promote",
+            str(trained_artifact),
+            str(heldout_path),
+            str(recent_path),
+            "--target",
+            "missing_column",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "missing_column" in result.stderr
+
+
+def test_promote_reports_recent_schema_mismatch(tmp_path: Path, trained_artifact: Path) -> None:
+    heldout_path = tmp_path / "heldout.csv"
+    recent_path = tmp_path / "recent.csv"
+    generate_synthetic_data(rows=200, fraud_rate=0.1, random_state=85).to_csv(
+        heldout_path, index=False
+    )
+    pd.DataFrame({"wrong": [1.0, 2.0]}).to_csv(recent_path, index=False)
+
+    result = runner.invoke(
+        app, ["promote", str(trained_artifact), str(heldout_path), str(recent_path)]
+    )
+
+    assert result.exit_code == 2
+    assert "Input schema does not match" in result.stderr
+
+
+def test_promote_protects_existing_bundle(tmp_path: Path) -> None:
+    model_path = tmp_path / "model.joblib"
+    heldout_path = tmp_path / "heldout.csv"
+    recent_path = tmp_path / "recent.csv"
+    output = tmp_path / "promotion.json"
+    model_path.write_bytes(b"placeholder")
+    heldout_path.write_text("x\n1\n", encoding="utf-8")
+    recent_path.write_text("x\n1\n", encoding="utf-8")
+    output.write_text("keep me", encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        [
+            "promote",
+            str(model_path),
+            str(heldout_path),
+            str(recent_path),
+            "--output",
+            str(output),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "Pass --overwrite" in result.stderr
+    assert output.read_text(encoding="utf-8") == "keep me"
+
+
 def test_benchmark_reports_without_output_file(tmp_path: Path, trained_artifact: Path) -> None:
     data_path = tmp_path / "transactions.csv"
     generate_synthetic_data(rows=200, random_state=25).to_csv(data_path, index=False)

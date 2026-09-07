@@ -1280,6 +1280,120 @@ def _resolve_report_costs(
     return ("custom", fp_cost, fn_cost)
 
 
+@app.command("promote")
+def promote_command(
+    model_path: Annotated[
+        Path,
+        typer.Argument(exists=True, readable=True, help="Model file or artifact directory."),
+    ],
+    heldout: Annotated[
+        Path,
+        typer.Argument(
+            exists=True, dir_okay=False, readable=True, help="Held-out labeled transactions."
+        ),
+    ],
+    recent: Annotated[
+        Path,
+        typer.Argument(
+            exists=True, dir_okay=False, readable=True, help="Recent transactions for drift."
+        ),
+    ],
+    target: Annotated[
+        str,
+        typer.Option(help="Binary label column containing 0 and 1."),
+    ] = DEFAULT_TARGET,
+    thresholds: Annotated[
+        str,
+        typer.Option(help="Comma-separated candidate thresholds, e.g. '0.2,0.5,0.8'."),
+    ] = "0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9",
+    false_positive_cost: Annotated[
+        float | None,
+        typer.Option(help="Override the model's false-positive cost weight."),
+    ] = None,
+    false_negative_cost: Annotated[
+        float | None,
+        typer.Option(help="Override the model's false-negative cost weight."),
+    ] = None,
+    bins: Annotated[
+        int,
+        typer.Option(min=2, max=20, help="Equal-width reliability bins."),
+    ] = 10,
+    batch_sizes: Annotated[
+        str,
+        typer.Option(help="Comma-separated scoring batch sizes, e.g. '1,10,100'."),
+    ] = "1,10,100",
+    repeat: Annotated[
+        int,
+        typer.Option(min=1, max=10, help="Timed runs per batch size; the median is reported."),
+    ] = 3,
+    output: Annotated[
+        Path | None,
+        typer.Option("--output", "-o", help="Optional JSON bundle destination."),
+    ] = None,
+    overwrite: Annotated[
+        bool,
+        typer.Option(help="Replace an existing bundle file."),
+    ] = False,
+) -> None:
+    """Assemble the promotion evidence bundle for a challenger model.
+
+    Runs calibration, threshold, drift, and benchmark evidence against held-out
+    labeled data and recent traffic, and packs the results with the model card
+    summary into one reviewable document. Assessment only: nothing is trained
+    and the bundle states facts, not a promotion verdict.
+    """
+    _guard_output(output, overwrite)
+
+    try:
+        model = load_model(model_path)
+        labeled = load_csv(heldout, target_column=target)
+        recent_features = model.validate_features(
+            pd.read_csv(recent).drop(columns=target, errors="ignore")
+        )
+        candidates = _parse_thresholds(thresholds)
+        policy_name, fp_cost, fn_cost = _resolve_report_costs(
+            model, false_positive_cost, false_negative_cost
+        )
+        sizes = _parse_batch_sizes(batch_sizes)
+        profile = model.metadata.get("reference_profile")
+        if not isinstance(profile, dict):
+            raise DriftError("Model artifact does not contain a reference profile.")
+        bundle = {
+            "model_version": str(model.metadata["dataset_fingerprint"])[:12],
+            "model": {
+                "estimator": model.metadata["estimator"],
+                "threshold": model.threshold,
+                "cost_policy": model.metadata.get("cost_policy"),
+                "created_at": model.metadata["created_at"],
+                "test_metrics": model.metadata["test_metrics"],
+            },
+            "calibration": calibration_report(
+                labeled.target.to_numpy(),
+                model.predict_probabilities(labeled.features),
+                bins=bins,
+            ).to_dict(),
+            "thresholds": _thresholds_payload(
+                model, labeled, candidates, policy_name, fp_cost, fn_cost
+            ),
+            "drift": assess_drift(
+                profile, recent_features, thresholds=model.metadata.get("drift_thresholds")
+            ).to_dict(),
+            "benchmark": _benchmark_payload(model, labeled.features, sizes, repeat),
+        }
+        _emit_report(json.dumps(bundle, indent=2), output)
+    except (
+        OSError,
+        UnicodeDecodeError,
+        pd.errors.ParserError,
+        pd.errors.EmptyDataError,
+        ModelArtifactError,
+        DataValidationError,
+        DriftError,
+        ValueError,
+    ) as exc:
+        _abort(str(exc))
+
+
 @app.command("serve")
 def serve_command(
     model_path: Annotated[
