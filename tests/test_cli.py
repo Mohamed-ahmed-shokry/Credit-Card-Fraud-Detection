@@ -599,6 +599,27 @@ def test_drift_reports_missing_reference_profile(tmp_path: Path, trained_model: 
     assert "does not contain a reference profile" in result.stderr
 
 
+def test_promote_reports_missing_reference_profile(
+    tmp_path: Path, trained_model: FraudModel
+) -> None:
+    artifact = _save_model_missing_metadata_key(
+        trained_model,
+        tmp_path / "artifact",
+        remove_key="reference_profile",
+    )
+    heldout_path = tmp_path / "heldout.csv"
+    recent_path = tmp_path / "recent.csv"
+    generate_synthetic_data(rows=200, fraud_rate=0.1, random_state=86).to_csv(
+        heldout_path, index=False
+    )
+    generate_synthetic_data(rows=200, random_state=87).to_csv(recent_path, index=False)
+
+    result = runner.invoke(app, ["promote", str(artifact), str(heldout_path), str(recent_path)])
+
+    assert result.exit_code == 2
+    assert "does not contain a reference profile" in result.stderr
+
+
 @pytest.mark.parametrize("command", ["inspect", "explain", "serve"])
 def test_commands_report_invalid_artifact_errors(tmp_path: Path, command: str) -> None:
     empty_artifact = tmp_path / "empty_artifact"
