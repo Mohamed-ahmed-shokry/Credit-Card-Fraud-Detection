@@ -8,6 +8,9 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- Keyless-signed container images: the release workflow publishes the API
+  image to GHCR with Sigstore/cosign signing (no stored keys), plus README
+  verification instructions and a release-checklist confirmation step.
 - CycloneDX SBOM generation for releases: the publish workflow installs the
   built wheel, inventories the shipping environment with `cyclonedx-bom`,
   and uploads the validated SBOM as a workflow artifact; the TestPyPI

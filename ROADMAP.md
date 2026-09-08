@@ -169,10 +169,21 @@ mission:
   inventories the shipping environment with `cyclonedx-bom`, and uploads the
   validated CycloneDX SBOM as a workflow artifact; the TestPyPI dry run
   exercises the same mechanism on every push so tool drift surfaces early.
-- **Signed container images** (`Proposed`) — sign the published API image
-  (e.g. Sigstore/cosign keyless signing in CI) so deployers can verify
-  provenance before pulling. Blocked on a maintainer decision first: images
-  are currently built but not pushed to any registry.
+- **Signed container images** (`Done`) — the release workflow publishes the
+  API image to GHCR and signs it keylessly with Sigstore/cosign (no stored
+  keys; least-privilege job permissions), with README verification
+  instructions. Like every release-gated workflow here, the first real
+  release exercises it.
+
+## Phase 11 — Serving and data frontiers (next)
+
+- **Streaming prediction endpoint** (`Proposed`) — evaluate whether a
+  single-transaction `POST /v1/score` route earns its keep next to the batch
+  endpoint, weighing latency shape and client ergonomics rather than adding
+  surface area by default.
+- **Reference label-delay analysis** (`Proposed`) — document how to reason
+  about chargeback label delays when assembling held-out evaluation sets,
+  since fraud labels arrive late and naive random splits overstate quality.
 
 ## Contributing to the roadmap
 
