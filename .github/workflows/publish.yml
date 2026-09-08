@@ -12,7 +12,9 @@ name: Publish to PyPI
 #   - Workflow name: publish.yml
 #   - Environment name: pypi
 # No API token or secret is needed; trusted publishing uses this
-# workflow's OIDC identity instead.
+# workflow's OIDC identity instead. The build job also records a CycloneDX
+# SBOM of the installed release candidate and uploads it as the `sbom`
+# workflow artifact for downstream auditors.
 
 on:
   release:
@@ -49,6 +51,29 @@ jobs:
         with:
           name: dist
           path: dist/
+
+      # Inventory exactly what ships: install the wheel so runtime
+      # dependencies are present, then record the environment as SBOM.
+      - name: Install release candidate
+        run: python -m pip install dist/*.whl
+
+      - name: Install SBOM tooling
+        run: python -m pip install "cyclonedx-bom>=7,<8"
+
+      - name: Generate SBOM
+        run: >
+          python -m cyclonedx_py environment
+          --pyproject pyproject.toml
+          --mc-type library
+          --output-reproducible
+          --output-format JSON
+          --output-file sbom/sbom.cdx.json
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom/
 
   publish:
     name: Publish to PyPI
