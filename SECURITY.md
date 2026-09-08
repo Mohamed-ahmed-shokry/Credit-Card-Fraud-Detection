@@ -72,6 +72,12 @@ The application rejects declared or streamed request bodies larger than 2 MiB.
 Production gateways should still enforce their own request-size, rate, and
 concurrency limits before traffic reaches the service.
 
+The API ships optional, off-by-default API-key and rate-limiting middleware as
+a documented reference starting point (see the README). They are defense in
+depth, not a replacement for gateway authentication: responses carry
+`Retry-After` and `X-RateLimit-*` headers, but key storage, rotation, and
+perimeter enforcement remain the operator's job.
+
 `GET /metrics` and `GET /health` are unauthenticated, like most Prometheus
 exposition endpoints. They report counts, labels, and timing only, never
 transaction values, but should still be reachable only from a trusted scrape

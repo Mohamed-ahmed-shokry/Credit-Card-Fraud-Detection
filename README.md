@@ -667,7 +667,7 @@ Project layout:
 ```text
 src/fraud_detection/
 ├── api.py          # versioned online prediction service
-├── cli.py          # training, comparison, scoring, explanation, drift, calibration, benchmarking, and serving
+├── cli.py          # training, comparison, stability, rolling, scoring, benchmarking, explanation, drift, calibration, thresholds, promotion, and serving
 ├── data.py         # ingestion, schema validation, and synthetic data
 ├── drift.py        # training profiles and PSI drift reporting
 ├── evaluation.py   # threshold tuning, imbalance-aware metrics, and calibration reports
