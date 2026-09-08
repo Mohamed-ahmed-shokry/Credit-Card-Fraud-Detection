@@ -648,6 +648,18 @@ The container runs as an unprivileged user with a read-only root filesystem, no
 Linux capabilities, and `no-new-privileges`. The model is supplied through the
 read-only `./artifacts/model` volume.
 
+Each GitHub Release also publishes a prebuilt image to the GitHub Container
+Registry, signed keylessly with Sigstore/cosign. Pull it instead of building
+locally, and verify the signature before deploying:
+
+```bash
+cosign verify ghcr.io/mohamed-ahmed-shokry/credit-card-fraud-detection:vX.Y.Z \
+  --certificate-identity-regexp 'https://github.com/Mohamed-ahmed-shokry/Credit-Card-Fraud-Detection/.github/workflows/publish.yml@.*' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+Mount the trained model read-only the same way regardless of image source.
+
 ## Development
 
 Run the same gates used in CI:

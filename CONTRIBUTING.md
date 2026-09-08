@@ -83,6 +83,9 @@ so no API token is stored in repository secrets.
 5. Verify the release on PyPI, confirm the trusted-publisher link on
    pypi.org is still configured for this repository and workflow, and confirm
    the `sbom` workflow artifact is present on the release run.
+6. Confirm the signed container image landed on GHCR (`ghcr.io` package for
+   this repository) and that `cosign verify` passes with the workflow
+   identity pinned as shown in the README's container deployment section.
 
 ## Security
 
