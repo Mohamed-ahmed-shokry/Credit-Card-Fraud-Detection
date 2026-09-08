@@ -74,11 +74,15 @@ so no API token is stored in repository secrets.
    new version with today's date), and `ROADMAP.md` statuses.
 2. Run the full quality gates above; all must pass, including the 97%
    branch-coverage floor and `twine check`.
-3. Confirm the TestPyPI dry-run workflow is green on `main`.
+3. Confirm the TestPyPI dry-run workflow is green on `main` (it needs its own
+   trusted publisher linked on test.pypi.org first; see the header comment in
+   `test-pypi.yml`).
 4. Tag the release (`git tag vX.Y.Z && git push origin vX.Y.Z`) and publish a
-   GitHub Release; the `publish.yml` workflow builds and uploads to PyPI.
-5. Verify the release on PyPI and confirm the trusted-publisher link on
-   pypi.org is still configured for this repository and workflow.
+   GitHub Release; the `publish.yml` workflow builds, uploads to PyPI, and
+   records a CycloneDX SBOM.
+5. Verify the release on PyPI, confirm the trusted-publisher link on
+   pypi.org is still configured for this repository and workflow, and confirm
+   the `sbom` workflow artifact is present on the release run.
 
 ## Security
 
