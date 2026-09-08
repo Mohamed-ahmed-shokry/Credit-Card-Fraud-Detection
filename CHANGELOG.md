@@ -8,6 +8,10 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- CycloneDX SBOM generation for releases: the publish workflow installs the
+  built wheel, inventories the shipping environment with `cyclonedx-bom`,
+  and uploads the validated SBOM as a workflow artifact; the TestPyPI
+  dry-run workflow exercises the same mechanism on every push.
 - A `promote` CLI command assembling calibration, threshold, drift, and
   benchmark evidence plus the model card summary into one reviewable
   promotion bundle (assessment only: it states facts, not a verdict).

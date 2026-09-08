@@ -163,14 +163,16 @@ mission:
   `drifted`, for cron and scheduled-job alerting without parsing JSON (the
   report is still printed first).
 
-## Phase 10 — Release hardening (next)
+## Phase 10 — Release hardening
 
-- **Release SBOM** (`Proposed`) — attach a CycloneDX software bill of
-  materials to GitHub releases from the existing dependency set, so
-  downstream auditors can inventory exactly what shipped.
+- **Release SBOM** (`Done`) — the publish workflow installs the built wheel,
+  inventories the shipping environment with `cyclonedx-bom`, and uploads the
+  validated CycloneDX SBOM as a workflow artifact; the TestPyPI dry run
+  exercises the same mechanism on every push so tool drift surfaces early.
 - **Signed container images** (`Proposed`) — sign the published API image
   (e.g. Sigstore/cosign keyless signing in CI) so deployers can verify
-  provenance before pulling.
+  provenance before pulling. Blocked on a maintainer decision first: images
+  are currently built but not pushed to any registry.
 
 ## Contributing to the roadmap
 
