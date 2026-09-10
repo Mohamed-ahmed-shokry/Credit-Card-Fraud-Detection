@@ -26,6 +26,12 @@ All notable changes to this project are documented here. The format follows
 - A `predict --threshold` override (CLI) and `threshold` request field (API)
   for audit/backtest scoring, always recorded next to the tuned
   `model_threshold` so overridden decisions are never confused with it.
+- A `POST /v1/score` single-transaction endpoint (API) returning the applied
+  threshold, the model threshold, and the per-transaction prediction with
+  optional explanations, sharing the scoring logic with the batch endpoint.
+- A `fraud-detect predict --threshold` override (CLI) recording the applied
+  threshold, the model threshold, and whether it was overridden in the output
+  summary.
 - Named business-cost policies: `train`/`compare`/`stability` accept
   `--cost-policy`, persisted as a `cost_policy` block in the model card and
   echoed by the `thresholds` report (`"custom"` when overridden ad hoc).

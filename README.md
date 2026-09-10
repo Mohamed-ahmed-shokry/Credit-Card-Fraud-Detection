@@ -660,6 +660,23 @@ cosign verify ghcr.io/mohamed-ahmed-shokry/credit-card-fraud-detection:vX.Y.Z \
 
 Mount the trained model read-only the same way regardless of image source.
 
+## Reference label-delay analysis
+
+Chargeback and fraud labels often arrive days or weeks after the transaction
+date. If a hold-out evaluation uses a naive random split, late-arriving labels
+can silently leak into the training set, inflating performance estimates.
+A sound evaluation must respect label availability timing:
+
+1. Define a maximum label delay (e.g., 60 days) from domain knowledge.
+2. When assembling the evaluation window, exclude transactions within
+   that delay from the test set, or accept that their labels are unreliable.
+3. In temporal splits, ensure the gap between the validation cutoff and
+   the test start exceeds the maximum label delay.
+
+The `stability` and `rolling` commands help quantify how much performance
+fluctuates across time windows, which is the practical symptom of label
+delay bias.
+
 ## Development
 
 Run the same gates used in CI:

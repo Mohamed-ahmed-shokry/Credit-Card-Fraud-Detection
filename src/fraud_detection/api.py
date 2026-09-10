@@ -109,6 +109,25 @@ class PredictionResponse(BaseModel):
     predictions: list[PredictionResult]
 
 
+class ScoreRequest(BaseModel):
+    """One numeric transaction feature mapping."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    transaction: dict[str, TransactionValue]
+    explain: bool = False
+    threshold: float | None = Field(default=None, ge=0.0, le=1.0)
+
+
+class ScoreResponse(BaseModel):
+    """Single-transaction prediction response."""
+
+    model_version: str
+    threshold: float
+    model_threshold: float
+    prediction: PredictionResult
+
+
 class HealthResponse(BaseModel):
     """Readiness and loaded model information."""
 
@@ -319,19 +338,19 @@ def create_app(
             threshold=loaded.threshold,
         )
 
-    @application.post(
-        "/v1/predict",
-        response_model=PredictionResponse,
-        tags=["predictions"],
-    )
-    async def predict(payload: PredictionRequest, request: Request) -> PredictionResponse:
-        loaded = _model_from_request(request)
-        frame = pd.DataFrame(payload.transactions)
+    def score_frame(
+        loaded: FraudModel,
+        frame: pd.DataFrame,
+        *,
+        explain: bool,
+        threshold: float | None,
+    ) -> tuple[float, list[PredictionResult]]:
+        """Score validated transactions and record decision counts."""
         probabilities = loaded.predict_probabilities(frame)
-        applied_threshold = loaded.threshold if payload.threshold is None else payload.threshold
+        applied_threshold = loaded.threshold if threshold is None else threshold
         decisions = probabilities >= applied_threshold
         results = []
-        if payload.explain:
+        if explain:
             explanations = loaded.explain_local(frame)
             for probability, decision, contributions in zip(
                 probabilities, decisions, explanations, strict=True
@@ -350,11 +369,42 @@ def create_app(
                 )
         prediction_counter.labels(is_fraud="true").inc(int(decisions.sum()))
         prediction_counter.labels(is_fraud="false").inc(int((~decisions).sum()))
+        return applied_threshold, results
+
+    @application.post(
+        "/v1/predict",
+        response_model=PredictionResponse,
+        tags=["predictions"],
+    )
+    async def predict(payload: PredictionRequest, request: Request) -> PredictionResponse:
+        loaded = _model_from_request(request)
+        frame = pd.DataFrame(payload.transactions)
+        applied_threshold, results = score_frame(
+            loaded, frame, explain=payload.explain, threshold=payload.threshold
+        )
         return PredictionResponse(
             model_version=str(loaded.metadata["dataset_fingerprint"])[:12],
             threshold=applied_threshold,
             model_threshold=loaded.threshold,
             predictions=results,
+        )
+
+    @application.post(
+        "/v1/score",
+        response_model=ScoreResponse,
+        tags=["predictions"],
+    )
+    async def score(payload: ScoreRequest, request: Request) -> ScoreResponse:
+        loaded = _model_from_request(request)
+        frame = pd.DataFrame([payload.transaction])
+        applied_threshold, results = score_frame(
+            loaded, frame, explain=payload.explain, threshold=payload.threshold
+        )
+        return ScoreResponse(
+            model_version=str(loaded.metadata["dataset_fingerprint"])[:12],
+            threshold=applied_threshold,
+            model_threshold=loaded.threshold,
+            prediction=results[0],
         )
 
     @application.get("/metrics", tags=["operations"])

@@ -9,6 +9,7 @@ from typing import cast
 import pytest
 from fastapi.testclient import TestClient
 
+from fraud_detection import __version__
 from fraud_detection.api import (
     MAX_REQUEST_BODY_BYTES,
     MODEL_PATH_ENVIRONMENT_VARIABLE,
@@ -48,7 +49,7 @@ def test_health_reports_loaded_model(
     assert response.status_code == 200
     assert response.json() == {
         "status": "ready",
-        "service_version": "0.1.0",
+        "service_version": __version__,
         "model_created_at": model.metadata["created_at"],
         "feature_count": 30,
         "threshold": model.threshold,
@@ -116,6 +117,90 @@ def test_predict_rejects_invalid_threshold_override(
     response = client.post("/v1/predict", json={"transactions": records, "threshold": threshold})
 
     assert response.status_code == 422
+
+
+def test_score_returns_single_prediction(
+    client: TestClient,
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, model, dataset = api_context
+    record = dataset.features.iloc[0].to_dict()
+
+    response = client.post("/v1/score", json={"transaction": record})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["model_version"] == model.metadata["dataset_fingerprint"][:12]
+    assert body["threshold"] == model.threshold
+    assert body["model_threshold"] == model.threshold
+    assert 0 <= body["prediction"]["fraud_probability"] <= 1
+    assert isinstance(body["prediction"]["is_fraud"], bool)
+    assert body["prediction"]["contributions"] is None
+
+
+def test_score_supports_explain_and_threshold_override(
+    client: TestClient,
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, model, dataset = api_context
+    record = dataset.features.iloc[0].to_dict()
+
+    response = client.post(
+        "/v1/score",
+        json={"transaction": record, "explain": True, "threshold": 0.0},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["threshold"] == 0.0
+    assert body["model_threshold"] == model.threshold
+    assert body["prediction"]["is_fraud"] is True
+    assert set(body["prediction"]["contributions"]) == set(model.feature_names)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"transaction": {"wrong": 1.0}},
+        {"transaction": {}, "threshold": 1.5},
+        {"transactions": []},
+    ],
+)
+def test_score_rejects_invalid_requests(client: TestClient, payload: dict[str, object]) -> None:
+    response = client.post("/v1/score", json=payload)
+
+    assert response.status_code == 422
+
+
+def test_score_counts_toward_prediction_metrics(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, model, dataset = api_context
+    single = dataset.features.iloc[:1].to_dict(orient="records")[0]
+    isolated_app = create_app(model=model)
+
+    with TestClient(isolated_app) as isolated_client:
+        isolated_client.post("/v1/score", json={"transaction": single})
+        response = isolated_client.get("/metrics")
+
+    assert response.status_code == 200
+    body = response.text
+    assert 'http_requests_total{method="POST",path="/v1/score",status_code="200"} 1.0' in body
+    fraud_count = float(
+        next(
+            line.rsplit(" ", 1)[1]
+            for line in body.splitlines()
+            if line.startswith('fraud_predictions_total{is_fraud="true"}')
+        )
+    )
+    legitimate_count = float(
+        next(
+            line.rsplit(" ", 1)[1]
+            for line in body.splitlines()
+            if line.startswith('fraud_predictions_total{is_fraud="false"}')
+        )
+    )
+    assert fraud_count + legitimate_count == 1
 
 
 def test_predict_returns_actionable_schema_error(client: TestClient) -> None:
@@ -306,8 +391,9 @@ def test_api_rejects_chunked_body_that_crosses_limit(client: TestClient) -> None
 def test_openapi_describes_versioned_prediction_endpoint(client: TestClient) -> None:
     document = client.get("/openapi.json").json()
 
-    assert document["info"]["version"] == "0.1.0"
+    assert document["info"]["version"] == __version__
     assert "/v1/predict" in document["paths"]
+    assert "/v1/score" in document["paths"]
 
 
 def test_request_context_propagates_safe_correlation_id(client: TestClient) -> None:
