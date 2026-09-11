@@ -32,6 +32,12 @@ All notable changes to this project are documented here. The format follows
 - A `fraud-detect predict --threshold` override (CLI) recording the applied
   threshold, the model threshold, and whether it was overridden in the output
   summary.
+- An optional `--explain-llm` flag on `predict` (and `"explain_llm": true`
+  in the API) that adds per-transaction natural-language rationales citing
+  the top contributing features and their direction.
+- Drift surveillance with `--fail-on warning|drifted` plus optional
+  `--webhook-slack` / `--webhook-pagerduty` flags to push real-time alerts
+  to Slack or PagerDuty, including the drifted features and their PSI values.
 - Reference label-delay analysis documentation in the README, explaining how
   chargeback label delays can leak into training data when using random splits
   and how the `stability` and `rolling` commands help quantify performance

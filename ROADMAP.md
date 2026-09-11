@@ -188,18 +188,28 @@ mission:
   quality. The `stability` and `rolling` commands help quantify how much
   performance fluctuates across time windows.
 
-## Phase 12 — Prompt engineering and governance (next)
+## Phase 12 — Prompt engineering and governance
 
-- **Per-transaction LLM explanations** (`Proposed`) — extend `predict` and
+- **Per-transaction LLM explanations** (`Done`) — extend `predict` and
   `promote` with an optional `--explain-llm` flag that uses a small language
   model to generate a natural-language rationale for the fraud score, citing
   the top contributing features and their direction. Record the prompt
   template and model version in the output for auditability.
-- **Model card drift alerts** (`Proposed`) — extend `drift` with an optional
+- **Model card drift alerts** (`Done`) — extend `drift` with an optional
   `--fail-on drifted` flag that posts a formatted alert (e.g., to Slack or
   PagerDuty) when PSI exceeds the cutoff, including the top drifted features
   and their current vs. reference distributions. Guard against false
   positives by requiring a minimum number of drifted features.
+
+## Phase 13 — Model governance and compliance (next)
+
+- **Model versioning and lineage** (`Proposed`) — track model artifacts
+  with content-addressable identifiers (SHA-256 of the training data,
+  hyperparameters, and code version) and link them to the Git commit that
+  produced them. Add a `model-card` command to display the full lineage.
+- **Automated compliance reporting** (`Proposed`) — generate a PDF/HTML
+  compliance report from the model card and recent monitoring data
+  (calibration, drift, stability, benchmark) for auditors and regulators.
 
 ## Contributing to the roadmap
 

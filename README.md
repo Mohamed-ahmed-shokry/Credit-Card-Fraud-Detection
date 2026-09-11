@@ -110,6 +110,27 @@ curl -X POST http://localhost:8000/v1/predict \
   }'
 ```
 
+For natural-language explanations of individual predictions, add
+`"explain_llm": true` (CLI: `--explain-llm`):
+
+```bash
+fraud-detect predict artifacts/model data/demo.csv \
+  --output predictions.csv --explain --explain-llm
+```
+
+```bash
+curl -X POST http://localhost:8000/v1/predict \
+  -H "Content-Type: application/json" \
+  -d '{
+    "transactions": [{"Time": 12345.0, "V1": -1.2, ...}],
+    "explain": true,
+    "explain_llm": true
+  }'
+```
+
+The output includes an `llm_explanation` column/field with a natural-language
+summary citing the top contributing features and their direction.
+
 ## Override the decision threshold for audits
 
 For audit and backtest scoring, both the CLI and the API accept an explicit
@@ -548,6 +569,30 @@ fraud-detect drift artifacts/model recent_transactions.csv --fail-on drifted
 ```
 
 The JSON report is still printed to stdout before the non-zero exit.
+
+For real-time alerting, integrate with Slack or PagerDuty:
+
+```bash
+fraud-detect drift artifacts/model recent_transactions.csv \
+  --fail-on drifted \
+  --webhook-slack https://hooks.slack.com/services/... \
+  --webhook-pagerduty <pagerduty-integration-key>
+```
+
+The `--fail-on` flag still controls the exit code, while webhooks deliver
+real-time notifications to your incident management system.
+
+For real-time alerting, integrate with Slack or PagerDuty:
+
+```bash
+fraud-detect drift artifacts/model recent_transactions.csv \
+  --fail-on drifted \
+  --webhook-slack https://hooks.slack.com/services/... \
+  --webhook-pagerduty <pagerduty-integration-key>
+```
+
+The `--fail-on` flag still controls the exit code, while webhooks deliver
+real-time notifications to your incident management system.
 
 ## Check probability calibration
 
