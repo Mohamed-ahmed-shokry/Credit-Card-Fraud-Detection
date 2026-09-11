@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import statistics
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Annotated, Any, NoReturn
 from uuid import uuid4
@@ -22,7 +24,12 @@ from fraud_detection.data import (
     generate_synthetic_data,
     load_csv,
 )
-from fraud_detection.drift import DriftError, assess_drift, surveillance_tripped
+from fraud_detection.drift import (
+    DriftError,
+    DriftReport,
+    assess_drift,
+    surveillance_tripped,
+)
 from fraud_detection.evaluation import (
     ThresholdRow,
     calibration_report,
@@ -1054,6 +1061,14 @@ def drift_command(
             "for scheduled surveillance."
         ),
     ] = None,
+    webhook_slack: Annotated[
+        str | None,
+        typer.Option(help="Slack webhook URL for drift alerts."),
+    ] = None,
+    webhook_pagerduty: Annotated[
+        str | None,
+        typer.Option(help="PagerDuty Events API v2 integration key for drift alerts."),
+    ] = None,
 ) -> None:
     """Compare current feature distributions with the training baseline."""
     _guard_output(output, overwrite)
@@ -1069,6 +1084,13 @@ def drift_command(
         report_json = json.dumps(report.to_dict(), indent=2)
         _emit_report(report_json, output)
         tripped = surveillance_tripped(report.overall_status, fail_on)
+        if tripped and (webhook_slack or webhook_pagerduty):
+            _send_drift_alert(
+                report=report,
+                webhook_slack=webhook_slack,
+                webhook_pagerduty=webhook_pagerduty,
+                model_version=str(model.metadata["dataset_fingerprint"])[:12],
+            )
     except (
         OSError,
         UnicodeDecodeError,
@@ -1086,6 +1108,95 @@ def drift_command(
             err=True,
         )
         raise typer.Exit(code=1)
+
+
+def _send_drift_alert(
+    *,
+    report: DriftReport,
+    webhook_slack: str | None,
+    webhook_pagerduty: str | None,
+    model_version: str,
+) -> None:
+    """Send drift alert to configured webhooks (Slack and/or PagerDuty)."""
+
+    # Build alert payload
+    alert_payload: dict[str, Any] = {
+        "model_version": model_version,
+        "overall_status": report.overall_status,
+        "mean_psi": report.mean_psi,
+        "max_psi": report.max_psi,
+        "drifted_features": [
+            {"feature": f.feature, "psi": f.psi, "status": f.status}
+            for f in report.features
+            if f.status in ("warning", "drifted")
+        ],
+    }
+
+    # Send to Slack
+    if webhook_slack:
+        slack_payload = {
+            "text": f"Drift Alert: Model {model_version} - {report.overall_status.upper()}",
+            "blocks": [
+                {
+                    "type": "header",
+                    "text": {
+                        "type": "plain_text",
+                        "text": f"Drift Alert: {report.overall_status.upper()}",
+                    },
+                },
+                {
+                    "type": "section",
+                    "fields": [
+                        {"type": "mrkdwn", "text": f"*Model:* {model_version}"},
+                        {"type": "mrkdwn", "text": f"*Status:* {report.overall_status}"},
+                        {"type": "mrkdwn", "text": f"*Mean PSI:* {report.mean_psi:.4f}"},
+                        {"type": "mrkdwn", "text": f"*Max PSI:* {report.max_psi:.4f}"},
+                    ],
+                },
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": "Drifted Features:\n"
+                        + "\n".join(
+                            f"• {f['feature']}: PSI={f['psi']:.4f} ({f['status']})"
+                            for f in alert_payload["drifted_features"][:5]
+                        ),
+                    },
+                },
+            ],
+        }
+        _post_webhook(webhook_slack, slack_payload)
+
+    # Send to PagerDuty
+    if webhook_pagerduty:
+        # PagerDuty Events API v2
+        has_drifted = any(
+            f.status == "drifted" for f in alert_payload["drifted_features"]
+        )
+        severity = "critical" if has_drifted else "warning"
+        pd_payload: dict[str, Any] = {
+            "routing_key": webhook_pagerduty,
+            "event_action": "trigger",
+            "payload": {
+                "summary": f"Drift Alert: Model {model_version} - {report.overall_status.upper()}",
+                "source": "fraud-detection",
+                "severity": severity,
+                "custom_details": alert_payload,
+            },
+        }
+        _post_webhook("https://events.pagerduty.com/v2/enqueue", pd_payload)
+
+
+def _post_webhook(url: str, payload: dict[str, Any]) -> None:
+    """Post JSON payload to a webhook URL with error handling."""
+    req = urllib.request.Request(
+        url, data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json"}
+    )
+    try:
+        urllib.request.urlopen(req, timeout=10)
+    except urllib.error.URLError as exc:
+        typer.echo(f"Warning: Failed to send webhook: {exc}", err=True)
 
 
 @app.command("calibration")
