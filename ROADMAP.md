@@ -175,15 +175,31 @@ mission:
   instructions. Like every release-gated workflow here, the first real
   release exercises it.
 
-## Phase 11 — Serving and data frontiers (next)
+## Phase 11 — Serving and data frontiers
 
-- **Streaming prediction endpoint** (`Proposed`) — evaluate whether a
-  single-transaction `POST /v1/score` route earns its keep next to the batch
-  endpoint, weighing latency shape and client ergonomics rather than adding
-  surface area by default.
-- **Reference label-delay analysis** (`Proposed`) — document how to reason
-  about chargeback label delays when assembling held-out evaluation sets,
-  since fraud labels arrive late and naive random splits overstate quality.
+- **Streaming prediction endpoint** (`Done`) — a single-transaction `POST /v1/score`
+  route alongside the batch endpoint, returning the applied threshold, the
+  model's tuned threshold, and the per-transaction prediction with optional
+  explanations. Shares the scoring helper with the batch endpoint so both
+  paths stay consistent.
+- **Reference label-delay analysis** (`Done`) — documented in the README: how
+  to reason about chargeback label delays when assembling held-out evaluation
+  sets, since fraud labels arrive late and naive random splits overstate
+  quality. The `stability` and `rolling` commands help quantify how much
+  performance fluctuates across time windows.
+
+## Phase 12 — Prompt engineering and governance (next)
+
+- **Per-transaction LLM explanations** (`Proposed`) — extend `predict` and
+  `promote` with an optional `--explain-llm` flag that uses a small language
+  model to generate a natural-language rationale for the fraud score, citing
+  the top contributing features and their direction. Record the prompt
+  template and model version in the output for auditability.
+- **Model card drift alerts** (`Proposed`) — extend `drift` with an optional
+  `--fail-on drifted` flag that posts a formatted alert (e.g., to Slack or
+  PagerDuty) when PSI exceeds the cutoff, including the top drifted features
+  and their current vs. reference distributions. Guard against false
+  positives by requiring a minimum number of drifted features.
 
 ## Contributing to the roadmap
 

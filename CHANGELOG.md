@@ -32,6 +32,10 @@ All notable changes to this project are documented here. The format follows
 - A `fraud-detect predict --threshold` override (CLI) recording the applied
   threshold, the model threshold, and whether it was overridden in the output
   summary.
+- Reference label-delay analysis documentation in the README, explaining how
+  chargeback label delays can leak into training data when using random splits
+  and how the `stability` and `rolling` commands help quantify performance
+  fluctuations across time windows.
 - Named business-cost policies: `train`/`compare`/`stability` accept
   `--cost-policy`, persisted as a `cost_policy` block in the model card and
   echoed by the `thresholds` report (`"custom"` when overridden ad hoc).
