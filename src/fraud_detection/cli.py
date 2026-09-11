@@ -1171,9 +1171,7 @@ def _send_drift_alert(
     # Send to PagerDuty
     if webhook_pagerduty:
         # PagerDuty Events API v2
-        has_drifted = any(
-            f.status == "drifted" for f in alert_payload["drifted_features"]
-        )
+        has_drifted = any(f.status == "drifted" for f in alert_payload["drifted_features"])
         severity = "critical" if has_drifted else "warning"
         pd_payload: dict[str, Any] = {
             "routing_key": webhook_pagerduty,
@@ -1190,11 +1188,11 @@ def _send_drift_alert(
 
 def _post_webhook(url: str, payload: dict[str, Any]) -> None:
     """Post JSON payload to a webhook URL with error handling."""
-    req = urllib.request.Request(
+    req = urllib.request.Request(  # noqa: S310
         url, data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json"}
     )
     try:
-        urllib.request.urlopen(req, timeout=10)
+        urllib.request.urlopen(req, timeout=10)  # noqa: S310
     except urllib.error.URLError as exc:
         typer.echo(f"Warning: Failed to send webhook: {exc}", err=True)
 
