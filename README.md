@@ -34,18 +34,21 @@ binary target contains exactly `0` (legitimate) and `1` (fraud).
 
 ## Architecture
 
+The detailed module boundaries, artifact contract, serving boundary, and
+extension invariants are documented in [ARCHITECTURE.md](ARCHITECTURE.md).
+
 ```mermaid
 flowchart LR
     A[CSV transactions] --> B[Schema and value validation]
     B --> C[Past or stratified train split]
     B --> D[Next validation window]
     B --> E[Untouched newest test window]
-    C --> F[Scale + class-balanced logistic regression]
+    C --> F[Fit selected calibrated classifier]
     F --> G[Select F1 threshold on validation]
     G --> H[Evaluate once on test]
     H --> I[Model artifact + JSON model card]
-    I --> J[Batch CLI]
-    I --> K[FastAPI /v1/predict]
+    I --> J[Batch CLI and governance reports]
+    I --> K[FastAPI /v1/predict and /v1/score]
 ```
 
 ## Quick start
@@ -76,6 +79,7 @@ Run the complete workflow without downloading private data:
 fraud-detect generate-data --output data/demo.csv --rows 5000
 fraud-detect train data/demo.csv --output artifacts/model
 fraud-detect inspect artifacts/model
+fraud-detect model-card artifacts/model
 fraud-detect explain artifacts/model --top 10
 fraud-detect drift artifacts/model data/demo.csv
 fraud-detect predict artifacts/model data/demo.csv --output predictions.csv
@@ -110,8 +114,10 @@ curl -X POST http://localhost:8000/v1/predict \
   }'
 ```
 
-For natural-language explanations of individual predictions, add
-`"explain_llm": true` (CLI: `--explain-llm`):
+For a deterministic natural-language explanation of individual predictions, add
+`"explain_llm": true` (CLI: `--explain-llm`). Despite the historical flag name,
+this reference implementation does not call an external language-model service;
+it renders an auditable template from the model's local contributions:
 
 ```bash
 fraud-detect predict artifacts/model data/demo.csv \
@@ -128,8 +134,8 @@ curl -X POST http://localhost:8000/v1/predict \
   }'
 ```
 
-The output includes an `llm_explanation` column/field with a natural-language
-summary citing the top contributing features and their direction.
+The CLI output includes an `llm_explanation` column and the API response includes
+an `explanation` field. Both cite the top contributing features and their direction.
 
 ## Override the decision threshold for audits
 
@@ -313,6 +319,23 @@ artifacts/model/
 ├── metadata.json   # readable model card, metrics, fingerprint, and schema
 └── model.joblib    # fitted preprocessing/model pipeline and threshold
 ```
+
+### Inspect model lineage
+
+Display a compact model identity and its content-addressable lineage:
+
+```bash
+fraud-detect model-card artifacts/model
+fraud-detect model-card artifacts/model --verbose --no-git-info
+```
+
+New artifacts persist a lineage block containing the dataset fingerprint, a
+SHA-256 hash of the canonical training configuration, the package version, and a
+content hash over those values. CLI-trained artifacts also record the Git commit
+and origin URL when Git metadata is available. The existing short
+`model_version` remains the first 12 characters of the dataset fingerprint for
+backward-compatible API and report identifiers. Older artifacts without lineage
+remain loadable.
 
 Model cards record the Python, joblib, NumPy, pandas, scikit-learn, and SciPy
 versions used for training. The loader requires the recorded scikit-learn version
@@ -582,18 +605,6 @@ fraud-detect drift artifacts/model recent_transactions.csv \
 The `--fail-on` flag still controls the exit code, while webhooks deliver
 real-time notifications to your incident management system.
 
-For real-time alerting, integrate with Slack or PagerDuty:
-
-```bash
-fraud-detect drift artifacts/model recent_transactions.csv \
-  --fail-on drifted \
-  --webhook-slack https://hooks.slack.com/services/... \
-  --webhook-pagerduty <pagerduty-integration-key>
-```
-
-The `--fail-on` flag still controls the exit code, while webhooks deliver
-real-time notifications to your incident management system.
-
 ## Check probability calibration
 
 Judge whether predicted probabilities mean what they say on held-out labeled
@@ -680,6 +691,21 @@ fraud-detect promote artifacts/challenger heldout_transactions.csv \
 The bundle states facts, not a verdict: promoting stays a human decision
 against the runbook checklist above.
 
+Render that bundle as a self-contained HTML compliance report. Optional
+stability evidence and the artifact integrity manifest can be included:
+
+```bash
+fraud-detect compliance reports/promotion.json \
+  --stability reports/stability.json \
+  --artifact artifacts/challenger \
+  --output reports/compliance.html
+```
+
+The report is dependency-free, escapes evidence values before rendering, and
+states evidence rather than making an automated promotion decision. The HTML
+contains model identity, holdout metrics, calibration, threshold tradeoffs,
+drift, serving benchmarks, optional stability, and artifact SHA-256 digests.
+
 ## Container deployment
 
 Train the model on the host first, then mount it read-only:
@@ -745,6 +771,7 @@ src/fraud_detection/
 ├── data.py         # ingestion, schema validation, and synthetic data
 ├── drift.py        # training profiles and PSI drift reporting
 ├── evaluation.py   # threshold tuning, imbalance-aware metrics, and calibration reports
+├── reporting.py    # self-contained HTML compliance report rendering
 └── model.py        # training, model card, inference, and persistence
 tests/              # unit, integration, CLI, and API tests
 ```

@@ -25,6 +25,11 @@ Activate the environment with `source .venv/bin/activate` on Linux/macOS or
 4. Document any public CLI, API, schema, or artifact-format change.
 5. Use small commits that each leave the repository in a verified state.
 
+Read [ARCHITECTURE.md](ARCHITECTURE.md) before changing artifact metadata,
+serving boundaries, or evaluation behavior. New artifact fields should be
+additive unless a migration is explicitly documented, and report renderers
+must escape values originating in evidence files.
+
 Do not tune a threshold or choose a model using the test split. The validation
 split owns model-selection decisions; the test split is for final evaluation only.
 Use precision/recall-oriented metrics for imbalanced behavior rather than accuracy

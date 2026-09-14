@@ -201,15 +201,39 @@ mission:
   and their current vs. reference distributions. Guard against false
   positives by requiring a minimum number of drifted features.
 
-## Phase 13 — Model governance and compliance (next)
+## Phase 13 — Model governance and compliance
 
-- **Model versioning and lineage** (`Proposed`) — track model artifacts
-  with content-addressable identifiers (SHA-256 of the training data,
-  hyperparameters, and code version) and link them to the Git commit that
-  produced them. Add a `model-card` command to display the full lineage.
-- **Automated compliance reporting** (`Proposed`) — generate a PDF/HTML
-  compliance report from the model card and recent monitoring data
-  (calibration, drift, stability, benchmark) for auditors and regulators.
+- **Model versioning and lineage** (`Done`) — newly trained artifacts persist
+  SHA-256 dataset and configuration fingerprints, package version, a combined
+  content hash, and best-effort Git commit/origin provenance from CLI training.
+  The `model-card` command exposes compact and verbose views while preserving
+  loading compatibility for older artifacts.
+- **Automated compliance reporting** (`Done`) — `compliance` renders a
+  self-contained, escaped HTML report from a `promote` bundle, with optional
+  stability evidence and artifact manifest hashes. It records evidence and
+  explicitly does not make an automated promotion decision.
+
+## Phase 14 — Evaluation realism and operational integration (next)
+
+The next phase should close the remaining gap between this reference workflow
+and a deployment team's data/operations process without turning the project
+into a general-purpose platform:
+
+- **Label-delay-aware temporal gaps** (`Proposed`) — add a configured gap
+  between training, validation, and test windows so chargeback latency is
+  enforced by the split implementation rather than documented only in the
+  runbook.
+- **Artifact lineage validation command** (`Proposed`) — add a read-only
+  validator that checks artifact integrity, runtime compatibility, lineage
+  completeness, and report compatibility before a deployment job consumes an
+  artifact.
+- **Structured audit event export** (`Proposed`) — provide an opt-in JSONL
+  sink for scoring and promotion events with redaction guarantees, leaving
+  durable storage, retention, and access control to the deploying operator.
+- **Optional explanation provider interface** (`Proposed`) — if external
+  language models are added, isolate them behind an explicit provider boundary
+  with timeouts, redaction, cost controls, and a deterministic fallback; the
+  current offline template remains the default.
 
 ## Contributing to the roadmap
 

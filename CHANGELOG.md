@@ -8,6 +8,17 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- Persisted model lineage with deterministic configuration and content hashes,
+  package version, and best-effort Git commit/origin provenance from CLI
+  training. The new `model-card` command exposes compact and verbose lineage
+  views while keeping older artifacts loadable.
+- A dependency-free `compliance` CLI command that renders promotion evidence,
+  optional stability results, and artifact manifest hashes as escaped,
+  self-contained HTML for human review.
+- API support for the documented `explain_llm` request flag, returning an
+  `explanation` field alongside the existing local contributions. The
+  historical flag now uses deterministic model-derived contribution templates,
+  not an unconfigured external service.
 - Keyless-signed container images: the release workflow publishes the API
   image to GHCR with Sigstore/cosign signing (no stored keys), plus README
   verification instructions and a release-checklist confirmation step.
