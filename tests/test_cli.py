@@ -1575,6 +1575,7 @@ def test_predict_supports_local_explanation(tmp_path: Path) -> None:
             "--output",
             str(output_path),
             "--explain",
+            "--explain-llm",
         ],
     )
     assert predicted.exit_code == 0, predicted.output
@@ -1583,6 +1584,7 @@ def test_predict_supports_local_explanation(tmp_path: Path) -> None:
     assert {"fraud_probability", "is_fraud"}.issubset(scored.columns)
     contrib_cols = [c for c in scored.columns if c.startswith("contrib_")]
     assert len(contrib_cols) == 30
+    assert scored["llm_explanation"].str.contains("Top contributing factors:").all()
 
 
 def test_model_card_prints_compact_view(tmp_path: Path, trained_artifact: Path) -> None:

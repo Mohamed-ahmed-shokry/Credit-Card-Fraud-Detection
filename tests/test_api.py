@@ -147,7 +147,12 @@ def test_score_supports_explain_and_threshold_override(
 
     response = client.post(
         "/v1/score",
-        json={"transaction": record, "explain": True, "threshold": 0.0},
+        json={
+            "transaction": record,
+            "explain": True,
+            "explain_llm": True,
+            "threshold": 0.0,
+        },
     )
 
     assert response.status_code == 200
@@ -156,6 +161,26 @@ def test_score_supports_explain_and_threshold_override(
     assert body["model_threshold"] == model.threshold
     assert body["prediction"]["is_fraud"] is True
     assert set(body["prediction"]["contributions"]) == set(model.feature_names)
+    assert "Top contributing factors:" in body["prediction"]["explanation"]
+
+
+def test_predict_supports_natural_language_explanation(
+    client: TestClient,
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, _, dataset = api_context
+    records = dataset.features.iloc[:2].to_dict(orient="records")
+
+    response = client.post(
+        "/v1/predict",
+        json={"transactions": records, "explain_llm": True, "threshold": 0.0},
+    )
+
+    assert response.status_code == 200
+    predictions = response.json()["predictions"]
+    assert all(item["is_fraud"] for item in predictions)
+    assert all("Top contributing factors:" in item["explanation"] for item in predictions)
+    assert all(item["contributions"] is None for item in predictions)
 
 
 @pytest.mark.parametrize(

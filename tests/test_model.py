@@ -703,6 +703,33 @@ def test_explain_local_returns_per_transaction_contributions(
     assert all(all(isinstance(v, float) for v in exp.values()) for exp in explanations)
 
 
+def test_explain_local_natural_language_uses_model_contributions(
+    trained_model: tuple[FraudModel, ValidatedDataset],
+) -> None:
+    model, dataset = trained_model
+    features = dataset.features.iloc[:2]
+    probabilities = model.predict_probabilities(features)
+
+    explanations = model.explain_local_natural_language(
+        features,
+        probabilities,
+        threshold=0.0,
+    )
+
+    assert len(explanations) == 2
+    assert all("classified as FRAUD" in explanation for explanation in explanations)
+    assert all("Top contributing factors:" in explanation for explanation in explanations)
+    assert any(feature in explanations[0] for feature in model.feature_names)
+    with pytest.raises(ValueError, match="top_k"):
+        model.explain_local_natural_language(features, probabilities, top_k=0)
+    with pytest.raises(ValueError, match="threshold"):
+        model.explain_local_natural_language(features, probabilities, threshold=2.0)
+    with pytest.raises(ModelArtifactError, match="valid probabilities"):
+        model.explain_local_natural_language(features, np.array([0.5]))
+    with pytest.raises(ModelArtifactError, match="transaction count"):
+        model.explain_local_natural_language(features, probabilities, contributions=[{}])
+
+
 def test_explain_local_requires_scaler_stats(
     trained_model: tuple[FraudModel, ValidatedDataset],
 ) -> None:
