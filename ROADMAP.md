@@ -17,6 +17,18 @@ replacement for a real gateway.
 
 Status legend: `Proposed` (not started), `In progress`, `Done`.
 
+## Current state
+
+The project is a beta reference implementation with the implementation work in
+Phases 2 through 13 complete. Phase 1's workflows are in place, but the first
+real PyPI release still requires maintainer-side trusted-publisher setup. The
+shipped system covers leakage-safe training, multiple calibrated estimators,
+threshold and calibration analysis, drift surveillance, promotion evidence,
+artifact integrity, signed release artifacts, online scoring, deterministic
+local/natural-language explanations, persisted lineage, and HTML compliance
+reports. The next direction is evaluation realism and operational integration,
+not another estimator or duplicate serving stack.
+
 ## Phase 1 — Distribution
 
 The package already builds cleanly and passes `twine check` in CI. Nothing
@@ -190,16 +202,15 @@ mission:
 
 ## Phase 12 — Prompt engineering and governance
 
-- **Per-transaction LLM explanations** (`Done`) — extend `predict` and
-  `promote` with an optional `--explain-llm` flag that uses a small language
-  model to generate a natural-language rationale for the fraud score, citing
-  the top contributing features and their direction. Record the prompt
-  template and model version in the output for auditability.
+- **Per-transaction natural-language explanations** (`Done`) — `predict` and
+  the API accept the historical `--explain-llm`/`explain_llm` flag and render a
+  deterministic, offline rationale from local model contributions, citing the
+  top contributing features and their direction. The response records the
+  applied threshold and remains auditable without an external provider.
 - **Model card drift alerts** (`Done`) — extend `drift` with an optional
-  `--fail-on drifted` flag that posts a formatted alert (e.g., to Slack or
-  PagerDuty) when PSI exceeds the cutoff, including the top drifted features
-  and their current vs. reference distributions. Guard against false
-  positives by requiring a minimum number of drifted features.
+  `--fail-on warning|drifted` flag and Slack/PagerDuty webhook options. Alerts
+  include the top drifted features and their PSI values; deployment-specific
+  minimum-feature policies remain an operator concern.
 
 ## Phase 13 — Model governance and compliance
 
