@@ -249,6 +249,70 @@ class FraudModel:
             return self._explain_local_logistic(ordered)
         return self._explain_local_importance(ordered)
 
+    def explain_local_natural_language(
+        self,
+        features: pd.DataFrame,
+        probabilities: np.ndarray,
+        *,
+        threshold: float | None = None,
+        contributions: list[dict[str, Any]] | None = None,
+        top_k: int = 3,
+    ) -> list[str]:
+        """Render deterministic natural-language explanations from local effects.
+
+        This is intentionally template-based rather than an external LLM call:
+        explanations remain reproducible, offline, and auditable while still
+        describing the model-derived contributions that drive each decision.
+        """
+        ordered = self.validate_features(features)
+        if not 1 <= top_k <= len(self.feature_names):
+            raise ValueError("top_k must be between 1 and the number of model features")
+        applied_threshold = self.threshold if threshold is None else threshold
+        if isinstance(applied_threshold, bool) or not 0.0 <= applied_threshold <= 1.0:
+            raise ValueError("threshold must be between 0 and 1")
+        probability_values = np.asarray(probabilities, dtype=float)
+        if (
+            probability_values.shape != (len(ordered),)
+            or not np.isfinite(probability_values).all()
+            or np.any((probability_values < 0.0) | (probability_values > 1.0))
+        ):
+            raise ModelArtifactError("Natural-language explanations require valid probabilities.")
+
+        local_contributions = contributions or self.explain_local(ordered)
+        if len(local_contributions) != len(ordered):
+            raise ModelArtifactError("Local explanations do not match the transaction count.")
+
+        explanations = []
+        for probability, row_contributions in zip(
+            probability_values, local_contributions, strict=True
+        ):
+            ranked = sorted(
+                row_contributions.items(),
+                key=lambda item: abs(float(item[1])),
+                reverse=True,
+            )[:top_k]
+            factors = ", ".join(
+                f"{feature} ({float(value):+.3f}, "
+                f"{'increases' if float(value) >= 0 else 'decreases'} fraud risk)"
+                for feature, value in ranked
+            )
+            probability_value = float(probability)
+            risk_level = (
+                "HIGH"
+                if probability_value >= 0.7
+                else "MEDIUM"
+                if probability_value >= 0.3
+                else "LOW"
+            )
+            decision = "FRAUD" if probability_value >= applied_threshold else "LEGITIMATE"
+            explanations.append(
+                f"Transaction classified as {decision} "
+                f"(fraud probability: {probability_value:.2%}, "
+                f"applied threshold: {applied_threshold:.2f}, risk level: {risk_level}). "
+                f"Top contributing factors: {factors}."
+            )
+        return explanations
+
     def _explain_local_logistic(self, ordered: pd.DataFrame) -> list[dict[str, Any]]:
         """Compute local explanations for logistic regression using standardized coefficients."""
         coefficients = self.metadata.get("feature_effects", [])

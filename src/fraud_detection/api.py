@@ -89,6 +89,7 @@ class PredictionRequest(BaseModel):
         Field(min_length=1, max_length=1_000),
     ]
     explain: bool = False
+    explain_llm: bool = False
     threshold: float | None = Field(default=None, ge=0.0, le=1.0)
 
 
@@ -98,6 +99,7 @@ class PredictionResult(BaseModel):
     fraud_probability: float
     is_fraud: bool
     contributions: dict[str, float] | None = None
+    explanation: str | None = None
 
 
 class PredictionResponse(BaseModel):
@@ -116,6 +118,7 @@ class ScoreRequest(BaseModel):
 
     transaction: dict[str, TransactionValue]
     explain: bool = False
+    explain_llm: bool = False
     threshold: float | None = Field(default=None, ge=0.0, le=1.0)
 
 
@@ -343,30 +346,38 @@ def create_app(
         frame: pd.DataFrame,
         *,
         explain: bool,
+        explain_llm: bool,
         threshold: float | None,
     ) -> tuple[float, list[PredictionResult]]:
         """Score validated transactions and record decision counts."""
         probabilities = loaded.predict_probabilities(frame)
         applied_threshold = loaded.threshold if threshold is None else threshold
         decisions = probabilities >= applied_threshold
+        local_explanations = loaded.explain_local(frame) if explain or explain_llm else None
+        natural_language = (
+            loaded.explain_local_natural_language(
+                frame,
+                probabilities,
+                threshold=applied_threshold,
+                contributions=local_explanations,
+            )
+            if explain_llm
+            else None
+        )
         results = []
-        if explain:
-            explanations = loaded.explain_local(frame)
-            for probability, decision, contributions in zip(
-                probabilities, decisions, explanations, strict=True
-            ):
-                results.append(
-                    PredictionResult(
-                        fraud_probability=float(probability),
-                        is_fraud=bool(decision),
-                        contributions=contributions,
-                    )
+        for index, (probability, decision) in enumerate(zip(probabilities, decisions, strict=True)):
+            results.append(
+                PredictionResult(
+                    fraud_probability=float(probability),
+                    is_fraud=bool(decision),
+                    contributions=(
+                        local_explanations[index]
+                        if explain and local_explanations is not None
+                        else None
+                    ),
+                    explanation=(natural_language[index] if natural_language else None),
                 )
-        else:
-            for probability, decision in zip(probabilities, decisions, strict=True):
-                results.append(
-                    PredictionResult(fraud_probability=float(probability), is_fraud=bool(decision))
-                )
+            )
         prediction_counter.labels(is_fraud="true").inc(int(decisions.sum()))
         prediction_counter.labels(is_fraud="false").inc(int((~decisions).sum()))
         return applied_threshold, results
@@ -380,7 +391,11 @@ def create_app(
         loaded = _model_from_request(request)
         frame = pd.DataFrame(payload.transactions)
         applied_threshold, results = score_frame(
-            loaded, frame, explain=payload.explain, threshold=payload.threshold
+            loaded,
+            frame,
+            explain=payload.explain,
+            explain_llm=payload.explain_llm,
+            threshold=payload.threshold,
         )
         return PredictionResponse(
             model_version=str(loaded.metadata["dataset_fingerprint"])[:12],
@@ -398,7 +413,11 @@ def create_app(
         loaded = _model_from_request(request)
         frame = pd.DataFrame([payload.transaction])
         applied_threshold, results = score_frame(
-            loaded, frame, explain=payload.explain, threshold=payload.threshold
+            loaded,
+            frame,
+            explain=payload.explain,
+            explain_llm=payload.explain_llm,
+            threshold=payload.threshold,
         )
         return ScoreResponse(
             model_version=str(loaded.metadata["dataset_fingerprint"])[:12],
