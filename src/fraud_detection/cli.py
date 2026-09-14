@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import statistics
+import subprocess
 import time
 import urllib.error
 import urllib.request
@@ -179,6 +180,47 @@ def _version_callback(show_version: bool) -> None:
         raise typer.Exit()
 
 
+def _git_info() -> dict[str, str]:
+    """Return best-effort Git information for model provenance and inspection."""
+    try:
+        commit_result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],  # noqa: S607
+            capture_output=True,
+            text=True,
+            timeout=5,
+            cwd=Path.cwd(),
+            check=False,
+        )
+        if commit_result.returncode != 0 or not commit_result.stdout.strip():
+            return {}
+
+        info = {"commit": commit_result.stdout.strip()}
+        log_result = subprocess.run(
+            ["git", "log", "-1", "--format=%ci %s"],  # noqa: S607
+            capture_output=True,
+            text=True,
+            timeout=5,
+            cwd=Path.cwd(),
+            check=False,
+        )
+        if log_result.returncode == 0 and log_result.stdout.strip():
+            info["last_commit"] = log_result.stdout.strip()
+
+        remote_result = subprocess.run(
+            ["git", "config", "--get", "remote.origin.url"],  # noqa: S607
+            capture_output=True,
+            text=True,
+            timeout=5,
+            cwd=Path.cwd(),
+            check=False,
+        )
+        if remote_result.returncode == 0 and remote_result.stdout.strip():
+            info["repository"] = remote_result.stdout.strip()
+        return info
+    except (OSError, subprocess.SubprocessError):
+        return {}
+
+
 @app.callback()
 def _main(
     version: Annotated[
@@ -304,7 +346,16 @@ def train_command(
             split_strategy=split_strategy,
             time_column=time_column,
         )
-        model = train_model(dataset, config=config)
+        git_info = _git_info()
+        provenance = {
+            key: git_info[source]
+            for key, source in (
+                ("git_commit", "commit"),
+                ("git_repository", "repository"),
+            )
+            if source in git_info
+        }
+        model = train_model(dataset, config=config, provenance=provenance or None)
         model_path = save_model(model, output)
     except (OSError, DataValidationError, ModelArtifactError, ValueError) as exc:
         _abort(str(exc))
@@ -1601,37 +1652,13 @@ def model_card_command(
         model = load_model(model_path)
         metadata = model.metadata
 
-        # Get Git commit info if requested
-        git_info: dict[str, Any] = {}
-        if git_info_flag:
-            import subprocess
-
-            try:
-                result = subprocess.run(
-                    ["git", "rev-parse", "HEAD"],  # noqa: S607
-                    capture_output=True,
-                    text=True,
-                    timeout=5,
-                    cwd=Path.cwd(),
-                )
-                if result.returncode == 0:
-                    git_info["commit"] = result.stdout.strip()
-                    result = subprocess.run(
-                        ["git", "log", "-1", "--format=%ci %s"],  # noqa: S607
-                        capture_output=True,
-                        text=True,
-                        timeout=5,
-                        cwd=Path.cwd(),
-                    )
-                    if result.returncode == 0:
-                        git_info["last_commit"] = result.stdout.strip()
-            except (subprocess.SubprocessError, FileNotFoundError):
-                git_info["error"] = "Git not available or not a repository"
+        git_info = _git_info() if git_info_flag else {}
 
         # Build model card
         card: dict[str, Any] = {
             "model_version": str(metadata.get("dataset_fingerprint", ""))[:12],
             "dataset_fingerprint": metadata.get("dataset_fingerprint"),
+            "lineage": metadata.get("lineage"),
             "created_at": metadata.get("created_at"),
             "estimator": metadata.get("estimator"),
             "threshold": metadata.get("threshold"),
@@ -1660,6 +1687,7 @@ def model_card_command(
             compact = {
                 "model_version": card["model_version"],
                 "dataset_fingerprint": card["dataset_fingerprint"],
+                "lineage": card["lineage"],
                 "estimator": card["estimator"],
                 "threshold": card["threshold"],
                 "created_at": card["created_at"],
