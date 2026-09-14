@@ -159,6 +159,9 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- The development HTTP test client constraint now requires `httpx2>=2.12`,
+  avoiding the vulnerable 2.9.x/httpcore2 dependency line reported by
+  `pip-audit`.
 - Model artifacts now use format version 2 for the calibrated estimator contract.
 - Model saving and loading validate the estimator, feature schema, decision threshold,
   finite JSON metadata, and agreement between the embedded and readable model cards.
