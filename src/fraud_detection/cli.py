@@ -39,6 +39,7 @@ from fraud_detection.evaluation import (
     summarize_thresholds,
 )
 from fraud_detection.model import (
+    MANIFEST_FILENAME,
     CalibrationMethod,
     EstimatorType,
     FraudModel,
@@ -50,6 +51,7 @@ from fraud_detection.model import (
     save_model,
     train_model,
 )
+from fraud_detection.reporting import ComplianceReportError, render_compliance_report
 
 app = typer.Typer(
     name="fraud-detect",
@@ -1596,6 +1598,74 @@ def promote_command(
         ValueError,
     ) as exc:
         _abort(str(exc))
+
+
+@app.command("compliance")
+def compliance_command(
+    bundle: Annotated[
+        Path,
+        typer.Argument(
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="Promotion bundle JSON produced by the promote command.",
+        ),
+    ],
+    stability: Annotated[
+        Path | None,
+        typer.Option(
+            "--stability",
+            help="Optional stability report JSON to include in the HTML report.",
+        ),
+    ] = None,
+    artifact: Annotated[
+        Path | None,
+        typer.Option(
+            "--artifact",
+            help="Optional model artifact directory or manifest JSON for integrity evidence.",
+        ),
+    ] = None,
+    output: Annotated[
+        Path | None,
+        typer.Option("--output", "-o", help="Optional HTML report destination."),
+    ] = None,
+    overwrite: Annotated[
+        bool,
+        typer.Option(help="Replace an existing report file."),
+    ] = False,
+) -> None:
+    """Render promotion evidence as a self-contained HTML compliance report."""
+    _guard_output(output, overwrite)
+    try:
+        bundle_payload = _read_json_mapping(bundle, "promotion bundle")
+        stability_payload = (
+            _read_json_mapping(stability, "stability report") if stability is not None else None
+        )
+        manifest_payload = None
+        if artifact is not None:
+            manifest_path = artifact / MANIFEST_FILENAME if artifact.is_dir() else artifact
+            manifest_payload = _read_json_mapping(manifest_path, "artifact manifest")
+        report = render_compliance_report(
+            bundle_payload,
+            stability=stability_payload,
+            manifest=manifest_payload,
+        )
+        if output is not None:
+            _atomic_write_text(report, output)
+        typer.echo(report)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ComplianceReportError) as exc:
+        _abort(str(exc))
+
+
+def _read_json_mapping(path: Path, description: str) -> dict[str, Any]:
+    """Read a JSON object used as compliance evidence."""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ComplianceReportError(f"Invalid {description} JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ComplianceReportError(f"The {description} must be a JSON object.")
+    return payload
 
 
 @app.command("model-card")
