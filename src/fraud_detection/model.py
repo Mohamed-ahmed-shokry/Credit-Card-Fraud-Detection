@@ -8,6 +8,7 @@ import warnings
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
+from hashlib import sha256
 from importlib.metadata import version as distribution_version
 from pathlib import Path
 from platform import python_version
@@ -26,6 +27,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
+from fraud_detection import __version__
 from fraud_detection.data import ValidatedDataset
 from fraud_detection.drift import build_reference_profile, default_thresholds
 from fraud_detection.evaluation import (
@@ -303,6 +305,7 @@ def train_model(
     dataset: ValidatedDataset,
     *,
     config: TrainingConfig | None = None,
+    provenance: dict[str, str] | None = None,
 ) -> FraudModel:
     """Fit and evaluate a deterministic fraud model with untouched test data."""
     settings = config or TrainingConfig()
@@ -395,6 +398,7 @@ def train_model(
         scaler_mean = scaler.mean_.tolist()
         scaler_scale = scaler.scale_.tolist()
 
+    dataset_fingerprint = _dataset_fingerprint(dataset)
     metadata: dict[str, Any] = {
         "artifact_version": ARTIFACT_VERSION,
         "created_at": datetime.now(UTC).isoformat(),
@@ -430,7 +434,7 @@ def train_model(
         "row_count": len(dataset.target),
         "fraud_count": int(dataset.target.sum()),
         "fraud_rate": float(dataset.target.mean()),
-        "dataset_fingerprint": _dataset_fingerprint(dataset),
+        "dataset_fingerprint": dataset_fingerprint,
         "splits": {
             "train": len(target_train),
             "validation": len(target_validation),
@@ -456,6 +460,11 @@ def train_model(
         "validation_metrics": validation_metrics_payload,
         "test_metrics": test_metrics_payload,
     }
+    metadata["lineage"] = _build_lineage(
+        dataset_fingerprint=dataset_fingerprint,
+        settings=settings,
+        provenance=provenance,
+    )
     return FraudModel(
         estimator=estimator,
         threshold=threshold,
@@ -682,6 +691,46 @@ def _dataset_fingerprint(dataset: ValidatedDataset) -> str:
     digest.update(cast(np.ndarray, feature_hash).tobytes())
     digest.update(cast(np.ndarray, target_hash).tobytes())
     return digest.hexdigest()
+
+
+def _build_lineage(
+    *,
+    dataset_fingerprint: str,
+    settings: TrainingConfig,
+    provenance: dict[str, str] | None,
+) -> dict[str, str]:
+    """Build deterministic content lineage for a newly trained artifact."""
+    config_json = json.dumps(
+        asdict(settings),
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    config_hash = sha256(config_json.encode("utf-8")).hexdigest()
+    content_json = json.dumps(
+        {
+            "code_version": __version__,
+            "config_hash": config_hash,
+            "dataset_fingerprint": dataset_fingerprint,
+        },
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    lineage = {
+        "code_version": __version__,
+        "config_hash": config_hash,
+        "content_hash": sha256(content_json.encode("utf-8")).hexdigest(),
+        "dataset_fingerprint": dataset_fingerprint,
+    }
+    if provenance:
+        for key in ("git_commit", "git_repository"):
+            value = provenance.get(key)
+            if value is not None:
+                if not value.strip():
+                    raise ValueError(f"provenance field {key!r} must not be empty")
+                lineage[key] = value
+    return lineage
 
 
 def _build_base_estimator(settings: TrainingConfig) -> Pipeline:
