@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -1580,3 +1581,121 @@ def test_predict_supports_local_explanation(tmp_path: Path) -> None:
     assert {"fraud_probability", "is_fraud"}.issubset(scored.columns)
     contrib_cols = [c for c in scored.columns if c.startswith("contrib_")]
     assert len(contrib_cols) == 30
+
+
+def test_model_card_prints_compact_view(tmp_path: Path, trained_artifact: Path) -> None:
+    data_path = tmp_path / "transactions.csv"
+    generate_synthetic_data(rows=200, fraud_rate=0.1, random_state=42).to_csv(
+        data_path, index=False
+    )
+
+    result = runner.invoke(
+        app,
+        ["model-card", str(trained_artifact)],
+    )
+
+    assert result.exit_code == 0, result.output
+    body = json.loads(result.stdout)
+    # model_version is the first 12 chars of dataset_fingerprint
+    assert body["model_version"] == body["dataset_fingerprint"][:12]
+    assert body["estimator"] == "CalibratedClassifierCV(LogisticRegression)"
+    assert "threshold" in body
+    assert "model_version" in body
+    assert "dataset_fingerprint" in body
+
+
+def test_model_card_verbose(tmp_path: Path, trained_artifact: Path) -> None:
+    data_path = tmp_path / "transactions.csv"
+    generate_synthetic_data(rows=200, fraud_rate=0.1, random_state=42).to_csv(
+        data_path, index=False
+    )
+
+    result = runner.invoke(app, ["model-card", str(trained_artifact), "--verbose"])
+
+    assert result.exit_code == 0, result.output
+    body = json.loads(result.stdout)
+    assert "model_version" in body
+    assert "dataset_fingerprint" in body
+    assert "estimator" in body
+    assert "threshold" in body
+    assert "artifact_version" in body
+    assert "training_config" in body
+    assert "cost_policy" in body
+    assert "drift_thresholds" in body
+    assert "splits" in body
+    assert "split_time_ranges" in body
+    assert "test_metrics" in body
+    assert "validation_metrics" in body
+    assert "cost_policy" in body
+    assert "feature_count" in body
+    assert "row_count" in body
+    assert "fraud_count" in body
+    assert "fraud_rate" in body
+    assert "feature_effects" in body
+    assert "scaler_mean" in body
+    assert "scaler_scale" in body
+
+
+def test_model_card_with_git_info(
+    tmp_path: Path, trained_artifact: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data_path = tmp_path / "transactions.csv"
+    generate_synthetic_data(rows=200, fraud_rate=0.1, random_state=42).to_csv(
+        data_path, index=False
+    )
+
+    def fake_run(cmd, **_kwargs):
+
+        class Result:
+            returncode = 0
+            stdout = "abc123\n"
+
+        class Result2:
+            returncode = 0
+            stdout = "2024-01-01 12:00:00 Initial commit\n"
+
+        if cmd[1] == "rev-parse":
+            return Result()
+        return Result2()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = runner.invoke(
+        app,
+        [
+            "model-card",
+            str(trained_artifact),
+            "--git-info",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    body = json.loads(result.stdout)
+    assert "git" in body
+    assert body["git"]["commit"] == "abc123"
+    assert body["git"]["last_commit"] == "2024-01-01 12:00:00 Initial commit"
+
+
+def test_model_card_without_git_info(tmp_path: Path, trained_artifact: Path) -> None:
+    data_path = tmp_path / "transactions.csv"
+    generate_synthetic_data(rows=200, random_state=42).to_csv(data_path, index=False)
+
+    result = runner.invoke(app, ["model-card", str(trained_artifact), "--no-git-info"])
+
+    assert result.exit_code == 0, result.output
+    body = json.loads(result.stdout)
+    assert "git" not in body
+
+
+def test_model_card_reports_missing_metadata(tmp_path: Path, trained_model: FraudModel) -> None:
+    artifact = tmp_path / "artifact"
+    save_model(trained_model, artifact)
+    metadata_path = artifact / "metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    del metadata["cost_policy"]
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    result = runner.invoke(app, ["model-card", str(artifact), "--verbose"])
+
+    assert result.exit_code == 2
+    assert "Artifact integrity check failed" in result.stderr

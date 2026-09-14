@@ -1574,6 +1574,112 @@ def promote_command(
         _abort(str(exc))
 
 
+@app.command("model-card")
+def model_card_command(
+    model_path: Annotated[
+        Path,
+        typer.Argument(exists=True, readable=True, help="Model file or artifact directory."),
+    ],
+    verbose: Annotated[
+        bool,
+        typer.Option(help="Include full model card with all metadata."),
+    ] = False,
+    git_info_flag: Annotated[
+        bool,
+        typer.Option(
+            "--git-info/--no-git-info", help="Include Git commit information if available."
+        ),
+    ] = True,
+) -> None:
+    """Display model card with versioning, lineage, and provenance information.
+
+    Shows content-addressable identifiers (SHA-256 of training data,
+    hyperparameters, and code version), training configuration, and
+    performance metrics. Optionally includes Git commit information.
+    """
+    try:
+        model = load_model(model_path)
+        metadata = model.metadata
+
+        # Get Git commit info if requested
+        git_info: dict[str, Any] = {}
+        if git_info_flag:
+            import subprocess
+
+            try:
+                result = subprocess.run(
+                    ["git", "rev-parse", "HEAD"],  # noqa: S607
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    cwd=Path.cwd(),
+                )
+                if result.returncode == 0:
+                    git_info["commit"] = result.stdout.strip()
+                    result = subprocess.run(
+                        ["git", "log", "-1", "--format=%ci %s"],  # noqa: S607
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                        cwd=Path.cwd(),
+                    )
+                    if result.returncode == 0:
+                        git_info["last_commit"] = result.stdout.strip()
+            except (subprocess.SubprocessError, FileNotFoundError):
+                git_info["error"] = "Git not available or not a repository"
+
+        # Build model card
+        card: dict[str, Any] = {
+            "model_version": str(metadata.get("dataset_fingerprint", ""))[:12],
+            "dataset_fingerprint": metadata.get("dataset_fingerprint"),
+            "created_at": metadata.get("created_at"),
+            "estimator": metadata.get("estimator"),
+            "threshold": metadata.get("threshold"),
+            "artifact_version": metadata.get("artifact_version"),
+            "training_config": metadata.get("training_config"),
+            "cost_policy": metadata.get("cost_policy"),
+            "drift_thresholds": metadata.get("drift_thresholds"),
+            "splits": metadata.get("splits"),
+            "split_time_ranges": metadata.get("split_time_ranges"),
+            "test_metrics": metadata.get("test_metrics"),
+            "validation_metrics": metadata.get("validation_metrics"),
+            "feature_count": metadata.get("feature_count"),
+            "row_count": metadata.get("row_count"),
+            "fraud_count": metadata.get("fraud_count"),
+            "fraud_rate": metadata.get("fraud_rate"),
+            "feature_effects": metadata.get("feature_effects") if verbose else None,
+            "scaler_mean": metadata.get("scaler_mean") if verbose else None,
+            "scaler_scale": metadata.get("scaler_scale") if verbose else None,
+        }
+
+        if git_info:
+            card["git"] = git_info
+
+        if not verbose:
+            # Compact view
+            compact = {
+                "model_version": card["model_version"],
+                "dataset_fingerprint": card["dataset_fingerprint"],
+                "estimator": card["estimator"],
+                "threshold": card["threshold"],
+                "created_at": card["created_at"],
+                "test_roc_auc": card.get("test_metrics", {}).get("roc_auc"),
+                "test_f1": card.get("test_metrics", {}).get("f1"),
+            }
+            if git_info:
+                compact["git"] = git_info
+            typer.echo(json.dumps(compact, indent=2, sort_keys=True))
+        else:
+            typer.echo(json.dumps(card, indent=2, sort_keys=True))
+
+    except (
+        OSError,
+        ModelArtifactError,
+        ValueError,
+    ) as exc:
+        _abort(str(exc))
+
+
 @app.command("serve")
 def serve_command(
     model_path: Annotated[
