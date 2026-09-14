@@ -11,7 +11,7 @@ import pytest
 from typer.testing import CliRunner
 
 from fraud_detection import __version__
-from fraud_detection.cli import _resolve_report_costs, app
+from fraud_detection.cli import _git_info, _resolve_report_costs, app
 from fraud_detection.data import (
     DEFAULT_TARGET,
     generate_synthetic_data,
@@ -105,6 +105,8 @@ def test_cli_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     assert metadata["training_config"]["false_negative_cost"] == 20
     assert metadata["calibration"] == {"method": "sigmoid", "folds": 4, "jobs": 1}
     assert metadata["training_config"]["split_strategy"] == "temporal"
+    assert len(metadata["lineage"]["git_commit"]) == 40
+    assert metadata["lineage"]["git_repository"]
     assert (
         metadata["split_time_ranges"]["train"]["maximum"]
         <= metadata["split_time_ranges"]["validation"]["minimum"]
@@ -1602,6 +1604,7 @@ def test_model_card_prints_compact_view(tmp_path: Path, trained_artifact: Path) 
     assert "threshold" in body
     assert "model_version" in body
     assert "dataset_fingerprint" in body
+    assert body["lineage"]["content_hash"]
 
 
 def test_model_card_verbose(tmp_path: Path, trained_artifact: Path) -> None:
@@ -1634,6 +1637,7 @@ def test_model_card_verbose(tmp_path: Path, trained_artifact: Path) -> None:
     assert "feature_effects" in body
     assert "scaler_mean" in body
     assert "scaler_scale" in body
+    assert body["lineage"]["dataset_fingerprint"] == body["dataset_fingerprint"]
 
 
 def test_model_card_with_git_info(
@@ -1674,6 +1678,7 @@ def test_model_card_with_git_info(
     assert "git" in body
     assert body["git"]["commit"] == "abc123"
     assert body["git"]["last_commit"] == "2024-01-01 12:00:00 Initial commit"
+    assert body["git"]["repository"] == "2024-01-01 12:00:00 Initial commit"
 
 
 def test_model_card_without_git_info(tmp_path: Path, trained_artifact: Path) -> None:
@@ -1685,6 +1690,41 @@ def test_model_card_without_git_info(tmp_path: Path, trained_artifact: Path) -> 
     assert result.exit_code == 0, result.output
     body = json.loads(result.stdout)
     assert "git" not in body
+
+
+def test_git_info_returns_empty_for_non_repository(monkeypatch: pytest.MonkeyPatch) -> None:
+    class Result:
+        returncode = 128
+        stdout = ""
+
+    monkeypatch.setattr("fraud_detection.cli.subprocess.run", lambda *_args, **_kwargs: Result())
+
+    assert _git_info() == {}
+
+
+def test_git_info_omits_failed_optional_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+    class Result:
+        def __init__(self, returncode: int, stdout: str) -> None:
+            self.returncode = returncode
+            self.stdout = stdout
+
+    def fake_run(command: list[str], **_kwargs: object) -> Result:
+        if command[1] == "rev-parse":
+            return Result(0, "abc123\n")
+        return Result(1, "")
+
+    monkeypatch.setattr("fraud_detection.cli.subprocess.run", fake_run)
+
+    assert _git_info() == {"commit": "abc123"}
+
+
+def test_git_info_handles_unavailable_git(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fail_run(*_args: object, **_kwargs: object) -> None:
+        raise FileNotFoundError("git")
+
+    monkeypatch.setattr("fraud_detection.cli.subprocess.run", fail_run)
+
+    assert _git_info() == {}
 
 
 def test_model_card_reports_missing_metadata(tmp_path: Path, trained_model: FraudModel) -> None:
