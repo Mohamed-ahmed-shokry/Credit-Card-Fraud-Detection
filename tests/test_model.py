@@ -13,6 +13,7 @@ import pandas as pd
 import pytest
 import sklearn
 
+from fraud_detection import __version__
 from fraud_detection.data import ValidatedDataset, generate_synthetic_data, validate_frame
 from fraud_detection.model import (
     ARTIFACT_VERSION,
@@ -26,6 +27,7 @@ from fraud_detection.model import (
     SplitStrategy,
     ThresholdStrategy,
     TrainingConfig,
+    _build_lineage,
     _extract_feature_effects,
     load_model,
     save_model,
@@ -70,6 +72,11 @@ def test_train_model_produces_reproducible_model_card(
     assert model.estimator.n_jobs == 1
     assert model.artifact_version == ARTIFACT_VERSION
     assert len(model.metadata["dataset_fingerprint"]) == 64
+    lineage = model.metadata["lineage"]
+    assert lineage["dataset_fingerprint"] == model.metadata["dataset_fingerprint"]
+    assert lineage["code_version"] == __version__
+    assert len(lineage["config_hash"]) == 64
+    assert len(lineage["content_hash"]) == 64
     assert len(model.metadata["reference_profile"]) == 30
     assert model.metadata["drift_thresholds"] == {"warning_at": 0.1, "drift_at": 0.25}
     effects = model.metadata["feature_effects"]
@@ -88,6 +95,27 @@ def test_train_model_produces_reproducible_model_card(
     assert repeated.threshold == pytest.approx(model.threshold)
     assert repeated.metadata["dataset_fingerprint"] == model.metadata["dataset_fingerprint"]
     assert repeated.metadata["test_metrics"] == model.metadata["test_metrics"]
+    assert repeated.metadata["lineage"] == model.metadata["lineage"]
+
+
+def test_lineage_records_optional_provenance() -> None:
+    lineage = _build_lineage(
+        dataset_fingerprint="a" * 64,
+        settings=TrainingConfig(),
+        provenance={
+            "git_commit": "abc123",
+            "git_repository": "https://example.test/repository.git",
+        },
+    )
+
+    assert lineage["git_commit"] == "abc123"
+    assert lineage["git_repository"] == "https://example.test/repository.git"
+    with pytest.raises(ValueError, match="must not be empty"):
+        _build_lineage(
+            dataset_fingerprint="a" * 64,
+            settings=TrainingConfig(),
+            provenance={"git_commit": " "},
+        )
 
 
 def test_prediction_rejects_duplicate_feature_names(
