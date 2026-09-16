@@ -109,6 +109,7 @@ class TrainingConfig:
     calibration_jobs: int = 1
     split_strategy: SplitStrategy = SplitStrategy.STRATIFIED
     time_column: str = "Time"
+    temporal_gap: float = 0.0
     # Tree-estimator hyperparameters (random forest uses n_estimators and
     # max_depth; histogram gradient boosting uses all four below).
     n_estimators: int = 100
@@ -154,6 +155,10 @@ class TrainingConfig:
             raise ValueError("split_strategy must be 'stratified' or 'temporal'")
         if not self.time_column.strip():
             raise ValueError("time_column must not be empty")
+        if not np.isfinite(self.temporal_gap) or self.temporal_gap < 0:
+            raise ValueError("temporal_gap must be non-negative and finite")
+        if self.temporal_gap > 0 and self.split_strategy is not SplitStrategy.TEMPORAL:
+            raise ValueError("temporal_gap requires split_strategy='temporal'")
         if self.n_estimators < 10:
             raise ValueError("n_estimators must be at least 10")
         if self.max_depth is not None and self.max_depth < 1:
@@ -953,19 +958,45 @@ def _split_dataset(
         )
         ordered_features = dataset.features.iloc[order].reset_index(drop=True)
         ordered_target = dataset.target.iloc[order].reset_index(drop=True)
+        times = ordered_features[settings.time_column].to_numpy(dtype=float)
         test_count = max(1, round(len(ordered_target) * settings.test_size))
         validation_count = max(1, round(len(ordered_target) * settings.validation_size))
-        train_end = len(ordered_target) - validation_count - test_count
-        validation_end = len(ordered_target) - test_count
+        if settings.temporal_gap == 0.0:
+            train_end = len(ordered_target) - validation_count - test_count
+            validation_start = train_end
+            validation_end = len(ordered_target) - test_count
+            test_start = validation_end
+        else:
+            test_start = len(ordered_target) - test_count
+            test_min_time = times[test_start]
+            val_end_cutoff = test_min_time - settings.temporal_gap
+            validation_end = int(np.searchsorted(times, val_end_cutoff, side="right"))
+            validation_start = max(0, validation_end - validation_count)
+            if validation_end <= validation_start:
+                raise ValueError(
+                    f"Temporal split with temporal_gap={settings.temporal_gap} "
+                    "leaves no validation rows."
+                )
+            val_min_time = times[validation_start]
+            train_end_cutoff = val_min_time - settings.temporal_gap
+            train_end = int(np.searchsorted(times, train_end_cutoff, side="right"))
+
         if train_end <= 0:
-            raise ValueError("Temporal split leaves no training rows.")
+            raise ValueError(
+                "Temporal split leaves no training rows."
+                if settings.temporal_gap == 0.0
+                else (
+                    f"Temporal split with temporal_gap={settings.temporal_gap} "
+                    "leaves no training rows."
+                )
+            )
 
         features_train = ordered_features.iloc[:train_end]
-        features_validation = ordered_features.iloc[train_end:validation_end]
-        features_test = ordered_features.iloc[validation_end:]
+        features_validation = ordered_features.iloc[validation_start:validation_end]
+        features_test = ordered_features.iloc[test_start:]
         target_train = ordered_target.iloc[:train_end]
-        target_validation = ordered_target.iloc[train_end:validation_end]
-        target_test = ordered_target.iloc[validation_end:]
+        target_validation = ordered_target.iloc[validation_start:validation_end]
+        target_test = ordered_target.iloc[test_start:]
         for split_name, split_target in (
             ("training", target_train),
             ("validation", target_validation),
@@ -1017,19 +1048,33 @@ def _split_time_ranges(
     features_validation: pd.DataFrame,
     features_test: pd.DataFrame,
     settings: TrainingConfig,
-) -> dict[str, dict[str, float]] | None:
+) -> dict[str, Any] | None:
     if settings.split_strategy is not SplitStrategy.TEMPORAL:
         return None
+    train_min = float(features_train[settings.time_column].min())
+    train_max = float(features_train[settings.time_column].max())
+    val_min = float(features_validation[settings.time_column].min())
+    val_max = float(features_validation[settings.time_column].max())
+    test_min = float(features_test[settings.time_column].min())
+    test_max = float(features_test[settings.time_column].max())
     return {
-        split_name: {
-            "minimum": float(features[settings.time_column].min()),
-            "maximum": float(features[settings.time_column].max()),
-        }
-        for split_name, features in (
-            ("train", features_train),
-            ("validation", features_validation),
-            ("test", features_test),
-        )
+        "train": {
+            "minimum": train_min,
+            "maximum": train_max,
+        },
+        "validation": {
+            "minimum": val_min,
+            "maximum": val_max,
+        },
+        "test": {
+            "minimum": test_min,
+            "maximum": test_max,
+        },
+        "gaps": {
+            "train_to_validation": val_min - train_max,
+            "validation_to_test": test_min - val_max,
+        },
+        "temporal_gap": settings.temporal_gap,
     }
 
 

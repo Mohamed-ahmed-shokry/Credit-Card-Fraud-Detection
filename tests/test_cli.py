@@ -1741,3 +1741,62 @@ def test_model_card_reports_missing_metadata(tmp_path: Path, trained_model: Frau
 
     assert result.exit_code == 2
     assert "Artifact integrity check failed" in result.stderr
+
+
+def test_train_cli_supports_temporal_gap(tmp_path: Path) -> None:
+    data_path = tmp_path / "transactions.csv"
+    generate_synthetic_data(rows=800, fraud_rate=0.1, random_state=42).to_csv(
+        data_path, index=False
+    )
+    artifact_path = tmp_path / "artifact"
+
+    result = runner.invoke(
+        app,
+        [
+            "train",
+            str(data_path),
+            "--output",
+            str(artifact_path),
+            "--split-strategy",
+            "temporal",
+            "--temporal-gap",
+            "3600",
+            "--calibration-method",
+            "none",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    metadata = json.loads((artifact_path / "metadata.json").read_text(encoding="utf-8"))
+    assert metadata["training_config"]["temporal_gap"] == 3600.0
+    assert metadata["split_time_ranges"]["temporal_gap"] == 3600.0
+    assert metadata["split_time_ranges"]["gaps"]["train_to_validation"] >= 3600.0
+    assert metadata["split_time_ranges"]["gaps"]["validation_to_test"] >= 3600.0
+
+
+def test_rolling_cli_supports_temporal_gap(tmp_path: Path) -> None:
+    data_path = tmp_path / "transactions.csv"
+    generate_synthetic_data(rows=800, fraud_rate=0.1, random_state=42).to_csv(
+        data_path, index=False
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "rolling",
+            str(data_path),
+            "--origins",
+            "2",
+            "--temporal-gap",
+            "1800",
+            "--calibration-method",
+            "none",
+            "--estimator",
+            "logistic_regression",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    results = json.loads(result.stdout)["results"]
+    assert len(results) == 1
+

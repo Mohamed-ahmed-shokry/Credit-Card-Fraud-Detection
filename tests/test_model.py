@@ -794,3 +794,51 @@ def test_extract_feature_effects_requires_permutation_data() -> None:
 
     with pytest.raises(ValueError, match="Permutation training data"):
         _extract_feature_effects(stub, ("x",), calibration_method=CalibrationMethod.NONE)
+
+
+def test_temporal_gap_validation() -> None:
+    with pytest.raises(ValueError, match="temporal_gap must be non-negative"):
+        TrainingConfig(
+            split_strategy=SplitStrategy.TEMPORAL,
+            temporal_gap=-1.0,
+        )
+
+    with pytest.raises(ValueError, match="temporal_gap requires split_strategy='temporal'"):
+        TrainingConfig(
+            split_strategy=SplitStrategy.STRATIFIED,
+            temporal_gap=10.0,
+        )
+
+
+def test_temporal_gap_enforces_separation() -> None:
+    dataset = validate_frame(generate_synthetic_data(rows=1_000, fraud_rate=0.1, random_state=42))
+    # Times in generate_synthetic_data range from 0 to 172,800
+    gap_seconds = 5_000.0
+    config = TrainingConfig(
+        split_strategy=SplitStrategy.TEMPORAL,
+        temporal_gap=gap_seconds,
+        calibration_method=CalibrationMethod.NONE,
+    )
+    model = train_model(dataset, config=config)
+
+    ranges = model.metadata["split_time_ranges"]
+    assert ranges is not None
+    assert ranges["gaps"]["train_to_validation"] >= gap_seconds
+    assert ranges["gaps"]["validation_to_test"] >= gap_seconds
+    assert ranges["temporal_gap"] == gap_seconds
+    assert ranges["validation"]["minimum"] - ranges["train"]["maximum"] >= gap_seconds
+    assert ranges["test"]["minimum"] - ranges["validation"]["maximum"] >= gap_seconds
+
+
+def test_temporal_gap_excessive_raises_clear_error() -> None:
+    dataset = validate_frame(generate_synthetic_data(rows=500, fraud_rate=0.1, random_state=42))
+    with pytest.raises(ValueError, match=r"Temporal split with temporal_gap=.* leaves no"):
+        train_model(
+            dataset,
+            config=TrainingConfig(
+                split_strategy=SplitStrategy.TEMPORAL,
+                temporal_gap=200_000.0,
+                calibration_method=CalibrationMethod.NONE,
+            ),
+        )
+

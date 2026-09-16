@@ -122,6 +122,13 @@ SplitStrategyOption = Annotated[
 TimeColumnOption = Annotated[
     str, typer.Option(help="Ordering feature used when --split-strategy temporal.")
 ]
+TemporalGapOption = Annotated[
+    float,
+    typer.Option(
+        min=0.0,
+        help="Minimum temporal gap (in time units) between splits to enforce label delay.",
+    ),
+]
 
 
 def _training_config(
@@ -146,6 +153,7 @@ def _training_config(
     calibration_jobs: int,
     split_strategy: SplitStrategy,
     time_column: str,
+    temporal_gap: float = 0.0,
     overrides: dict[str, Any] | None = None,
 ) -> TrainingConfig:
     """Assemble the shared training configuration for train, compare, and stability."""
@@ -170,6 +178,7 @@ def _training_config(
         "calibration_jobs": calibration_jobs,
         "split_strategy": split_strategy,
         "time_column": time_column,
+        "temporal_gap": temporal_gap,
     }
     if overrides:
         kwargs.update(overrides)
@@ -312,6 +321,7 @@ def train_command(
     calibration_jobs: CalibrationJobsOption = 1,
     split_strategy: SplitStrategyOption = SplitStrategy.STRATIFIED,
     time_column: TimeColumnOption = "Time",
+    temporal_gap: TemporalGapOption = 0.0,
     overwrite: Annotated[
         bool,
         typer.Option(help="Replace an existing model artifact."),
@@ -347,6 +357,7 @@ def train_command(
             calibration_jobs=calibration_jobs,
             split_strategy=split_strategy,
             time_column=time_column,
+            temporal_gap=temporal_gap,
         )
         git_info = _git_info()
         provenance = {
@@ -743,6 +754,7 @@ def rolling_command(
     calibration_method: CalibrationMethodOption = CalibrationMethod.SIGMOID,
     calibration_folds: CalibrationFoldsOption = 3,
     calibration_jobs: CalibrationJobsOption = 1,
+    temporal_gap: TemporalGapOption = 0.0,
 ) -> None:
     """Evaluate rolling chronological prefixes and report metric spread.
 
@@ -792,6 +804,7 @@ def rolling_command(
                     calibration_jobs=calibration_jobs,
                     split_strategy=SplitStrategy.TEMPORAL,
                     time_column=time_column,
+                    temporal_gap=temporal_gap,
                 )
                 model = train_model(prefix, config=config)
                 estimator_label = str(model.metadata["estimator"])
