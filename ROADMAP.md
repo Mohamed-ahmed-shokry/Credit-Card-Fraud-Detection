@@ -230,11 +230,11 @@ The next phase closes the remaining gap between this reference workflow
 and a deployment team's data/operations process without turning the project
 into a general-purpose platform:
 
-- **Label-delay-aware temporal gaps** (`In progress`) — add a configured gap
+- **Label-delay-aware temporal gaps** (`Done`) — add a configured gap
   between training, validation, and test windows so chargeback latency is
   enforced by the split implementation rather than documented only in the
   runbook.
-- **Artifact lineage validation command** (`Proposed`) — add a read-only
+- **Artifact lineage validation command** (`In progress`) — add a read-only
   validator that checks artifact integrity, runtime compatibility, lineage
   completeness, and report compatibility before a deployment job consumes an
   artifact.
