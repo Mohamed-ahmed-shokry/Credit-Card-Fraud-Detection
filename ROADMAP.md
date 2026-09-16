@@ -224,13 +224,13 @@ mission:
   stability evidence and artifact manifest hashes. It records evidence and
   explicitly does not make an automated promotion decision.
 
-## Phase 14 — Evaluation realism and operational integration (next)
+## Phase 14 — Evaluation realism and operational integration (in progress)
 
-The next phase should close the remaining gap between this reference workflow
+The next phase closes the remaining gap between this reference workflow
 and a deployment team's data/operations process without turning the project
 into a general-purpose platform:
 
-- **Label-delay-aware temporal gaps** (`Proposed`) — add a configured gap
+- **Label-delay-aware temporal gaps** (`In progress`) — add a configured gap
   between training, validation, and test windows so chargeback latency is
   enforced by the split implementation rather than documented only in the
   runbook.
