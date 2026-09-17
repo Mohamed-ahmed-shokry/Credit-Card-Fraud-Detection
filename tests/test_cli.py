@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import subprocess
 from copy import deepcopy
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,7 @@ from fraud_detection.data import (
     validate_frame,
 )
 from fraud_detection.model import (
+    MANIFEST_FILENAME,
     METADATA_FILENAME,
     MODEL_FILENAME,
     FraudModel,
@@ -1650,7 +1652,7 @@ def test_model_card_with_git_info(
         data_path, index=False
     )
 
-    def fake_run(cmd, **_kwargs):
+    def fake_run(cmd: Any, **_kwargs: Any) -> Any:
 
         class Result:
             returncode = 0
@@ -1799,4 +1801,59 @@ def test_rolling_cli_supports_temporal_gap(tmp_path: Path) -> None:
     assert result.exit_code == 0, result.output
     results = json.loads(result.stdout)["results"]
     assert len(results) == 1
+
+
+def test_validate_artifact_cli_success(tmp_path: Path, trained_model: FraudModel) -> None:
+    artifact_path = tmp_path / "artifact"
+    save_model(trained_model, artifact_path)
+
+    result = runner.invoke(app, ["validate-artifact", str(artifact_path)])
+    assert result.exit_code == 0, result.output
+    report = json.loads(result.stdout)
+    assert report["valid"] is True
+    assert report["errors"] == []
+
+
+def test_validate_artifact_cli_failure_on_corrupted_file(
+    tmp_path: Path, trained_model: FraudModel
+) -> None:
+    artifact_path = tmp_path / "artifact"
+    save_model(trained_model, artifact_path)
+    (artifact_path / MODEL_FILENAME).write_bytes(b"tampered_content")
+
+    result = runner.invoke(app, ["validate-artifact", str(artifact_path)])
+    assert result.exit_code == 1
+    report = json.loads(result.stdout)
+    assert report["valid"] is False
+    assert len(report["errors"]) > 0
+
+
+def test_validate_artifact_cli_strict_fails_without_git(
+    tmp_path: Path, trained_model: FraudModel
+) -> None:
+    artifact_path = tmp_path / "artifact"
+    save_model(trained_model, artifact_path)
+    # Strip git_commit from lineage
+    meta_path = artifact_path / METADATA_FILENAME
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    meta["lineage"].pop("git_commit", None)
+    meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    manifest_path = artifact_path / MANIFEST_FILENAME
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["files"][METADATA_FILENAME] = sha256(meta_path.read_bytes()).hexdigest()
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    # Non-strict should pass with warning
+    normal_result = runner.invoke(app, ["validate-artifact", str(artifact_path)])
+    assert normal_result.exit_code == 0
+    normal_report = json.loads(normal_result.stdout)
+    assert normal_report["valid"] is True
+    assert len(normal_report["warnings"]) > 0
+
+    # Strict mode should fail
+    strict_result = runner.invoke(app, ["validate-artifact", str(artifact_path), "--strict"])
+    assert strict_result.exit_code == 1
+    strict_report = json.loads(strict_result.stdout)
+    assert strict_report["valid"] is False
+
 

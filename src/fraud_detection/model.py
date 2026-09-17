@@ -752,6 +752,361 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+@dataclass(frozen=True)
+class CheckResult:
+    """Outcome of an individual artifact validation check."""
+
+    name: str
+    status: str
+    details: str
+    data: dict[str, Any] | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "name": self.name,
+            "status": self.status,
+            "details": self.details,
+        }
+        if self.data is not None:
+            payload["data"] = self.data
+        return payload
+
+
+@dataclass(frozen=True)
+class ArtifactValidationReport:
+    """Comprehensive read-only validation report for a model artifact."""
+
+    valid: bool
+    artifact_path: str
+    artifact_version: int | None
+    checks: tuple[CheckResult, ...]
+    errors: tuple[str, ...]
+    warnings: tuple[str, ...]
+    metadata_summary: dict[str, Any] | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "valid": self.valid,
+            "artifact_path": self.artifact_path,
+            "artifact_version": self.artifact_version,
+            "checks": [check.to_dict() for check in self.checks],
+            "errors": list(self.errors),
+            "warnings": list(self.warnings),
+            "metadata_summary": self.metadata_summary,
+        }
+
+
+def validate_artifact(
+    path: Path | str,
+    *,
+    strict: bool = False,
+) -> ArtifactValidationReport:
+    """Inspect and validate artifact integrity, runtime compatibility, lineage, and reports."""
+    artifact_path = Path(path)
+    checks: list[CheckResult] = []
+    errors: list[str] = []
+    warnings_list: list[str] = []
+    metadata_summary: dict[str, Any] | None = None
+    artifact_version: int | None = None
+
+    if not artifact_path.exists():
+        msg = f"Artifact path does not exist: {artifact_path}"
+        errors.append(msg)
+        checks.append(CheckResult(name="path_exists", status="failed", details=msg))
+        return ArtifactValidationReport(
+            valid=False,
+            artifact_path=str(artifact_path),
+            artifact_version=None,
+            checks=tuple(checks),
+            errors=tuple(errors),
+            warnings=tuple(warnings_list),
+        )
+
+    is_dir = artifact_path.is_dir()
+    manifest_file = artifact_path / MANIFEST_FILENAME if is_dir else None
+    metadata_file = artifact_path / METADATA_FILENAME if is_dir else None
+    model_file = artifact_path / MODEL_FILENAME if is_dir else artifact_path
+
+    raw_metadata: dict[str, Any] | None = None
+    can_load_model = False
+
+    # 1. Manifest and file integrity check
+    if not is_dir:
+        warnings_list.append("Artifact is a standalone file without directory manifest.")
+        if strict:
+            errors.append("Strict mode requires a full artifact directory with manifest.json.")
+        checks.append(
+            CheckResult(
+                name="integrity",
+                status="failed" if strict else "warning",
+                details="Standalone joblib file without manifest.json.",
+            )
+        )
+        can_load_model = not strict and model_file.is_file()
+    elif manifest_file is None or not manifest_file.is_file():
+        errors.append(f"Missing {MANIFEST_FILENAME} in artifact directory.")
+        checks.append(
+            CheckResult(
+                name="integrity",
+                status="failed",
+                details=f"Missing {MANIFEST_FILENAME}.",
+            )
+        )
+    else:
+        integrity_ok = True
+        try:
+            manifest = json.loads(
+                manifest_file.read_text(encoding="utf-8"),
+                parse_constant=_reject_json_constant,
+            )
+            artifact_version = manifest.get("artifact_version")
+            if manifest.get("hash_algorithm") != "sha256":
+                errors.append(
+                    f"Unsupported manifest hash algorithm: {manifest.get('hash_algorithm')}"
+                )
+                integrity_ok = False
+            if artifact_version != ARTIFACT_VERSION:
+                errors.append(
+                    f"Artifact version {artifact_version} does not match "
+                    f"current {ARTIFACT_VERSION}."
+                )
+                integrity_ok = False
+
+            files_map = manifest.get("files", {})
+            for fname in (MODEL_FILENAME, METADATA_FILENAME):
+                fpath = artifact_path / fname
+                expected_hash = files_map.get(fname)
+                if not fpath.is_file():
+                    errors.append(f"Missing required artifact file: {fname}")
+                    integrity_ok = False
+                elif not expected_hash:
+                    errors.append(f"Manifest missing entry for file: {fname}")
+                    integrity_ok = False
+                else:
+                    actual_hash = _file_sha256(fpath)
+                    if actual_hash != expected_hash:
+                        errors.append(
+                            f"Integrity digest mismatch for {fname}: "
+                            f"expected {expected_hash}, got {actual_hash}"
+                        )
+                        integrity_ok = False
+
+            can_load_model = integrity_ok and model_file.is_file()
+            checks.append(
+                CheckResult(
+                    name="integrity",
+                    status="passed" if integrity_ok else "failed",
+                    details=(
+                        "Manifest digests verified successfully."
+                        if integrity_ok
+                        else "Integrity verification failed."
+                    ),
+                    data={"manifest_files": list(files_map.keys())},
+                )
+            )
+        except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+            errors.append(f"Failed to read or parse manifest: {exc}")
+            checks.append(
+                CheckResult(name="integrity", status="failed", details=str(exc))
+            )
+
+    # Read metadata.json if present
+    if metadata_file and metadata_file.is_file():
+        try:
+            raw_metadata = json.loads(
+                metadata_file.read_text(encoding="utf-8"),
+                parse_constant=_reject_json_constant,
+            )
+            if not isinstance(raw_metadata, dict):
+                errors.append("metadata.json does not contain a JSON mapping.")
+                raw_metadata = None
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            errors.append(f"Failed to read or parse metadata.json: {exc}")
+
+    # 2. Runtime compatibility check
+    if raw_metadata is not None:
+        art_sklearn = raw_metadata.get("scikit_learn_version")
+        if art_sklearn != sklearn.__version__:
+            errors.append(
+                f"scikit-learn runtime mismatch: artifact was created with {art_sklearn}, "
+                f"current runtime is {sklearn.__version__}."
+            )
+            checks.append(
+                CheckResult(
+                    name="runtime_compatibility",
+                    status="failed",
+                    details=f"scikit-learn mismatch: {art_sklearn} != {sklearn.__version__}",
+                    data={"artifact_sklearn": art_sklearn, "runtime_sklearn": sklearn.__version__},
+                )
+            )
+        else:
+            checks.append(
+                CheckResult(
+                    name="runtime_compatibility",
+                    status="passed",
+                    details=f"Runtime scikit-learn version matches: {sklearn.__version__}",
+                    data={"scikit_learn": sklearn.__version__},
+                )
+            )
+
+    # 3. Lineage completeness check
+    if raw_metadata is not None:
+        lineage = raw_metadata.get("lineage")
+        if not isinstance(lineage, dict):
+            errors.append("Artifact metadata is missing 'lineage' block.")
+            checks.append(
+                CheckResult(
+                    name="lineage_completeness",
+                    status="failed",
+                    details="Missing lineage block.",
+                )
+            )
+        else:
+            lineage_ok = True
+            for req_key in ("dataset_fingerprint", "config_hash", "code_version", "content_hash"):
+                if not lineage.get(req_key):
+                    errors.append(f"Lineage is missing required key {req_key!r}.")
+                    lineage_ok = False
+
+            if lineage_ok:
+                content_json = json.dumps(
+                    {
+                        "code_version": lineage["code_version"],
+                        "config_hash": lineage["config_hash"],
+                        "dataset_fingerprint": lineage["dataset_fingerprint"],
+                    },
+                    allow_nan=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+                expected_content_hash = sha256(content_json.encode("utf-8")).hexdigest()
+                if lineage["content_hash"] != expected_content_hash:
+                    errors.append(
+                        f"Lineage content_hash mismatch: expected {expected_content_hash}, "
+                        f"got {lineage['content_hash']}"
+                    )
+                    lineage_ok = False
+
+            has_git = bool(lineage.get("git_commit"))
+            if not has_git:
+                warn_msg = "Lineage does not include git commit provenance."
+                warnings_list.append(warn_msg)
+                if strict:
+                    errors.append(warn_msg)
+                    lineage_ok = False
+
+            checks.append(
+                CheckResult(
+                    name="lineage_completeness",
+                    status="passed" if lineage_ok else "failed",
+                    details=(
+                        "Lineage hashes verified successfully."
+                        if lineage_ok
+                        else "Lineage verification failed."
+                    ),
+                    data={
+                        "dataset_fingerprint": lineage.get("dataset_fingerprint"),
+                        "content_hash": lineage.get("content_hash"),
+                        "has_git_provenance": has_git,
+                    },
+                )
+            )
+
+    # 4. Model and report compatibility check
+    loaded_model: FraudModel | None = None
+    if not can_load_model:
+        errors.append("Model deserialization skipped due to integrity verification failure.")
+    elif model_file.is_file():
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", InconsistentVersionWarning)
+                candidate = joblib.load(model_file)
+            if not isinstance(candidate, FraudModel):
+                errors.append("Deserialized file does not contain a FraudModel instance.")
+            else:
+                loaded_model = candidate
+                _validate_loaded_model(candidate)
+                if raw_metadata is not None:
+                    embedded_meta = json.loads(_serialize_metadata(candidate.metadata))
+                    if embedded_meta != raw_metadata:
+                        errors.append("Persisted metadata.json does not match embedded metadata.")
+        except (
+            OSError,
+            ModelArtifactError,
+            ValueError,
+            TypeError,
+            KeyError,
+            AttributeError,
+            ImportError,
+            EOFError,
+        ) as exc:
+            errors.append(f"Model loading or structural validation failed: {exc}")
+
+    if loaded_model is not None:
+        meta = loaded_model.metadata
+        report_missing = [
+            req_field
+            for req_field in (
+                "feature_effects",
+                "reference_profile",
+                "drift_thresholds",
+                "cost_policy",
+                "validation_metrics",
+                "test_metrics",
+            )
+            if req_field not in meta or meta[req_field] is None
+        ]
+
+        if report_missing:
+            errors.append(f"Model metadata is missing required report fields: {report_missing}")
+            checks.append(
+                CheckResult(
+                    name="report_compatibility",
+                    status="failed",
+                    details=f"Missing report fields: {report_missing}",
+                )
+            )
+        else:
+            checks.append(
+                CheckResult(
+                    name="report_compatibility",
+                    status="passed",
+                    details="All required report structures and metrics are present.",
+                )
+            )
+
+        test_metrics = meta.get("test_metrics")
+        test_roc = test_metrics.get("roc_auc") if isinstance(test_metrics, dict) else None
+        metadata_summary = {
+            "estimator": str(meta.get("estimator")),
+            "threshold": loaded_model.threshold,
+            "feature_count": len(loaded_model.feature_names),
+            "created_at": meta.get("created_at"),
+            "dataset_fingerprint": meta.get("dataset_fingerprint"),
+            "test_roc_auc": test_roc,
+        }
+    else:
+        checks.append(
+            CheckResult(
+                name="report_compatibility",
+                status="failed",
+                details="Could not inspect model for report compatibility.",
+            )
+        )
+
+    is_valid = len(errors) == 0
+    return ArtifactValidationReport(
+        valid=is_valid,
+        artifact_path=str(artifact_path),
+        artifact_version=artifact_version or ARTIFACT_VERSION,
+        checks=tuple(checks),
+        errors=tuple(errors),
+        warnings=tuple(warnings_list),
+        metadata_summary=metadata_summary,
+    )
+
+
+
 def _dataset_fingerprint(dataset: ValidatedDataset) -> str:
     digest = hashlib.sha256()
     digest.update("\0".join(dataset.feature_names).encode())

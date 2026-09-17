@@ -50,6 +50,7 @@ from fraud_detection.model import (
     load_model,
     save_model,
     train_model,
+    validate_artifact,
 )
 from fraud_detection.reporting import ComplianceReportError, render_compliance_report
 
@@ -1038,6 +1039,27 @@ def inspect_command(
     except ModelArtifactError as exc:
         _abort(str(exc))
     typer.echo(json.dumps(model.metadata, indent=2, sort_keys=True))
+
+
+@app.command("validate-artifact")
+def validate_artifact_command(
+    model_path: Annotated[
+        Path,
+        typer.Argument(exists=True, readable=True, help="Model file or artifact directory."),
+    ],
+    strict: Annotated[
+        bool,
+        typer.Option(
+            "--strict",
+            help="Enforce strict requirements including Git provenance and directory manifest.",
+        ),
+    ] = False,
+) -> None:
+    """Validate artifact integrity, runtime compatibility, lineage, and report readiness."""
+    report = validate_artifact(model_path, strict=strict)
+    typer.echo(json.dumps(report.to_dict(), indent=2, sort_keys=True))
+    if not report.valid:
+        raise typer.Exit(code=1)
 
 
 @app.command("explain")

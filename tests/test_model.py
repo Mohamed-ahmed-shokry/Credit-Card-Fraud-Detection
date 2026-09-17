@@ -6,6 +6,7 @@ from copy import deepcopy
 from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import joblib
 import numpy as np
@@ -32,6 +33,7 @@ from fraud_detection.model import (
     load_model,
     save_model,
     train_model,
+    validate_artifact,
 )
 
 
@@ -292,7 +294,7 @@ def test_load_model_requires_valid_integrity_manifest(
     with pytest.raises(ModelArtifactError, match="non-standard JSON"):
         load_model(artifact_directory)
 
-    manifest = {
+    manifest: dict[str, Any] = {
         "artifact_version": ARTIFACT_VERSION,
         "hash_algorithm": "md5",
         "files": {MODEL_FILENAME: "0" * 64, METADATA_FILENAME: "0" * 64},
@@ -733,7 +735,8 @@ def test_explain_local_natural_language_uses_model_contributions(
 def test_explain_local_requires_scaler_stats(
     trained_model: tuple[FraudModel, ValidatedDataset],
 ) -> None:
-    model, dataset = trained_model
+    original_model, dataset = trained_model
+    model = deepcopy(original_model)
     model.metadata.pop("scaler_mean", None)
     model.metadata.pop("scaler_scale", None)
 
@@ -744,7 +747,8 @@ def test_explain_local_requires_scaler_stats(
 def test_explain_local_requires_feature_effects(
     trained_model: tuple[FraudModel, ValidatedDataset],
 ) -> None:
-    model, dataset = trained_model
+    original_model, dataset = trained_model
+    model = deepcopy(original_model)
     model.metadata.pop("feature_effects", None)
 
     with pytest.raises(ModelArtifactError, match="Feature effects not available"):
@@ -841,4 +845,70 @@ def test_temporal_gap_excessive_raises_clear_error() -> None:
                 calibration_method=CalibrationMethod.NONE,
             ),
         )
+
+
+def test_validate_artifact_success(
+    tmp_path: Path, trained_model: tuple[FraudModel, ValidatedDataset]
+) -> None:
+    model, _ = trained_model
+    artifact_dir = tmp_path / "artifact"
+    save_model(model, artifact_dir)
+
+    report = validate_artifact(artifact_dir)
+    assert report.valid is True
+    assert len(report.errors) == 0
+    assert report.artifact_version == ARTIFACT_VERSION
+    assert report.metadata_summary is not None
+    assert report.metadata_summary["feature_count"] == len(model.feature_names)
+    assert any(c.name == "integrity" and c.status == "passed" for c in report.checks)
+    assert any(c.name == "runtime_compatibility" and c.status == "passed" for c in report.checks)
+    assert any(c.name == "lineage_completeness" and c.status == "passed" for c in report.checks)
+    assert any(c.name == "report_compatibility" and c.status == "passed" for c in report.checks)
+    data_dict = report.to_dict()
+    assert data_dict["valid"] is True
+
+
+def test_validate_artifact_missing_path(tmp_path: Path) -> None:
+    missing = tmp_path / "nonexistent"
+    report = validate_artifact(missing)
+    assert report.valid is False
+    assert any("does not exist" in err for err in report.errors)
+
+
+def test_validate_artifact_tampered_manifest(
+    tmp_path: Path, trained_model: tuple[FraudModel, ValidatedDataset]
+) -> None:
+    model, _ = trained_model
+    artifact_dir = tmp_path / "artifact_tampered"
+    save_model(model, artifact_dir)
+
+    # Corrupt model.joblib content without updating manifest
+    (artifact_dir / MODEL_FILENAME).write_bytes(b"corrupted_joblib_data")
+    report = validate_artifact(artifact_dir)
+    assert report.valid is False
+    assert any("Integrity digest mismatch" in err for err in report.errors)
+
+
+def test_validate_artifact_corrupted_lineage(
+    tmp_path: Path, trained_model: tuple[FraudModel, ValidatedDataset]
+) -> None:
+    model, _ = trained_model
+    artifact_dir = tmp_path / "artifact_lineage"
+    save_model(model, artifact_dir)
+
+    # Tamper with metadata.json lineage
+    meta_path = artifact_dir / METADATA_FILENAME
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    meta["lineage"]["content_hash"] = "0" * 64
+    meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    # Also update manifest to match new metadata digest so integrity passes but lineage fails
+    manifest_path = artifact_dir / MANIFEST_FILENAME
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["files"][METADATA_FILENAME] = sha256(meta_path.read_bytes()).hexdigest()
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    report = validate_artifact(artifact_dir)
+    assert report.valid is False
+    assert any("Lineage content_hash mismatch" in err for err in report.errors)
+
 
