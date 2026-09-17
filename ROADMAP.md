@@ -234,11 +234,11 @@ into a general-purpose platform:
   between training, validation, and test windows so chargeback latency is
   enforced by the split implementation rather than documented only in the
   runbook.
-- **Artifact lineage validation command** (`In progress`) — add a read-only
+- **Artifact lineage validation command** (`Done`) — add a read-only
   validator that checks artifact integrity, runtime compatibility, lineage
   completeness, and report compatibility before a deployment job consumes an
   artifact.
-- **Structured audit event export** (`Proposed`) — provide an opt-in JSONL
+- **Structured audit event export** (`In progress`) — provide an opt-in JSONL
   sink for scoring and promotion events with redaction guarantees, leaving
   durable storage, retention, and access control to the deploying operator.
 - **Optional explanation provider interface** (`Proposed`) — if external
