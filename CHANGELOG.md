@@ -8,6 +8,24 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- Label-delay-aware temporal gaps: added `--temporal-gap` CLI option and
+  `temporal_gap` parameter to `TrainingConfig`, `train_model`, and
+  `split_dataset_temporally`, enforcing holdout window separation to reflect
+  chargeback maturation latency.
+- Read-only artifact lineage validation command (`fraud-detect validate-artifact`)
+  and `validate_artifact()` helper, verifying manifest digests, runtime
+  compatibility, lineage completeness, and report readiness, with an optional
+  `--strict` flag to require Git commit provenance.
+- Structured audit event export: opt-in thread-safe JSONL audit sink
+  (`JsonlAuditSink`, `AuditEvent`, `NullAuditSink`) with strict payment card
+  (Luhn-validated PAN) and sensitive key redaction guarantees, supported via
+  `--audit-log` in `predict` and `promote` CLI commands and
+  `FRAUD_AUDIT_LOG_PATH` in FastAPI serving.
+- Isolated explanation provider interface (`ExplanationProvider` protocol,
+  `TemplateExplanationProvider`, `ExternalExplanationProvider`) supporting
+  timeouts, prompt redaction, cost controls (`CostController`), and
+  deterministic fallback, with the offline template remaining default across
+  the model, API, and CLI.
 - Persisted model lineage with deterministic configuration and content hashes,
   package version, and best-effort Git commit/origin provenance from CLI
   training. The new `model-card` command exposes compact and verbose lineage

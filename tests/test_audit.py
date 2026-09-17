@@ -173,3 +173,18 @@ def test_build_promotion_audit_event() -> None:
     assert event.event_type == "promotion"
     assert event.payload["bundle"]["status"] == "promoted"
     assert event.payload["metadata"]["operator"] == "ci-bot"
+
+    # With metadata=None
+    event_no_meta = build_promotion_audit_event(
+        model_version="mod2",
+        dataset_fingerprint="fp2",
+        bundle_summary={"status": "rejected"},
+    )
+    assert "metadata" not in event_no_meta.payload
+
+
+def test_redact_data_without_pan_masking() -> None:
+    text = "Card 4532-0151-1283-0366 present"
+    result = redact_data(text, mask_pan_values=False)
+    assert result == text
+

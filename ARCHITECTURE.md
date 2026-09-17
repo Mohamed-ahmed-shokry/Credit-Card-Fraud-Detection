@@ -21,6 +21,12 @@ financial-services platform.
 6. `drift.py` compares current numeric distributions with the training profile;
    `evaluation.py` computes holdout, calibration, and threshold reports;
    `reporting.py` renders promotion evidence as escaped, self-contained HTML.
+7. `audit.py` exports thread-safe, structured JSONL audit events for scoring and
+   promotion decisions with automated Luhn-validated PAN and sensitive key
+   redaction guarantees.
+8. `explanations.py` defines the `ExplanationProvider` boundary, keeping
+   deterministic offline template explanations as default while wrapping external
+   LLM calls with timeouts, prompt redaction, cost controls, and fallback.
 
 ## Artifact contract
 
@@ -36,6 +42,10 @@ model.joblib    trusted-process pickle containing the fitted FraudModel
 metadata and manifest are complete. `load_model` verifies the manifest before
 deserialization, checks the scikit-learn runtime, validates the embedded model,
 and confirms that embedded and readable metadata agree.
+
+`validate_artifact` (and the `validate-artifact` CLI command) provides a
+safe, read-only validation pass verifying manifest integrity, runtime
+compatibility, lineage completeness, and report readiness prior to deployment.
 
 The lineage block on newly trained artifacts contains:
 
@@ -54,7 +64,8 @@ loadable, but their model cards identify the missing provenance.
 `create_app` receives an already trusted model or resolves one from
 `FRAUD_MODEL_PATH` at startup. It applies request-size limits, strict finite
 numeric validation, optional API-key and in-memory rate limiting middleware,
-request correlation headers, structured logging, and isolated Prometheus
+request correlation headers, structured logging, opt-in JSONL audit event export
+(`FRAUD_AUDIT_LOG_PATH`), pluggable explanation providers, and isolated Prometheus
 metrics. Authentication, network policy, durable rate limiting, secret
 management, and audit-log retention remain deployment responsibilities.
 
@@ -68,9 +79,13 @@ the request and response, while the tuned artifact threshold remains visible as
 - The test split is untouched until final evaluation.
 - Temporal evaluation sorts by the configured time feature and rejects
   single-class windows.
+- Temporal gaps enforce holdout separation to mirror label delay (chargeback maturation)
+  without unconfirmed labels leaking into training windows.
 - Calibration is fit inside training data and is never fitted on holdout data.
 - Drift is a diagnostic signal; it is not treated as proof of changed model
   quality without labels and business context.
+- Explanations isolate external model calls behind timeouts, redactions, cost
+  controls, and deterministic fallbacks.
 - Compliance reports assemble evidence and never make an automatic promotion
   decision.
 

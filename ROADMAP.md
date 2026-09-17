@@ -20,14 +20,14 @@ Status legend: `Proposed` (not started), `In progress`, `Done`.
 ## Current state
 
 The project is a beta reference implementation with the implementation work in
-Phases 2 through 13 complete. Phase 1's workflows are in place, but the first
+Phases 2 through 14 complete. Phase 1's workflows are in place, but the first
 real PyPI release still requires maintainer-side trusted-publisher setup. The
 shipped system covers leakage-safe training, multiple calibrated estimators,
-threshold and calibration analysis, drift surveillance, promotion evidence,
-artifact integrity, signed release artifacts, online scoring, deterministic
-local/natural-language explanations, persisted lineage, and HTML compliance
-reports. The next direction is evaluation realism and operational integration,
-not another estimator or duplicate serving stack.
+threshold and calibration analysis, label-delay temporal gaps, drift surveillance,
+promotion evidence, artifact integrity and lineage validation, signed release
+artifacts, online scoring, structured audit event export, an isolated explanation
+provider boundary with deterministic fallback, persisted lineage, and HTML
+compliance reports.
 
 ## Phase 1 — Distribution
 
@@ -224,7 +224,7 @@ mission:
   stability evidence and artifact manifest hashes. It records evidence and
   explicitly does not make an automated promotion decision.
 
-## Phase 14 — Evaluation realism and operational integration (in progress)
+## Phase 14 — Evaluation realism and operational integration
 
 The next phase closes the remaining gap between this reference workflow
 and a deployment team's data/operations process without turning the project
@@ -241,7 +241,7 @@ into a general-purpose platform:
 - **Structured audit event export** (`Done`) — provide an opt-in JSONL
   sink for scoring and promotion events with redaction guarantees, leaving
   durable storage, retention, and access control to the deploying operator.
-- **Optional explanation provider interface** (`In progress`) — if external
+- **Optional explanation provider interface** (`Done`) — if external
   language models are added, isolate them behind an explicit provider boundary
   with timeouts, redaction, cost controls, and a deterministic fallback; the
   current offline template remains the default.

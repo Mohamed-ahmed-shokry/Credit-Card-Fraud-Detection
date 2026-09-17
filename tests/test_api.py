@@ -666,3 +666,26 @@ def test_score_emits_audit_event_to_configured_sink(
     assert event["payload"]["batch_size"] == 1
     assert event["payload"]["request_id"] == "single-score-999"
 
+
+def test_predict_and_score_gracefully_handle_audit_sink_failure(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, model, dataset = api_context
+
+    class FailingAuditSink:
+        def emit(self, _event: object) -> None:
+            raise RuntimeError("Audit storage unavailable")
+
+        def close(self) -> None:
+            pass
+
+    app = create_app(model=model, audit_sink=FailingAuditSink())
+    record = dataset.features.iloc[0].to_dict()
+
+    with TestClient(app) as test_client:
+        pred_resp = test_client.post("/v1/predict", json={"transactions": [record]})
+        assert pred_resp.status_code == 200
+        score_resp = test_client.post("/v1/score", json={"transaction": record})
+        assert score_resp.status_code == 200
+
+

@@ -157,6 +157,56 @@ def test_cost_controller_rate_and_token_limits() -> None:
     assert ok_blocked is False
     assert reason_blocked == "Rate limit exceeded (requests per minute)"
 
+    # Test sliding window eviction of old timestamps
+    rate_controller._timestamps.append(time.time() - 120.0)  # noqa: SLF001
+    assert rate_controller.check_and_record()[0] is False  # cleans up old timestamp
+
+
+def test_external_provider_cost_controller_blocking() -> None:
+    blocked_controller = CostController(max_requests_per_minute=1)
+    blocked_controller.check_and_record()  # consume the 1 allowed
+
+    provider = ExternalExplanationProvider(
+        endpoint_fn=lambda _p: "Not called",
+        cost_controller=blocked_controller,
+    )
+    req = ExplanationRequest(
+        probability=0.8,
+        threshold=0.5,
+        decision="FRAUD",
+        contributions={"V1": 0.2},
+    )
+    res = provider.explain(req)
+    assert res.fallback_triggered is True
+    assert res.provider == "template"
+    assert "Rate limit exceeded" in str(res.fallback_reason)
+
+
+def test_external_provider_unredacted_and_batch() -> None:
+    captured: list[dict[str, Any]] = []
+
+    def record_payload(p: dict[str, Any]) -> str:
+        captured.append(p)
+        return "Custom batch result"
+
+    provider = ExternalExplanationProvider(
+        endpoint_fn=record_payload,
+        redact_inputs=False,
+    )
+    reqs = [
+        ExplanationRequest(
+            probability=0.7,
+            threshold=0.5,
+            decision="FRAUD",
+            contributions={"V1": 0.1},
+            features={"token": "unmasked_secret"},
+        )
+    ]
+    results = provider.explain_batch(reqs)
+    assert len(results) == 1
+    assert results[0].explanation == "Custom batch result"
+    assert captured[0]["features"]["token"] == "unmasked_secret"  # noqa: S105
+
 
 def test_model_explain_with_custom_provider() -> None:
     dataset = validate_frame(generate_synthetic_data(rows=500, fraud_rate=0.08, random_state=42))

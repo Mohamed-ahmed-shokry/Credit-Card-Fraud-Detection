@@ -912,3 +912,229 @@ def test_validate_artifact_corrupted_lineage(
     assert any("Lineage content_hash mismatch" in err for err in report.errors)
 
 
+def test_validate_artifact_standalone_joblib(
+    tmp_path: Path, trained_model: tuple[FraudModel, ValidatedDataset]
+) -> None:
+    model, _ = trained_model
+    joblib_path = tmp_path / "model.joblib"
+    joblib.dump(model, joblib_path)
+
+    # Non-strict mode passes with warning
+    normal_report = validate_artifact(joblib_path)
+    assert normal_report.valid is True
+    assert len(normal_report.warnings) > 0
+
+    # Strict mode fails
+    strict_report = validate_artifact(joblib_path, strict=True)
+    assert strict_report.valid is False
+    assert any("Strict mode requires" in err for err in strict_report.errors)
+
+
+def test_validate_artifact_missing_manifest_in_dir(tmp_path: Path) -> None:
+    empty_dir = tmp_path / "empty_dir"
+    empty_dir.mkdir()
+    report = validate_artifact(empty_dir)
+    assert report.valid is False
+    assert any(f"Missing {MANIFEST_FILENAME}" in err for err in report.errors)
+
+
+def test_validate_artifact_manifest_version_and_algo_checks(
+    tmp_path: Path, trained_model: tuple[FraudModel, ValidatedDataset]
+) -> None:
+    model, _ = trained_model
+    artifact_dir = tmp_path / "art_manifest"
+    save_model(model, artifact_dir)
+    manifest_path = artifact_dir / MANIFEST_FILENAME
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+    # Unsupported hash algorithm & version mismatch
+    manifest["hash_algorithm"] = "sha512"
+    manifest["artifact_version"] = 999
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    report = validate_artifact(artifact_dir)
+    assert report.valid is False
+    assert any("Unsupported manifest hash algorithm" in err for err in report.errors)
+    assert any("Artifact version 999" in err for err in report.errors)
+
+
+def test_validate_artifact_malformed_manifest_and_metadata_json(
+    tmp_path: Path, trained_model: tuple[FraudModel, ValidatedDataset]
+) -> None:
+    model, _ = trained_model
+    artifact_dir = tmp_path / "art_bad_json"
+    save_model(model, artifact_dir)
+
+    # Corrupt manifest json syntax
+    (artifact_dir / MANIFEST_FILENAME).write_text("{not valid json", encoding="utf-8")
+    report = validate_artifact(artifact_dir)
+    assert report.valid is False
+    assert any("Failed to read or parse manifest" in err for err in report.errors)
+
+    # Restore valid manifest but corrupt metadata json
+    save_model(model, artifact_dir)
+    (artifact_dir / METADATA_FILENAME).write_text("{not valid json", encoding="utf-8")
+    manifest_path = artifact_dir / MANIFEST_FILENAME
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["files"][METADATA_FILENAME] = sha256(b"{not valid json").hexdigest()
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    report_meta = validate_artifact(artifact_dir)
+    assert report_meta.valid is False
+    assert any("Failed to read or parse metadata.json" in err for err in report_meta.errors)
+
+
+def test_validate_artifact_sklearn_runtime_mismatch(
+    tmp_path: Path, trained_model: tuple[FraudModel, ValidatedDataset]
+) -> None:
+    model, _ = trained_model
+    artifact_dir = tmp_path / "art_sklearn"
+    save_model(model, artifact_dir)
+
+    meta_path = artifact_dir / METADATA_FILENAME
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    meta["scikit_learn_version"] = "0.0.1"
+    meta_path.write_text(json.dumps(meta), encoding="utf-8")
+    manifest_path = artifact_dir / MANIFEST_FILENAME
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["files"][METADATA_FILENAME] = sha256(meta_path.read_bytes()).hexdigest()
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    report = validate_artifact(artifact_dir)
+    assert report.valid is False
+    assert any("scikit-learn runtime mismatch" in err for err in report.errors)
+
+
+def test_validate_artifact_missing_lineage_keys(
+    tmp_path: Path, trained_model: tuple[FraudModel, ValidatedDataset]
+) -> None:
+    model, _ = trained_model
+    artifact_dir = tmp_path / "art_lineage_keys"
+    save_model(model, artifact_dir)
+
+    meta_path = artifact_dir / METADATA_FILENAME
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    meta["lineage"].pop("dataset_fingerprint", None)
+    meta_path.write_text(json.dumps(meta), encoding="utf-8")
+    manifest_path = artifact_dir / MANIFEST_FILENAME
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["files"][METADATA_FILENAME] = sha256(meta_path.read_bytes()).hexdigest()
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    report = validate_artifact(artifact_dir)
+    assert report.valid is False
+    assert any("Lineage is missing required key" in err for err in report.errors)
+
+
+def test_validate_artifact_non_fraud_model_object(tmp_path: Path) -> None:
+    standalone_file = tmp_path / "not_model.joblib"
+    joblib.dump({"key": "not a FraudModel instance"}, standalone_file)
+
+    report = validate_artifact(standalone_file)
+    assert report.valid is False
+    assert any("does not contain a FraudModel" in err for err in report.errors)
+
+
+def test_validate_artifact_missing_file_in_manifest(
+    tmp_path: Path, trained_model: tuple[FraudModel, ValidatedDataset]
+) -> None:
+    model, _ = trained_model
+    artifact_dir = tmp_path / "art_missing_file"
+    save_model(model, artifact_dir)
+    (artifact_dir / METADATA_FILENAME).unlink()
+
+    report = validate_artifact(artifact_dir)
+    assert report.valid is False
+    assert any("Missing required artifact file" in err for err in report.errors)
+
+
+def test_validate_artifact_manifest_missing_entry(
+    tmp_path: Path, trained_model: tuple[FraudModel, ValidatedDataset]
+) -> None:
+    model, _ = trained_model
+    artifact_dir = tmp_path / "art_missing_entry"
+    save_model(model, artifact_dir)
+    manifest_path = artifact_dir / MANIFEST_FILENAME
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["files"].pop(METADATA_FILENAME, None)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    report = validate_artifact(artifact_dir)
+    assert report.valid is False
+    assert any("Manifest missing entry for file" in err for err in report.errors)
+
+
+def test_validate_artifact_metadata_not_a_mapping(
+    tmp_path: Path, trained_model: tuple[FraudModel, ValidatedDataset]
+) -> None:
+    model, _ = trained_model
+    artifact_dir = tmp_path / "art_not_a_map"
+    save_model(model, artifact_dir)
+    meta_path = artifact_dir / METADATA_FILENAME
+    meta_path.write_text("[]", encoding="utf-8")
+    manifest_path = artifact_dir / MANIFEST_FILENAME
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["files"][METADATA_FILENAME] = sha256(b"[]").hexdigest()
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    report = validate_artifact(artifact_dir)
+    assert report.valid is False
+    assert any("does not contain a JSON mapping" in err for err in report.errors)
+
+
+def test_validate_artifact_lineage_not_a_mapping(
+    tmp_path: Path, trained_model: tuple[FraudModel, ValidatedDataset]
+) -> None:
+    model, _ = trained_model
+    artifact_dir = tmp_path / "art_lineage_not_map"
+    save_model(model, artifact_dir)
+    meta_path = artifact_dir / METADATA_FILENAME
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    meta["lineage"] = "not_a_dict"
+    meta_path.write_text(json.dumps(meta), encoding="utf-8")
+    manifest_path = artifact_dir / MANIFEST_FILENAME
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["files"][METADATA_FILENAME] = sha256(meta_path.read_bytes()).hexdigest()
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    report = validate_artifact(artifact_dir)
+    assert report.valid is False
+    assert any("missing 'lineage' block" in err for err in report.errors)
+
+
+def test_validate_artifact_embedded_metadata_mismatch(
+    tmp_path: Path, trained_model: tuple[FraudModel, ValidatedDataset]
+) -> None:
+    model, _ = trained_model
+    artifact_dir = tmp_path / "art_meta_mismatch"
+    save_model(model, artifact_dir)
+    meta_path = artifact_dir / METADATA_FILENAME
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    meta["row_count"] = 99999
+    meta_path.write_text(json.dumps(meta), encoding="utf-8")
+    manifest_path = artifact_dir / MANIFEST_FILENAME
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["files"][METADATA_FILENAME] = sha256(meta_path.read_bytes()).hexdigest()
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    report = validate_artifact(artifact_dir)
+    assert report.valid is False
+    assert any("does not match embedded metadata" in err for err in report.errors)
+
+
+def test_validate_artifact_missing_report_fields(
+    tmp_path: Path, trained_model: tuple[FraudModel, ValidatedDataset]
+) -> None:
+    original_model, _ = trained_model
+    model = deepcopy(original_model)
+    model.metadata.pop("reference_profile", None)
+    artifact_dir = tmp_path / "art_missing_report"
+    save_model(model, artifact_dir)
+
+    report = validate_artifact(artifact_dir)
+    assert report.valid is False
+    assert any("missing required report fields" in err for err in report.errors)
+
+
+
+

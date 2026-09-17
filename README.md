@@ -238,12 +238,17 @@ order, evaluate chronologically to train on the past and test on the newest wind
 fraud-detect train Dataset/creditcard.csv \
   --output artifacts/model \
   --split-strategy temporal \
-  --time-column Time
+  --time-column Time \
+  --temporal-gap 86400
 ```
 
 Chronological training records each split's minimum and maximum time in the model
-card. Every window must contain legitimate and fraudulent examples; otherwise
-training stops with an actionable error rather than publishing invalid metrics.
+card. To account for chargeback maturation and label delay in fraud operations,
+pass `--temporal-gap <seconds>`. The split enforces an untouched buffer window
+between train, validation, and test splits so recent unconfirmed transactions do
+not leak into earlier training windows. Every window must contain legitimate and
+fraudulent examples; otherwise training stops with an actionable error rather
+than publishing invalid metrics.
 
 To minimize an explicit business-cost policy on validation data:
 
@@ -342,6 +347,27 @@ versions used for training. The loader requires the recorded scikit-learn versio
 to exactly match the serving runtime. Cross-version pickle/joblib loading is
 unsupported; retrain the model after dependency upgrades instead of bypassing this
 check.
+
+### Validate artifact integrity and lineage
+
+Before a promotion gate or production container consumes an artifact, run
+`validate-artifact` to verify manifest SHA-256 digests, runtime version compatibility,
+lineage completeness, and report readiness without unpickling untrusted code:
+
+```bash
+fraud-detect validate-artifact artifacts/model
+fraud-detect validate-artifact artifacts/model --strict
+```
+
+The command checks that:
+- `manifest.json` correctly signs `model.joblib` and `metadata.json`;
+- The artifact was created with the currently installed scikit-learn runtime;
+- The lineage block contains complete dataset fingerprint, configuration hash,
+  and content hash;
+- All metrics, reference profiles, and cost policy parameters required for
+  reporting and drift surveillance are present.
+
+Pass `--strict` in deployment CI/CD pipelines to fail if Git commit provenance is missing.
 
 Keep superseded artifact directories (for example `artifacts/model-2026-09-01/`)
 until the replacement has proven itself: reproducible `compare`, `stability`,
@@ -554,6 +580,36 @@ Excess requests return `429 Too Many Requests` with `Retry-After`,
 `X-RateLimit-Limit`, and `X-RateLimit-Remaining` headers. Allowed responses
 carry `X-RateLimit-Limit` and `X-RateLimit-Remaining` so clients can back off
 before hitting the cap.
+
+### Structured audit event export
+
+Export structured, thread-safe JSONL audit events for scoring decisions and promotion
+evidence without sending raw cardholder data or sensitive credentials into audit storage:
+
+- In FastAPI, configure `FRAUD_AUDIT_LOG_PATH=/path/to/audit.jsonl` or pass `audit_sink=JsonlAuditSink(...)` to `create_app`.
+- In the CLI, pass `--audit-log audit.jsonl` to `fraud-detect predict` or `fraud-detect promote`.
+
+**Redaction guarantees:**
+Audit payloads automatically mask any field matching sensitive key patterns (`card`,
+`pan`, `token`, `secret`, `password`, `key`, `cvv`, etc.) and sanitize any string
+containing a Luhn-validated 13–19 digit payment card number into `[REDACTED_PAN]`.
+
+### Explanation provider interface
+
+The system provides an explicit provider boundary (`ExplanationProvider`) for
+natural-language risk explanations:
+
+- **Offline deterministic template (default):** `TemplateExplanationProvider` renders
+  reproducible, auditable factor rationales without external dependencies or network overhead.
+- **External LLM provider boundary:** `ExternalExplanationProvider` allows delegating
+  explanations to language model endpoints while protecting operations with:
+  - Strict timeouts (`timeout_seconds`);
+  - Input redaction scrubbed of card numbers and tokens;
+  - Cost controls (`CostController` with requests-per-minute and token budgets);
+  - Deterministic fallback to the template provider if an error or timeout occurs.
+
+Configure a custom provider in `create_app(explanation_provider=...)` or pass it to
+`FraudModel.explain_local_natural_language()`.
 
 ## Monitor feature drift
 
