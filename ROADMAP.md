@@ -238,10 +238,10 @@ into a general-purpose platform:
   validator that checks artifact integrity, runtime compatibility, lineage
   completeness, and report compatibility before a deployment job consumes an
   artifact.
-- **Structured audit event export** (`In progress`) — provide an opt-in JSONL
+- **Structured audit event export** (`Done`) — provide an opt-in JSONL
   sink for scoring and promotion events with redaction guarantees, leaving
   durable storage, retention, and access control to the deploying operator.
-- **Optional explanation provider interface** (`Proposed`) — if external
+- **Optional explanation provider interface** (`In progress`) — if external
   language models are added, isolate them behind an explicit provider boundary
   with timeouts, redaction, cost controls, and a deterministic fallback; the
   current offline template remains the default.
