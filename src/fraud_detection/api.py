@@ -37,6 +37,7 @@ from fraud_detection.audit import (
     NullAuditSink,
     build_scoring_audit_event,
 )
+from fraud_detection.explanations import ExplanationProvider
 from fraud_detection.model import FraudModel, ModelArtifactError, load_model
 
 MODEL_PATH_ENVIRONMENT_VARIABLE = "FRAUD_MODEL_PATH"
@@ -156,6 +157,7 @@ def create_app(
     rate_limit_requests: int = 0,
     rate_limit_window_seconds: float = 60.0,
     audit_sink: AuditSink | None = None,
+    explanation_provider: ExplanationProvider | None = None,
 ) -> FastAPI:
     """Create an application using an injected model or a trusted artifact path.
 
@@ -169,6 +171,8 @@ def create_app(
         rate_limit_window_seconds: Time window for rate limiting in seconds.
         audit_sink: Optional structured audit sink. If omitted, checks
             the `FRAUD_AUDIT_LOG_PATH` environment variable or defaults to NullAuditSink.
+        explanation_provider: Optional explanation provider for natural language risk
+            summaries. Defaults to offline deterministic TemplateExplanationProvider.
     """
     logging.basicConfig(level=logging.INFO)
 
@@ -222,6 +226,7 @@ def create_app(
             loaded_model = load_model(configured_path)
         application.state.model = loaded_model
         application.state.audit_sink = resolved_audit_sink
+        application.state.explanation_provider = explanation_provider
         yield
         resolved_audit_sink.close()
 
@@ -382,6 +387,7 @@ def create_app(
                 probabilities,
                 threshold=applied_threshold,
                 contributions=local_explanations,
+                provider=explanation_provider,
             )
             if explain_llm
             else None

@@ -36,6 +36,11 @@ from fraud_detection.evaluation import (
     select_cost_threshold,
     select_f1_threshold,
 )
+from fraud_detection.explanations import (
+    ExplanationProvider,
+    ExplanationRequest,
+    TemplateExplanationProvider,
+)
 
 ARTIFACT_VERSION = 2
 MODEL_FILENAME = "model.joblib"
@@ -262,12 +267,13 @@ class FraudModel:
         threshold: float | None = None,
         contributions: list[dict[str, Any]] | None = None,
         top_k: int = 3,
+        provider: ExplanationProvider | None = None,
     ) -> list[str]:
-        """Render deterministic natural-language explanations from local effects.
+        """Render natural-language explanations from local effects.
 
-        This is intentionally template-based rather than an external LLM call:
-        explanations remain reproducible, offline, and auditable while still
-        describing the model-derived contributions that drive each decision.
+        Defaults to TemplateExplanationProvider for offline, reproducible, and
+        auditable explanations, while supporting optional external providers
+        behind an isolated provider boundary.
         """
         ordered = self.validate_features(features)
         if not 1 <= top_k <= len(self.feature_names):
@@ -287,36 +293,24 @@ class FraudModel:
         if len(local_contributions) != len(ordered):
             raise ModelArtifactError("Local explanations do not match the transaction count.")
 
-        explanations = []
-        for probability, row_contributions in zip(
-            probability_values, local_contributions, strict=True
-        ):
-            ranked = sorted(
-                row_contributions.items(),
-                key=lambda item: abs(float(item[1])),
-                reverse=True,
-            )[:top_k]
-            factors = ", ".join(
-                f"{feature} ({float(value):+.3f}, "
-                f"{'increases' if float(value) >= 0 else 'decreases'} fraud risk)"
-                for feature, value in ranked
+        active_provider = provider or TemplateExplanationProvider()
+        requests = [
+            ExplanationRequest(
+                probability=float(prob),
+                threshold=applied_threshold,
+                decision="FRAUD" if float(prob) >= applied_threshold else "LEGITIMATE",
+                contributions={k: float(v) for k, v in row_contrib.items()},
+                features={str(k): v for k, v in ordered.iloc[i].to_dict().items()}
+                if len(ordered) > 0
+                else {},
+                top_k=top_k,
             )
-            probability_value = float(probability)
-            risk_level = (
-                "HIGH"
-                if probability_value >= 0.7
-                else "MEDIUM"
-                if probability_value >= 0.3
-                else "LOW"
+            for i, (prob, row_contrib) in enumerate(
+                zip(probability_values, local_contributions, strict=True)
             )
-            decision = "FRAUD" if probability_value >= applied_threshold else "LEGITIMATE"
-            explanations.append(
-                f"Transaction classified as {decision} "
-                f"(fraud probability: {probability_value:.2%}, "
-                f"applied threshold: {applied_threshold:.2f}, risk level: {risk_level}). "
-                f"Top contributing factors: {factors}."
-            )
-        return explanations
+        ]
+        results = active_provider.explain_batch(requests)
+        return [res.explanation for res in results]
 
     def _explain_local_logistic(self, ordered: pd.DataFrame) -> list[dict[str, Any]]:
         """Compute local explanations for logistic regression using standardized coefficients."""

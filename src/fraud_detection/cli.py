@@ -43,6 +43,7 @@ from fraud_detection.evaluation import (
     expected_classification_cost,
     summarize_thresholds,
 )
+from fraud_detection.explanations import ExplanationProvider
 from fraud_detection.model import (
     MANIFEST_FILENAME,
     CalibrationMethod,
@@ -853,12 +854,14 @@ def _generate_llm_explanations(
     features: pd.DataFrame,
     probabilities: np.ndarray,
     threshold: float,
+    provider: ExplanationProvider | None = None,
 ) -> list[str]:
-    """Generate deterministic natural-language explanations from model effects."""
+    """Generate natural-language explanations from model effects via provider."""
     return model.explain_local_natural_language(
         features,
         probabilities,
         threshold=threshold,
+        provider=provider,
     )
 
 
