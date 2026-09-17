@@ -18,6 +18,11 @@ import typer
 import uvicorn
 
 from fraud_detection import __version__
+from fraud_detection.audit import (
+    JsonlAuditSink,
+    build_promotion_audit_event,
+    build_scoring_audit_event,
+)
 from fraud_detection.data import (
     DEFAULT_TARGET,
     DataValidationError,
@@ -890,6 +895,14 @@ def predict_command(
         bool,
         typer.Option(help="Include per-transaction LLM-generated natural language explanations."),
     ] = False,
+    audit_log: Annotated[
+        Path | None,
+        typer.Option(
+            "--audit-log",
+            "-a",
+            help="Optional JSONL destination for structured scoring audit events.",
+        ),
+    ] = None,
     overwrite: Annotated[bool, typer.Option(help="Replace an existing output file.")] = False,
 ) -> None:
     """Batch-score transactions and write probabilities plus binary decisions."""
@@ -923,6 +936,32 @@ def predict_command(
             for idx, explanation in enumerate(llm_explanations):
                 scored.loc[scored.index[idx], "llm_explanation"] = explanation
         _atomic_write_csv(scored, output)
+
+        if audit_log is not None:
+            sink = JsonlAuditSink(audit_log)
+            try:
+                scoring_event = build_scoring_audit_event(
+                    model_version=str(model.metadata.get("dataset_fingerprint", ""))[:12],
+                    dataset_fingerprint=str(model.metadata.get("dataset_fingerprint", "")),
+                    threshold=applied_threshold,
+                    predictions=[
+                        {
+                            "index": int(idx),
+                            "fraud_probability": float(prob),
+                            "is_fraud": bool(pred),
+                        }
+                        for idx, prob, pred in zip(
+                            scored.index,
+                            probabilities,
+                            predictions,
+                            strict=True,
+                        )
+                    ],
+                    client_metadata={"source_file": str(data), "output_file": str(output)},
+                )
+                sink.emit(scoring_event)
+            finally:
+                sink.close()
     except (
         OSError,
         UnicodeDecodeError,
@@ -1571,6 +1610,14 @@ def promote_command(
         Path | None,
         typer.Option("--output", "-o", help="Optional JSON bundle destination."),
     ] = None,
+    audit_log: Annotated[
+        Path | None,
+        typer.Option(
+            "--audit-log",
+            "-a",
+            help="Optional JSONL destination for structured promotion audit events.",
+        ),
+    ] = None,
     overwrite: Annotated[
         bool,
         typer.Option(help="Replace an existing bundle file."),
@@ -1599,7 +1646,7 @@ def promote_command(
         profile = model.metadata.get("reference_profile")
         if not isinstance(profile, dict):
             raise DriftError("Model artifact does not contain a reference profile.")
-        bundle = {
+        bundle: dict[str, Any] = {
             "model_version": str(model.metadata["dataset_fingerprint"])[:12],
             "model": {
                 "estimator": model.metadata["estimator"],
@@ -1622,6 +1669,26 @@ def promote_command(
             "benchmark": _benchmark_payload(model, labeled.features, sizes, repeat),
         }
         _emit_report(json.dumps(bundle, indent=2), output)
+
+        if audit_log is not None:
+            sink = JsonlAuditSink(audit_log)
+            try:
+                promotion_event = build_promotion_audit_event(
+                    model_version=str(model.metadata.get("dataset_fingerprint", ""))[:12],
+                    dataset_fingerprint=str(model.metadata.get("dataset_fingerprint", "")),
+                    bundle_summary={
+                        "model_version": bundle["model_version"],
+                        "estimator": bundle["model"]["estimator"],
+                        "threshold": bundle["model"]["threshold"],
+                        "test_metrics": bundle["model"]["test_metrics"],
+                        "drift_detected": bundle["drift"].get("drift_detected", False),
+                        "warning_detected": bundle["drift"].get("warning_detected", False),
+                    },
+                    metadata={"heldout_path": str(heldout), "recent_path": str(recent)},
+                )
+                sink.emit(promotion_event)
+            finally:
+                sink.close()
     except (
         OSError,
         UnicodeDecodeError,

@@ -1857,3 +1857,70 @@ def test_validate_artifact_cli_strict_fails_without_git(
     assert strict_report["valid"] is False
 
 
+def test_predict_cli_with_audit_log(
+    tmp_path: Path, trained_artifact: Path
+) -> None:
+    data_path = tmp_path / "transactions.csv"
+    output_path = tmp_path / "predictions.csv"
+    audit_log = tmp_path / "audit" / "predict_audit.jsonl"
+    generate_synthetic_data(rows=200, fraud_rate=0.1, random_state=42).to_csv(
+        data_path, index=False
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "predict",
+            str(trained_artifact),
+            str(data_path),
+            "--output",
+            str(output_path),
+            "--audit-log",
+            str(audit_log),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert audit_log.is_file()
+    lines = audit_log.read_text(encoding="utf-8").strip().split("\n")
+    assert len(lines) == 1
+    record = json.loads(lines[0])
+    assert record["event_type"] == "scoring"
+    assert record["payload"]["batch_size"] == 200
+    assert len(record["payload"]["predictions"]) == 200
+
+
+def test_promote_cli_with_audit_log(
+    tmp_path: Path, trained_artifact: Path
+) -> None:
+    heldout_path = tmp_path / "heldout.csv"
+    recent_path = tmp_path / "recent.csv"
+    audit_log = tmp_path / "audit" / "promote_audit.jsonl"
+    generate_synthetic_data(rows=200, fraud_rate=0.1, random_state=81).to_csv(
+        heldout_path, index=False
+    )
+    generate_synthetic_data(rows=200, fraud_rate=0.1, random_state=82).to_csv(
+        recent_path, index=False
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "promote",
+            str(trained_artifact),
+            str(heldout_path),
+            str(recent_path),
+            "--audit-log",
+            str(audit_log),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert audit_log.is_file()
+    lines = audit_log.read_text(encoding="utf-8").strip().split("\n")
+    assert len(lines) == 1
+    record = json.loads(lines[0])
+    assert record["event_type"] == "promotion"
+    assert "bundle" in record["payload"]
+    assert "estimator" in record["payload"]["bundle"]
+
+
+

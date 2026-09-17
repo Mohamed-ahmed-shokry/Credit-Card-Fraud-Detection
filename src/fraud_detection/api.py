@@ -31,9 +31,16 @@ from starlette.middleware.base import RequestResponseEndpoint
 from starlette.responses import Response
 
 from fraud_detection import __version__
+from fraud_detection.audit import (
+    AuditSink,
+    JsonlAuditSink,
+    NullAuditSink,
+    build_scoring_audit_event,
+)
 from fraud_detection.model import FraudModel, ModelArtifactError, load_model
 
 MODEL_PATH_ENVIRONMENT_VARIABLE = "FRAUD_MODEL_PATH"
+AUDIT_LOG_ENVIRONMENT_VARIABLE = "FRAUD_AUDIT_LOG_PATH"
 REQUEST_ID_HEADER = "X-Request-ID"
 PROCESS_TIME_HEADER = "X-Process-Time-Ms"
 MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024
@@ -148,6 +155,7 @@ def create_app(
     api_keys: list[str] | None = None,
     rate_limit_requests: int = 0,
     rate_limit_window_seconds: float = 60.0,
+    audit_sink: AuditSink | None = None,
 ) -> FastAPI:
     """Create an application using an injected model or a trusted artifact path.
 
@@ -159,6 +167,8 @@ def create_app(
         rate_limit_requests: Maximum requests per window. If > 0, enables rate
             limiting per client IP.
         rate_limit_window_seconds: Time window for rate limiting in seconds.
+        audit_sink: Optional structured audit sink. If omitted, checks
+            the `FRAUD_AUDIT_LOG_PATH` environment variable or defaults to NullAuditSink.
     """
     logging.basicConfig(level=logging.INFO)
 
@@ -189,6 +199,16 @@ def create_app(
     )
     api_key_set = set(api_keys) if api_keys else None
 
+    resolved_audit_sink: AuditSink
+    if audit_sink is not None:
+        resolved_audit_sink = audit_sink
+    else:
+        configured_audit_path = os.getenv(AUDIT_LOG_ENVIRONMENT_VARIABLE)
+        if configured_audit_path:
+            resolved_audit_sink = JsonlAuditSink(Path(configured_audit_path))
+        else:
+            resolved_audit_sink = NullAuditSink()
+
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         loaded_model = model
@@ -201,7 +221,9 @@ def create_app(
                 )
             loaded_model = load_model(configured_path)
         application.state.model = loaded_model
+        application.state.audit_sink = resolved_audit_sink
         yield
+        resolved_audit_sink.close()
 
     application = FastAPI(
         title="Credit Card Fraud Detection API",
@@ -397,6 +419,26 @@ def create_app(
             explain_llm=payload.explain_llm,
             threshold=payload.threshold,
         )
+        sink: AuditSink = getattr(request.app.state, "audit_sink", resolved_audit_sink)
+        try:
+            audit_event = build_scoring_audit_event(
+                model_version=str(loaded.metadata.get("dataset_fingerprint", ""))[:12],
+                dataset_fingerprint=str(loaded.metadata.get("dataset_fingerprint", "")),
+                threshold=applied_threshold,
+                predictions=[
+                    {
+                        "fraud_probability": r.fraud_probability,
+                        "is_fraud": r.is_fraud,
+                        "contributions": r.contributions,
+                        "explanation": r.explanation,
+                    }
+                    for r in results
+                ],
+                request_id=getattr(request.state, "request_id", None),
+            )
+            sink.emit(audit_event)
+        except Exception:
+            logger.exception("Failed to emit scoring audit event.")
         return PredictionResponse(
             model_version=str(loaded.metadata["dataset_fingerprint"])[:12],
             threshold=applied_threshold,
@@ -419,6 +461,25 @@ def create_app(
             explain_llm=payload.explain_llm,
             threshold=payload.threshold,
         )
+        sink: AuditSink = getattr(request.app.state, "audit_sink", resolved_audit_sink)
+        try:
+            audit_event = build_scoring_audit_event(
+                model_version=str(loaded.metadata.get("dataset_fingerprint", ""))[:12],
+                dataset_fingerprint=str(loaded.metadata.get("dataset_fingerprint", "")),
+                threshold=applied_threshold,
+                predictions=[
+                    {
+                        "fraud_probability": results[0].fraud_probability,
+                        "is_fraud": results[0].is_fraud,
+                        "contributions": results[0].contributions,
+                        "explanation": results[0].explanation,
+                    }
+                ],
+                request_id=getattr(request.state, "request_id", None),
+            )
+            sink.emit(audit_event)
+        except Exception:
+            logger.exception("Failed to emit scoring audit event.")
         return ScoreResponse(
             model_version=str(loaded.metadata["dataset_fingerprint"])[:12],
             threshold=applied_threshold,

@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 
 from fraud_detection import __version__
 from fraud_detection.api import (
+    AUDIT_LOG_ENVIRONMENT_VARIABLE,
     MAX_REQUEST_BODY_BYTES,
     MODEL_PATH_ENVIRONMENT_VARIABLE,
     PROCESS_TIME_HEADER,
@@ -18,6 +19,7 @@ from fraud_detection.api import (
     app_from_environment,
     create_app,
 )
+from fraud_detection.audit import JsonlAuditSink
 from fraud_detection.data import ValidatedDataset, generate_synthetic_data, validate_frame
 from fraud_detection.model import FraudModel, save_model, train_model
 
@@ -584,3 +586,83 @@ def test_rate_limit_middleware_rejects_over_limit(
         assert response3.headers["X-RateLimit-Limit"] == "2"
         assert response3.headers["X-RateLimit-Remaining"] == "0"
         assert int(response3.headers["Retry-After"]) >= 0
+
+
+def test_predict_emits_audit_event_to_configured_sink(
+    tmp_path: Path,
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, model, dataset = api_context
+    records = dataset.features.iloc[:2].to_dict(orient="records")
+    audit_file = tmp_path / "audit" / "scoring.jsonl"
+    sink = JsonlAuditSink(audit_file)
+    app = create_app(model=model, audit_sink=sink)
+
+    with TestClient(app) as test_client:
+        response = test_client.post(
+            "/v1/predict",
+            json={"transactions": records, "explain": True},
+            headers={"X-Request-ID": "test-req-123"},
+        )
+        assert response.status_code == 200
+
+    assert audit_file.exists()
+    lines = audit_file.read_text(encoding="utf-8").strip().split("\n")
+    assert len(lines) == 1
+    event = json.loads(lines[0])
+    assert event["event_type"] == "scoring"
+    assert event["model_version"] == str(model.metadata["dataset_fingerprint"])[:12]
+    assert event["payload"]["batch_size"] == 2
+    assert event["payload"]["request_id"] == "test-req-123"
+    assert len(event["payload"]["predictions"]) == 2
+
+
+def test_predict_emits_audit_event_via_environment_variable(
+    tmp_path: Path,
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, model, dataset = api_context
+    audit_file = tmp_path / "env_audit.jsonl"
+    monkeypatch.setenv(AUDIT_LOG_ENVIRONMENT_VARIABLE, str(audit_file))
+    records = dataset.features.iloc[:1].to_dict(orient="records")
+    app = create_app(model=model)
+
+    with TestClient(app) as test_client:
+        response = test_client.post("/v1/predict", json={"transactions": records})
+        assert response.status_code == 200
+
+    assert audit_file.exists()
+    lines = audit_file.read_text(encoding="utf-8").strip().split("\n")
+    assert len(lines) == 1
+    event = json.loads(lines[0])
+    assert event["event_type"] == "scoring"
+    assert event["payload"]["batch_size"] == 1
+
+
+def test_score_emits_audit_event_to_configured_sink(
+    tmp_path: Path,
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, model, dataset = api_context
+    record = dataset.features.iloc[0].to_dict()
+    audit_file = tmp_path / "score_audit.jsonl"
+    sink = JsonlAuditSink(audit_file)
+    app = create_app(model=model, audit_sink=sink)
+
+    with TestClient(app) as test_client:
+        response = test_client.post(
+            "/v1/score",
+            json={"transaction": record},
+            headers={"X-Request-ID": "single-score-999"},
+        )
+        assert response.status_code == 200
+
+    assert audit_file.exists()
+    lines = audit_file.read_text(encoding="utf-8").strip().split("\n")
+    assert len(lines) == 1
+    event = json.loads(lines[0])
+    assert event["event_type"] == "scoring"
+    assert event["payload"]["batch_size"] == 1
+    assert event["payload"]["request_id"] == "single-score-999"
+
