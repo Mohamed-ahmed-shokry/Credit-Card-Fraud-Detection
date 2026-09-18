@@ -25,6 +25,7 @@ from fraud_detection.model import (
     FraudModel,
     save_model,
     train_model,
+    verify_attestation,
 )
 
 runner = CliRunner()
@@ -1812,6 +1813,67 @@ def test_validate_artifact_cli_success(tmp_path: Path, trained_model: FraudModel
     report = json.loads(result.stdout)
     assert report["valid"] is True
     assert report["errors"] == []
+
+
+def test_validate_artifact_cli_attestation_output(
+    tmp_path: Path, trained_model: FraudModel
+) -> None:
+    artifact_path = tmp_path / "artifact"
+    save_model(trained_model, artifact_path)
+    att_path = tmp_path / "attestation.json"
+
+    # Generate attestation with custom signer
+    result = runner.invoke(
+        app,
+        [
+            "validate-artifact",
+            str(artifact_path),
+            "--attestation-output",
+            str(att_path),
+            "--signer",
+            "release-bot-v1",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert att_path.is_file()
+
+    # Verify content and digest
+    is_valid, msg = verify_attestation(att_path)
+    assert is_valid is True
+    assert "successfully" in msg
+    att = json.loads(att_path.read_text(encoding="utf-8"))
+    assert att["verifier"]["signer"] == "release-bot-v1"
+    assert att["status"] == "PASSED"
+
+    # Test overwrite protection
+    res_no_ow = runner.invoke(
+        app,
+        [
+            "validate-artifact",
+            str(artifact_path),
+            "--attestation-output",
+            str(att_path),
+        ],
+    )
+    assert res_no_ow.exit_code == 2
+    assert "already exists" in res_no_ow.output
+
+    # Test overwrite permitted
+    res_ow = runner.invoke(
+        app,
+        [
+            "validate-artifact",
+            str(artifact_path),
+            "--attestation-output",
+            str(att_path),
+            "--overwrite",
+            "--signer",
+            "release-bot-v2",
+        ],
+    )
+    assert res_ow.exit_code == 0, res_ow.output
+    att2 = json.loads(att_path.read_text(encoding="utf-8"))
+    assert att2["verifier"]["signer"] == "release-bot-v2"
 
 
 def test_validate_artifact_cli_failure_on_corrupted_file(

@@ -1523,9 +1523,34 @@ def validate_artifact_command(
             help="Enforce strict requirements including Git provenance and directory manifest.",
         ),
     ] = False,
+    attestation_output: Annotated[
+        Path | None,
+        typer.Option(
+            "--attestation-output",
+            "-a",
+            help="Optional JSON destination for signed attestation manifest.",
+        ),
+    ] = None,
+    signer: Annotated[
+        str | None,
+        typer.Option(help="Identifier or entity signing the verification attestation."),
+    ] = None,
+    overwrite: Annotated[
+        bool,
+        typer.Option(help="Replace an existing attestation output file."),
+    ] = False,
 ) -> None:
     """Validate artifact integrity, runtime compatibility, lineage, and report readiness."""
+    _guard_output(attestation_output, overwrite)
     report = validate_artifact(model_path, strict=strict)
+
+    if attestation_output is not None:
+        attestation = report.to_attestation(signer=signer)
+        _atomic_write_text(
+            json.dumps(attestation, indent=2, sort_keys=True) + "\n",
+            attestation_output,
+        )
+
     typer.echo(json.dumps(report.to_dict(), indent=2, sort_keys=True))
     if not report.valid:
         raise typer.Exit(code=1)

@@ -789,6 +789,87 @@ class ArtifactValidationReport:
             "metadata_summary": self.metadata_summary,
         }
 
+    def to_attestation(self, *, signer: str | None = None) -> dict[str, Any]:
+        """Convert the validation report into a signed, tamper-evident attestation manifest."""
+        return generate_attestation(self, signer=signer)
+
+
+def generate_attestation(
+    report: ArtifactValidationReport,
+    *,
+    signer: str | None = None,
+) -> dict[str, Any]:
+    """Generate a tamper-evident machine-readable attestation manifest from a validation report."""
+    lineage_block: dict[str, Any] | None = None
+    if report.metadata_summary and isinstance(report.metadata_summary.get("lineage"), dict):
+        lineage_block = dict(report.metadata_summary["lineage"])
+
+    payload: dict[str, Any] = {
+        "artifact_path": report.artifact_path,
+        "artifact_version": report.artifact_version,
+        "attestation_schema": "1.0",
+        "checks": {
+            check.name: {"details": check.details, "status": check.status}
+            for check in report.checks
+        },
+        "errors": list(report.errors),
+        "lineage": lineage_block,
+        "status": "PASSED" if report.valid else "FAILED",
+        "timestamp": datetime.now(UTC).isoformat(),
+        "verifier": {
+            "code_version": __version__,
+            "scikit_learn_version": sklearn.__version__,
+            "signer": signer or "fraud-detect",
+        },
+        "warnings": list(report.warnings),
+    }
+
+    canonical_body = json.dumps(payload, allow_nan=False, sort_keys=True, separators=(",", ":"))
+    attestation_digest = sha256(canonical_body.encode("utf-8")).hexdigest()
+
+    full_attestation = dict(payload)
+    full_attestation["attestation_digest"] = attestation_digest
+    return full_attestation
+
+
+def verify_attestation(
+    attestation_or_path: dict[str, Any] | Path | str,
+) -> tuple[bool, str]:
+    """Verify that an attestation manifest has not been tampered with.
+
+    Returns (is_valid, message).
+    """
+    if isinstance(attestation_or_path, (Path, str)):
+        path = Path(attestation_or_path)
+        if not path.is_file():
+            return False, f"Attestation file not found: {path}"
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                attestation: Any = json.load(f)
+        except (OSError, json.JSONDecodeError) as exc:
+            return False, f"Failed to read attestation JSON: {exc}"
+    else:
+        attestation = attestation_or_path
+
+    if not isinstance(attestation, dict):
+        return False, "Attestation root must be a JSON object"
+
+    claimed_digest = attestation.get("attestation_digest")
+    if not claimed_digest or not isinstance(claimed_digest, str):
+        return False, "Missing or invalid 'attestation_digest' field"
+
+    payload = {k: v for k, v in attestation.items() if k != "attestation_digest"}
+    try:
+        canonical_body = json.dumps(payload, allow_nan=False, sort_keys=True, separators=(",", ":"))
+    except (TypeError, ValueError) as exc:
+        return False, f"Failed to serialize canonical payload: {exc}"
+
+    actual_digest = sha256(canonical_body.encode("utf-8")).hexdigest()
+    if claimed_digest != actual_digest:
+        return False, f"Digest mismatch: claimed {claimed_digest}, computed {actual_digest}"
+
+    return True, "Attestation digest verified successfully"
+
 
 def validate_artifact(
     path: Path | str,
@@ -1078,6 +1159,7 @@ def validate_artifact(
             "created_at": meta.get("created_at"),
             "dataset_fingerprint": meta.get("dataset_fingerprint"),
             "test_roc_auc": test_roc,
+            "lineage": meta.get("lineage"),
         }
     else:
         checks.append(

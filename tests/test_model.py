@@ -6,7 +6,7 @@ from copy import deepcopy
 from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import joblib
 import numpy as np
@@ -30,10 +30,12 @@ from fraud_detection.model import (
     TrainingConfig,
     _build_lineage,
     _extract_feature_effects,
+    generate_attestation,
     load_model,
     save_model,
     train_model,
     validate_artifact,
+    verify_attestation,
 )
 
 
@@ -1134,6 +1136,76 @@ def test_validate_artifact_missing_report_fields(
     report = validate_artifact(artifact_dir)
     assert report.valid is False
     assert any("missing required report fields" in err for err in report.errors)
+
+
+def test_attestation_generation_and_verification(
+    tmp_path: Path, trained_model: tuple[FraudModel, ValidatedDataset]
+) -> None:
+    model, _ = trained_model
+    artifact_dir = tmp_path / "artifact_attestation"
+    save_model(model, artifact_dir)
+
+    report = validate_artifact(artifact_dir)
+    assert report.valid is True
+
+    # 1. Generate attestation from method and function
+    attestation = report.to_attestation(signer="ci-security-agent")
+    attestation_direct = generate_attestation(report, signer="ci-security-agent")
+    assert attestation["attestation_schema"] == attestation_direct["attestation_schema"]
+    assert attestation["verifier"] == attestation_direct["verifier"]
+    assert attestation["status"] == "PASSED"
+    assert attestation["verifier"]["signer"] == "ci-security-agent"
+    assert attestation["attestation_schema"] == "1.0"
+    assert "attestation_digest" in attestation
+    assert attestation["lineage"] is not None
+
+    # 2. Verify attestation dict
+    is_valid, msg = verify_attestation(attestation)
+    assert is_valid is True
+    assert "successfully" in msg
+
+    # 3. Verify attestation from file
+    att_file = tmp_path / "attestation.json"
+    att_file.write_text(json.dumps(attestation, indent=2), encoding="utf-8")
+    is_valid_file, msg_file = verify_attestation(att_file)
+    assert is_valid_file is True
+    assert "successfully" in msg_file
+
+    # 4. Tamper with payload -> verification fails
+    tampered_att = deepcopy(attestation)
+    tampered_att["status"] = "FAILED"
+    is_valid_tampered, msg_tampered = verify_attestation(tampered_att)
+    assert is_valid_tampered is False
+    assert "Digest mismatch" in msg_tampered
+
+    # 5. Missing digest
+    no_digest = {k: v for k, v in attestation.items() if k != "attestation_digest"}
+    is_valid_nd, msg_nd = verify_attestation(no_digest)
+    assert is_valid_nd is False
+    assert "Missing or invalid" in msg_nd
+
+    # 6. Non-existent file path
+    is_valid_missing, msg_missing = verify_attestation(tmp_path / "nonexistent.json")
+    assert is_valid_missing is False
+    assert "not found" in msg_missing
+
+    # 7. Malformed JSON file
+    bad_json = tmp_path / "bad.json"
+    bad_json.write_text("invalid json {", encoding="utf-8")
+    is_valid_bad, msg_bad = verify_attestation(bad_json)
+    assert is_valid_bad is False
+    assert "Failed to read attestation JSON" in msg_bad
+
+    # 8. Non-dict root
+    is_valid_list, msg_list = verify_attestation(cast(Any, ["not", "a", "dict"]))
+    assert is_valid_list is False
+    assert "must be a JSON object" in msg_list
+
+    bad_root_file = tmp_path / "bad_root.json"
+    bad_root_file.write_text("[]", encoding="utf-8")
+    is_valid_br, msg_br = verify_attestation(bad_root_file)
+    assert is_valid_br is False
+    assert "must be a JSON object" in msg_br
 
 
 
