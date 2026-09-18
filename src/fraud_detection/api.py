@@ -431,6 +431,7 @@ def create_app(
                 model_version=str(loaded.metadata.get("dataset_fingerprint", ""))[:12],
                 dataset_fingerprint=str(loaded.metadata.get("dataset_fingerprint", "")),
                 threshold=applied_threshold,
+                features=payload.transactions,
                 predictions=[
                     {
                         "fraud_probability": r.fraud_probability,
@@ -473,6 +474,7 @@ def create_app(
                 model_version=str(loaded.metadata.get("dataset_fingerprint", ""))[:12],
                 dataset_fingerprint=str(loaded.metadata.get("dataset_fingerprint", "")),
                 threshold=applied_threshold,
+                features=[payload.transaction],
                 predictions=[
                     {
                         "fraud_probability": results[0].fraud_probability,

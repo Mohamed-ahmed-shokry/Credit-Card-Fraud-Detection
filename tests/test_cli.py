@@ -1923,4 +1923,77 @@ def test_promote_cli_with_audit_log(
     assert "estimator" in record["payload"]["bundle"]
 
 
+def test_replay_audit_cli(tmp_path: Path, trained_artifact: Path) -> None:
+    data_path = tmp_path / "transactions.csv"
+    output_path = tmp_path / "predictions.csv"
+    audit_log = tmp_path / "audit" / "predict_audit.jsonl"
+    replay_out = tmp_path / "audit" / "replay_report.json"
+    generate_synthetic_data(rows=200, fraud_rate=0.1, random_state=42).to_csv(
+        data_path, index=False
+    )
 
+    # 1. Run predict with audit log to generate audit events containing inline features
+    pred_res = runner.invoke(
+        app,
+        [
+            "predict",
+            str(trained_artifact),
+            str(data_path),
+            "--output",
+            str(output_path),
+            "--audit-log",
+            str(audit_log),
+        ],
+    )
+    assert pred_res.exit_code == 0, pred_res.output
+
+    # 2. Replay audit log against same model: should MATCH
+    replay_res = runner.invoke(
+        app,
+        [
+            "replay-audit",
+            str(audit_log),
+            str(trained_artifact),
+            "--output",
+            str(replay_out),
+        ],
+    )
+    assert replay_res.exit_code == 0, replay_res.output
+    assert replay_out.is_file()
+    report = json.loads(replay_res.stdout)
+    assert report["status"] == "MATCH"
+    assert report["replayed_events"] == 1
+    assert report["total_transactions"] == 200
+    assert report["score_discrepancies"] == 0
+    assert report["decision_flips"] == 0
+
+    # 3. Replay with threshold override causing decision flips and --fail-on-divergence
+    flip_res = runner.invoke(
+        app,
+        [
+            "replay-audit",
+            str(audit_log),
+            str(trained_artifact),
+            "--threshold",
+            "0.9999",
+            "--fail-on-divergence",
+        ],
+    )
+    assert flip_res.exit_code == 1
+    flip_report = json.loads(flip_res.stdout)
+    assert flip_report["status"] == "DIVERGENT"
+    assert flip_report["decision_flips"] > 0
+
+    # 4. Guard output overwrite protection
+    dup_res = runner.invoke(
+        app,
+        [
+            "replay-audit",
+            str(audit_log),
+            str(trained_artifact),
+            "--output",
+            str(replay_out),
+        ],
+    )
+    assert dup_res.exit_code != 0
+    assert "Output already exists" in dup_res.output

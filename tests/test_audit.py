@@ -5,10 +5,13 @@ from __future__ import annotations
 import concurrent.futures
 import json
 from pathlib import Path
+from typing import Any
 
 from fraud_detection import __version__
 from fraud_detection.audit import (
     AuditEvent,
+    AuditReplayReport,
+    DiscrepancyDetail,
     JsonlAuditSink,
     NullAuditSink,
     _is_luhn_valid,
@@ -16,6 +19,7 @@ from fraud_detection.audit import (
     build_promotion_audit_event,
     build_scoring_audit_event,
     redact_data,
+    replay_audit_log,
 )
 
 
@@ -187,4 +191,173 @@ def test_redact_data_without_pan_masking() -> None:
     text = "Card 4532-0151-1283-0366 present"
     result = redact_data(text, mask_pan_values=False)
     assert result == text
+
+
+class DummyFraudModel:
+    """Mock model for fast, deterministic audit replay unit testing."""
+
+    def __init__(
+        self,
+        threshold: float = 0.5,
+        probs: list[float] | None = None,
+        feature_names: list[str] | None = None,
+    ) -> None:
+        self.threshold = threshold
+        self.probs = probs or [0.1, 0.9]
+        self.feature_names = feature_names or ["V1", "V2", "Amount"]
+
+    def predict_probabilities(self, frame: Any) -> list[float]:
+        n = len(frame)
+        if len(self.probs) < n:
+            return (self.probs * ((n // len(self.probs)) + 1))[:n]
+        return self.probs[:n]
+
+
+def test_build_scoring_audit_event_features_and_fallback() -> None:
+    event = build_scoring_audit_event(
+        model_version="mod1",
+        dataset_fingerprint="fp1",
+        threshold=0.5,
+        predictions=[{"fraud_probability": 0.9, "is_fraud": True}],
+        features=[{"V1": 0.1, "V2": 0.2, "Amount": 50.0, "card_number": "4532015112830366"}],
+        fallback_applied=True,
+        fallback_reason="Estimator degraded",
+    )
+    assert event.payload["fallback_applied"] is True
+    assert event.payload["fallback_reason"] == "Estimator degraded"
+    assert "features" in event.payload
+    redacted = event.to_dict(redact=True)
+    assert redacted["payload"]["features"][0]["card_number"] == "[REDACTED]"
+    assert redacted["payload"]["features"][0]["Amount"] == 50.0
+
+
+def test_replay_audit_log_match(tmp_path: Path) -> None:
+    log_file = tmp_path / "audit.jsonl"
+    model = DummyFraudModel(threshold=0.5, probs=[0.05, 0.95])
+
+    event = build_scoring_audit_event(
+        model_version="v1",
+        dataset_fingerprint="fp1",
+        threshold=0.5,
+        predictions=[
+            {"fraud_probability": 0.05, "is_fraud": False},
+            {"fraud_probability": 0.95, "is_fraud": True},
+        ],
+        features=[
+            {"V1": 1.0, "V2": 2.0, "Amount": 10.0},
+            {"V1": -1.0, "V2": -2.0, "Amount": 100.0},
+        ],
+    )
+    log_file.write_text(event.to_json() + "\n", encoding="utf-8")
+
+    report = replay_audit_log(log_file, model)
+    assert isinstance(report, AuditReplayReport)
+    assert report.status == "MATCH"
+    assert report.total_events == 1
+    assert report.scoring_events == 1
+    assert report.replayed_events == 1
+    assert report.skipped_events == 0
+    assert report.total_transactions == 2
+    assert report.score_discrepancies == 0
+    assert report.decision_flips == 0
+    assert report.max_absolute_difference < 1e-4
+    assert len(report.discrepancies) == 0
+
+    as_dict = report.to_dict()
+    assert as_dict["status"] == "MATCH"
+
+
+def test_replay_audit_log_divergence(tmp_path: Path) -> None:
+    log_file = tmp_path / "audit.jsonl"
+    # Challenger model predicts different scores
+    model = DummyFraudModel(threshold=0.5, probs=[0.85, 0.10])
+
+    event = build_scoring_audit_event(
+        model_version="v1",
+        dataset_fingerprint="fp1",
+        threshold=0.5,
+        predictions=[
+            {"fraud_probability": 0.05, "is_fraud": False},
+            {"fraud_probability": 0.95, "is_fraud": True},
+        ],
+        features=[
+            {"V1": 1.0, "V2": 2.0, "Amount": 10.0, "extra_col": 999},
+            {"V1": -1.0, "V2": -2.0, "Amount": 100.0, "extra_col": 888},
+        ],
+    )
+    log_file.write_text(event.to_json() + "\n", encoding="utf-8")
+
+    report = replay_audit_log(log_file, model, tolerance=0.01)
+    assert isinstance(report, AuditReplayReport)
+    assert report.status == "DIVERGENT"
+    assert report.score_discrepancies == 2
+    assert report.decision_flips == 2
+    assert report.max_absolute_difference > 0.7
+    assert len(report.discrepancies) == 2
+    first_disc = report.discrepancies[0]
+    assert isinstance(first_disc, DiscrepancyDetail)
+    assert first_disc.decision_flipped is True
+    assert first_disc.to_dict()["decision_flipped"] is True
+
+
+def test_replay_audit_log_external_data(tmp_path: Path) -> None:
+    log_file = tmp_path / "audit.jsonl"
+    data_file = tmp_path / "tx.csv"
+    data_file.write_text("V1,V2,Amount\n1.0,2.0,10.0\n-1.0,-2.0,100.0\n", encoding="utf-8")
+
+    model = DummyFraudModel(threshold=0.5, probs=[0.05, 0.95])
+    # Audit event without inline features
+    event = build_scoring_audit_event(
+        model_version="v1",
+        dataset_fingerprint="fp1",
+        threshold=0.5,
+        predictions=[
+            {"fraud_probability": 0.05, "is_fraud": False},
+            {"fraud_probability": 0.95, "is_fraud": True},
+        ],
+    )
+    log_file.write_text(event.to_json() + "\n", encoding="utf-8")
+
+    report = replay_audit_log(log_file, model, data_path=data_file)
+    assert report.status == "MATCH"
+    assert report.replayed_events == 1
+    assert report.total_transactions == 2
+
+
+def test_replay_audit_log_empty_and_skipped(tmp_path: Path) -> None:
+    log_file = tmp_path / "empty_audit.jsonl"
+    # Write a promotion event (not scoring) and an event without features
+    promo = build_promotion_audit_event(
+        model_version="v1", dataset_fingerprint="fp1", bundle_summary={"status": "ok"}
+    )
+    no_feat = build_scoring_audit_event(
+        model_version="v1",
+        dataset_fingerprint="fp1",
+        threshold=0.5,
+        predictions=[{"fraud_probability": 0.1, "is_fraud": False}],
+    )
+    log_file.write_text(promo.to_json() + "\n\n" + no_feat.to_json() + "\n", encoding="utf-8")
+
+    model = DummyFraudModel()
+    report = replay_audit_log(log_file, model)
+    assert report.status == "EMPTY"
+    assert report.scoring_events == 1
+    assert report.skipped_events == 1
+    assert report.replayed_events == 0
+
+
+def test_replay_audit_log_missing_file(tmp_path: Path) -> None:
+    import pytest
+
+    missing_log = tmp_path / "does_not_exist.jsonl"
+    model = DummyFraudModel()
+    with pytest.raises(FileNotFoundError, match="Audit log file not found"):
+        replay_audit_log(missing_log, model)
+
+    log_file = tmp_path / "valid.jsonl"
+    log_file.write_text("", encoding="utf-8")
+    missing_data = tmp_path / "missing_data.csv"
+    with pytest.raises(FileNotFoundError, match="Transaction data file not found"):
+        replay_audit_log(log_file, model, data_path=missing_data)
+
 

@@ -22,6 +22,7 @@ from fraud_detection.audit import (
     JsonlAuditSink,
     build_promotion_audit_event,
     build_scoring_audit_event,
+    replay_audit_log,
 )
 from fraud_detection.data import (
     DEFAULT_TARGET,
@@ -947,6 +948,7 @@ def predict_command(
                     model_version=str(model.metadata.get("dataset_fingerprint", ""))[:12],
                     dataset_fingerprint=str(model.metadata.get("dataset_fingerprint", "")),
                     threshold=applied_threshold,
+                    features=features.to_dict(orient="records"),
                     predictions=[
                         {
                             "index": int(idx),
@@ -1081,6 +1083,75 @@ def inspect_command(
     except ModelArtifactError as exc:
         _abort(str(exc))
     typer.echo(json.dumps(model.metadata, indent=2, sort_keys=True))
+
+
+@app.command("replay-audit")
+def replay_audit_command(
+    audit_log: Annotated[
+        Path,
+        typer.Argument(exists=True, readable=True, help="Audit log JSONL file."),
+    ],
+    model_path: Annotated[
+        Path,
+        typer.Argument(exists=True, readable=True, help="Model file or artifact directory."),
+    ],
+    data: Annotated[
+        Path | None,
+        typer.Option(
+            "--data",
+            "-d",
+            exists=True,
+            readable=True,
+            help="Optional CSV containing original transactions if features are not inline.",
+        ),
+    ] = None,
+    threshold: Annotated[
+        float | None,
+        typer.Option(help="Override scoring decision threshold during replay."),
+    ] = None,
+    tolerance: Annotated[
+        float,
+        typer.Option(min=0.0, help="Score difference tolerance before flagging discrepancy."),
+    ] = 1e-4,
+    output: Annotated[
+        Path | None,
+        typer.Option("--output", "-o", help="Optional JSON destination for replay report."),
+    ] = None,
+    overwrite: Annotated[
+        bool,
+        typer.Option(help="Replace an existing output file."),
+    ] = False,
+    fail_on_divergence: Annotated[
+        bool,
+        typer.Option(help="Exit with non-zero code if scores or decisions diverge."),
+    ] = False,
+) -> None:
+    """Replay scoring events from a JSONL audit log against a model to detect score divergence."""
+    _guard_output(output, overwrite)
+
+    try:
+        report = replay_audit_log(
+            audit_log,
+            model_path,
+            data_path=data,
+            threshold=threshold,
+            tolerance=tolerance,
+        )
+    except (FileNotFoundError, ModelArtifactError, OSError, ValueError) as exc:
+        _abort(str(exc))
+
+    report_dict = report.to_dict()
+    if output is not None:
+        try:
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(json.dumps(report_dict, indent=2, sort_keys=True), encoding="utf-8")
+        except OSError as exc:
+            _abort(f"Failed to write replay report: {exc}")
+
+    typer.echo(json.dumps(report_dict, indent=2, sort_keys=True))
+
+    if fail_on_divergence and report.status == "DIVERGENT":
+        raise typer.Exit(code=1)
 
 
 @app.command("validate-artifact")
