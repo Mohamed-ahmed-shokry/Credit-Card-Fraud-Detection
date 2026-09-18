@@ -4,7 +4,7 @@ import json
 import logging
 from collections.abc import Iterator
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import pytest
 from fastapi.testclient import TestClient
@@ -687,5 +687,142 @@ def test_predict_and_score_gracefully_handle_audit_sink_failure(
         assert pred_resp.status_code == 200
         score_resp = test_client.post("/v1/score", json={"transaction": record})
         assert score_resp.status_code == 200
+
+
+def test_fallback_mode_constant_on_model_error(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, model, dataset = api_context
+    record = dataset.features.iloc[0].to_dict()
+
+    class FaultyModel:
+        threshold = 0.5
+        feature_names = model.feature_names
+        metadata = model.metadata
+
+        def predict_probabilities(self, _frame: Any) -> list[float]:
+            raise RuntimeError("Underlying estimator corrupted")
+
+    app = create_app(
+        model=FaultyModel(),  # type: ignore[arg-type]
+        fallback_mode="constant",
+        fallback_score=0.75,
+    )
+    with TestClient(app) as test_client:
+        response = test_client.post("/v1/predict", json={"transactions": [record]})
+        assert response.status_code == 200
+        data = response.json()
+        assert data["fallback_applied"] is True
+        assert "model_exception: RuntimeError" in data["fallback_reason"]
+        assert len(data["predictions"]) == 1
+        assert data["predictions"][0]["fraud_probability"] == 0.75
+        assert data["predictions"][0]["is_fraud"] is True
+
+        # Check /metrics has fallback counter
+        metrics_resp = test_client.get("/metrics")
+        assert metrics_resp.status_code == 200
+        assert "fraud_fallback_predictions_total" in metrics_resp.text
+
+
+def test_fallback_mode_rule_based_on_amount(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, model, dataset = api_context
+    rec_low = dataset.features.iloc[0].to_dict()
+    rec_low["Amount"] = 50.0
+    rec_high = dataset.features.iloc[1].to_dict()
+    rec_high["Amount"] = 1500.0
+
+    app = create_app(
+        model=model,
+        fallback_mode="rule",
+        fallback_amount_threshold=1000.0,
+        degraded_mode=True,
+    )
+    with TestClient(app) as test_client:
+        response = test_client.post(
+            "/v1/predict",
+            json={"transactions": [rec_low, rec_high]},
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["fallback_applied"] is True
+        assert data["fallback_reason"] == "degraded_mode_active"
+        assert len(data["predictions"]) == 2
+        # Low amount -> non-fraud
+        assert data["predictions"][0]["fraud_probability"] == 0.0
+        assert data["predictions"][0]["is_fraud"] is False
+        assert "Amount (50.00) < 1000.00" in data["predictions"][0]["explanation"]
+        # High amount -> fraud
+        assert data["predictions"][1]["fraud_probability"] == 1.0
+        assert data["predictions"][1]["is_fraud"] is True
+        assert "Amount (1500.00) >= 1000.00" in data["predictions"][1]["explanation"]
+
+        # Also test /v1/score single endpoint
+        score_resp = test_client.post("/v1/score", json={"transaction": rec_high})
+        assert score_resp.status_code == 200
+        score_data = score_resp.json()
+        assert score_data["fallback_applied"] is True
+        assert score_data["prediction"]["is_fraud"] is True
+
+
+def test_simulate_degraded_header_and_health_status(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, model, dataset = api_context
+    record = dataset.features.iloc[0].to_dict()
+
+    app = create_app(
+        model=model,
+        fallback_mode="constant",
+        fallback_score=0.42,
+        degraded_mode=False,
+    )
+    with TestClient(app) as test_client:
+        # Normal health
+        h_ready = test_client.get("/health")
+        assert h_ready.status_code == 200
+        assert h_ready.json()["status"] == "ready"
+        assert h_ready.json().get("fallback_mode") == "constant"
+
+        # Normal predict (not degraded)
+        p_normal = test_client.post("/v1/predict", json={"transactions": [record]})
+        assert p_normal.json()["fallback_applied"] is False
+
+        # Chaos testing via header
+        p_chaos = test_client.post(
+            "/v1/predict",
+            json={"transactions": [record]},
+            headers={"X-Simulate-Degraded": "true"},
+        )
+        assert p_chaos.status_code == 200
+        assert p_chaos.json()["fallback_applied"] is True
+        assert p_chaos.json()["predictions"][0]["fraud_probability"] == 0.42
+
+    # Now with degraded_mode=True on app
+    app_degraded = create_app(
+        model=model,
+        fallback_mode="constant",
+        degraded_mode=True,
+    )
+    with TestClient(app_degraded) as test_client:
+        h_deg = test_client.get("/health")
+        assert h_deg.status_code == 200
+        assert h_deg.json()["status"] == "degraded"
+        assert h_deg.json()["degraded_mode"] is True
+
+
+def test_fallback_configuration_validation(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    import pytest
+
+    _, model, _ = api_context
+    with pytest.raises(ValueError, match="Invalid fallback_mode"):
+        create_app(model=model, fallback_mode="unsupported_mode")
+
+    with pytest.raises(ValueError, match=r"fallback_score must be between 0\.0 and 1\.0"):
+        create_app(model=model, fallback_score=1.5)
+
 
 

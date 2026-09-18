@@ -42,6 +42,10 @@ from fraud_detection.model import FraudModel, ModelArtifactError, load_model
 
 MODEL_PATH_ENVIRONMENT_VARIABLE = "FRAUD_MODEL_PATH"
 AUDIT_LOG_ENVIRONMENT_VARIABLE = "FRAUD_AUDIT_LOG_PATH"
+FALLBACK_MODE_ENVIRONMENT_VARIABLE = "FRAUD_FALLBACK_MODE"
+FALLBACK_SCORE_ENVIRONMENT_VARIABLE = "FRAUD_FALLBACK_SCORE"
+FALLBACK_AMOUNT_THRESHOLD_ENVIRONMENT_VARIABLE = "FRAUD_FALLBACK_AMOUNT_THRESHOLD"
+DEGRADED_MODE_ENVIRONMENT_VARIABLE = "FRAUD_DEGRADED_MODE"
 REQUEST_ID_HEADER = "X-Request-ID"
 PROCESS_TIME_HEADER = "X-Process-Time-Ms"
 MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024
@@ -117,6 +121,8 @@ class PredictionResponse(BaseModel):
     threshold: float
     model_threshold: float
     predictions: list[PredictionResult]
+    fallback_applied: bool = False
+    fallback_reason: str | None = None
 
 
 class ScoreRequest(BaseModel):
@@ -137,6 +143,8 @@ class ScoreResponse(BaseModel):
     threshold: float
     model_threshold: float
     prediction: PredictionResult
+    fallback_applied: bool = False
+    fallback_reason: str | None = None
 
 
 class HealthResponse(BaseModel):
@@ -147,6 +155,9 @@ class HealthResponse(BaseModel):
     model_created_at: str
     feature_count: int
     threshold: float
+    degraded_mode: bool | None = None
+    fallback_mode: str | None = None
+
 
 
 def create_app(
@@ -158,6 +169,10 @@ def create_app(
     rate_limit_window_seconds: float = 60.0,
     audit_sink: AuditSink | None = None,
     explanation_provider: ExplanationProvider | None = None,
+    fallback_mode: str | None = None,
+    fallback_score: float | None = None,
+    fallback_amount_threshold: float | None = None,
+    degraded_mode: bool | None = None,
 ) -> FastAPI:
     """Create an application using an injected model or a trusted artifact path.
 
@@ -173,8 +188,45 @@ def create_app(
             the `FRAUD_AUDIT_LOG_PATH` environment variable or defaults to NullAuditSink.
         explanation_provider: Optional explanation provider for natural language risk
             summaries. Defaults to offline deterministic TemplateExplanationProvider.
+        fallback_mode: Fallback policy when degraded or on model failure:
+            'raise' (default), 'rule' (heuristic on Amount), or 'constant'.
+        fallback_score: Fixed score for 'constant' fallback mode (default: 0.5).
+        fallback_amount_threshold: Amount cutoff for 'rule' fallback mode (default: 1000.0).
+        degraded_mode: When True, bypasses primary model and uses fallback policy.
     """
     logging.basicConfig(level=logging.INFO)
+
+    raw_mode = (
+        fallback_mode
+        if fallback_mode is not None
+        else os.getenv(FALLBACK_MODE_ENVIRONMENT_VARIABLE, "raise")
+    ).lower().strip()
+    if raw_mode not in {"raise", "rule", "constant"}:
+        raise ValueError(
+            f"Invalid fallback_mode '{raw_mode}'; must be 'raise', 'rule', or 'constant'."
+        )
+    resolved_fallback_mode = raw_mode
+
+    raw_score = (
+        fallback_score
+        if fallback_score is not None
+        else float(os.getenv(FALLBACK_SCORE_ENVIRONMENT_VARIABLE, "0.5"))
+    )
+    if not (0.0 <= raw_score <= 1.0):
+        raise ValueError("fallback_score must be between 0.0 and 1.0.")
+    resolved_fallback_score = raw_score
+
+    resolved_fallback_amount = (
+        fallback_amount_threshold
+        if fallback_amount_threshold is not None
+        else float(os.getenv(FALLBACK_AMOUNT_THRESHOLD_ENVIRONMENT_VARIABLE, "1000.0"))
+    )
+
+    resolved_degraded_mode = (
+        degraded_mode
+        if degraded_mode is not None
+        else os.getenv(DEGRADED_MODE_ENVIRONMENT_VARIABLE, "false").lower() in {"1", "true", "yes"}
+    )
 
     metrics_registry = CollectorRegistry()
     request_counter = Counter(
@@ -193,6 +245,12 @@ def create_app(
         "fraud_predictions_total",
         "Total scored transactions by decision.",
         ["is_fraud"],
+        registry=metrics_registry,
+    )
+    fallback_counter = Counter(
+        "fraud_fallback_predictions_total",
+        "Total fallback predictions executed due to degraded mode or runtime error.",
+        ["mode", "reason"],
         registry=metrics_registry,
     )
 
@@ -227,6 +285,11 @@ def create_app(
         application.state.model = loaded_model
         application.state.audit_sink = resolved_audit_sink
         application.state.explanation_provider = explanation_provider
+        application.state.fallback_mode = resolved_fallback_mode
+        application.state.fallback_score = resolved_fallback_score
+        application.state.fallback_amount_threshold = resolved_fallback_amount
+        application.state.degraded_mode = resolved_degraded_mode
+        application.state.fallback_counter = fallback_counter
         yield
         resolved_audit_sink.close()
 
@@ -357,15 +420,24 @@ def create_app(
     ) -> JSONResponse:
         return JSONResponse(status_code=422, content={"detail": str(exception)})
 
-    @application.get("/health", response_model=HealthResponse, tags=["operations"])
+    @application.get(
+        "/health",
+        response_model=HealthResponse,
+        response_model_exclude_none=True,
+        tags=["operations"],
+    )
     async def health(request: Request) -> HealthResponse:
         loaded = _model_from_request(request)
+        is_degraded = bool(getattr(request.app.state, "degraded_mode", False))
+        fb_mode = str(getattr(request.app.state, "fallback_mode", "raise"))
         return HealthResponse(
-            status="ready",
+            status="degraded" if is_degraded else "ready",
             service_version=__version__,
             model_created_at=str(loaded.metadata["created_at"]),
             feature_count=len(loaded.feature_names),
             threshold=loaded.threshold,
+            degraded_mode=True if is_degraded else None,
+            fallback_mode=fb_mode if fb_mode != "raise" else None,
         )
 
     def score_frame(
@@ -375,10 +447,89 @@ def create_app(
         explain: bool,
         explain_llm: bool,
         threshold: float | None,
-    ) -> tuple[float, list[PredictionResult]]:
-        """Score validated transactions and record decision counts."""
-        probabilities = loaded.predict_probabilities(frame)
+        fallback_mode: str = "raise",
+        fallback_score: float = 0.5,
+        fallback_amount_threshold: float = 1000.0,
+        force_degraded: bool = False,
+    ) -> tuple[float, list[PredictionResult], bool, str | None]:
+        """Score transactions with runtime guardrails and resilient degraded-state fallback."""
         applied_threshold = loaded.threshold if threshold is None else threshold
+        fallback_applied = False
+        fallback_reason: str | None = None
+        probabilities = None
+
+        if force_degraded and fallback_mode != "raise":
+            fallback_applied = True
+            fallback_reason = "degraded_mode_active"
+        else:
+            try:
+                probabilities = loaded.predict_probabilities(frame)
+            except Exception as exc:
+                if fallback_mode == "raise":
+                    raise
+                logger.warning(
+                    "Primary model scoring failed; activating fallback guardrail (%s): %s",
+                    fallback_mode,
+                    exc,
+                )
+                fallback_applied = True
+                fallback_reason = f"model_exception: {type(exc).__name__}"
+
+        if fallback_applied:
+            results: list[PredictionResult] = []
+            if fallback_mode == "constant":
+                dec_const = fallback_score >= applied_threshold
+                results = [
+                    PredictionResult(
+                        fraud_probability=float(fallback_score),
+                        is_fraud=bool(dec_const),
+                        contributions=None,
+                        explanation="Fallback policy (constant) applied.",
+                    )
+                    for _ in range(len(frame))
+                ]
+            elif fallback_mode == "rule":
+                amounts = frame["Amount"] if "Amount" in frame.columns else [0.0] * len(frame)
+                for amount in amounts:
+                    try:
+                        amt_val = float(amount)
+                    except (ValueError, TypeError):
+                        amt_val = 0.0
+                    is_high = amt_val >= fallback_amount_threshold
+                    prob = 1.0 if is_high else 0.0
+                    is_fraud = bool(prob >= applied_threshold)
+                    rule_exp = (
+                        f"Fallback rule applied: Amount ({amt_val:.2f}) "
+                        f"{'>=' if is_high else '<'} {fallback_amount_threshold:.2f}."
+                    )
+                    results.append(
+                        PredictionResult(
+                            fraud_probability=prob,
+                            is_fraud=is_fraud,
+                            contributions=None,
+                            explanation=rule_exp,
+                        )
+                    )
+            else:
+                results = [
+                    PredictionResult(
+                        fraud_probability=0.0,
+                        is_fraud=False,
+                        contributions=None,
+                        explanation="Fallback default applied.",
+                    )
+                    for _ in range(len(frame))
+                ]
+            fraud_count = sum(1 for r in results if r.is_fraud)
+            prediction_counter.labels(is_fraud="true").inc(fraud_count)
+            prediction_counter.labels(is_fraud="false").inc(len(results) - fraud_count)
+            fallback_counter.labels(
+                mode=fallback_mode, reason=fallback_reason or "unknown"
+            ).inc(len(results))
+            return applied_threshold, results, True, fallback_reason
+
+        if probabilities is None:
+            raise RuntimeError("Primary model returned no probabilities.")
         decisions = probabilities >= applied_threshold
         local_explanations = loaded.explain_local(frame) if explain or explain_llm else None
         natural_language = (
@@ -408,7 +559,7 @@ def create_app(
             )
         prediction_counter.labels(is_fraud="true").inc(int(decisions.sum()))
         prediction_counter.labels(is_fraud="false").inc(int((~decisions).sum()))
-        return applied_threshold, results
+        return applied_threshold, results, False, None
 
     @application.post(
         "/v1/predict",
@@ -418,12 +569,23 @@ def create_app(
     async def predict(payload: PredictionRequest, request: Request) -> PredictionResponse:
         loaded = _model_from_request(request)
         frame = pd.DataFrame(payload.transactions)
-        applied_threshold, results = score_frame(
+        force_degraded = bool(getattr(request.app.state, "degraded_mode", False)) or (
+            request.headers.get("X-Simulate-Degraded", "").lower() == "true"
+        )
+        fb_mode = str(getattr(request.app.state, "fallback_mode", "raise"))
+        fb_score = float(getattr(request.app.state, "fallback_score", 0.5))
+        fb_amount = float(getattr(request.app.state, "fallback_amount_threshold", 1000.0))
+
+        applied_threshold, results, fallback_applied, fallback_reason = score_frame(
             loaded,
             frame,
             explain=payload.explain,
             explain_llm=payload.explain_llm,
             threshold=payload.threshold,
+            fallback_mode=fb_mode,
+            fallback_score=fb_score,
+            fallback_amount_threshold=fb_amount,
+            force_degraded=force_degraded,
         )
         sink: AuditSink = getattr(request.app.state, "audit_sink", resolved_audit_sink)
         try:
@@ -432,6 +594,8 @@ def create_app(
                 dataset_fingerprint=str(loaded.metadata.get("dataset_fingerprint", "")),
                 threshold=applied_threshold,
                 features=payload.transactions,
+                fallback_applied=fallback_applied,
+                fallback_reason=fallback_reason,
                 predictions=[
                     {
                         "fraud_probability": r.fraud_probability,
@@ -451,6 +615,8 @@ def create_app(
             threshold=applied_threshold,
             model_threshold=loaded.threshold,
             predictions=results,
+            fallback_applied=fallback_applied,
+            fallback_reason=fallback_reason,
         )
 
     @application.post(
@@ -461,12 +627,23 @@ def create_app(
     async def score(payload: ScoreRequest, request: Request) -> ScoreResponse:
         loaded = _model_from_request(request)
         frame = pd.DataFrame([payload.transaction])
-        applied_threshold, results = score_frame(
+        force_degraded = bool(getattr(request.app.state, "degraded_mode", False)) or (
+            request.headers.get("X-Simulate-Degraded", "").lower() == "true"
+        )
+        fb_mode = str(getattr(request.app.state, "fallback_mode", "raise"))
+        fb_score = float(getattr(request.app.state, "fallback_score", 0.5))
+        fb_amount = float(getattr(request.app.state, "fallback_amount_threshold", 1000.0))
+
+        applied_threshold, results, fallback_applied, fallback_reason = score_frame(
             loaded,
             frame,
             explain=payload.explain,
             explain_llm=payload.explain_llm,
             threshold=payload.threshold,
+            fallback_mode=fb_mode,
+            fallback_score=fb_score,
+            fallback_amount_threshold=fb_amount,
+            force_degraded=force_degraded,
         )
         sink: AuditSink = getattr(request.app.state, "audit_sink", resolved_audit_sink)
         try:
@@ -475,6 +652,8 @@ def create_app(
                 dataset_fingerprint=str(loaded.metadata.get("dataset_fingerprint", "")),
                 threshold=applied_threshold,
                 features=[payload.transaction],
+                fallback_applied=fallback_applied,
+                fallback_reason=fallback_reason,
                 predictions=[
                     {
                         "fraud_probability": results[0].fraud_probability,
@@ -493,6 +672,8 @@ def create_app(
             threshold=applied_threshold,
             model_threshold=loaded.threshold,
             prediction=results[0],
+            fallback_applied=fallback_applied,
+            fallback_reason=fallback_reason,
         )
 
     @application.get("/metrics", tags=["operations"])
