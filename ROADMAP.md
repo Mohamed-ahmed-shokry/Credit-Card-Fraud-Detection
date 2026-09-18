@@ -246,9 +246,28 @@ into a general-purpose platform:
   with timeouts, redaction, cost controls, and a deterministic fallback; the
   current offline template remains the default.
 
+## Phase 15 — Continuous Surveillance, Audit Replay, and Serving Guardrails (next)
+
+This phase strengthens operational reliability, auditability, and automated model lifecycles:
+
+- **Audit log replay and divergence backtesting** (`In progress`) — a `replay-audit`
+  command and replay engine to stream historical JSONL scoring audit logs through a
+  model, reporting decision flips, score divergence rates, and maximum discrepancy metrics.
+- **Serving guardrails and degraded-state fallback** (`In progress`) — resilient runtime
+  fallback policies (rule-based heuristic or constant-score fallback) in the FastAPI serving
+  layer when estimators encounter runtime exceptions or when degraded operations are signaled.
+- **Automated champion-challenger retraining pipeline** (`In progress`) — a `retrain`
+  command that ingests fresh labeled transactions with temporal gaps, trains a challenger,
+  evaluates both champion and challenger on identical held-out test data, and assesses
+  metric improvements against strict promotion guardrails.
+- **Machine-readable lineage attestation export** (`In progress`) — extend
+  `validate-artifact` with `--attestation-output` to emit cryptographically verifiable,
+  tamper-evident JSON attestation manifests for CI/CD gates and deployment admission controllers.
+
 ## Contributing to the roadmap
 
 Open an issue or a pull request that references the relevant phase item.
 Proposing a new item is welcome; keep it scoped to this project's stated
 mission rather than general production-readiness concerns already assigned
 to the deploying operator in SECURITY.md.
+
