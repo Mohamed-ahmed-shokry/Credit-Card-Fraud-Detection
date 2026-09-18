@@ -1392,6 +1392,9 @@ def _split_dataset(
     )
 
 
+split_dataset = _split_dataset
+
+
 def _split_time_ranges(
     features_train: pd.DataFrame,
     features_validation: pd.DataFrame,

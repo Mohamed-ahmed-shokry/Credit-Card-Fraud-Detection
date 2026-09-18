@@ -56,6 +56,7 @@ from fraud_detection.model import (
     TrainingConfig,
     load_model,
     save_model,
+    split_dataset,
     train_model,
     validate_artifact,
 )
@@ -393,6 +394,361 @@ def train_command(
             sort_keys=True,
         )
     )
+
+
+@app.command("retrain")
+def retrain_command(
+    champion: Annotated[
+        Path,
+        typer.Argument(
+            exists=True, readable=True, help="Existing champion model file or directory."
+        ),
+    ],
+    data: Annotated[
+        Path,
+        typer.Argument(
+            exists=True, dir_okay=False, readable=True, help="New labeled transaction dataset."
+        ),
+    ],
+    output: Annotated[
+        Path,
+        typer.Option("--output", "-o", help="Destination path for challenger model artifact."),
+    ] = Path("artifacts/challenger"),
+    target: Annotated[
+        str,
+        typer.Option(help="Binary target column containing 0 and 1."),
+    ] = DEFAULT_TARGET,
+    metric: Annotated[
+        str,
+        typer.Option(
+            help="Primary evaluation metric for promotion: 'auprc', 'f1', or 'expected_cost'."
+        ),
+    ] = "auprc",
+    min_gain: Annotated[
+        float,
+        typer.Option(help="Minimum required metric improvement to promote challenger."),
+    ] = 0.0,
+    test_size: TestSizeOption = 0.2,
+    validation_size: ValidationSizeOption = 0.2,
+    seed: SeedOption = 42,
+    estimator: Annotated[
+        EstimatorType | None,
+        typer.Option(help="Estimator type for challenger; defaults to champion's estimator."),
+    ] = None,
+    threshold_strategy: Annotated[
+        ThresholdStrategy | None,
+        typer.Option(help="Threshold strategy; defaults to champion's strategy."),
+    ] = None,
+    cost_policy: CostPolicyOption = "default",
+    false_positive_cost: Annotated[
+        float | None,
+        typer.Option(help="False positive cost weight; defaults to champion's cost weight."),
+    ] = None,
+    false_negative_cost: Annotated[
+        float | None,
+        typer.Option(help="False negative cost weight; defaults to champion's cost weight."),
+    ] = None,
+    calibration_method: Annotated[
+        CalibrationMethod | None,
+        typer.Option(help="Calibration method; defaults to champion's calibration method."),
+    ] = None,
+    calibration_folds: CalibrationFoldsOption = 3,
+    calibration_jobs: CalibrationJobsOption = 1,
+    split_strategy: Annotated[
+        SplitStrategy | None,
+        typer.Option(help="Split strategy; defaults to champion's split strategy or temporal."),
+    ] = None,
+    time_column: TimeColumnOption = "Time",
+    temporal_gap: TemporalGapOption = 0.0,
+    report_output: Annotated[
+        Path | None,
+        typer.Option("--report-output", "-r", help="Optional JSON path for retraining report."),
+    ] = None,
+    promote: Annotated[
+        bool,
+        typer.Option(
+            help=(
+                "Automatically promote challenger (saving to champion destination) "
+                "if criteria pass."
+            )
+        ),
+    ] = False,
+    overwrite: Annotated[
+        bool,
+        typer.Option(help="Replace an existing challenger output."),
+    ] = False,
+    fail_on_rejection: Annotated[
+        bool,
+        typer.Option(help="Exit with non-zero code if challenger fails promotion criteria."),
+    ] = False,
+) -> None:
+    """Train challenger, compare with champion on test data, and decide promotion."""
+    valid_metrics = {"auprc", "f1", "expected_cost"}
+    normalized_metric = metric.lower().strip()
+    if normalized_metric not in valid_metrics:
+        _abort(f"Invalid evaluation metric '{metric}'; must be one of {sorted(valid_metrics)}.")
+
+    output_has_content = output.is_file() or (
+        output.is_dir() and next(output.iterdir(), None) is not None
+    )
+    if output_has_content and not overwrite:
+        _abort(f"Output already exists: {output}. Pass --overwrite to replace it.")
+    _guard_output(report_output, overwrite)
+
+    try:
+        champion_model = load_model(champion)
+        champ_meta = champion_model.metadata
+        champ_tc = champ_meta.get("training_config", {})
+
+        # Resolve configuration defaults from champion metadata
+        champ_est_raw = champ_tc.get("estimator")
+        if champ_est_raw is not None:
+            try:
+                default_est = EstimatorType(champ_est_raw)
+            except ValueError:
+                default_est = EstimatorType.LOGISTIC_REGRESSION
+        else:
+            est_desc = str(champ_meta.get("estimator", "")).lower()
+            if "forest" in est_desc:
+                default_est = EstimatorType.RANDOM_FOREST
+            elif "boost" in est_desc:
+                default_est = EstimatorType.HIST_GRADIENT_BOOSTING
+            else:
+                default_est = EstimatorType.LOGISTIC_REGRESSION
+        resolved_estimator = estimator if estimator is not None else default_est
+
+        champ_thresh_raw = champ_tc.get("threshold_strategy")
+        try:
+            default_thresh = (
+                ThresholdStrategy(champ_thresh_raw)
+                if champ_thresh_raw is not None
+                else ThresholdStrategy.F1
+            )
+        except ValueError:
+            default_thresh = ThresholdStrategy.F1
+        resolved_thresh_strat = (
+            threshold_strategy if threshold_strategy is not None else default_thresh
+        )
+
+        champ_calib_raw = champ_tc.get("calibration_method")
+        try:
+            default_calib = (
+                CalibrationMethod(champ_calib_raw)
+                if champ_calib_raw is not None
+                else CalibrationMethod.SIGMOID
+            )
+        except ValueError:
+            default_calib = CalibrationMethod.SIGMOID
+        resolved_calib_method = (
+            calibration_method if calibration_method is not None else default_calib
+        )
+
+        champ_split_raw = champ_tc.get("split_strategy")
+        try:
+            default_split = (
+                SplitStrategy(champ_split_raw)
+                if champ_split_raw is not None
+                else SplitStrategy.STRATIFIED
+            )
+        except ValueError:
+            default_split = SplitStrategy.STRATIFIED
+        resolved_split_strat = split_strategy if split_strategy is not None else default_split
+
+        resolved_fp_cost = (
+            false_positive_cost
+            if false_positive_cost is not None
+            else float(champ_tc.get("false_positive_cost", 1.0))
+        )
+        resolved_fn_cost = (
+            false_negative_cost
+            if false_negative_cost is not None
+            else float(champ_tc.get("false_negative_cost", 10.0))
+        )
+        resolved_max_iter = int(champ_tc.get("max_iterations", 1_000))
+        resolved_regularization = float(champ_tc.get("regularization", 1.0))
+        resolved_n_est = int(champ_tc.get("n_estimators", 100))
+        raw_depth = champ_tc.get("max_depth")
+        resolved_max_depth = int(raw_depth) if raw_depth is not None else None
+        resolved_lr = float(champ_tc.get("learning_rate", 0.1))
+        resolved_l2 = float(champ_tc.get("l2_regularization", 0.0))
+        resolved_max_bins = int(champ_tc.get("max_bins", 255))
+
+        dataset = load_csv(data, target_column=target)
+        config = _training_config(
+            test_size=test_size,
+            validation_size=validation_size,
+            random_state=seed,
+            estimator=resolved_estimator,
+            max_iterations=resolved_max_iter,
+            regularization=resolved_regularization,
+            n_estimators=resolved_n_est,
+            max_depth=resolved_max_depth,
+            learning_rate=resolved_lr,
+            l2_regularization=resolved_l2,
+            max_bins=resolved_max_bins,
+            threshold_strategy=resolved_thresh_strat,
+            cost_policy=cost_policy,
+            false_positive_cost=resolved_fp_cost,
+            false_negative_cost=resolved_fn_cost,
+            calibration_method=resolved_calib_method,
+            calibration_folds=calibration_folds,
+            calibration_jobs=calibration_jobs,
+            split_strategy=resolved_split_strat,
+            time_column=time_column,
+            temporal_gap=temporal_gap,
+        )
+
+        git_info = _git_info()
+        provenance = {
+            key: git_info[source]
+            for key, source in (
+                ("git_commit", "commit"),
+                ("git_repository", "repository"),
+            )
+            if source in git_info
+        }
+
+        # Train challenger model
+        challenger_model = train_model(dataset, config=config, provenance=provenance or None)
+        challenger_path = save_model(challenger_model, output)
+
+        # Get exact test split to evaluate both models on identical data
+        (
+            _,
+            _,
+            features_test,
+            _,
+            _,
+            target_test,
+        ) = split_dataset(dataset, config)
+        y_test = target_test.to_numpy()
+
+        # Evaluate challenger on test split
+        chall_probs = challenger_model.predict_probabilities(features_test)
+        chall_metrics = evaluate_predictions(
+            y_test,
+            chall_probs,
+            threshold=challenger_model.threshold,
+        )
+        chall_cost = expected_classification_cost(
+            y_test,
+            chall_probs,
+            threshold=challenger_model.threshold,
+            false_positive_cost=resolved_fp_cost,
+            false_negative_cost=resolved_fn_cost,
+        )
+
+        # Evaluate champion on test split
+        champ_probs = champion_model.predict_probabilities(features_test)
+        champ_metrics = evaluate_predictions(
+            y_test,
+            champ_probs,
+            threshold=champion_model.threshold,
+        )
+        champ_cost = expected_classification_cost(
+            y_test,
+            champ_probs,
+            threshold=champion_model.threshold,
+            false_positive_cost=resolved_fp_cost,
+            false_negative_cost=resolved_fn_cost,
+        )
+
+        # Compare primary metric
+        if normalized_metric == "auprc":
+            champ_metric_val = champ_metrics.average_precision
+            chall_metric_val = chall_metrics.average_precision
+            metric_gain = chall_metric_val - champ_metric_val
+            meets_gain = metric_gain >= min_gain
+        elif normalized_metric == "f1":
+            champ_metric_val = champ_metrics.f1
+            chall_metric_val = chall_metrics.f1
+            metric_gain = chall_metric_val - champ_metric_val
+            meets_gain = metric_gain >= min_gain
+        else:  # expected_cost
+            champ_metric_val = champ_cost
+            chall_metric_val = chall_cost
+            metric_gain = champ_metric_val - chall_metric_val
+            meets_gain = metric_gain >= min_gain
+
+        # Guardrail: ensure challenger recall has not collapsed
+        guardrail_passed = True
+        guardrail_reason: str | None = None
+        if chall_metrics.recall < 0.05 and champ_metrics.recall >= 0.05:
+            guardrail_passed = False
+            guardrail_reason = (
+                f"Challenger recall ({chall_metrics.recall:.4f}) collapsed below 0.05 guardrail."
+            )
+
+        is_promoted = meets_gain and guardrail_passed
+        decision = "PROMOTED" if is_promoted else "REJECTED"
+        if not meets_gain:
+            decision_reason = (
+                f"Challenger {normalized_metric} ({chall_metric_val:.4f}) failed to achieve "
+                f"minimum gain {min_gain:+.4f} against champion ({champ_metric_val:.4f}); "
+                f"actual gain: {metric_gain:+.4f}."
+            )
+        elif not guardrail_passed:
+            decision_reason = f"Challenger failed guardrail: {guardrail_reason}"
+        else:
+            decision_reason = (
+                f"Challenger {normalized_metric} ({chall_metric_val:.4f}) exceeded champion "
+                f"({champ_metric_val:.4f}) with gain {metric_gain:+.4f} "
+                f"(required: >={min_gain:+.4f})."
+            )
+
+        promoted_to_champion = False
+        if is_promoted and promote and champion.is_dir():
+            save_model(challenger_model, champion)
+            promoted_to_champion = True
+
+        champ_metrics_dict = champ_metrics.to_dict()
+        champ_metrics_dict["expected_cost_per_transaction"] = champ_cost
+        chall_metrics_dict = chall_metrics.to_dict()
+        chall_metrics_dict["expected_cost_per_transaction"] = chall_cost
+
+        report: dict[str, Any] = {
+            "decision": decision,
+            "decision_reason": decision_reason,
+            "primary_metric": normalized_metric,
+            "min_gain_required": min_gain,
+            "metric_gain": round(metric_gain, 6),
+            "promoted_to_champion": promoted_to_champion,
+            "champion": {
+                "path": str(champion),
+                "model_version": str(champ_meta.get("dataset_fingerprint", ""))[:12],
+                "estimator": champ_meta.get("estimator"),
+                "threshold": champion_model.threshold,
+                "test_metrics": champ_metrics_dict,
+            },
+            "challenger": {
+                "path": str(challenger_path),
+                "model_version": str(
+                    challenger_model.metadata.get("dataset_fingerprint", "")
+                )[:12],
+                "estimator": challenger_model.metadata.get("estimator"),
+                "threshold": challenger_model.threshold,
+                "test_metrics": chall_metrics_dict,
+            },
+            "dataset": {
+                "path": str(data),
+                "total_rows": len(dataset.target),
+                "test_rows": len(y_test),
+                "split_strategy": config.split_strategy.value,
+                "temporal_gap": config.temporal_gap,
+            },
+        }
+
+        report_json = json.dumps(report, indent=2, sort_keys=True)
+        if report_output is not None:
+            _atomic_write_text(report_json + "\n", report_output)
+
+        typer.echo(report_json)
+
+        if fail_on_rejection and not is_promoted:
+            raise typer.Exit(code=1)
+
+    except (OSError, DataValidationError, ModelArtifactError, ValueError) as exc:
+        _abort(str(exc))
 
 
 @app.command("compare")

@@ -1984,7 +1984,6 @@ def test_replay_audit_cli(tmp_path: Path, trained_artifact: Path) -> None:
     assert flip_report["status"] == "DIVERGENT"
     assert flip_report["decision_flips"] > 0
 
-    # 4. Guard output overwrite protection
     dup_res = runner.invoke(
         app,
         [
@@ -1997,3 +1996,114 @@ def test_replay_audit_cli(tmp_path: Path, trained_artifact: Path) -> None:
     )
     assert dup_res.exit_code != 0
     assert "Output already exists" in dup_res.output
+
+
+def test_retrain_cli(tmp_path: Path, trained_artifact: Path) -> None:
+    data_path = tmp_path / "fresh_data.csv"
+    challenger_path = tmp_path / "challenger_model"
+    report_path = tmp_path / "retrain_report.json"
+    generate_synthetic_data(rows=200, fraud_rate=0.1, random_state=123).to_csv(
+        data_path, index=False
+    )
+
+    # 1. Successful retrain run with promotion
+    res = runner.invoke(
+        app,
+        [
+            "retrain",
+            str(trained_artifact),
+            str(data_path),
+            "--output",
+            str(challenger_path),
+            "--report-output",
+            str(report_path),
+            "--min-gain",
+            "-1.0",  # Allow non-regressive / acceptable promotion
+            "--temporal-gap",
+            "0.0",
+        ],
+    )
+    assert res.exit_code == 0, res.output
+    assert challenger_path.is_dir()
+    assert report_path.is_file()
+    report = json.loads(res.stdout)
+    assert report["decision"] == "PROMOTED"
+    assert report["primary_metric"] == "auprc"
+    assert "champion" in report
+    assert "challenger" in report
+    assert report["dataset"]["total_rows"] == 200
+
+    # 2. Rejection with --fail-on-rejection
+    fail_res = runner.invoke(
+        app,
+        [
+            "retrain",
+            str(trained_artifact),
+            str(data_path),
+            "--output",
+            str(tmp_path / "challenger_fail"),
+            "--min-gain",
+            "0.999",  # Unachievable gain requirement
+            "--fail-on-rejection",
+        ],
+    )
+    assert fail_res.exit_code == 1
+    fail_report = json.loads(fail_res.stdout)
+    assert fail_report["decision"] == "REJECTED"
+
+    # 3. Retrain with --metric expected_cost
+    cost_res = runner.invoke(
+        app,
+        [
+            "retrain",
+            str(trained_artifact),
+            str(data_path),
+            "--output",
+            str(tmp_path / "challenger_cost"),
+            "--metric",
+            "expected_cost",
+            "--min-gain",
+            "-100.0",
+        ],
+    )
+    assert cost_res.exit_code == 0, cost_res.output
+    cost_report = json.loads(cost_res.stdout)
+    assert cost_report["primary_metric"] == "expected_cost"
+
+    # 4. Invalid metric
+    bad_metric_res = runner.invoke(
+        app,
+        [
+            "retrain",
+            str(trained_artifact),
+            str(data_path),
+            "--metric",
+            "nonexistent_metric",
+        ],
+    )
+    assert bad_metric_res.exit_code == 2
+
+    # 5. Retrain with --promote flag
+    import shutil
+
+    champ_copy = tmp_path / "champ_copy"
+    shutil.copytree(trained_artifact, champ_copy)
+    promote_res = runner.invoke(
+        app,
+        [
+            "retrain",
+            str(champ_copy),
+            str(data_path),
+            "--output",
+            str(tmp_path / "challenger_promote"),
+            "--min-gain",
+            "-1.0",
+            "--promote",
+        ],
+    )
+    assert promote_res.exit_code == 0, promote_res.output
+    promote_report = json.loads(promote_res.stdout)
+    assert promote_report["decision"] == "PROMOTED"
+    assert promote_report["promoted_to_champion"] is True
+
+
