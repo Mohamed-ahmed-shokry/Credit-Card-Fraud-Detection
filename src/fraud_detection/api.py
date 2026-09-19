@@ -488,13 +488,10 @@ def create_app(
                     )
                     for _ in range(len(frame))
                 ]
-            elif fallback_mode == "rule":
+            else:
                 amounts = frame["Amount"] if "Amount" in frame.columns else [0.0] * len(frame)
                 for amount in amounts:
-                    try:
-                        amt_val = float(amount)
-                    except (ValueError, TypeError):
-                        amt_val = 0.0
+                    amt_val = float(amount)
                     is_high = amt_val >= fallback_amount_threshold
                     prob = 1.0 if is_high else 0.0
                     is_fraud = bool(prob >= applied_threshold)
@@ -510,16 +507,6 @@ def create_app(
                             explanation=rule_exp,
                         )
                     )
-            else:
-                results = [
-                    PredictionResult(
-                        fraud_probability=0.0,
-                        is_fraud=False,
-                        contributions=None,
-                        explanation="Fallback default applied.",
-                    )
-                    for _ in range(len(frame))
-                ]
             fraud_count = sum(1 for r in results if r.is_fraud)
             prediction_counter.labels(is_fraud="true").inc(fraud_count)
             prediction_counter.labels(is_fraud="false").inc(len(results) - fraud_count)

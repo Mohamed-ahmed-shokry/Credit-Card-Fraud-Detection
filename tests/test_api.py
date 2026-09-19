@@ -5,6 +5,7 @@ import logging
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, cast
+from unittest.mock import MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
@@ -823,6 +824,23 @@ def test_fallback_configuration_validation(
 
     with pytest.raises(ValueError, match=r"fallback_score must be between 0\.0 and 1\.0"):
         create_app(model=model, fallback_score=1.5)
+
+
+def test_primary_model_returns_none_probabilities(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, model, dataset = api_context
+    rec = dataset.features.iloc[0].to_dict()
+
+    mock_model = MagicMock(wraps=model)
+    mock_model.predict_probabilities.return_value = None
+
+    app = create_app(model=mock_model)
+    with (
+        TestClient(app) as test_client,
+        pytest.raises(RuntimeError, match="Primary model returned no probabilities"),
+    ):
+        test_client.post("/v1/predict", json={"transactions": [rec]})
 
 
 
