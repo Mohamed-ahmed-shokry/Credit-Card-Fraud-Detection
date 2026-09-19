@@ -361,3 +361,92 @@ def test_replay_audit_log_missing_file(tmp_path: Path) -> None:
         replay_audit_log(log_file, model, data_path=missing_data)
 
 
+def test_audit_event_fallback_without_reason() -> None:
+    event = build_scoring_audit_event(
+        model_version="v1",
+        dataset_fingerprint="fp1",
+        threshold=0.5,
+        predictions=[{"fraud_probability": 0.1, "is_fraud": False}],
+        fallback_applied=True,
+        fallback_reason=None,
+    )
+    assert event.payload["fallback_applied"] is True
+    assert "fallback_reason" not in event.payload
+
+
+def test_replay_audit_log_skip_edge_cases(tmp_path: Path) -> None:
+    log_file = tmp_path / "skip_edge_cases.jsonl"
+    lines = [
+        "not-valid-json",
+        json.dumps(["not", "a", "dict"]),
+        json.dumps({"event_type": "promotion", "payload": {}}),
+        json.dumps({"event_type": "scoring", "payload": "not-a-dict"}),
+        json.dumps({"event_type": "scoring", "payload": {"predictions": []}}),
+        json.dumps(
+            {
+                "event_type": "scoring",
+                "payload": {
+                    "features": [{"V1": 1.0}],
+                    "predictions": ["not-a-dict-prediction"],
+                },
+            }
+        ),
+    ]
+    log_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    model = DummyFraudModel(threshold=0.5, probs=[0.1])
+    report = replay_audit_log(log_file, model)
+    assert report.total_events == 6
+    assert report.scoring_events == 3
+    assert report.skipped_events == 2
+    assert report.replayed_events == 1
+    assert report.total_transactions == 0
+
+    # Test external offset exhausted
+    data_file = tmp_path / "one_row.csv"
+    data_file.write_text("V1,Amount\n1.0,10.0\n", encoding="utf-8")
+    two_preds_log = tmp_path / "two_preds.jsonl"
+    two_preds_log.write_text(
+        json.dumps(
+            {
+                "event_type": "scoring",
+                "payload": {
+                    "predictions": [
+                        {"fraud_probability": 0.1, "is_fraud": False},
+                        {"fraud_probability": 0.9, "is_fraud": True},
+                    ]
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    report_exhausted = replay_audit_log(two_preds_log, model, data_path=data_file)
+    assert report_exhausted.skipped_events == 1
+
+    # Test model prediction exception during replay
+    class FailingModel:
+        def __init__(self) -> None:
+            self.feature_names = ["V1"]
+
+        def predict_probabilities(self, _df: Any) -> Any:
+            raise RuntimeError("Inference breakdown")
+
+    fail_log = tmp_path / "fail.jsonl"
+    fail_log.write_text(
+        json.dumps(
+            {
+                "event_type": "scoring",
+                "payload": {
+                    "features": [{"V1": 1.0}],
+                    "predictions": [{"fraud_probability": 0.1, "is_fraud": False}],
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    report_fail = replay_audit_log(fail_log, FailingModel())
+    assert report_fail.skipped_events == 1
+
+
