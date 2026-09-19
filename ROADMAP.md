@@ -19,15 +19,17 @@ Status legend: `Proposed` (not started), `In progress`, `Done`.
 
 ## Current state
 
-The project is a beta reference implementation with the implementation work in
-Phases 2 through 14 complete. Phase 1's workflows are in place, but the first
+The project is a production-grade reference implementation with the implementation work in
+Phases 2 through 15 complete. Phase 1's workflows are in place, but the first
 real PyPI release still requires maintainer-side trusted-publisher setup. The
 shipped system covers leakage-safe training, multiple calibrated estimators,
 threshold and calibration analysis, label-delay temporal gaps, drift surveillance,
 promotion evidence, artifact integrity and lineage validation, signed release
 artifacts, online scoring, structured audit event export, an isolated explanation
-provider boundary with deterministic fallback, persisted lineage, and HTML
-compliance reports.
+provider boundary with deterministic fallback, persisted lineage, HTML compliance
+reports, historical audit log replay, degraded serving fallback guardrails,
+an automated champion-challenger retraining pipeline, and machine-readable
+cryptographic lineage attestation manifests.
 
 ## Phase 1 — Distribution
 
@@ -246,23 +248,37 @@ into a general-purpose platform:
   with timeouts, redaction, cost controls, and a deterministic fallback; the
   current offline template remains the default.
 
-## Phase 15 — Continuous Surveillance, Audit Replay, and Serving Guardrails (next)
+## Phase 15 — Continuous Surveillance, Audit Replay, and Serving Guardrails
 
 This phase strengthens operational reliability, auditability, and automated model lifecycles:
 
-- **Audit log replay and divergence backtesting** (`In progress`) — a `replay-audit`
+- **Audit log replay and divergence backtesting** (`Done`) — a `replay-audit`
   command and replay engine to stream historical JSONL scoring audit logs through a
   model, reporting decision flips, score divergence rates, and maximum discrepancy metrics.
-- **Serving guardrails and degraded-state fallback** (`In progress`) — resilient runtime
+- **Serving guardrails and degraded-state fallback** (`Done`) — resilient runtime
   fallback policies (rule-based heuristic or constant-score fallback) in the FastAPI serving
   layer when estimators encounter runtime exceptions or when degraded operations are signaled.
-- **Automated champion-challenger retraining pipeline** (`In progress`) — a `retrain`
+- **Automated champion-challenger retraining pipeline** (`Done`) — a `retrain`
   command that ingests fresh labeled transactions with temporal gaps, trains a challenger,
   evaluates both champion and challenger on identical held-out test data, and assesses
   metric improvements against strict promotion guardrails.
-- **Machine-readable lineage attestation export** (`In progress`) — extend
+- **Machine-readable lineage attestation export** (`Done`) — extend
   `validate-artifact` with `--attestation-output` to emit cryptographically verifiable,
   tamper-evident JSON attestation manifests for CI/CD gates and deployment admission controllers.
+
+## Phase 16 — Adaptive Streaming Surveillance, Anomaly Profiling, and Edge Optimization (next)
+
+This phase explores continuous streaming diagnostics and edge runtime deployment efficiency:
+
+- **Adaptive multi-window drift detection** (`Proposed`) — dual-window surveillance
+  comparing short-term operational windows (e.g. 1 hour / 1 day) against baseline reference
+  profiles to detect abrupt distribution shocks before monthly batch aggregations trip.
+- **Quantized & pruned edge runtime export** (`Proposed`) — optional export of validated
+  models into lightweight, optimized ONNX/INT8 runtime representations for ultra-low-latency
+  sub-millisecond gateway filtering.
+- **Shadow-scoring telemetry and circuit breaker** (`Proposed`) — automated traffic shadowing
+  with configurable latency budgets and dynamic circuit breaking when model evaluation times
+  exceed operational thresholds.
 
 ## Contributing to the roadmap
 

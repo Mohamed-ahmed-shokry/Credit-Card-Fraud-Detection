@@ -369,6 +369,16 @@ The command checks that:
 
 Pass `--strict` in deployment CI/CD pipelines to fail if Git commit provenance is missing.
 
+To export a machine-readable, tamper-evident attestation manifest for deployment admission gates:
+
+```bash
+fraud-detect validate-artifact artifacts/model \
+  --attestation-output reports/attestation.json \
+  --signer release-bot-v1
+```
+
+The resulting manifest contains the validation checks, runtime environment, and a canonical SHA-256 digest over the entire verification payload that can be verified programmatically via `verify_attestation()`.
+
 Keep superseded artifact directories (for example `artifacts/model-2026-09-01/`)
 until the replacement has proven itself: reproducible `compare`, `stability`,
 and `drift` runs are only possible while the old model card, reference profile,
@@ -581,6 +591,15 @@ Excess requests return `429 Too Many Requests` with `Retry-After`,
 carry `X-RateLimit-Limit` and `X-RateLimit-Remaining` so clients can back off
 before hitting the cap.
 
+### Serving guardrails and degraded-state fallback
+
+Configure resilient fallback policies when runtime exceptions occur or during degraded upstream conditions:
+
+- `fallback_mode`: `"constant"` (returns fixed calibrated score, default 0.5), `"rule"` (heuristic based on transaction amount threshold), or `"raise"` (fails with 500 error).
+- Environment variables: `FRAUD_FALLBACK_MODE`, `FRAUD_FALLBACK_SCORE`, `FRAUD_FALLBACK_AMOUNT_THRESHOLD`, `FRAUD_DEGRADED_MODE`.
+- Chaos testing header: Pass `X-Simulate-Degraded: true` on `/v1/predict` or `/v1/score` requests to simulate degraded-state fallback scoring.
+- Observability: Fallback activations are tracked via Prometheus metric `fraud_fallback_predictions_total` with `mode` and `reason` labels.
+
 ### Structured audit event export
 
 Export structured, thread-safe JSONL audit events for scoring decisions and promotion
@@ -593,6 +612,19 @@ evidence without sending raw cardholder data or sensitive credentials into audit
 Audit payloads automatically mask any field matching sensitive key patterns (`card`,
 `pan`, `token`, `secret`, `password`, `key`, `cvv`, etc.) and sanitize any string
 containing a Luhn-validated 13–19 digit payment card number into `[REDACTED_PAN]`.
+
+### Replay audit logs and backtest divergence
+
+Stream historical JSONL scoring audit logs through a model to backtest candidate thresholds or compare model versions:
+
+```bash
+fraud-detect replay-audit logs/audit.jsonl artifacts/model \
+  --tolerance 0.05 \
+  --output reports/replay.json \
+  --fail-on-divergence
+```
+
+The replay engine streams events line by line without holding full logs in memory, recalculates probability predictions, flags decision flips, and records maximum absolute probability discrepancies.
 
 ### Explanation provider interface
 
@@ -733,6 +765,27 @@ Roll back by re-pointing the volume at the retained artifact from the previous
 step (see the retention policy under training) and re-running the `/health`
 smoke test. Keep the losing challenger's reports: they document why the
 decision was made.
+
+### Automated champion-challenger retraining pipeline
+
+For automated MLOps workflows, `retrain` automates challenger training, off-sample benchmarking against the incumbent champion, and guardrailed promotion:
+
+```bash
+fraud-detect retrain artifacts/champion data/fresh_batch.csv \
+  --output artifacts/challenger \
+  --metric roc_auc \
+  --min-gain 0.005 \
+  --output-report reports/retrain_decision.json \
+  --promote \
+  --fail-on-rejection
+```
+
+The retraining pipeline:
+1. Re-uses the champion's estimator type, hyperparameters, and cost policy unless overridden;
+2. Enforces configured `--temporal-gap` buffer windows across train, validation, and test splits;
+3. Evaluates both champion and challenger on the identical untouched holdout test partition;
+4. Requires the challenger to meet the `--min-gain` threshold over the champion;
+5. When `--promote` is supplied and the challenger wins, atomically updates the champion artifact directory.
 
 Assemble the promotion evidence for a challenger into one reviewable document
 with `promote`, which runs calibration, threshold, drift, and benchmark

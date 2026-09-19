@@ -8,6 +8,22 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- Audit log replay and divergence backtesting: added `replay_audit_log()` engine
+  and `fraud-detect replay-audit` CLI command, enabling stream processing of
+  historical JSONL scoring audit logs, tolerance thresholding, decision-flip detection,
+  and export of divergence reports.
+- Serving guardrails and degraded-state fallback: implemented safe fallback policies
+  in FastAPI serving (`constant`, `rule`, `raise`), degraded-mode runtime toggle via
+  environment variable or `X-Simulate-Degraded` header, and Prometheus fallback counter
+  metrics (`fraud_fallback_predictions_total`).
+- Automated champion-challenger retraining pipeline: added `fraud-detect retrain`
+  CLI command to train challengers on fresh data with temporal gaps, evaluate
+  champion vs challenger on identical holdout data, verify minimum metric gains, and
+  optionally promote winners to champion.
+- Machine-readable lineage attestation manifests: added `generate_attestation()`,
+  `verify_attestation()`, and `fraud-detect validate-artifact --attestation-output`
+  with `--signer` support to export and verify tamper-evident, cryptographically
+  digested SHA-256 JSON attestation manifests for CI/CD gates.
 - Label-delay-aware temporal gaps: added `--temporal-gap` CLI option and
   `temporal_gap` parameter to `TrainingConfig`, `train_model`, and
   `split_dataset_temporally`, enforcing holdout window separation to reflect

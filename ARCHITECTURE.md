@@ -15,18 +15,23 @@ financial-services platform.
    thresholded decisions, local explanations, metadata, and artifact loading.
 4. `cli.py` orchestrates offline workflows without duplicating model logic:
    training, comparison, scoring, monitoring, promotion evidence, model-card
-   inspection, and compliance rendering.
+   inspection, compliance rendering, historical audit replay, challenger retraining,
+   and machine-readable attestation export.
 5. `api.py` adapts the same `FraudModel` to bounded FastAPI requests. Batch and
-   single-transaction endpoints share one scoring helper.
+   single-transaction endpoints share one scoring helper with resilient serving
+   guardrails (`fallback_mode`) and degraded-state handling.
 6. `drift.py` compares current numeric distributions with the training profile;
    `evaluation.py` computes holdout, calibration, and threshold reports;
    `reporting.py` renders promotion evidence as escaped, self-contained HTML.
 7. `audit.py` exports thread-safe, structured JSONL audit events for scoring and
    promotion decisions with automated Luhn-validated PAN and sensitive key
-   redaction guarantees.
+   redaction guarantees, and provides `replay_audit_log` for historical replay
+   and divergence backtesting.
 8. `explanations.py` defines the `ExplanationProvider` boundary, keeping
    deterministic offline template explanations as default while wrapping external
    LLM calls with timeouts, prompt redaction, cost controls, and fallback.
+9. `model.py` provides `generate_attestation` and `verify_attestation` to export
+   and verify tamper-evident, canonical SHA-256 digested attestation manifests.
 
 ## Artifact contract
 
@@ -56,6 +61,10 @@ The lineage block on newly trained artifacts contains:
   version;
 - optional `git_commit` and `git_repository` values from CLI training.
 
+Artifact validation reports can be exported as signed machine-readable JSON
+attestation manifests via `generate_attestation()` / `validate-artifact --attestation-output`,
+providing a verifiable SHA-256 cryptographic digest over the full verification state for admission controllers.
+
 Lineage is additive. Artifacts created before lineage was introduced remain
 loadable, but their model cards identify the missing provenance.
 
@@ -66,8 +75,12 @@ loadable, but their model cards identify the missing provenance.
 numeric validation, optional API-key and in-memory rate limiting middleware,
 request correlation headers, structured logging, opt-in JSONL audit event export
 (`FRAUD_AUDIT_LOG_PATH`), pluggable explanation providers, and isolated Prometheus
-metrics. Authentication, network policy, durable rate limiting, secret
-management, and audit-log retention remain deployment responsibilities.
+metrics. Serving guardrails support degraded-state fallback policies (`constant`,
+`rule`, `raise`) configurable via environment variables or header simulation
+(`X-Simulate-Degraded`), with fallback executions tracked by Prometheus counters
+(`fraud_fallback_predictions_total`). Authentication, network policy, durable
+rate limiting, secret management, and audit-log retention remain deployment
+responsibilities.
 
 The API does not retrain or mutate a model. Threshold overrides are explicit in
 the request and response, while the tuned artifact threshold remains visible as
