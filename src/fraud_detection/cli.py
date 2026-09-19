@@ -1726,7 +1726,7 @@ def _send_drift_alert(
     # Send to PagerDuty
     if webhook_pagerduty:
         # PagerDuty Events API v2
-        has_drifted = any(f.status == "drifted" for f in alert_payload["drifted_features"])
+        has_drifted = any(f["status"] == "drifted" for f in alert_payload["drifted_features"])
         severity = "critical" if has_drifted else "warning"
         pd_payload: dict[str, Any] = {
             "routing_key": webhook_pagerduty,

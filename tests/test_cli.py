@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 import subprocess
+import urllib.error
 from copy import deepcopy
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
+from unittest.mock import MagicMock, patch
 
 import pandas as pd
 import pytest
@@ -2167,5 +2169,82 @@ def test_retrain_cli(tmp_path: Path, trained_artifact: Path) -> None:
     promote_report = json.loads(promote_res.stdout)
     assert promote_report["decision"] == "PROMOTED"
     assert promote_report["promoted_to_champion"] is True
+
+
+def test_drift_cli_success(tmp_path: Path, trained_artifact: Path) -> None:
+    data_path = tmp_path / "drift_data.csv"
+    generate_synthetic_data(rows=250, random_state=42).to_csv(data_path, index=False)
+
+    result = runner.invoke(app, ["drift", str(trained_artifact), str(data_path)])
+    assert result.exit_code == 0, result.output
+    report = json.loads(result.stdout)
+    assert report["overall_status"] in ("stable", "warning", "drifted")
+    assert "mean_psi" in report
+
+
+def test_drift_cli_surveillance_tripped_and_webhooks(
+    tmp_path: Path, trained_artifact: Path
+) -> None:
+    data_path = tmp_path / "drift_data.csv"
+    generate_synthetic_data(rows=250, random_state=42).to_csv(data_path, index=False)
+
+    with patch("urllib.request.urlopen") as mock_urlopen:
+        mock_urlopen.return_value = MagicMock()
+        result = runner.invoke(
+            app,
+            [
+                "drift",
+                str(trained_artifact),
+                str(data_path),
+                "--fail-on",
+                "stable",
+                "--webhook-slack",
+                "https://hooks.slack.com/services/test/123",
+                "--webhook-pagerduty",
+                "pd_key_abc",
+            ],
+        )
+        assert result.exit_code == 1
+        assert "Drift surveillance tripped" in result.output
+        assert mock_urlopen.call_count == 2
+
+
+def test_drift_cli_webhook_failure(tmp_path: Path, trained_artifact: Path) -> None:
+    data_path = tmp_path / "drift_data.csv"
+    generate_synthetic_data(rows=250, random_state=42).to_csv(data_path, index=False)
+
+    with patch("urllib.request.urlopen") as mock_urlopen:
+        mock_urlopen.side_effect = urllib.error.URLError("connection refused")
+        result = runner.invoke(
+            app,
+            [
+                "drift",
+                str(trained_artifact),
+                str(data_path),
+                "--fail-on",
+                "stable",
+                "--webhook-slack",
+                "https://hooks.slack.com/services/test/123",
+            ],
+        )
+        assert result.exit_code == 1
+        assert "Warning: Failed to send webhook" in result.output
+
+
+def test_replay_audit_cli_invalid_model_error(tmp_path: Path) -> None:
+    log_path = tmp_path / "audit.jsonl"
+    log_path.write_text("{}", encoding="utf-8")
+    bad_model = tmp_path / "bad_model"
+    bad_model.mkdir()
+    result = runner.invoke(
+        app,
+        [
+            "replay-audit",
+            str(log_path),
+            str(bad_model),
+        ],
+    )
+    assert result.exit_code == 2
+    assert "Error:" in result.output
 
 
