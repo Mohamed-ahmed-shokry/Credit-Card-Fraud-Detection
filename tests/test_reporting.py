@@ -8,7 +8,12 @@ import pytest
 from typer.testing import CliRunner
 
 from fraud_detection.cli import app
-from fraud_detection.reporting import ComplianceReportError, render_compliance_report
+from fraud_detection.reporting import (
+    ComplianceReportError,
+    _fmt,
+    _missing_version,
+    render_compliance_report,
+)
 
 runner = CliRunner()
 
@@ -236,3 +241,111 @@ def test_compliance_command_rejects_non_object_bundle(tmp_path: Path) -> None:
 
     assert result.exit_code == 2
     assert "must be a JSON object" in result.stderr
+
+
+def test_fmt_edge_cases() -> None:
+    assert _fmt(None) == "-"
+    assert _fmt(True) == "true"
+    assert _fmt(False) == "false"
+    assert _fmt(float("inf")) == "inf"
+    assert _fmt(["list"]) == "[&#x27;list&#x27;]"
+    assert _fmt(12) == "12"
+    assert _fmt(12.34567) == "12.3457"
+
+
+def test_missing_version_helper() -> None:
+    bundle_with_created = {"model": {"created_at": "2026-09-14T10:00:00+00:00"}}
+    assert _missing_version(bundle_with_created) == "2026-09-14T1"
+    assert _missing_version({}) == "unknown"
+
+
+def test_compliance_report_more_error_paths() -> None:
+    # model.test_metrics not mapping
+    b1 = _bundle()
+    b1["model"]["test_metrics"] = "not-a-map"
+    with pytest.raises(ComplianceReportError, match=r"model\.test_metrics"):
+        render_compliance_report(b1)
+
+    # calibration.detail has non-mapping item
+    b2 = _bundle()
+    b2["calibration"]["detail"] = ["not-a-dict"]
+    with pytest.raises(ComplianceReportError, match=r"calibration\.detail"):
+        render_compliance_report(b2)
+
+    # thresholds.detail has non-mapping item
+    b3 = _bundle()
+    b3["thresholds"]["detail"] = ["not-a-dict"]
+    with pytest.raises(ComplianceReportError, match=r"thresholds\.detail"):
+        render_compliance_report(b3)
+
+    # drift.features has non-mapping item
+    b4 = _bundle()
+    b4["drift"]["features"] = ["not-a-dict"]
+    with pytest.raises(ComplianceReportError, match=r"drift\.features"):
+        render_compliance_report(b4)
+
+    # benchmark.results has non-mapping item
+    b5 = _bundle()
+    b5["benchmark"]["results"] = ["not-a-dict"]
+    with pytest.raises(ComplianceReportError, match=r"benchmark\.results"):
+        render_compliance_report(b5)
+
+    # stability.results has non-mapping item
+    with pytest.raises(ComplianceReportError, match="must contain JSON objects"):
+        render_compliance_report(_bundle(), stability={"results": ["not-a-dict"]})
+
+
+def test_compliance_report_minimal_optional_sections() -> None:
+    bundle = _bundle()
+    # Remove optional subsections to exercise None branches
+    bundle.pop("model_version", None)
+    bundle["model"].pop("cost_policy", None)
+    bundle["model"].pop("created_at", None)
+    bundle["thresholds"].pop("model_threshold_metrics", None)
+    bundle["thresholds"].pop("detail", None)
+    bundle["drift"].pop("thresholds", None)
+    bundle["drift"].pop("features", None)
+
+    html = render_compliance_report(bundle)
+    assert "Model compliance report" in html
+    assert "unknown" in html
+
+
+def test_compliance_report_stability_with_metrics() -> None:
+    stability_data = {
+        "results": [
+            {
+                "estimator": "LogisticRegression",
+                "test_metrics_mean": {"roc_auc": 0.95, "f1": 0.88},
+                "test_metrics_std": {"roc_auc": 0.01, "f1": 0.02},
+            }
+        ]
+    }
+    report = render_compliance_report(_bundle(), stability=stability_data)
+    assert "Retraining stability" in report
+    assert "LogisticRegression" in report
+
+
+def test_compliance_command_manifest_error_cases(tmp_path: Path) -> None:
+    bundle_path = tmp_path / "bundle.json"
+    bundle_path.write_text(json.dumps(_bundle()), encoding="utf-8")
+
+    # Invalid JSON manifest
+    bad_manifest = tmp_path / "bad_manifest.json"
+    bad_manifest.write_text("invalid json {", encoding="utf-8")
+    res_bad = runner.invoke(
+        app,
+        ["compliance", str(bundle_path), "--artifact", str(bad_manifest)],
+    )
+    assert res_bad.exit_code == 2
+    assert "Invalid artifact manifest JSON" in res_bad.stderr
+
+    # Non-object manifest
+    non_obj_manifest = tmp_path / "non_obj_manifest.json"
+    non_obj_manifest.write_text("[]", encoding="utf-8")
+    res_no = runner.invoke(
+        app,
+        ["compliance", str(bundle_path), "--artifact", str(non_obj_manifest)],
+    )
+    assert res_no.exit_code == 2
+    assert "must be a JSON object" in res_no.stderr
