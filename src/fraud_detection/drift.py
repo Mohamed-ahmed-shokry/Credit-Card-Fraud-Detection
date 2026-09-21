@@ -164,6 +164,148 @@ def build_reference_profile(
     return profile
 
 
+class StreamingProfile:
+    """Incremental online distribution and quantile profiler for streaming surveillance."""
+
+    def __init__(self, feature_edges: dict[str, list[float]]) -> None:
+        if not feature_edges:
+            raise DriftError("feature_edges must not be empty.")
+        self.feature_edges: dict[str, list[float]] = {}
+        self.counts: dict[str, np.ndarray] = {}
+        self.total_counts: dict[str, int] = {}
+        self.means: dict[str, float] = {}
+        self.m2s: dict[str, float] = {}
+
+        for feature, edges in feature_edges.items():
+            if not isinstance(feature, str) or not feature:
+                raise DriftError("Feature names must be non-empty strings.")
+            interior = np.asarray(edges, dtype=float)
+            if not np.isfinite(interior).all() or np.any(np.diff(interior) <= 0):
+                raise DriftError(
+                    f"Bin edges for feature {feature!r} must be finite and strictly increasing."
+                )
+            self.feature_edges[feature] = [float(e) for e in interior]
+            self.counts[feature] = np.zeros(len(interior) + 1, dtype=np.int64)
+            self.total_counts[feature] = 0
+            self.means[feature] = 0.0
+            self.m2s[feature] = 0.0
+
+    @classmethod
+    def from_reference_profile(
+        cls, reference_profile: dict[str, dict[str, Any]]
+    ) -> StreamingProfile:
+        """Initialize a streaming profiler using bin edges from a reference profile."""
+        if not reference_profile:
+            raise DriftError("Reference profile must not be empty.")
+        feature_edges: dict[str, list[float]] = {}
+        for feature, baseline in reference_profile.items():
+            edges = baseline.get("edges")
+            if not isinstance(edges, list) or len(edges) < 2:
+                raise DriftError(f"Invalid edges in reference profile for feature {feature!r}.")
+            interior = edges[1:-1]
+            feature_edges[feature] = [float(e) for e in interior]
+        return cls(feature_edges)
+
+    def update(self, batch: pd.DataFrame | list[dict[str, Any]]) -> None:
+        """Update streaming distribution statistics with a batch of observations."""
+        if isinstance(batch, list):
+            if not batch:
+                return
+            frame = pd.DataFrame(batch)
+        elif isinstance(batch, pd.DataFrame):
+            if batch.empty:
+                return
+            frame = batch
+        else:
+            raise DriftError("Batch must be a pandas DataFrame or list of dicts.")
+
+        column_lookup = _normalized_column_lookup(frame, context="Streaming")
+        expected = set(self.feature_edges)
+        provided = set(column_lookup)
+        if not expected.issubset(provided):
+            missing = sorted(expected - provided)
+            raise DriftError(f"Streaming batch is missing expected features: {missing}")
+
+        for feature, edges_list in self.feature_edges.items():
+            values = _numeric_feature_values(frame, column_lookup[feature], context="Streaming")
+            if not np.isfinite(values).all():
+                raise DriftError(f"Streaming feature {feature!r} contains non-finite values.")
+
+            full_edges = np.concatenate(([-np.inf], edges_list, [np.inf]))
+            batch_counts, _ = np.histogram(values, bins=full_edges)
+            self.counts[feature] += batch_counts
+
+            n_b = len(values)
+            if n_b > 0:
+                n_a = self.total_counts[feature]
+                n = n_a + n_b
+                mean_b = float(np.mean(values))
+                m2_b = float(np.sum((values - mean_b) ** 2))
+
+                delta = mean_b - self.means[feature]
+                self.means[feature] += delta * (n_b / n)
+                self.m2s[feature] += m2_b + (delta**2) * (n_a * n_b / n)
+                self.total_counts[feature] = n
+
+    def to_reference_profile(self) -> dict[str, dict[str, Any]]:
+        """Export accumulated statistics to reference profile schema."""
+        profile: dict[str, dict[str, Any]] = {}
+        for feature, edges in self.feature_edges.items():
+            total = self.total_counts[feature]
+            if total == 0:
+                num_bins = len(edges) + 1
+                proportions = [1.0 / num_bins] * num_bins
+                std = 0.0
+            else:
+                proportions = [float(c / total) for c in self.counts[feature]]
+                std = float(np.sqrt(self.m2s[feature] / total))
+
+            profile[feature] = {
+                "edges": [None, *edges, None],
+                "proportions": proportions,
+                "mean": float(self.means[feature]),
+                "standard_deviation": std,
+            }
+        return profile
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize full internal profiler state for checkpointing."""
+        return {
+            "features": {
+                feature: {
+                    "edges": self.feature_edges[feature],
+                    "counts": [int(c) for c in self.counts[feature]],
+                    "total_count": self.total_counts[feature],
+                    "mean": float(self.means[feature]),
+                    "m2": float(self.m2s[feature]),
+                }
+                for feature in self.feature_edges
+            }
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> StreamingProfile:
+        """Restore profiler state from a serialized checkpoint."""
+        if not isinstance(data, dict) or "features" not in data:
+            raise DriftError("Invalid profiler state dictionary: missing 'features'.")
+        raw_features = data["features"]
+        if not isinstance(raw_features, dict) or not raw_features:
+            raise DriftError("Profiler state 'features' must be a non-empty mapping.")
+
+        feature_edges = {
+            feature: [float(e) for e in spec["edges"]]
+            for feature, spec in raw_features.items()
+        }
+        instance = cls(feature_edges)
+        for feature, spec in raw_features.items():
+            instance.counts[feature] = np.asarray(spec["counts"], dtype=np.int64)
+            instance.total_counts[feature] = int(spec["total_count"])
+            instance.means[feature] = float(spec["mean"])
+            instance.m2s[feature] = float(spec["m2"])
+        return instance
+
+
+
 def assess_drift(
     reference_profile: dict[str, dict[str, Any]],
     features: pd.DataFrame,

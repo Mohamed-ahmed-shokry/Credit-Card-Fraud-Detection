@@ -2321,4 +2321,135 @@ def test_multi_window_drift_cli_error_handling(tmp_path: Path, trained_artifact:
     assert "less than short_window_rows" in result.output
 
 
+def test_stream_profile_cli_csv(tmp_path: Path, trained_artifact: Path) -> None:
+    csv_path = tmp_path / "stream_data.csv"
+    generate_synthetic_data(rows=250, random_state=42).to_csv(csv_path, index=False)
+    out_profile = tmp_path / "profile.json"
+    chk_path = tmp_path / "checkpoint.json"
+
+    result = runner.invoke(
+        app,
+        [
+            "stream-profile",
+            str(csv_path),
+            "-o",
+            str(out_profile),
+            "--model-path",
+            str(trained_artifact),
+            "--checkpoint-output",
+            str(chk_path),
+            "--batch-size",
+            "100",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "Successfully updated streaming profile" in result.output
+
+    data = json.loads(out_profile.read_text(encoding="utf-8"))
+    assert isinstance(data, dict)
+    assert "Amount" in data
+    assert "proportions" in data["Amount"]
+
+    chk = json.loads(chk_path.read_text(encoding="utf-8"))
+    assert "features" in chk
+    assert chk["features"]["Amount"]["total_count"] == 250
+
+
+def test_stream_profile_cli_resume_from_checkpoint(tmp_path: Path, trained_artifact: Path) -> None:
+    csv_path = tmp_path / "stream_data.csv"
+    generate_synthetic_data(rows=250, random_state=42).to_csv(csv_path, index=False)
+    out_profile1 = tmp_path / "p1.json"
+    chk_path = tmp_path / "checkpoint.json"
+
+    r1 = runner.invoke(
+        app,
+        [
+            "stream-profile",
+            str(csv_path),
+            "-o",
+            str(out_profile1),
+            "--model-path",
+            str(trained_artifact),
+            "--checkpoint-output",
+            str(chk_path),
+        ],
+    )
+    assert r1.exit_code == 0, r1.output
+
+    # Resume from checkpoint on another chunk
+    out_profile2 = tmp_path / "p2.json"
+    r2 = runner.invoke(
+        app,
+        [
+            "stream-profile",
+            str(csv_path),
+            "-o",
+            str(out_profile2),
+            "--state-input",
+            str(chk_path),
+            "--checkpoint-output",
+            str(chk_path),
+            "--overwrite",
+        ],
+    )
+    assert r2.exit_code == 0, r2.output
+    chk2 = json.loads(chk_path.read_text(encoding="utf-8"))
+    assert chk2["features"]["Amount"]["total_count"] == 500
+
+
+def test_stream_profile_cli_jsonl(tmp_path: Path, trained_artifact: Path) -> None:
+    jsonl_path = tmp_path / "audit.jsonl"
+    frame = generate_synthetic_data(rows=250, random_state=42)
+    records = frame.drop(columns="Class").to_dict(orient="records")
+
+    with jsonl_path.open("w", encoding="utf-8") as f:
+        # Write some scoring events
+        event1 = {
+            "event_type": "scoring",
+            "payload": {"features": records[:100]},
+        }
+        event2 = {
+            "event_type": "scoring",
+            "payload": {"features": records[100:]},
+        }
+        f.write(json.dumps(event1) + "\n")
+        f.write(json.dumps(event2) + "\n")
+
+    out_profile = tmp_path / "profile_jsonl.json"
+    result = runner.invoke(
+        app,
+        [
+            "stream-profile",
+            str(jsonl_path),
+            "-o",
+            str(out_profile),
+            "--model-path",
+            str(trained_artifact),
+            "--batch-size",
+            "50",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    data = json.loads(out_profile.read_text(encoding="utf-8"))
+    assert "Amount" in data
+
+
+def test_stream_profile_cli_error_empty_data(tmp_path: Path) -> None:
+    empty_file = tmp_path / "empty.csv"
+    empty_file.write_text("", encoding="utf-8")
+    out_file = tmp_path / "out.json"
+
+    result = runner.invoke(
+        app,
+        [
+            "stream-profile",
+            str(empty_file),
+            "-o",
+            str(out_file),
+        ],
+    )
+    assert result.exit_code == 2
+
+
+
 

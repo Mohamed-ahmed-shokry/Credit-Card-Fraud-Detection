@@ -35,8 +35,10 @@ from fraud_detection.drift import (
     DriftError,
     DriftReport,
     MultiWindowDriftReport,
+    StreamingProfile,
     assess_drift,
     assess_multi_window_drift,
+    build_reference_profile,
     surveillance_tripped,
 )
 from fraud_detection.evaluation import (
@@ -1938,6 +1940,142 @@ def _send_multi_window_drift_alert(
         }
         _post_webhook("https://events.pagerduty.com/v2/enqueue", pd_payload)
 
+
+@app.command("stream-profile")
+def stream_profile_command(
+    data: Annotated[
+        Path,
+        typer.Argument(
+            exists=True, dir_okay=False, readable=True, help="Streaming CSV or JSONL audit file."
+        ),
+    ],
+    output: Annotated[
+        Path,
+        typer.Option("--output", "-o", help="Destination JSON path for reference profile."),
+    ],
+    model_path: Annotated[
+        Path | None,
+        typer.Option(
+            help="Optional trained model artifact to supply initial reference profile edges."
+        ),
+    ] = None,
+    state_input: Annotated[
+        Path | None,
+        typer.Option(help="Optional saved StreamingProfile JSON checkpoint to resume from."),
+    ] = None,
+    checkpoint_output: Annotated[
+        Path | None,
+        typer.Option(help="Optional destination path to save updated StreamingProfile state."),
+    ] = None,
+    batch_size: Annotated[
+        int,
+        typer.Option(min=1, help="Number of rows per streaming update chunk."),
+    ] = 500,
+    target: Annotated[
+        str,
+        typer.Option(help="Optional label column to exclude from feature profiling."),
+    ] = DEFAULT_TARGET,
+    overwrite: Annotated[
+        bool,
+        typer.Option(help="Replace existing destination files."),
+    ] = False,
+) -> None:
+    """Incrementally profile feature distributions from streaming CSV batches or JSONL logs."""
+    _guard_output(output, overwrite)
+    if checkpoint_output is not None:
+        _guard_output(checkpoint_output, overwrite)
+
+    try:
+        profiler: StreamingProfile | None = None
+        if state_input is not None:
+            if not state_input.is_file():
+                _abort(f"State input file not found: {state_input}")
+            state_data = json.loads(state_input.read_text(encoding="utf-8"))
+            profiler = StreamingProfile.from_dict(state_data)
+        elif model_path is not None:
+            model = load_model(model_path)
+            profile = model.metadata.get("reference_profile")
+            if not isinstance(profile, dict):
+                raise DriftError("Model artifact does not contain a reference profile.")
+            profiler = StreamingProfile.from_reference_profile(profile)
+
+        total_rows_processed = 0
+        is_jsonl = data.suffix.lower() == ".jsonl"
+
+        if is_jsonl:
+            batch_records: list[dict[str, Any]] = []
+            with data.open("r", encoding="utf-8") as f:
+                for line in f:
+                    stripped = line.strip()
+                    if not stripped:
+                        continue
+                    try:
+                        event = json.loads(stripped)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(event, dict):
+                        continue
+                    payload = event.get("payload")
+                    if not isinstance(payload, dict):
+                        continue
+                    features_list = payload.get("features")
+                    if isinstance(features_list, list):
+                        for item in features_list:
+                            if isinstance(item, dict):
+                                batch_records.append(item)
+                                if len(batch_records) >= batch_size:
+                                    if profiler is None:
+                                        init_frame = pd.DataFrame(batch_records).drop(
+                                            columns=target, errors="ignore"
+                                        )
+                                        ref = build_reference_profile(init_frame)
+                                        profiler = StreamingProfile.from_reference_profile(ref)
+                                    profiler.update(batch_records)
+                                    total_rows_processed += len(batch_records)
+                                    batch_records = []
+            if batch_records:
+                if profiler is None:
+                    init_frame = pd.DataFrame(batch_records).drop(columns=target, errors="ignore")
+                    ref = build_reference_profile(init_frame)
+                    profiler = StreamingProfile.from_reference_profile(ref)
+                profiler.update(batch_records)
+                total_rows_processed += len(batch_records)
+        else:
+            reader = pd.read_csv(data, chunksize=batch_size)
+            for chunk in reader:
+                features_chunk = chunk.drop(columns=target, errors="ignore")
+                if profiler is None:
+                    ref = build_reference_profile(features_chunk)
+                    profiler = StreamingProfile.from_reference_profile(ref)
+                profiler.update(features_chunk)
+                total_rows_processed += len(features_chunk)
+
+        if profiler is None or total_rows_processed == 0:
+            _abort("No valid transaction records found to profile.")
+
+        ref_profile = profiler.to_reference_profile()
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps(ref_profile, indent=2), encoding="utf-8")
+
+        if checkpoint_output is not None:
+            checkpoint_output.parent.mkdir(parents=True, exist_ok=True)
+            checkpoint_output.write_text(
+                json.dumps(profiler.to_dict(), indent=2), encoding="utf-8"
+            )
+
+        typer.echo(
+            f"Successfully updated streaming profile for {len(ref_profile)} features "
+            f"across {total_rows_processed} transactions."
+        )
+    except (
+        OSError,
+        UnicodeDecodeError,
+        pd.errors.ParserError,
+        pd.errors.EmptyDataError,
+        ModelArtifactError,
+        DriftError,
+    ) as exc:
+        _abort(str(exc))
 
 
 @app.command("calibration")

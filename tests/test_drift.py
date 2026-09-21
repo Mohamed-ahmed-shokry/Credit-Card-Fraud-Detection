@@ -10,6 +10,7 @@ from fraud_detection.drift import (
     DriftError,
     MultiWindowDriftReport,
     MultiWindowFeatureDrift,
+    StreamingProfile,
     assess_drift,
     assess_multi_window_drift,
     build_reference_profile,
@@ -312,4 +313,87 @@ def test_multi_window_drift_honors_thresholds() -> None:
     assert report.overall_status == "drifted"
     assert report.warning_at == 0.01
     assert report.drift_at == 0.02
+
+
+def test_streaming_profile_updates_and_matches_batch_profile() -> None:
+    rng = np.random.default_rng(123)
+    frame = pd.DataFrame(
+        {
+            "amount": rng.uniform(10, 500, 1_000),
+            "velocity": rng.normal(5, 2, 1_000),
+        }
+    )
+    batch_ref = build_reference_profile(frame, bins=10)
+
+    sp = StreamingProfile.from_reference_profile(batch_ref)
+
+    # Feed in 5 chunks of 200 rows
+    for i in range(5):
+        chunk = frame.iloc[i * 200 : (i + 1) * 200]
+        sp.update(chunk)
+
+    stream_ref = sp.to_reference_profile()
+
+    for feat in ["amount", "velocity"]:
+        assert stream_ref[feat]["mean"] == pytest.approx(batch_ref[feat]["mean"], rel=1e-5)
+        assert stream_ref[feat]["standard_deviation"] == pytest.approx(
+            batch_ref[feat]["standard_deviation"], rel=1e-5
+        )
+        assert stream_ref[feat]["proportions"] == pytest.approx(
+            batch_ref[feat]["proportions"], rel=1e-5
+        )
+
+
+def test_streaming_profile_serialization_roundtrip() -> None:
+    frame = pd.DataFrame({"x": np.linspace(0, 100, 200)})
+    sp = StreamingProfile({"x": [25.0, 50.0, 75.0]})
+    sp.update(frame.iloc[:100])
+
+    state = sp.to_dict()
+    sp_restored = StreamingProfile.from_dict(state)
+
+    # Update both with the second half
+    sp.update(frame.iloc[100:])
+    sp_restored.update(frame.iloc[100:])
+
+    assert sp.to_reference_profile() == sp_restored.to_reference_profile()
+
+
+def test_streaming_profile_validation_and_errors() -> None:
+    with pytest.raises(DriftError, match="feature_edges must not be empty"):
+        StreamingProfile({})
+
+    with pytest.raises(DriftError, match="Feature names must be non-empty"):
+        StreamingProfile({"": [1.0, 2.0]})
+
+    with pytest.raises(DriftError, match="strictly increasing"):
+        StreamingProfile({"x": [5.0, 2.0]})
+
+    with pytest.raises(DriftError, match="Reference profile must not be empty"):
+        StreamingProfile.from_reference_profile({})
+
+    with pytest.raises(DriftError, match="Invalid edges in reference profile"):
+        StreamingProfile.from_reference_profile({"x": {"edges": [None]}})
+
+    sp = StreamingProfile({"x": [10.0, 20.0]})
+
+    # Empty batch gracefully ignored
+    sp.update(pd.DataFrame())
+    sp.update([])
+
+    with pytest.raises(DriftError, match="Batch must be a pandas DataFrame or list"):
+        sp.update("not-a-batch")  # type: ignore[arg-type]
+
+    with pytest.raises(DriftError, match="missing expected features"):
+        sp.update(pd.DataFrame({"wrong": [1.0]}))
+
+    with pytest.raises(DriftError, match="non-finite values"):
+        sp.update(pd.DataFrame({"x": [np.nan]}))
+
+    with pytest.raises(DriftError, match="missing 'features'"):
+        StreamingProfile.from_dict({})
+
+    with pytest.raises(DriftError, match="must be a non-empty mapping"):
+        StreamingProfile.from_dict({"features": {}})
+
 
