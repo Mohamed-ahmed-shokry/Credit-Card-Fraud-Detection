@@ -397,3 +397,14 @@ def test_streaming_profile_validation_and_errors() -> None:
         StreamingProfile.from_dict({"features": {}})
 
 
+def test_streaming_profile_empty_to_reference_profile() -> None:
+    sp = StreamingProfile({"feature_a": [10.0, 20.0]})
+    ref = sp.to_reference_profile()
+    assert "feature_a" in ref
+    assert ref["feature_a"]["edges"] == [None, 10.0, 20.0, None]
+    assert len(ref["feature_a"]["proportions"]) == 3
+    assert pytest.approx(sum(ref["feature_a"]["proportions"])) == 1.0
+    assert ref["feature_a"]["standard_deviation"] == 0.0
+
+
+

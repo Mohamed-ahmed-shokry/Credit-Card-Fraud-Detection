@@ -25,6 +25,7 @@ from fraud_detection.model import (
     METADATA_FILENAME,
     MODEL_FILENAME,
     FraudModel,
+    load_model,
     save_model,
     train_model,
     verify_attestation,
@@ -2303,6 +2304,58 @@ def test_multi_window_drift_cli_surveillance_tripped_and_webhooks(
         assert mock_urlopen.call_count == 2
 
 
+def test_multi_window_drift_cli_webhook_slack_only(tmp_path: Path, trained_artifact: Path) -> None:
+    data_path = tmp_path / "drift_data.csv"
+    generate_synthetic_data(rows=250, random_state=42).to_csv(data_path, index=False)
+
+    with patch("urllib.request.urlopen") as mock_urlopen:
+        mock_urlopen.return_value = MagicMock()
+        result = runner.invoke(
+            app,
+            [
+                "multi-window-drift",
+                str(trained_artifact),
+                str(data_path),
+                "--short-window-rows",
+                "50",
+                "--fail-on",
+                "stable",
+                "--webhook-slack",
+                "https://hooks.slack.com/services/test/123",
+            ],
+        )
+        assert result.exit_code == 1
+        assert mock_urlopen.call_count == 1
+
+
+def test_multi_window_drift_cli_webhook_pagerduty_critical(
+    tmp_path: Path, trained_artifact: Path
+) -> None:
+    data_path = tmp_path / "drifted_heavy.csv"
+    df = generate_synthetic_data(rows=250, random_state=42)
+    df.loc[df.index[-50:], "Amount"] = 999999.0
+    df.to_csv(data_path, index=False)
+
+    with patch("urllib.request.urlopen") as mock_urlopen:
+        mock_urlopen.return_value = MagicMock()
+        result = runner.invoke(
+            app,
+            [
+                "multi-window-drift",
+                str(trained_artifact),
+                str(data_path),
+                "--short-window-rows",
+                "50",
+                "--fail-on",
+                "drifted",
+                "--webhook-pagerduty",
+                "pd_routing_key_123",
+            ],
+        )
+        assert result.exit_code == 1
+        assert mock_urlopen.call_count == 1
+
+
 def test_multi_window_drift_cli_error_handling(tmp_path: Path, trained_artifact: Path) -> None:
     data_path = tmp_path / "short_data.csv"
     generate_synthetic_data(rows=250, random_state=42).iloc[:10].to_csv(data_path, index=False)
@@ -2449,6 +2502,112 @@ def test_stream_profile_cli_error_empty_data(tmp_path: Path) -> None:
         ],
     )
     assert result.exit_code == 2
+
+
+def test_stream_profile_cli_csv_auto_init(tmp_path: Path) -> None:
+    csv_path = tmp_path / "stream_data.csv"
+    generate_synthetic_data(rows=200, random_state=42).to_csv(csv_path, index=False)
+    out_profile = tmp_path / "auto_profile.json"
+
+    result = runner.invoke(
+        app,
+        [
+            "stream-profile",
+            str(csv_path),
+            "-o",
+            str(out_profile),
+            "--batch-size",
+            "50",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    data = json.loads(out_profile.read_text(encoding="utf-8"))
+    assert "Amount" in data
+    assert "proportions" in data["Amount"]
+
+
+def test_stream_profile_cli_jsonl_auto_init_and_filtering(tmp_path: Path) -> None:
+    jsonl_path = tmp_path / "stream.jsonl"
+    frame = generate_synthetic_data(rows=200, random_state=42)
+    records = frame.drop(columns="Class").to_dict(orient="records")
+
+    with jsonl_path.open("w", encoding="utf-8") as f:
+        f.write("\n")
+        f.write("not-a-valid-json\n")
+        f.write('"just-a-string"\n')
+        f.write(json.dumps({"event_type": "ignored"}) + "\n")
+        f.write(json.dumps({"payload": {"features": records[:100]}}) + "\n")
+        f.write(json.dumps({"payload": {"features": records[100:]}}) + "\n")
+
+    out_profile = tmp_path / "auto_jsonl.json"
+    result = runner.invoke(
+        app,
+        [
+            "stream-profile",
+            str(jsonl_path),
+            "-o",
+            str(out_profile),
+            "--batch-size",
+            "50",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    data = json.loads(out_profile.read_text(encoding="utf-8"))
+    assert "Amount" in data
+
+
+def test_stream_profile_cli_errors(tmp_path: Path, trained_artifact: Path) -> None:
+    csv_path = tmp_path / "stream_data.csv"
+    generate_synthetic_data(rows=200, random_state=42).to_csv(csv_path, index=False)
+    out_profile = tmp_path / "err_profile.json"
+
+    res1 = runner.invoke(
+        app,
+        [
+            "stream-profile",
+            str(csv_path),
+            "-o",
+            str(out_profile),
+            "--state-input",
+            str(tmp_path / "non_existent_state.json"),
+        ],
+    )
+    assert res1.exit_code == 2
+    assert "State input file not found" in res1.output
+
+    model = load_model(trained_artifact)
+    model.metadata.pop("reference_profile", None)
+    corrupted_model_path = tmp_path / "no_profile_model.joblib"
+    save_model(model, corrupted_model_path)
+
+    res2 = runner.invoke(
+        app,
+        [
+            "stream-profile",
+            str(csv_path),
+            "-o",
+            str(out_profile),
+            "--model-path",
+            str(corrupted_model_path),
+        ],
+    )
+    assert res2.exit_code == 2
+    assert "reference profile" in res2.output
+
+    bad_jsonl = tmp_path / "bad.jsonl"
+    bad_jsonl.write_text('{"empty": true}\n', encoding="utf-8")
+    res3 = runner.invoke(
+        app,
+        [
+            "stream-profile",
+            str(bad_jsonl),
+            "-o",
+            str(out_profile),
+        ],
+    )
+    assert res3.exit_code == 2
+    assert "No valid transaction records" in res3.output
+
 
 
 def test_simulate_drift_cli_success(tmp_path: Path) -> None:

@@ -15,10 +15,15 @@ from fastapi.testclient import TestClient
 from fraud_detection import __version__
 from fraud_detection.api import (
     AUDIT_LOG_ENVIRONMENT_VARIABLE,
+    CIRCUIT_BREAKER_ENABLED_ENVIRONMENT_VARIABLE,
+    CIRCUIT_BREAKER_FAILURE_THRESHOLD_ENVIRONMENT_VARIABLE,
+    CIRCUIT_BREAKER_LATENCY_BUDGET_ENVIRONMENT_VARIABLE,
+    CIRCUIT_BREAKER_RECOVERY_TIMEOUT_ENVIRONMENT_VARIABLE,
     MAX_REQUEST_BODY_BYTES,
     MODEL_PATH_ENVIRONMENT_VARIABLE,
     PROCESS_TIME_HEADER,
     REQUEST_ID_HEADER,
+    SHADOW_MODEL_PATH_ENVIRONMENT_VARIABLE,
     CircuitBreaker,
     app_from_environment,
     create_app,
@@ -1063,6 +1068,61 @@ def test_traffic_shadowing_and_metrics(
     assert len(shadow_events) >= 2
     assert shadow_events[0]["payload"]["evaluated_count"] == 5
     assert shadow_events[0]["model_version"] == "shadow987654"
+
+
+def test_create_app_with_circuit_breaker_and_shadow_env_vars(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, primary_model, _ = api_context
+    shadow_path = tmp_path / "shadow_model.joblib"
+    save_model(primary_model, shadow_path)
+
+    monkeypatch.setenv(CIRCUIT_BREAKER_ENABLED_ENVIRONMENT_VARIABLE, "true")
+    monkeypatch.setenv(CIRCUIT_BREAKER_FAILURE_THRESHOLD_ENVIRONMENT_VARIABLE, "3")
+    monkeypatch.setenv(CIRCUIT_BREAKER_RECOVERY_TIMEOUT_ENVIRONMENT_VARIABLE, "2.5")
+    monkeypatch.setenv(CIRCUIT_BREAKER_LATENCY_BUDGET_ENVIRONMENT_VARIABLE, "75.0")
+    monkeypatch.setenv(SHADOW_MODEL_PATH_ENVIRONMENT_VARIABLE, str(shadow_path))
+
+    app = create_app(model=primary_model)
+    with TestClient(app) as test_client:
+        h = test_client.get("/health")
+        assert h.status_code == 200
+        health_data = h.json()
+        assert health_data["circuit_breaker"]["state"] == "closed"
+        assert health_data["shadow_model_version"] is not None
+
+
+def test_traffic_shadowing_exception_handling(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+    tmp_path: Path,
+) -> None:
+    _, primary_model, dataset = api_context
+    recs = [dataset.features.iloc[i].to_dict() for i in range(2)]
+
+    shadow_model = MagicMock(wraps=primary_model)
+    shadow_model.metadata = {
+        "created_at": "2026-09-20",
+        "dataset_fingerprint": "err_fingerprint_123",
+    }
+    shadow_model.threshold = 0.5
+    shadow_model.predict_probabilities.side_effect = RuntimeError("Shadow execution exploded")
+
+    sink = JsonlAuditSink(tmp_path / "audit_shadow_err.jsonl")
+    app = create_app(
+        model=primary_model,
+        shadow_model=shadow_model,
+        audit_sink=sink,
+    )
+
+    with TestClient(app) as client:
+        res = client.post("/v1/predict", json={"transactions": recs})
+        assert res.status_code == 200
+        assert len(res.json()["predictions"]) == 2
+
+    sink.close()
+
 
 
 
