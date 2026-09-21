@@ -268,6 +268,33 @@ def build_promotion_audit_event(
     )
 
 
+def build_shadow_scoring_audit_event(
+    *,
+    shadow_model_version: str | None,
+    shadow_dataset_fingerprint: str | None,
+    evaluated_count: int,
+    discrepancy_count: int,
+    discrepancies: Sequence[dict[str, Any]],
+    request_id: str | None = None,
+) -> AuditEvent:
+    """Construct a structured shadow scoring audit event."""
+    payload: dict[str, Any] = {
+        "evaluated_count": evaluated_count,
+        "discrepancy_count": discrepancy_count,
+        "discrepancies": list(discrepancies),
+    }
+    if request_id is not None:
+        payload["request_id"] = request_id
+
+    return AuditEvent(
+        event_type="shadow_scoring",
+        model_version=shadow_model_version,
+        dataset_fingerprint=shadow_dataset_fingerprint,
+        payload=payload,
+    )
+
+
+
 @dataclass(frozen=True)
 class DiscrepancyDetail:
     """Record of a single replayed transaction discrepancy."""

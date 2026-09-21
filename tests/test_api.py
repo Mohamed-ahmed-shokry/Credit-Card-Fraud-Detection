@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, cast
 from unittest.mock import MagicMock
 
+import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
@@ -17,6 +19,7 @@ from fraud_detection.api import (
     MODEL_PATH_ENVIRONMENT_VARIABLE,
     PROCESS_TIME_HEADER,
     REQUEST_ID_HEADER,
+    CircuitBreaker,
     app_from_environment,
     create_app,
 )
@@ -841,6 +844,226 @@ def test_primary_model_returns_none_probabilities(
         pytest.raises(RuntimeError, match="Primary model returned no probabilities"),
     ):
         test_client.post("/v1/predict", json={"transactions": [rec]})
+
+
+def test_circuit_breaker_unit() -> None:
+    tripped_count = 0
+
+    def on_trip() -> None:
+        nonlocal tripped_count
+        tripped_count += 1
+
+    cb = CircuitBreaker(
+        failure_threshold=3,
+        recovery_timeout=0.05,
+        latency_budget_ms=10.0,
+        half_open_success_threshold=2,
+        on_trip=on_trip,
+    )
+
+    assert cb.state == "closed"
+    assert cb.allow_request() is True
+
+    cb.record_failure()
+    assert cb.state == "closed"
+    assert cb.consecutive_failures == 1
+
+    cb.record_success()
+    assert cb.consecutive_failures == 0
+
+    cb.record_failure()
+    cb.record_failure()
+    cb.record_failure()
+    assert cb.state == "open"
+    assert tripped_count == 1
+    assert cb.allow_request() is False
+
+    time.sleep(0.06)
+    assert cb.allow_request() is True
+    assert cb.state == "half_open"
+
+    cb.record_failure()
+    assert cb.state == "open"
+    assert tripped_count == 2
+    assert cb.allow_request() is False
+
+    time.sleep(0.06)
+    assert cb.allow_request() is True
+    assert cb.state == "half_open"
+    cb.record_success()
+    assert cb.state == "half_open"
+    cb.record_success()
+    assert cb.state == "closed"
+    assert cb.consecutive_failures == 0
+
+    cb.trip()
+    assert cb.state == "open"
+    assert tripped_count == 3
+    cb.reset()
+    assert cb.state == "closed"
+
+    with pytest.raises(ValueError, match="failure_threshold"):
+        CircuitBreaker(failure_threshold=0)
+    with pytest.raises(ValueError, match="recovery_timeout"):
+        CircuitBreaker(recovery_timeout=0)
+    with pytest.raises(ValueError, match="latency_budget_ms"):
+        CircuitBreaker(latency_budget_ms=0)
+    with pytest.raises(ValueError, match="half_open_success_threshold"):
+        CircuitBreaker(half_open_success_threshold=0)
+
+
+def test_circuit_breaker_api_routing_and_health(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, model, dataset = api_context
+    rec = dataset.features.iloc[0].to_dict()
+
+    mock_model = MagicMock(wraps=model)
+    mock_model.metadata = model.metadata
+    mock_model.threshold = model.threshold
+    mock_model.feature_names = model.feature_names
+    mock_model.predict_probabilities.side_effect = RuntimeError("simulated model crash")
+
+    cb = CircuitBreaker(failure_threshold=2, recovery_timeout=0.08)
+    app = create_app(
+        model=mock_model,
+        circuit_breaker=cb,
+        fallback_mode="constant",
+        fallback_score=0.88,
+    )
+
+    with TestClient(app) as client:
+        r1 = client.post("/v1/score", json={"transaction": rec})
+        assert r1.status_code == 200
+        assert r1.json()["fallback_applied"] is True
+        assert "model_exception" in r1.json()["fallback_reason"]
+        assert cb.state == "closed"
+
+        r2 = client.post("/v1/score", json={"transaction": rec})
+        assert r2.status_code == 200
+        assert cb.state == "open"
+
+        mock_model.predict_probabilities.reset_mock()
+        r3 = client.post("/v1/score", json={"transaction": rec})
+        assert r3.status_code == 200
+        assert r3.json()["fallback_applied"] is True
+        assert r3.json()["fallback_reason"] == "circuit_breaker_open"
+        assert r3.json()["prediction"]["fraud_probability"] == 0.88
+        mock_model.predict_probabilities.assert_not_called()
+
+        h = client.get("/health")
+        assert h.status_code == 200
+        h_data = h.json()
+        assert h_data["status"] == "degraded"
+        assert h_data["circuit_breaker"]["state"] == "open"
+
+        m = client.get("/metrics")
+        assert "fraud_circuit_breaker_state 2.0" in m.text
+        assert "fraud_circuit_breaker_tripped_total 1.0" in m.text
+
+        time.sleep(0.1)
+        mock_model.predict_probabilities.side_effect = None
+        mock_model.predict_probabilities.return_value = np.array([0.05])
+
+        r4 = client.post("/v1/score", json={"transaction": rec})
+        assert r4.status_code == 200
+        assert r4.json()["fallback_applied"] is False
+        assert cb.state == "closed"
+
+        h_ready = client.get("/health")
+        assert h_ready.json()["status"] == "ready"
+        assert h_ready.json()["circuit_breaker"]["state"] == "closed"
+
+
+def test_circuit_breaker_raise_when_open(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, model, dataset = api_context
+    rec = dataset.features.iloc[0].to_dict()
+
+    cb = CircuitBreaker(failure_threshold=1)
+    cb.trip()
+
+    app = create_app(model=model, circuit_breaker=cb, fallback_mode="raise")
+    with (
+        TestClient(app) as client,
+        pytest.raises(RuntimeError, match="Circuit breaker is OPEN"),
+    ):
+        client.post("/v1/predict", json={"transactions": [rec]})
+
+
+def test_circuit_breaker_latency_sla_breach(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, model, dataset = api_context
+    rec = dataset.features.iloc[0].to_dict()
+
+    mock_model = MagicMock(wraps=model)
+    mock_model.metadata = model.metadata
+    mock_model.threshold = model.threshold
+    mock_model.feature_names = model.feature_names
+
+    def slow_predict(_frame: Any) -> np.ndarray:
+        time.sleep(0.02)
+        return np.array([0.1])
+
+    mock_model.predict_probabilities.side_effect = slow_predict
+
+    cb = CircuitBreaker(failure_threshold=1, latency_budget_ms=5.0)
+    app = create_app(model=mock_model, circuit_breaker=cb)
+
+    with TestClient(app) as client:
+        client.post("/v1/score", json={"transaction": rec})
+        assert cb.state == "open"
+
+
+def test_traffic_shadowing_and_metrics(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+    tmp_path: Path,
+) -> None:
+    _, primary_model, dataset = api_context
+    recs = [dataset.features.iloc[i].to_dict() for i in range(5)]
+
+    shadow_model = MagicMock(wraps=primary_model)
+    shadow_model.metadata = {
+        "created_at": "2026-09-20",
+        "dataset_fingerprint": "shadow9876543210",
+    }
+    shadow_model.threshold = 0.5
+    shadow_model.predict_probabilities.side_effect = lambda df: np.array([0.99] * len(df))
+
+    sink = JsonlAuditSink(tmp_path / "audit_shadow.jsonl")
+    app = create_app(
+        model=primary_model,
+        shadow_model=shadow_model,
+        audit_sink=sink,
+    )
+
+    with TestClient(app) as client:
+        h = client.get("/health")
+        assert h.status_code == 200
+        assert h.json()["shadow_model_version"] == "shadow987654"
+
+        res = client.post("/v1/predict", json={"transactions": recs})
+        assert res.status_code == 200
+
+        res_single = client.post("/v1/score", json={"transaction": recs[0]})
+        assert res_single.status_code == 200
+
+        m = client.get("/metrics")
+        assert "fraud_shadow_evaluations_total" in m.text
+
+    sink.close()
+    lines = [
+        json.loads(line)
+        for line in (tmp_path / "audit_shadow.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    shadow_events = [event for event in lines if event.get("event_type") == "shadow_scoring"]
+    assert len(shadow_events) >= 2
+    assert shadow_events[0]["payload"]["evaluated_count"] == 5
+    assert shadow_events[0]["model_version"] == "shadow987654"
+
 
 
 

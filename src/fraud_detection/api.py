@@ -7,22 +7,23 @@ import math
 import os
 import re
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
-from typing import Annotated, cast
+from typing import Annotated, Any, cast
 from uuid import uuid4
 
 import pandas as pd
-from fastapi import FastAPI, Request
+from fastapi import BackgroundTasks, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from prometheus_client import (
     CONTENT_TYPE_LATEST,
     CollectorRegistry,
     Counter,
+    Gauge,
     Histogram,
     generate_latest,
 )
@@ -36,6 +37,7 @@ from fraud_detection.audit import (
     JsonlAuditSink,
     NullAuditSink,
     build_scoring_audit_event,
+    build_shadow_scoring_audit_event,
 )
 from fraud_detection.explanations import ExplanationProvider
 from fraud_detection.model import FraudModel, ModelArtifactError, load_model
@@ -46,6 +48,17 @@ FALLBACK_MODE_ENVIRONMENT_VARIABLE = "FRAUD_FALLBACK_MODE"
 FALLBACK_SCORE_ENVIRONMENT_VARIABLE = "FRAUD_FALLBACK_SCORE"
 FALLBACK_AMOUNT_THRESHOLD_ENVIRONMENT_VARIABLE = "FRAUD_FALLBACK_AMOUNT_THRESHOLD"
 DEGRADED_MODE_ENVIRONMENT_VARIABLE = "FRAUD_DEGRADED_MODE"
+SHADOW_MODEL_PATH_ENVIRONMENT_VARIABLE = "FRAUD_SHADOW_MODEL_PATH"
+CIRCUIT_BREAKER_ENABLED_ENVIRONMENT_VARIABLE = "FRAUD_CIRCUIT_BREAKER_ENABLED"
+CIRCUIT_BREAKER_FAILURE_THRESHOLD_ENVIRONMENT_VARIABLE = (
+    "FRAUD_CIRCUIT_BREAKER_FAILURE_THRESHOLD"
+)
+CIRCUIT_BREAKER_RECOVERY_TIMEOUT_ENVIRONMENT_VARIABLE = (
+    "FRAUD_CIRCUIT_BREAKER_RECOVERY_TIMEOUT"
+)
+CIRCUIT_BREAKER_LATENCY_BUDGET_ENVIRONMENT_VARIABLE = (
+    "FRAUD_CIRCUIT_BREAKER_LATENCY_BUDGET_MS"
+)
 REQUEST_ID_HEADER = "X-Request-ID"
 PROCESS_TIME_HEADER = "X-Process-Time-Ms"
 MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024
@@ -89,6 +102,119 @@ class _RateLimiter:
             remaining=self.max_requests - len(timestamps),
             retry_after_seconds=0,
         )
+
+
+class CircuitBreaker:
+    """Automated operational circuit breaker protecting scoring endpoints."""
+
+    def __init__(
+        self,
+        *,
+        failure_threshold: int = 5,
+        recovery_timeout: float = 30.0,
+        latency_budget_ms: float | None = None,
+        half_open_success_threshold: int = 1,
+        on_trip: Callable[[], None] | None = None,
+    ) -> None:
+        if failure_threshold < 1:
+            raise ValueError("failure_threshold must be at least 1.")
+        if recovery_timeout <= 0:
+            raise ValueError("recovery_timeout must be positive.")
+        if latency_budget_ms is not None and latency_budget_ms <= 0:
+            raise ValueError("latency_budget_ms must be positive.")
+        if half_open_success_threshold < 1:
+            raise ValueError("half_open_success_threshold must be at least 1.")
+
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self.latency_budget_ms = latency_budget_ms
+        self.half_open_success_threshold = half_open_success_threshold
+        self.on_trip = on_trip
+
+        self.state = "closed"
+        self.consecutive_failures = 0
+        self.consecutive_successes = 0
+        self.last_failure_time: float | None = None
+        self.last_state_change = time.time()
+
+    def allow_request(self) -> bool:
+        """Determine whether an incoming request may proceed to primary model scoring."""
+        if self.state == "closed":
+            return True
+        if self.state == "open":
+            now = time.time()
+            if (
+                self.last_failure_time is not None
+                and (now - self.last_failure_time) >= self.recovery_timeout
+            ):
+                self.state = "half_open"
+                self.consecutive_successes = 0
+                self.last_state_change = now
+                logger.info("CircuitBreaker transitioned from open to half_open (probing).")
+                return True
+            return False
+        return True
+
+    def record_success(self) -> None:
+        """Record a successful primary evaluation within latency budget."""
+        if self.state == "half_open":
+            self.consecutive_successes += 1
+            if self.consecutive_successes >= self.half_open_success_threshold:
+                self.state = "closed"
+                self.consecutive_failures = 0
+                self.consecutive_successes = 0
+                self.last_state_change = time.time()
+                logger.info("CircuitBreaker recovered: transitioned from half_open to closed.")
+        elif self.state == "closed":
+            self.consecutive_failures = 0
+
+    def record_failure(self, reason: str = "exception") -> None:
+        """Record a failure (exception or latency budget breach)."""
+        now = time.time()
+        self.last_failure_time = now
+        self.consecutive_failures += 1
+        if self.state == "half_open":
+            self.state = "open"
+            self.last_state_change = now
+            if self.on_trip is not None:
+                self.on_trip()
+            logger.warning("CircuitBreaker probe failed (%s); transitioned back to open.", reason)
+        elif self.state == "closed":
+            if self.consecutive_failures >= self.failure_threshold:
+                self.state = "open"
+                self.last_state_change = now
+                if self.on_trip is not None:
+                    self.on_trip()
+                logger.warning(
+                    "CircuitBreaker tripped to open after %d consecutive failures (%s).",
+                    self.consecutive_failures,
+                    reason,
+                )
+
+    def trip(self) -> None:
+        """Force the circuit breaker to OPEN state."""
+        self.state = "open"
+        self.last_failure_time = time.time()
+        self.last_state_change = time.time()
+        if self.on_trip is not None:
+            self.on_trip()
+
+    def reset(self) -> None:
+        """Reset the circuit breaker to CLOSED state."""
+        self.state = "closed"
+        self.consecutive_failures = 0
+        self.consecutive_successes = 0
+        self.last_state_change = time.time()
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return circuit breaker status dictionary."""
+        return {
+            "state": self.state,
+            "consecutive_failures": self.consecutive_failures,
+            "failure_threshold": self.failure_threshold,
+            "recovery_timeout": self.recovery_timeout,
+            "latency_budget_ms": self.latency_budget_ms,
+        }
 
 
 class PredictionRequest(BaseModel):
@@ -157,6 +283,9 @@ class HealthResponse(BaseModel):
     threshold: float
     degraded_mode: bool | None = None
     fallback_mode: str | None = None
+    circuit_breaker: dict[str, Any] | None = None
+    shadow_model_version: str | None = None
+
 
 
 
@@ -173,6 +302,12 @@ def create_app(
     fallback_score: float | None = None,
     fallback_amount_threshold: float | None = None,
     degraded_mode: bool | None = None,
+    shadow_model: FraudModel | None = None,
+    shadow_model_path: Path | str | None = None,
+    circuit_breaker: CircuitBreaker | None = None,
+    latency_budget_ms: float | None = None,
+    circuit_breaker_failure_threshold: int = 5,
+    circuit_breaker_recovery_timeout: float = 30.0,
 ) -> FastAPI:
     """Create an application using an injected model or a trusted artifact path.
 
@@ -193,6 +328,12 @@ def create_app(
         fallback_score: Fixed score for 'constant' fallback mode (default: 0.5).
         fallback_amount_threshold: Amount cutoff for 'rule' fallback mode (default: 1000.0).
         degraded_mode: When True, bypasses primary model and uses fallback policy.
+        shadow_model: Pre-loaded shadow challenger model instance.
+        shadow_model_path: Path to shadow challenger model artifact directory.
+        circuit_breaker: Optional pre-configured CircuitBreaker instance.
+        latency_budget_ms: Max scoring latency (ms) before tripping circuit breaker.
+        circuit_breaker_failure_threshold: Consecutive failures before opening circuit breaker.
+        circuit_breaker_recovery_timeout: Seconds before probing recovery in half-open state.
     """
     logging.basicConfig(level=logging.INFO)
 
@@ -228,6 +369,40 @@ def create_app(
         else os.getenv(DEGRADED_MODE_ENVIRONMENT_VARIABLE, "false").lower() in {"1", "true", "yes"}
     )
 
+    resolved_shadow_path = shadow_model_path or os.getenv(SHADOW_MODEL_PATH_ENVIRONMENT_VARIABLE)
+
+    cb_enabled = (
+        circuit_breaker is not None
+        or latency_budget_ms is not None
+        or os.getenv(CIRCUIT_BREAKER_ENABLED_ENVIRONMENT_VARIABLE, "false").lower()
+        in {"1", "true", "yes"}
+    )
+    resolved_cb: CircuitBreaker | None = None
+    if circuit_breaker is not None:
+        resolved_cb = circuit_breaker
+    elif cb_enabled:
+        fail_thresh = int(
+            os.getenv(
+                CIRCUIT_BREAKER_FAILURE_THRESHOLD_ENVIRONMENT_VARIABLE,
+                str(circuit_breaker_failure_threshold),
+            )
+        )
+        recov_timeout = float(
+            os.getenv(
+                CIRCUIT_BREAKER_RECOVERY_TIMEOUT_ENVIRONMENT_VARIABLE,
+                str(circuit_breaker_recovery_timeout),
+            )
+        )
+        lat_budget = latency_budget_ms
+        env_lat = os.getenv(CIRCUIT_BREAKER_LATENCY_BUDGET_ENVIRONMENT_VARIABLE)
+        if lat_budget is None and env_lat:
+            lat_budget = float(env_lat)
+        resolved_cb = CircuitBreaker(
+            failure_threshold=fail_thresh,
+            recovery_timeout=recov_timeout,
+            latency_budget_ms=lat_budget,
+        )
+
     metrics_registry = CollectorRegistry()
     request_counter = Counter(
         "http_requests_total",
@@ -253,6 +428,31 @@ def create_app(
         ["mode", "reason"],
         registry=metrics_registry,
     )
+    circuit_breaker_gauge = Gauge(
+        "fraud_circuit_breaker_state",
+        "State of the scoring circuit breaker (0=closed, 1=half_open, 2=open).",
+        registry=metrics_registry,
+    )
+    circuit_breaker_tripped_counter = Counter(
+        "fraud_circuit_breaker_tripped_total",
+        "Total times the scoring circuit breaker has tripped to open.",
+        registry=metrics_registry,
+    )
+    shadow_evaluations_counter = Counter(
+        "fraud_shadow_evaluations_total",
+        "Total transactions evaluated by shadow challenger model.",
+        ["has_discrepancy"],
+        registry=metrics_registry,
+    )
+    shadow_discrepancies_counter = Counter(
+        "fraud_shadow_discrepancies_total",
+        "Total shadow challenger classification discrepancies with primary model.",
+        ["shadow_decision", "primary_decision"],
+        registry=metrics_registry,
+    )
+
+    if resolved_cb is not None:
+        resolved_cb.on_trip = circuit_breaker_tripped_counter.inc
 
     rate_limiter = (
         _RateLimiter(rate_limit_requests, rate_limit_window_seconds)
@@ -282,7 +482,14 @@ def create_app(
                     "or pass model_path to create_app()."
                 )
             loaded_model = load_model(configured_path)
+
+        loaded_shadow = shadow_model
+        if loaded_shadow is None and resolved_shadow_path is not None:
+            loaded_shadow = load_model(resolved_shadow_path)
+
         application.state.model = loaded_model
+        application.state.shadow_model = loaded_shadow
+        application.state.circuit_breaker = resolved_cb
         application.state.audit_sink = resolved_audit_sink
         application.state.explanation_provider = explanation_provider
         application.state.fallback_mode = resolved_fallback_mode
@@ -290,6 +497,10 @@ def create_app(
         application.state.fallback_amount_threshold = resolved_fallback_amount
         application.state.degraded_mode = resolved_degraded_mode
         application.state.fallback_counter = fallback_counter
+        application.state.shadow_evaluations_counter = shadow_evaluations_counter
+        application.state.shadow_discrepancies_counter = shadow_discrepancies_counter
+        application.state.circuit_breaker_tripped_counter = circuit_breaker_tripped_counter
+        application.state.circuit_breaker_gauge = circuit_breaker_gauge
         yield
         resolved_audit_sink.close()
 
@@ -429,7 +640,17 @@ def create_app(
     async def health(request: Request) -> HealthResponse:
         loaded = _model_from_request(request)
         is_degraded = bool(getattr(request.app.state, "degraded_mode", False))
+        cb: CircuitBreaker | None = getattr(request.app.state, "circuit_breaker", None)
+        cb_dict = cb.to_dict() if cb is not None else None
+        if cb is not None and cb.state == "open":
+            is_degraded = True
         fb_mode = str(getattr(request.app.state, "fallback_mode", "raise"))
+        sh_model: FraudModel | None = getattr(request.app.state, "shadow_model", None)
+        sh_ver = (
+            str(sh_model.metadata["dataset_fingerprint"])[:12]
+            if sh_model is not None
+            else None
+        )
         return HealthResponse(
             status="degraded" if is_degraded else "ready",
             service_version=__version__,
@@ -438,6 +659,8 @@ def create_app(
             threshold=loaded.threshold,
             degraded_mode=True if is_degraded else None,
             fallback_mode=fb_mode if fb_mode != "raise" else None,
+            circuit_breaker=cb_dict,
+            shadow_model_version=sh_ver,
         )
 
     def score_frame(
@@ -451,6 +674,7 @@ def create_app(
         fallback_score: float = 0.5,
         fallback_amount_threshold: float = 1000.0,
         force_degraded: bool = False,
+        circuit_breaker: CircuitBreaker | None = None,
     ) -> tuple[float, list[PredictionResult], bool, str | None]:
         """Score transactions with runtime guardrails and resilient degraded-state fallback."""
         applied_threshold = loaded.threshold if threshold is None else threshold
@@ -461,10 +685,29 @@ def create_app(
         if force_degraded and fallback_mode != "raise":
             fallback_applied = True
             fallback_reason = "degraded_mode_active"
+        elif circuit_breaker is not None and not circuit_breaker.allow_request():
+            if fallback_mode == "raise":
+                raise RuntimeError("Circuit breaker is OPEN: primary model scoring is suspended.")
+            fallback_applied = True
+            fallback_reason = "circuit_breaker_open"
         else:
+            t0 = perf_counter()
             try:
                 probabilities = loaded.predict_probabilities(frame)
+                elapsed_ms = (perf_counter() - t0) * 1000.0
+                if circuit_breaker is not None:
+                    if (
+                        circuit_breaker.latency_budget_ms is not None
+                        and elapsed_ms > circuit_breaker.latency_budget_ms
+                    ):
+                        circuit_breaker.record_failure(reason="latency_budget_exceeded")
+                    else:
+                        circuit_breaker.record_success()
             except Exception as exc:
+                if circuit_breaker is not None:
+                    circuit_breaker.record_failure(
+                        reason=f"model_exception: {type(exc).__name__}"
+                    )
                 if fallback_mode == "raise":
                     raise
                 logger.warning(
@@ -553,7 +796,11 @@ def create_app(
         response_model=PredictionResponse,
         tags=["predictions"],
     )
-    async def predict(payload: PredictionRequest, request: Request) -> PredictionResponse:
+    async def predict(
+        payload: PredictionRequest,
+        request: Request,
+        background_tasks: BackgroundTasks,
+    ) -> PredictionResponse:
         loaded = _model_from_request(request)
         frame = pd.DataFrame(payload.transactions)
         force_degraded = bool(getattr(request.app.state, "degraded_mode", False)) or (
@@ -562,6 +809,7 @@ def create_app(
         fb_mode = str(getattr(request.app.state, "fallback_mode", "raise"))
         fb_score = float(getattr(request.app.state, "fallback_score", 0.5))
         fb_amount = float(getattr(request.app.state, "fallback_amount_threshold", 1000.0))
+        cb: CircuitBreaker | None = getattr(request.app.state, "circuit_breaker", None)
 
         applied_threshold, results, fallback_applied, fallback_reason = score_frame(
             loaded,
@@ -573,6 +821,7 @@ def create_app(
             fallback_score=fb_score,
             fallback_amount_threshold=fb_amount,
             force_degraded=force_degraded,
+            circuit_breaker=cb,
         )
         sink: AuditSink = getattr(request.app.state, "audit_sink", resolved_audit_sink)
         try:
@@ -597,6 +846,24 @@ def create_app(
             sink.emit(audit_event)
         except Exception:
             logger.exception("Failed to emit scoring audit event.")
+
+        sh_model: FraudModel | None = getattr(request.app.state, "shadow_model", None)
+        if sh_model is not None:
+            background_tasks.add_task(
+                _evaluate_shadow_traffic,
+                shadow_model=sh_model,
+                frame=frame,
+                primary_results=results,
+                audit_sink=sink,
+                request_id=getattr(request.state, "request_id", None),
+                shadow_evaluations_counter=getattr(
+                    request.app.state, "shadow_evaluations_counter", None
+                ),
+                shadow_discrepancies_counter=getattr(
+                    request.app.state, "shadow_discrepancies_counter", None
+                ),
+            )
+
         return PredictionResponse(
             model_version=str(loaded.metadata["dataset_fingerprint"])[:12],
             threshold=applied_threshold,
@@ -611,7 +878,11 @@ def create_app(
         response_model=ScoreResponse,
         tags=["predictions"],
     )
-    async def score(payload: ScoreRequest, request: Request) -> ScoreResponse:
+    async def score(
+        payload: ScoreRequest,
+        request: Request,
+        background_tasks: BackgroundTasks,
+    ) -> ScoreResponse:
         loaded = _model_from_request(request)
         frame = pd.DataFrame([payload.transaction])
         force_degraded = bool(getattr(request.app.state, "degraded_mode", False)) or (
@@ -620,6 +891,7 @@ def create_app(
         fb_mode = str(getattr(request.app.state, "fallback_mode", "raise"))
         fb_score = float(getattr(request.app.state, "fallback_score", 0.5))
         fb_amount = float(getattr(request.app.state, "fallback_amount_threshold", 1000.0))
+        cb: CircuitBreaker | None = getattr(request.app.state, "circuit_breaker", None)
 
         applied_threshold, results, fallback_applied, fallback_reason = score_frame(
             loaded,
@@ -631,6 +903,7 @@ def create_app(
             fallback_score=fb_score,
             fallback_amount_threshold=fb_amount,
             force_degraded=force_degraded,
+            circuit_breaker=cb,
         )
         sink: AuditSink = getattr(request.app.state, "audit_sink", resolved_audit_sink)
         try:
@@ -654,6 +927,24 @@ def create_app(
             sink.emit(audit_event)
         except Exception:
             logger.exception("Failed to emit scoring audit event.")
+
+        sh_model: FraudModel | None = getattr(request.app.state, "shadow_model", None)
+        if sh_model is not None:
+            background_tasks.add_task(
+                _evaluate_shadow_traffic,
+                shadow_model=sh_model,
+                frame=frame,
+                primary_results=results,
+                audit_sink=sink,
+                request_id=getattr(request.state, "request_id", None),
+                shadow_evaluations_counter=getattr(
+                    request.app.state, "shadow_evaluations_counter", None
+                ),
+                shadow_discrepancies_counter=getattr(
+                    request.app.state, "shadow_discrepancies_counter", None
+                ),
+            )
+
         return ScoreResponse(
             model_version=str(loaded.metadata["dataset_fingerprint"])[:12],
             threshold=applied_threshold,
@@ -665,12 +956,79 @@ def create_app(
 
     @application.get("/metrics", tags=["operations"])
     async def metrics() -> Response:
+        cb: CircuitBreaker | None = getattr(application.state, "circuit_breaker", None)
+        if cb is not None:
+            gauge: Gauge | None = getattr(application.state, "circuit_breaker_gauge", None)
+            if gauge is not None:
+                state_map = {"closed": 0.0, "half_open": 1.0, "open": 2.0}
+                gauge.set(state_map.get(cb.state, 0.0))
         return Response(
             content=generate_latest(metrics_registry),
             media_type=CONTENT_TYPE_LATEST,
         )
 
     return application
+
+
+def _evaluate_shadow_traffic(
+    *,
+    shadow_model: FraudModel,
+    frame: pd.DataFrame,
+    primary_results: list[PredictionResult],
+    audit_sink: AuditSink,
+    request_id: str | None,
+    shadow_evaluations_counter: Counter | None = None,
+    shadow_discrepancies_counter: Counter | None = None,
+) -> None:
+    """Evaluate candidate transactions against shadow model asynchronously."""
+    try:
+        shadow_probabilities = shadow_model.predict_probabilities(frame)
+        shadow_decisions = shadow_probabilities >= shadow_model.threshold
+
+        discrepancies = 0
+        discrepancy_details: list[dict[str, Any]] = []
+        for idx, (p_res, s_prob, s_dec) in enumerate(
+            zip(primary_results, shadow_probabilities, shadow_decisions, strict=True)
+        ):
+            s_dec_bool = bool(s_dec)
+            if p_res.is_fraud != s_dec_bool:
+                discrepancies += 1
+                discrepancy_details.append(
+                    {
+                        "index": idx,
+                        "primary_probability": p_res.fraud_probability,
+                        "primary_decision": p_res.is_fraud,
+                        "shadow_probability": float(s_prob),
+                        "shadow_decision": s_dec_bool,
+                    }
+                )
+                if shadow_discrepancies_counter is not None:
+                    shadow_discrepancies_counter.labels(
+                        shadow_decision=str(s_dec_bool).lower(),
+                        primary_decision=str(p_res.is_fraud).lower(),
+                    ).inc()
+
+        has_discrepancy = discrepancies > 0
+        if shadow_evaluations_counter is not None:
+            shadow_evaluations_counter.labels(
+                has_discrepancy=str(has_discrepancy).lower()
+            ).inc(len(primary_results))
+
+        shadow_event = build_shadow_scoring_audit_event(
+            shadow_model_version=str(
+                shadow_model.metadata.get("dataset_fingerprint", "")
+            )[:12],
+            shadow_dataset_fingerprint=str(
+                shadow_model.metadata.get("dataset_fingerprint", "")
+            ),
+            evaluated_count=len(primary_results),
+            discrepancy_count=discrepancies,
+            discrepancies=discrepancy_details,
+            request_id=request_id,
+        )
+        audit_sink.emit(shadow_event)
+    except Exception:
+        logger.exception("Shadow scoring evaluation failed.")
 
 
 async def _request_body_error(request: Request) -> JSONResponse | None:
