@@ -29,6 +29,7 @@ from fraud_detection.data import (
     DataValidationError,
     ValidatedDataset,
     generate_synthetic_data,
+    inject_drift,
     load_csv,
 )
 from fraud_detection.drift import (
@@ -2074,6 +2075,96 @@ def stream_profile_command(
         pd.errors.EmptyDataError,
         ModelArtifactError,
         DriftError,
+    ) as exc:
+        _abort(str(exc))
+
+
+@app.command("simulate-drift")
+def simulate_drift_command(
+    data: Annotated[
+        Path,
+        typer.Argument(
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="Input CSV dataset to inject drift into.",
+        ),
+    ],
+    output: Annotated[
+        Path,
+        typer.Option("--output", "-o", help="Destination CSV file for drifted dataset."),
+    ],
+    features: Annotated[
+        list[str] | None,
+        typer.Option(
+            help="Specific features to drift (repeat flag; defaults to all non-target)."
+        ),
+    ] = None,
+    mean_offset: Annotated[
+        float,
+        typer.Option(help="Additive shift applied to feature distributions."),
+    ] = 0.0,
+    variance_scale: Annotated[
+        float,
+        typer.Option(min=0.0, help="Multiplicative scale applied to standard deviations."),
+    ] = 1.0,
+    anomaly_fraction: Annotated[
+        float,
+        typer.Option(min=0.0, max=1.0, help="Fraction of rows to inject anomaly spikes into."),
+    ] = 0.0,
+    anomaly_scale: Annotated[
+        float,
+        typer.Option(min=0.0, help="Magnitude multiplier for injected anomaly spikes."),
+    ] = 5.0,
+    sample_fraction: Annotated[
+        float,
+        typer.Option(min=0.01, max=1.0, help="Fraction of recent tail rows to modify."),
+    ] = 1.0,
+    seed: Annotated[
+        int,
+        typer.Option(help="Random seed for repeatable noise and sampling."),
+    ] = 42,
+    target: Annotated[
+        str,
+        typer.Option(help="Optional label column to preserve without modification."),
+    ] = DEFAULT_TARGET,
+    overwrite: Annotated[
+        bool,
+        typer.Option(help="Replace existing destination file."),
+    ] = False,
+) -> None:
+    """Inject synthetic distribution shifts and anomalies for chaos and surveillance testing."""
+    _guard_output(output, overwrite)
+
+    try:
+        frame = pd.read_csv(data)
+        drifted = inject_drift(
+            frame,
+            target_features=features,
+            mean_offset=mean_offset,
+            variance_scale=variance_scale,
+            anomaly_fraction=anomaly_fraction,
+            anomaly_scale=anomaly_scale,
+            sample_fraction=sample_fraction,
+            target_column=target,
+            random_state=seed,
+        )
+        output.parent.mkdir(parents=True, exist_ok=True)
+        drifted.to_csv(output, index=False)
+        num_drifted_features = len(features) if features else len(
+            [c for c in frame.columns if c != target]
+        )
+        affected_rows = max(1, round(len(frame) * sample_fraction))
+        typer.echo(
+            f"Successfully injected drift into {num_drifted_features} features across "
+            f"{affected_rows}/{len(frame)} rows. Saved to {output}."
+        )
+    except (
+        OSError,
+        UnicodeDecodeError,
+        pd.errors.ParserError,
+        pd.errors.EmptyDataError,
+        DataValidationError,
     ) as exc:
         _abort(str(exc))
 

@@ -2451,5 +2451,119 @@ def test_stream_profile_cli_error_empty_data(tmp_path: Path) -> None:
     assert result.exit_code == 2
 
 
+def test_simulate_drift_cli_success(tmp_path: Path) -> None:
+    csv_path = tmp_path / "input.csv"
+    generate_synthetic_data(rows=250, random_state=42).to_csv(csv_path, index=False)
+    drifted_path = tmp_path / "drifted.csv"
+
+    result = runner.invoke(
+        app,
+        [
+            "simulate-drift",
+            str(csv_path),
+            "-o",
+            str(drifted_path),
+            "--mean-offset",
+            "10.0",
+            "--variance-scale",
+            "1.5",
+            "--sample-fraction",
+            "0.5",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "Successfully injected drift" in result.output
+    assert drifted_path.is_file()
+
+    drifted_df = pd.read_csv(drifted_path)
+    assert len(drifted_df) == 250
+
+
+def test_simulate_drift_cli_specific_features(tmp_path: Path) -> None:
+    csv_path = tmp_path / "input.csv"
+    orig_df = generate_synthetic_data(rows=250, random_state=42)
+    orig_df.to_csv(csv_path, index=False)
+    drifted_path = tmp_path / "drifted_amount.csv"
+
+    result = runner.invoke(
+        app,
+        [
+            "simulate-drift",
+            str(csv_path),
+            "-o",
+            str(drifted_path),
+            "--features",
+            "Amount",
+            "--mean-offset",
+            "100.0",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    drifted_df = pd.read_csv(drifted_path)
+    assert drifted_df["Amount"].mean() > orig_df["Amount"].mean() + 80.0
+    pd.testing.assert_series_equal(drifted_df["V1"], orig_df["V1"])
+
+
+def test_simulate_drift_cli_validation_error(tmp_path: Path) -> None:
+    csv_path = tmp_path / "input.csv"
+    generate_synthetic_data(rows=250, random_state=42).to_csv(csv_path, index=False)
+    drifted_path = tmp_path / "drifted.csv"
+
+    result = runner.invoke(
+        app,
+        [
+            "simulate-drift",
+            str(csv_path),
+            "-o",
+            str(drifted_path),
+            "--features",
+            "non_existent",
+        ],
+    )
+    assert result.exit_code == 2
+    assert "Target features not found" in result.output
+
+
+def test_simulate_drift_e2e_with_multi_window_surveillance(
+    tmp_path: Path, trained_artifact: Path
+) -> None:
+    csv_path = tmp_path / "baseline.csv"
+    generate_synthetic_data(rows=300, random_state=42).to_csv(csv_path, index=False)
+    drifted_path = tmp_path / "chaos_drifted.csv"
+
+    # Inject extreme tail drift in the last 50 rows
+    sim_res = runner.invoke(
+        app,
+        [
+            "simulate-drift",
+            str(csv_path),
+            "-o",
+            str(drifted_path),
+            "--mean-offset",
+            "20.0",
+            "--sample-fraction",
+            "0.166",
+        ],
+    )
+    assert sim_res.exit_code == 0, sim_res.output
+
+    # Multi-window surveillance on the shifted dataset
+    mw_res = runner.invoke(
+        app,
+        [
+            "multi-window-drift",
+            str(trained_artifact),
+            str(drifted_path),
+            "--short-window-rows",
+            "50",
+            "--fail-on",
+            "warning",
+        ],
+    )
+    assert mw_res.exit_code == 1
+    assert "Multi-window drift surveillance tripped" in mw_res.output
+
+
+
 
 
