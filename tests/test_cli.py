@@ -2248,3 +2248,77 @@ def test_replay_audit_cli_invalid_model_error(tmp_path: Path) -> None:
     assert "Error:" in result.output
 
 
+def test_multi_window_drift_cli_success(tmp_path: Path, trained_artifact: Path) -> None:
+    data_path = tmp_path / "drift_data.csv"
+    generate_synthetic_data(rows=250, random_state=42).to_csv(data_path, index=False)
+    out_file = tmp_path / "mw_report.json"
+
+    result = runner.invoke(
+        app,
+        [
+            "multi-window-drift",
+            str(trained_artifact),
+            str(data_path),
+            "--short-window-rows",
+            "50",
+            "--output",
+            str(out_file),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    report = json.loads(result.stdout)
+    assert report["short_window_rows"] == 50
+    assert report["long_window_rows"] == 250
+    assert report["overall_status"] in ("stable", "warning", "drifted")
+    assert "max_velocity" in report
+    assert out_file.exists()
+
+
+def test_multi_window_drift_cli_surveillance_tripped_and_webhooks(
+    tmp_path: Path, trained_artifact: Path
+) -> None:
+    data_path = tmp_path / "drift_data.csv"
+    generate_synthetic_data(rows=250, random_state=42).to_csv(data_path, index=False)
+
+    with patch("urllib.request.urlopen") as mock_urlopen:
+        mock_urlopen.return_value = MagicMock()
+        result = runner.invoke(
+            app,
+            [
+                "multi-window-drift",
+                str(trained_artifact),
+                str(data_path),
+                "--short-window-rows",
+                "50",
+                "--fail-on",
+                "stable",
+                "--webhook-slack",
+                "https://hooks.slack.com/services/test/123",
+                "--webhook-pagerduty",
+                "pd_key_abc",
+            ],
+        )
+        assert result.exit_code == 1
+        assert "Multi-window drift surveillance tripped" in result.output
+        assert mock_urlopen.call_count == 2
+
+
+def test_multi_window_drift_cli_error_handling(tmp_path: Path, trained_artifact: Path) -> None:
+    data_path = tmp_path / "short_data.csv"
+    generate_synthetic_data(rows=250, random_state=42).iloc[:10].to_csv(data_path, index=False)
+
+    result = runner.invoke(
+        app,
+        [
+            "multi-window-drift",
+            str(trained_artifact),
+            str(data_path),
+            "--short-window-rows",
+            "50",
+        ],
+    )
+    assert result.exit_code == 2
+    assert "less than short_window_rows" in result.output
+
+
+

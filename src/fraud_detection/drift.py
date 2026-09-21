@@ -50,6 +50,49 @@ class DriftReport:
         }
 
 
+@dataclass(frozen=True)
+class MultiWindowFeatureDrift:
+    """Drift result for one model feature across dual observation windows."""
+
+    feature: str
+    short_psi: float
+    long_psi: float
+    velocity: float
+    status: str
+
+
+@dataclass(frozen=True)
+class MultiWindowDriftReport:
+    """Serializable multi-window drift report for short and long surveillance windows."""
+
+    short_window_rows: int
+    long_window_rows: int
+    overall_status: str
+    mean_short_psi: float
+    max_short_psi: float
+    mean_long_psi: float
+    max_long_psi: float
+    max_velocity: float
+    features: tuple[MultiWindowFeatureDrift, ...]
+    warning_at: float = STABLE_THRESHOLD
+    drift_at: float = DRIFT_THRESHOLD
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-compatible report mapping."""
+        return {
+            "short_window_rows": self.short_window_rows,
+            "long_window_rows": self.long_window_rows,
+            "overall_status": self.overall_status,
+            "mean_short_psi": self.mean_short_psi,
+            "max_short_psi": self.max_short_psi,
+            "mean_long_psi": self.mean_long_psi,
+            "max_long_psi": self.max_long_psi,
+            "max_velocity": self.max_velocity,
+            "thresholds": {"warning_at": self.warning_at, "drift_at": self.drift_at},
+            "features": [asdict(item) for item in self.features],
+        }
+
+
 def default_thresholds() -> dict[str, float]:
     """Return the reference PSI cutoffs persisted with each model card."""
     return {"warning_at": STABLE_THRESHOLD, "drift_at": DRIFT_THRESHOLD}
@@ -220,6 +263,77 @@ def assess_drift(
         warning_at=warning_at,
         drift_at=drift_at,
     )
+
+
+def assess_multi_window_drift(
+    reference_profile: dict[str, dict[str, Any]],
+    features: pd.DataFrame,
+    *,
+    short_window_rows: int = 100,
+    thresholds: object = None,
+) -> MultiWindowDriftReport:
+    """Compare recent (short window) and aggregate (long window) features with baseline.
+
+    The short window evaluates the last `short_window_rows` transactions in
+    `features`, while the long window evaluates the entire feature set.
+    Drift velocity is calculated as `(short_psi - long_psi)` to reveal rapid
+    distribution shifts before long-term metrics trip.
+    """
+    if short_window_rows < 2:
+        raise DriftError("short_window_rows must be at least 2.")
+    if len(features) < short_window_rows:
+        raise DriftError(
+            f"Current features rows ({len(features)}) is less than "
+            f"short_window_rows ({short_window_rows})."
+        )
+
+    warning_at, drift_at = resolve_thresholds(thresholds)
+    long_report = assess_drift(reference_profile, features, thresholds=thresholds)
+    short_features = features.iloc[-short_window_rows:]
+    short_report = assess_drift(reference_profile, short_features, thresholds=thresholds)
+
+    short_lookup = {item.feature: item for item in short_report.features}
+    long_lookup = {item.feature: item for item in long_report.features}
+
+    results: list[MultiWindowFeatureDrift] = []
+    for feature, long_item in long_lookup.items():
+        short_item = short_lookup[feature]
+        s_psi = short_item.psi
+        l_psi = long_item.psi
+        vel = s_psi - l_psi
+        feat_status = _status(max(s_psi, l_psi), warning_at=warning_at, drift_at=drift_at)
+        results.append(
+            MultiWindowFeatureDrift(
+                feature=feature,
+                short_psi=s_psi,
+                long_psi=l_psi,
+                velocity=vel,
+                status=feat_status,
+            )
+        )
+
+    ordered = tuple(sorted(results, key=lambda item: item.short_psi, reverse=True))
+    short_psis = [item.short_psi for item in ordered]
+    long_psis = [item.long_psi for item in ordered]
+    velocities = [item.velocity for item in ordered]
+
+    overall_max_psi = max(short_report.max_psi, long_report.max_psi)
+    overall_status = _status(overall_max_psi, warning_at=warning_at, drift_at=drift_at)
+
+    return MultiWindowDriftReport(
+        short_window_rows=short_window_rows,
+        long_window_rows=len(features),
+        overall_status=overall_status,
+        mean_short_psi=float(np.mean(short_psis)),
+        max_short_psi=float(np.max(short_psis)),
+        mean_long_psi=float(np.mean(long_psis)),
+        max_long_psi=float(np.max(long_psis)),
+        max_velocity=float(np.max(velocities)),
+        features=ordered,
+        warning_at=warning_at,
+        drift_at=drift_at,
+    )
+
 
 
 _SURVEILLANCE_SEVERITY = {"stable": 0, "warning": 1, "drifted": 2}

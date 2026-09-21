@@ -8,7 +8,10 @@ from fraud_detection.drift import (
     DRIFT_THRESHOLD,
     STABLE_THRESHOLD,
     DriftError,
+    MultiWindowDriftReport,
+    MultiWindowFeatureDrift,
     assess_drift,
+    assess_multi_window_drift,
     build_reference_profile,
     default_thresholds,
     resolve_thresholds,
@@ -225,3 +228,88 @@ def test_reference_profile_rejects_numeric_overflow() -> None:
 
     with pytest.raises(DriftError, match="numeric overflow"):
         build_reference_profile(frame)
+
+
+def test_multi_window_drift_stable() -> None:
+    frame = pd.DataFrame(
+        {
+            "amount": np.tile(np.linspace(1, 100, 10), 100),
+            "velocity": np.tile(np.arange(10), 100),
+        }
+    )
+    profile = build_reference_profile(frame)
+
+    report = assess_multi_window_drift(profile, frame, short_window_rows=100)
+
+    assert isinstance(report, MultiWindowDriftReport)
+    assert isinstance(report.features[0], MultiWindowFeatureDrift)
+    assert report.overall_status == "stable"
+    assert report.short_window_rows == 100
+    assert report.long_window_rows == 1_000
+    assert report.max_short_psi == pytest.approx(0.0)
+    assert report.max_long_psi == pytest.approx(0.0)
+    assert report.max_velocity == pytest.approx(0.0)
+
+    d = report.to_dict()
+    assert d["short_window_rows"] == 100
+    assert d["long_window_rows"] == 1_000
+    assert d["overall_status"] == "stable"
+    assert len(d["features"]) == 2
+    assert "velocity" in d["features"][0]
+
+
+def test_multi_window_drift_detects_sudden_acceleration() -> None:
+    rng = np.random.default_rng(42)
+    reference = pd.DataFrame(
+        {
+            "stable_feat": rng.normal(0, 1, 1_500),
+            "spiking_feat": rng.normal(0, 1, 1_500),
+        }
+    )
+    profile = build_reference_profile(reference)
+
+    # Current has mostly baseline, but the last 150 rows have an extreme shift
+    current = pd.DataFrame(
+        {
+            "stable_feat": rng.normal(0, 1, 1_000),
+            "spiking_feat": np.concatenate(
+                [rng.normal(0, 1, 850), rng.normal(15, 1, 150)]
+            ),
+        }
+    )
+
+    report = assess_multi_window_drift(profile, current, short_window_rows=100)
+
+    assert report.overall_status == "drifted"
+    spiking = next(item for item in report.features if item.feature == "spiking_feat")
+    assert spiking.short_psi > spiking.long_psi
+    assert spiking.velocity > 0.0
+    assert spiking.status == "drifted"
+    assert report.max_velocity > 0.0
+
+
+def test_multi_window_drift_rejects_invalid_short_window() -> None:
+    frame = pd.DataFrame({"x": [1.0, 2.0, 3.0, 4.0, 5.0]})
+    profile = build_reference_profile(frame)
+
+    with pytest.raises(DriftError, match=r"short_window_rows must be at least 2"):
+        assess_multi_window_drift(profile, frame, short_window_rows=1)
+
+    with pytest.raises(DriftError, match=r"less than short_window_rows"):
+        assess_multi_window_drift(profile, frame, short_window_rows=10)
+
+
+def test_multi_window_drift_honors_thresholds() -> None:
+    rng = np.random.default_rng(42)
+    reference = pd.DataFrame({"x": rng.normal(0, 1, 1_000)})
+    profile = build_reference_profile(reference)
+    current = pd.DataFrame({"x": rng.normal(1, 1, 500)})
+
+    # Strict thresholds: turns small change into drifted
+    report = assess_multi_window_drift(
+        profile, current, short_window_rows=100, thresholds={"warning_at": 0.01, "drift_at": 0.02}
+    )
+    assert report.overall_status == "drifted"
+    assert report.warning_at == 0.01
+    assert report.drift_at == 0.02
+

@@ -34,7 +34,9 @@ from fraud_detection.data import (
 from fraud_detection.drift import (
     DriftError,
     DriftReport,
+    MultiWindowDriftReport,
     assess_drift,
+    assess_multi_window_drift,
     surveillance_tripped,
 )
 from fraud_detection.evaluation import (
@@ -1750,6 +1752,192 @@ def _post_webhook(url: str, payload: dict[str, Any]) -> None:
         urllib.request.urlopen(req, timeout=10)  # noqa: S310
     except urllib.error.URLError as exc:
         typer.echo(f"Warning: Failed to send webhook: {exc}", err=True)
+
+
+@app.command("multi-window-drift")
+def multi_window_drift_command(
+    model_path: Annotated[
+        Path,
+        typer.Argument(exists=True, readable=True, help="Model file or artifact directory."),
+    ],
+    data: Annotated[
+        Path,
+        typer.Argument(exists=True, dir_okay=False, readable=True, help="Current transactions."),
+    ],
+    short_window_rows: Annotated[
+        int,
+        typer.Option(min=2, help="Number of recent rows for the short surveillance window."),
+    ] = 100,
+    target: Annotated[
+        str,
+        typer.Option(help="Optional label column to exclude from feature analysis."),
+    ] = DEFAULT_TARGET,
+    output: Annotated[
+        Path | None,
+        typer.Option("--output", "-o", help="Optional JSON report destination."),
+    ] = None,
+    overwrite: Annotated[
+        bool,
+        typer.Option(help="Replace an existing report file."),
+    ] = False,
+    fail_on: Annotated[
+        str | None,
+        typer.Option(
+            help="Exit 1 when the overall status reaches 'warning' or 'drifted', "
+            "for scheduled surveillance."
+        ),
+    ] = None,
+    webhook_slack: Annotated[
+        str | None,
+        typer.Option(help="Slack webhook URL for drift alerts."),
+    ] = None,
+    webhook_pagerduty: Annotated[
+        str | None,
+        typer.Option(help="PagerDuty Events API v2 integration key for drift alerts."),
+    ] = None,
+) -> None:
+    """Perform dual-window drift surveillance comparing recent and aggregate features."""
+    _guard_output(output, overwrite)
+
+    try:
+        model = load_model(model_path)
+        frame = pd.read_csv(data).drop(columns=target, errors="ignore")
+        features = model.validate_features(frame)
+        profile = model.metadata.get("reference_profile")
+        if not isinstance(profile, dict):
+            raise DriftError("Model artifact does not contain a reference profile.")
+        report = assess_multi_window_drift(
+            profile,
+            features,
+            short_window_rows=short_window_rows,
+            thresholds=model.metadata.get("drift_thresholds"),
+        )
+        report_json = json.dumps(report.to_dict(), indent=2)
+        _emit_report(report_json, output)
+        tripped = surveillance_tripped(report.overall_status, fail_on)
+        if tripped and (webhook_slack or webhook_pagerduty):
+            _send_multi_window_drift_alert(
+                report=report,
+                webhook_slack=webhook_slack,
+                webhook_pagerduty=webhook_pagerduty,
+                model_version=str(model.metadata["dataset_fingerprint"])[:12],
+            )
+    except (
+        OSError,
+        UnicodeDecodeError,
+        pd.errors.ParserError,
+        pd.errors.EmptyDataError,
+        ModelArtifactError,
+        DriftError,
+    ) as exc:
+        _abort(str(exc))
+
+    if tripped:
+        typer.echo(
+            f"Multi-window drift surveillance tripped: overall_status={report.overall_status} "
+            f"meets --fail-on {fail_on}.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+
+def _send_multi_window_drift_alert(
+    *,
+    report: MultiWindowDriftReport,
+    webhook_slack: str | None,
+    webhook_pagerduty: str | None,
+    model_version: str,
+) -> None:
+    """Send multi-window drift alert to configured webhooks (Slack and/or PagerDuty)."""
+    alert_payload: dict[str, Any] = {
+        "model_version": model_version,
+        "overall_status": report.overall_status,
+        "short_window_rows": report.short_window_rows,
+        "long_window_rows": report.long_window_rows,
+        "mean_short_psi": report.mean_short_psi,
+        "max_short_psi": report.max_short_psi,
+        "mean_long_psi": report.mean_long_psi,
+        "max_long_psi": report.max_long_psi,
+        "max_velocity": report.max_velocity,
+        "drifted_features": [
+            {
+                "feature": f.feature,
+                "short_psi": f.short_psi,
+                "long_psi": f.long_psi,
+                "velocity": f.velocity,
+                "status": f.status,
+            }
+            for f in report.features
+            if f.status in ("warning", "drifted")
+        ],
+    }
+
+    if webhook_slack:
+        slack_payload = {
+            "text": (
+                f"Multi-Window Drift Alert: Model {model_version} - "
+                f"{report.overall_status.upper()}"
+            ),
+            "blocks": [
+                {
+                    "type": "header",
+                    "text": {
+                        "type": "plain_text",
+                        "text": f"Multi-Window Drift Alert: {report.overall_status.upper()}",
+                    },
+                },
+                {
+                    "type": "section",
+                    "fields": [
+                        {"type": "mrkdwn", "text": f"*Model:* {model_version}"},
+                        {"type": "mrkdwn", "text": f"*Status:* {report.overall_status}"},
+                        {"type": "mrkdwn", "text": f"*Max Short PSI:* {report.max_short_psi:.4f}"},
+                        {"type": "mrkdwn", "text": f"*Max Long PSI:* {report.max_long_psi:.4f}"},
+                        {"type": "mrkdwn", "text": f"*Max Velocity:* {report.max_velocity:.4f}"},
+                        {
+                            "type": "mrkdwn",
+                            "text": (
+                                f"*Windows:* {report.short_window_rows}/"
+                                f"{report.long_window_rows} rows"
+                            ),
+                        },
+                    ],
+                },
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": "Drifted Features:\n"
+                        + "\n".join(
+                            f"• {f['feature']}: Short PSI={f['short_psi']:.4f}, "
+                            f"Long PSI={f['long_psi']:.4f}, Vel={f['velocity']:+.4f} "
+                            f"({f['status']})"
+                            for f in alert_payload["drifted_features"][:5]
+                        ),
+                    },
+                },
+            ],
+        }
+        _post_webhook(webhook_slack, slack_payload)
+
+    if webhook_pagerduty:
+        has_drifted = any(f["status"] == "drifted" for f in alert_payload["drifted_features"])
+        severity = "critical" if has_drifted else "warning"
+        pd_payload: dict[str, Any] = {
+            "routing_key": webhook_pagerduty,
+            "event_action": "trigger",
+            "payload": {
+                "summary": (
+                    f"Multi-Window Drift Alert: Model {model_version} - "
+                    f"{report.overall_status.upper()}"
+                ),
+                "source": "fraud-detection",
+                "severity": severity,
+                "custom_details": alert_payload,
+            },
+        }
+        _post_webhook("https://events.pagerduty.com/v2/enqueue", pd_payload)
+
 
 
 @app.command("calibration")
