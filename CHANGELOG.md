@@ -8,6 +8,23 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- Dual-window streaming drift surveillance: added `assess_multi_window_drift()` engine,
+  `MultiWindowDriftReport` / `WindowFeatureDrift` data models, and `fraud-detect multi-window-drift`
+  CLI command computing short-window PSI, long-window PSI, and drift velocity/acceleration
+  with automated alerting webhooks for Slack and PagerDuty.
+- Traffic shadowing and operational circuit breakers in FastAPI serving: added stateful
+  `CircuitBreaker` (tracking consecutive failures and latency SLA budgets across CLOSED,
+  HALF_OPEN, and OPEN states) with automated fallback execution, plus background non-blocking
+  challenger traffic shadowing via `shadow_model_path`, `/health` telemetry, and Prometheus
+  metrics (`fraud_shadow_evaluations_total`, `fraud_circuit_breaker_state`).
+- Streaming distribution and quantile profiler: added online incremental `StreamingProfile`
+  (Welford's algorithm for running means/variances, streaming histogram binning) and
+  `fraud-detect stream-profile` CLI command supporting batch-by-batch updating from CSV chunks
+  or JSONL audit logs without retaining raw historical transactions.
+- Surveillance simulation and chaos testing harness: added `inject_drift()` engine and
+  `fraud-detect simulate-drift` CLI command to inject deterministic distribution shifts
+  (mean offsets, variance scaling, anomaly spikes) into transaction datasets for testing
+  surveillance webhooks, fallback policies, and circuit breakers.
 - Audit log replay and divergence backtesting: added `replay_audit_log()` engine
   and `fraud-detect replay-audit` CLI command, enabling stream processing of
   historical JSONL scoring audit logs, tolerance thresholding, decision-flip detection,

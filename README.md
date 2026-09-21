@@ -840,6 +840,60 @@ cosign verify ghcr.io/mohamed-ahmed-shokry/credit-card-fraud-detection:vX.Y.Z \
 
 Mount the trained model read-only the same way regardless of image source.
 
+## Streaming surveillance and traffic shadowing
+
+### Dual-window drift surveillance
+
+Detect sudden distribution shifts before batch metrics trip by computing short-window PSI (recent traffic) and long-window baseline PSI with velocity and acceleration tracking:
+
+```bash
+fraud-detect multi-window-drift artifacts/model data/recent.csv \
+  --short-window-rows 200 \
+  --fail-on warning \
+  --webhook-slack https://hooks.slack.com/services/... \
+  --webhook-pagerduty pd_service_key \
+  --output reports/multi_window_drift.json
+```
+
+### Traffic shadowing and circuit breaker serving
+
+Deploy canary or challenger models alongside champions with zero impact on user-facing latency. Background asynchronous tasks evaluate shadowed transactions and record divergence events to audit logs and Prometheus metrics:
+
+```bash
+FRAUD_MODEL_PATH=artifacts/champion \
+FRAUD_SHADOW_MODEL_PATH=artifacts/challenger \
+FRAUD_CIRCUIT_BREAKER_ENABLED=true \
+FRAUD_CIRCUIT_BREAKER_FAILURE_THRESHOLD=5 \
+FRAUD_CIRCUIT_BREAKER_LATENCY_BUDGET_MS=25.0 \
+uvicorn fraud_detection.api:app --host 0.0.0.0 --port 8000
+```
+
+When latency budgets or failure thresholds are breached, the circuit breaker trips from `CLOSED` to `OPEN` and executes configured safe fallback policies (`constant` or `rule`) to protect upstream callers.
+
+### Streaming distribution profiler
+
+Accumulate online reference distributions incrementally across streaming CSV batches or JSONL audit logs using Welford's algorithm without holding raw historical transactions in memory:
+
+```bash
+fraud-detect stream-profile data/stream.csv \
+  --output profiles/streaming_reference.json \
+  --checkpoint-output profiles/checkpoint.json \
+  --batch-size 500
+```
+
+### Surveillance simulation & chaos testing
+
+Inject controlled synthetic shifts (mean offsets, variance scaling, anomaly spikes) to validate surveillance webhooks and circuit breakers in staging environments:
+
+```bash
+fraud-detect simulate-drift data/demo.csv \
+  --output data/chaos_drifted.csv \
+  --feature Amount \
+  --mean-offset 50.0 \
+  --variance-scale 2.0 \
+  --anomaly-rate 0.05
+```
+
 ## Reference label-delay analysis
 
 Chargeback and fraud labels often arrive days or weeks after the transaction
@@ -875,13 +929,15 @@ Project layout:
 
 ```text
 src/fraud_detection/
-├── api.py          # versioned online prediction service
-├── cli.py          # training, comparison, stability, rolling, scoring, benchmarking, explanation, drift, calibration, thresholds, promotion, and serving
+├── api.py          # versioned online prediction service, circuit breakers, and traffic shadowing
+├── audit.py        # structured JSONL audit logs with Luhn PAN redaction and log replay
+├── cli.py          # training, comparison, surveillance, profiling, simulation, and serving CLI
 ├── data.py         # ingestion, schema validation, and synthetic data
-├── drift.py        # training profiles and PSI drift reporting
+├── drift.py        # multi-window drift surveillance and streaming quantile profiler
 ├── evaluation.py   # threshold tuning, imbalance-aware metrics, and calibration reports
+├── explanations.py # isolated explanation provider protocols and cost controls
 ├── reporting.py    # self-contained HTML compliance report rendering
-└── model.py        # training, model card, inference, and persistence
+└── model.py        # training, model card, inference, and cryptographic attestation
 tests/              # unit, integration, CLI, and API tests
 ```
 

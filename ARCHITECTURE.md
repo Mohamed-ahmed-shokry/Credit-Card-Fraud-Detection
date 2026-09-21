@@ -13,18 +13,23 @@ financial-services platform.
    evaluates the untouched test split.
 3. The fitted `FraudModel` owns feature ordering, probability validation,
    thresholded decisions, local explanations, metadata, and artifact loading.
-4. `cli.py` orchestrates offline workflows without duplicating model logic:
+4. `cli.py` orchestrates offline and operational workflows without duplicating model logic:
    training, comparison, scoring, monitoring, promotion evidence, model-card
    inspection, compliance rendering, historical audit replay, challenger retraining,
-   and machine-readable attestation export.
+   machine-readable attestation export, multi-window drift surveillance, streaming
+   profiling, and chaos simulation.
 5. `api.py` adapts the same `FraudModel` to bounded FastAPI requests. Batch and
    single-transaction endpoints share one scoring helper with resilient serving
-   guardrails (`fallback_mode`) and degraded-state handling.
-6. `drift.py` compares current numeric distributions with the training profile;
+   guardrails (`fallback_mode`), degraded-state handling, an automated stateful
+   `CircuitBreaker` (tracking failure counts and latency budgets), and non-blocking
+   asynchronous challenger traffic shadowing (`shadow_model_path`).
+6. `drift.py` compares current numeric distributions with the training profile,
+   provides multi-window surveillance computing drift velocity and acceleration,
+   and implements an online incremental `StreamingProfile` via Welford's algorithm.
    `evaluation.py` computes holdout, calibration, and threshold reports;
    `reporting.py` renders promotion evidence as escaped, self-contained HTML.
-7. `audit.py` exports thread-safe, structured JSONL audit events for scoring and
-   promotion decisions with automated Luhn-validated PAN and sensitive key
+7. `audit.py` exports thread-safe, structured JSONL audit events for scoring,
+   shadowing, and promotion decisions with automated Luhn-validated PAN and sensitive key
    redaction guarantees, and provides `replay_audit_log` for historical replay
    and divergence backtesting.
 8. `explanations.py` defines the `ExplanationProvider` boundary, keeping
@@ -82,6 +87,18 @@ metrics. Serving guardrails support degraded-state fallback policies (`constant`
 rate limiting, secret management, and audit-log retention remain deployment
 responsibilities.
 
+For operational resiliency and safe challenger evaluation:
+- `CircuitBreaker` maintains scoring stability. Consecutive failures exceeding
+  `failure_threshold` or execution times exceeding `latency_budget_ms` trip the
+  breaker from `CLOSED` to `OPEN`, failing over immediately to fallback policies
+  until `recovery_timeout` elapses, after which a `HALF_OPEN` probe test determines
+  recovery. Breaker state is tracked via `/health` telemetry and Prometheus
+  (`fraud_circuit_breaker_state`).
+- Asynchronous traffic shadowing evaluates transactions against `shadow_model_path`
+  in the background without blocking or delaying primary client responses, recording
+  prediction discrepancies and latency metrics (`fraud_shadow_evaluations_total`)
+  to structured audit logs.
+
 The API does not retrain or mutate a model. Threshold overrides are explicit in
 the request and response, while the tuned artifact threshold remains visible as
 `model_threshold`.
@@ -101,6 +118,17 @@ the request and response, while the tuned artifact threshold remains visible as
   controls, and deterministic fallbacks.
 - Compliance reports assemble evidence and never make an automatic promotion
   decision.
+
+## Operational surveillance & safety invariants
+
+- Multi-window drift analyzes both recent short windows and baseline long windows
+  to compute velocity ($\Delta \text{PSI}$) and acceleration ($\Delta^2 \text{PSI}$),
+  detecting distribution shifts early without waiting for full batch cycles.
+- Streaming profile accumulation updates feature distributions incrementally
+  using Welford's algorithm, keeping memory constant regardless of stream length.
+- Traffic shadowing never blocks, delays, or fails primary scoring responses.
+- Circuit breakers fail fast to safe deterministic fallback policies when upstream
+  or model degradations occur.
 
 ## Extension guidance
 

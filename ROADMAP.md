@@ -266,23 +266,23 @@ This phase strengthens operational reliability, auditability, and automated mode
   `validate-artifact` with `--attestation-output` to emit cryptographically verifiable,
   tamper-evident JSON attestation manifests for CI/CD gates and deployment admission controllers.
 
-## Phase 16 — Dual-Window Streaming Surveillance, Traffic Shadowing, and Operational Circuit Breakers (In progress)
+## Phase 16 — Dual-Window Streaming Surveillance, Traffic Shadowing, and Operational Circuit Breakers (Done)
 
 This phase strengthens online operational safety, real-time diagnostic surveillance, and canary shadowing:
 
-- **Dual-window streaming drift surveillance** (`In progress`) — an `assess_multi_window_drift()`
+- **Dual-window streaming drift surveillance** (`Done`) — an `assess_multi_window_drift()`
   engine and `multi-window-drift` CLI command that computes short-window PSI (recent transactions)
   and long-window PSI against reference profiles, calculating drift velocity and acceleration to
   catch sudden distribution shocks before aggregate batch metrics trip.
-- **Traffic shadowing & latency circuit breaker in FastAPI serving** (`In progress`) — asynchronous
+- **Traffic shadowing & latency circuit breaker in FastAPI serving** (`Done`) — asynchronous
   challenger traffic shadowing via `shadow_model_path` without adding latency to primary response
   paths, paired with an automated `CircuitBreaker` that tracks consecutive failures and latency SLA
   breaches, automatically tripping to safe fallback modes (`constant` or `rule`) when models degrade.
-- **Streaming distribution and quantile profiler** (`In progress`) — an incremental
+- **Streaming distribution and quantile profiler** (`Done`) — an incremental
   `StreamingProfile` class and `stream-profile` CLI command to update reference profile bins and
   distribution statistics online from streaming CSV batches or JSONL audit logs without keeping
   historical transactions in memory.
-- **Surveillance simulation and chaos harness** (`In progress`) — a `simulate-drift` CLI command
+- **Surveillance simulation and chaos harness** (`Done`) — a `simulate-drift` CLI command
   to inject synthetic distribution shifts (mean offsets, variance scaling, anomaly spikes) into
   validation datasets to test alerting webhooks, fallback behavior, and circuit breakers in staging.
 
