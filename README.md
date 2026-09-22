@@ -88,6 +88,44 @@ fraud-detect predict artifacts/model data/demo.csv --output predictions.csv
 Synthetic data exists for demos and smoke tests only. It must not be used to claim
 real-world model performance.
 
+## Export an edge runtime
+
+The dependency-light edge runtime supports the uncalibrated logistic-regression
+artifact contract. Train that contract explicitly, then export the versioned JSON
+artifact:
+
+```bash
+fraud-detect train data/demo.csv \
+  --output artifacts/model-uncalibrated \
+  --calibration-method none
+fraud-detect export-edge artifacts/model-uncalibrated \
+  --output artifacts/edge-model.json \
+  --validation-data data/demo.csv
+```
+
+`export-edge` quantizes standardized logistic coefficients to signed int8, persists
+the feature order, scaler statistics, threshold, quantization scale, and any pruned
+features, and records maximum and mean probability error when validation data is
+provided. The default maximum error tolerance is `0.01`; use `--max-error` to set a
+stricter or looser bound. `--prune-epsilon` can zero small coefficients, but export
+is refused if the resulting validation error exceeds the configured tolerance.
+
+The runtime scorer does not import scikit-learn:
+
+```python
+from fraud_detection.edge import load_edge_model
+
+edge_model = load_edge_model("artifacts/edge-model.json")
+transaction = {feature: 0.0 for feature in edge_model.feature_names}
+probability = edge_model.score_record(transaction)
+is_fraud = edge_model.predict_record(transaction)
+```
+
+The example abbreviates the feature mapping; every exported feature is required and
+extra or non-finite values are rejected. Calibrated logistic, random-forest, and
+histogram-gradient-boosting artifacts are rejected because this runtime does not
+silently approximate their probability transformations.
+
 ## Explain individual predictions
 
 Show per-transaction feature contributions to understand why a specific transaction
@@ -536,9 +574,35 @@ Every HTTP response includes:
 
 - `X-Request-ID`, which propagates a safe caller-supplied identifier or generates one;
 - `X-Process-Time-Ms`, the server-side request duration.
+- `traceparent`, a W3C trace context. A valid incoming context is continued with a
+  new server span; malformed or absent input starts a new trace.
 
 Completion and failure logs carry the same request ID for correlation. Request IDs
 are operational labels only and must not contain cardholder or personal data.
+
+### Optional distributed tracing
+
+Tracing is disabled by default. Configure an OTLP/HTTP collector either on the
+`serve` command or with environment variables:
+
+```bash
+fraud-detect serve artifacts/model \
+  --otlp-endpoint http://otel-collector:4318 \
+  --otlp-service-name fraud-detection-api \
+  --otlp-timeout-seconds 0.5
+```
+
+Equivalent environment configuration is `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`,
+`OTEL_SERVICE_NAME`, and `FRAUD_OTLP_TIMEOUT_SECONDS`. An endpoint without
+`/v1/traces` receives that path automatically. The exporter sends best-effort JSON
+OTLP spans asynchronously; collector timeouts and network failures are logged and
+cannot fail a scoring request. Span attributes contain the HTTP method/path/status,
+request ID, and model version, but never transaction feature values.
+
+Use HTTPS or a private collector network when traces cross a trust boundary. This
+reference exporter does not configure collector authentication or durable trace
+storage, and it rejects endpoints with embedded credentials; those controls belong
+to the deployment gateway or collector.
 
 `GET /metrics` reports Prometheus-format counters and a histogram: total requests
 and request duration labeled by method, path, and status code, plus total scored
