@@ -42,6 +42,7 @@ from fraud_detection.drift import (
     build_reference_profile,
     surveillance_tripped,
 )
+from fraud_detection.edge import EdgeArtifactError, build_edge_model
 from fraud_detection.evaluation import (
     ThresholdRow,
     calibration_report,
@@ -1222,6 +1223,98 @@ def _generate_llm_explanations(
         probabilities,
         threshold=threshold,
         provider=provider,
+    )
+
+
+@app.command("export-edge")
+def export_edge_command(
+    model_path: Annotated[
+        Path,
+        typer.Argument(exists=True, readable=True, help="Model file or artifact directory."),
+    ],
+    output: Annotated[
+        Path,
+        typer.Option("--output", "-o", help="Edge JSON artifact destination."),
+    ] = Path("edge-model.json"),
+    validation_data: Annotated[
+        Path | None,
+        typer.Option(
+            "--validation-data",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="Optional CSV used to measure source-model probability error.",
+        ),
+    ] = None,
+    target: Annotated[
+        str,
+        typer.Option(help="Optional label column to exclude from validation features."),
+    ] = DEFAULT_TARGET,
+    prune_epsilon: Annotated[
+        float,
+        typer.Option(min=0.0, help="Zero coefficients whose absolute value is below this value."),
+    ] = 0.0,
+    max_error: Annotated[
+        float,
+        typer.Option(min=0.0, help="Maximum allowed validation probability error."),
+    ] = 0.01,
+    overwrite: Annotated[bool, typer.Option(help="Replace an existing edge artifact.")] = False,
+) -> None:
+    """Export a supported model to the dependency-light int8 edge runtime."""
+    _guard_output(output, overwrite)
+    try:
+        model = load_model(model_path)
+        edge_model = build_edge_model(model, prune_epsilon=prune_epsilon)
+        validation: dict[str, Any] | None = None
+        if validation_data is not None:
+            frame = pd.read_csv(validation_data)
+            features = frame.drop(columns=target, errors="ignore")
+            source_probabilities = model.predict_probabilities(features)
+            records = [
+                {str(key): value for key, value in record.items()}
+                for record in features.to_dict(orient="records")
+            ]
+            edge_probabilities = edge_model.score_records(records)
+            errors = np.abs(source_probabilities - np.asarray(edge_probabilities))
+            maximum_error = float(errors.max())
+            mean_error = float(errors.mean())
+            validation = {
+                "rows": len(features),
+                "max_absolute_probability_error": maximum_error,
+                "mean_absolute_probability_error": mean_error,
+                "max_error_tolerance": max_error,
+            }
+            if maximum_error > max_error:
+                _abort(
+                    "Edge export exceeds the probability error tolerance: "
+                    f"max={maximum_error:.6f}, tolerance={max_error:.6f}."
+                )
+
+        payload = edge_model.to_dict()
+        if validation is not None:
+            payload["validation"] = validation
+        _atomic_write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", output)
+    except (
+        EdgeArtifactError,
+        ModelArtifactError,
+        OSError,
+        UnicodeDecodeError,
+        pd.errors.EmptyDataError,
+        pd.errors.ParserError,
+        ValueError,
+    ) as exc:
+        _abort(str(exc))
+
+    typer.echo(
+        json.dumps(
+            {
+                "output": str(output),
+                "feature_count": len(edge_model.feature_names),
+                "quantization_bits": edge_model.quantization_bits,
+                "pruned_features": list(edge_model.pruned_features),
+                "validation": validation,
+            }
+        )
     )
 
 

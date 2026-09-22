@@ -24,7 +24,9 @@ from fraud_detection.model import (
     MANIFEST_FILENAME,
     METADATA_FILENAME,
     MODEL_FILENAME,
+    CalibrationMethod,
     FraudModel,
+    TrainingConfig,
     load_model,
     save_model,
     train_model,
@@ -45,6 +47,61 @@ def trained_artifact(tmp_path_factory: pytest.TempPathFactory, trained_model: Fr
     artifact_directory = tmp_path_factory.mktemp("artifact")
     save_model(trained_model, artifact_directory)
     return artifact_directory
+
+
+def test_export_edge_command_validates_and_protects_output(tmp_path: Path) -> None:
+    dataset = validate_frame(generate_synthetic_data(rows=500, random_state=11))
+    model = train_model(
+        dataset,
+        config=TrainingConfig(calibration_method=CalibrationMethod.NONE),
+    )
+    artifact_path = tmp_path / "artifact"
+    save_model(model, artifact_path)
+    validation_path = tmp_path / "validation.csv"
+    validation = dataset.features.copy()
+    validation[DEFAULT_TARGET] = dataset.target
+    validation.to_csv(validation_path, index=False)
+    edge_path = tmp_path / "edge-model.json"
+
+    exported = runner.invoke(
+        app,
+        [
+            "export-edge",
+            str(artifact_path),
+            "--output",
+            str(edge_path),
+            "--validation-data",
+            str(validation_path),
+        ],
+    )
+
+    assert exported.exit_code == 0, exported.output
+    summary = json.loads(exported.stdout)
+    assert summary["quantization_bits"] == 8
+    assert summary["validation"]["rows"] == 500
+    payload = json.loads(edge_path.read_text(encoding="utf-8"))
+    assert payload["schema_version"] == 1
+    assert payload["validation"]["max_absolute_probability_error"] <= 0.01
+
+    protected = runner.invoke(
+        app,
+        ["export-edge", str(artifact_path), "--output", str(edge_path)],
+    )
+    assert protected.exit_code == 2
+    assert "Pass --overwrite" in protected.stderr
+
+
+def test_export_edge_command_rejects_calibrated_artifact(
+    trained_artifact: Path,
+    tmp_path: Path,
+) -> None:
+    result = runner.invoke(
+        app,
+        ["export-edge", str(trained_artifact), "--output", str(tmp_path / "edge.json")],
+    )
+
+    assert result.exit_code == 2
+    assert "calibration_method='none'" in result.stderr
 
 
 def test_version_flag_prints_installed_version_and_exits() -> None:
