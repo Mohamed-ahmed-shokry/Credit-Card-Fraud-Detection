@@ -32,6 +32,9 @@ def test_trace_context_parses_and_creates_child() -> None:
     [
         "00-00000000000000000000000000000000-0123456789abcdef-01",
         "00-0123456789abcdef0123456789abcdef-0000000000000000-01",
+        "00-0123456789abcdef0123456789abcdeg-0123456789abcdef-01",
+        "00-0123456789abcdef0123456789abcdef-0123456789abcdeg-01",
+        "00-0123456789abcdef0123456789abcdef-0123456789abcdef-0g",
         "01-0123456789abcdef0123456789abcdef-0123456789abcdef-01",
         "malformed",
     ],
@@ -83,6 +86,30 @@ def test_otlp_payload_contains_http_span_and_service_attributes() -> None:
     assert exported_span["status"]["code"] == 1
 
 
+def test_otlp_payload_encodes_boolean_and_float_attributes() -> None:
+    span = TraceSpan(
+        name="HTTP /health",
+        context=TraceContext.new(),
+        parent_span_id=None,
+        start_time_unix_nano=1,
+        end_time_unix_nano=2,
+        attributes={"sampled": True, "duration": 0.5, "attempt": 2},
+        status_code=503,
+    )
+
+    payload = span.to_otlp("fraud-api")
+    values = {
+        item["key"]: item["value"]
+        for item in payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["attributes"]
+    }
+    assert values == {
+        "sampled": {"boolValue": True},
+        "duration": {"doubleValue": 0.5},
+        "attempt": {"intValue": "2"},
+    }
+    assert payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["status"]["code"] == 2
+
+
 def test_otlp_export_is_non_blocking_and_isolates_failures() -> None:
     exporter = OTLPHttpTraceExporter("http://collector:4318")
     completed = threading.Event()
@@ -109,3 +136,31 @@ def test_otlp_export_is_non_blocking_and_isolates_failures() -> None:
 def test_otlp_endpoint_requires_http_url() -> None:
     with pytest.raises(ValueError, match="absolute HTTP"):
         OTLPHttpTraceExporter("collector:4318")
+    with pytest.raises(ValueError, match="credentials"):
+        OTLPHttpTraceExporter("https://user:password@collector:4318")
+    with pytest.raises(ValueError, match="service_name"):
+        OTLPHttpTraceExporter("https://collector:4318", service_name=" ")
+    with pytest.raises(ValueError, match="timeout"):
+        OTLPHttpTraceExporter("https://collector:4318", timeout_seconds=0)
+
+
+def test_otlp_export_logs_collector_failure() -> None:
+    exporter = OTLPHttpTraceExporter("http://collector:4318")
+    span = TraceSpan(
+        name="HTTP /health",
+        context=TraceContext.new(),
+        parent_span_id=None,
+        start_time_unix_nano=1,
+        end_time_unix_nano=2,
+        attributes={},
+        status_code=200,
+    )
+    with (
+        patch(
+            "fraud_detection.telemetry.urllib.request.urlopen",
+            side_effect=OSError("collector unavailable"),
+        ),
+        patch("fraud_detection.telemetry.logger.warning") as warning,
+    ):
+        exporter._send(span)  # noqa: SLF001
+        warning.assert_called_once()

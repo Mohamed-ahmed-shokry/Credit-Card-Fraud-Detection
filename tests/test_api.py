@@ -116,6 +116,44 @@ def test_invalid_traceparent_starts_new_trace_and_export_failure_is_isolated(
     assert context.trace_id != "invalid"
 
 
+def test_otlp_environment_configures_optional_exporter(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, model, _ = api_context
+    configured: dict[str, object] = {}
+
+    class _ConfiguredExporter(_RecordingTraceExporter):
+        def __init__(
+            self,
+            endpoint: str,
+            *,
+            service_name: str,
+            timeout_seconds: float,
+        ) -> None:
+            super().__init__()
+            configured.update(
+                endpoint=endpoint,
+                service_name=service_name,
+                timeout_seconds=timeout_seconds,
+            )
+
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "http://collector:4318")
+    monkeypatch.setenv("OTEL_SERVICE_NAME", "fraud-api")
+    monkeypatch.setenv("FRAUD_OTLP_TIMEOUT_SECONDS", "0.25")
+    monkeypatch.setattr("fraud_detection.api.OTLPHttpTraceExporter", _ConfiguredExporter)
+
+    with TestClient(create_app(model=model)) as configured_client:
+        response = configured_client.get("/health")
+
+    assert response.status_code == 200
+    assert configured == {
+        "endpoint": "http://collector:4318",
+        "service_name": "fraud-api",
+        "timeout_seconds": 0.25,
+    }
+
+
 def test_predict_scores_ordered_batch(
     client: TestClient,
     api_context: tuple[TestClient, FraudModel, ValidatedDataset],
