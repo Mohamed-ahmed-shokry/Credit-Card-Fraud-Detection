@@ -3086,6 +3086,26 @@ def serve_command(
         float,
         typer.Option(min=0.01, help="Optional OTLP collector request timeout in seconds."),
     ] = 0.5,
+    attestation: Annotated[
+        Path | None,
+        typer.Option(
+            "--attestation",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="Optional signed attestation required before serving.",
+        ),
+    ] = None,
+    trust_bundle: Annotated[
+        Path | None,
+        typer.Option(
+            "--trust-bundle",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="Optional rotation-aware trust bundle paired with --attestation.",
+        ),
+    ] = None,
 ) -> None:
     """Run the versioned HTTP prediction service with optional trace export."""
     from fraud_detection.api import create_app
@@ -3100,6 +3120,8 @@ def serve_command(
             otlp_endpoint=otlp_endpoint,
             otlp_service_name=otlp_service_name,
             otlp_timeout_seconds=otlp_timeout_seconds,
+            attestation_path=attestation,
+            trust_bundle_path=trust_bundle,
         ),
         host=host,
         port=port,
