@@ -8,6 +8,14 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- Dependency-light edge runtime export: added `fraud-detect export-edge` and a
+  schema-versioned int8 JSON scorer for supported uncalibrated logistic artifacts,
+  with optional coefficient pruning, validation-set error measurement, and strict
+  output refusal when the configured probability tolerance is exceeded.
+- Optional distributed tracing: added W3C `traceparent` propagation and best-effort
+  asynchronous OTLP/HTTP request spans, configurable through `create_app`,
+  `fraud-detect serve`, and OTEL/FRAUD environment variables while remaining disabled
+  by default and isolated from scoring failures.
 - Dual-window streaming drift surveillance: added `assess_multi_window_drift()` engine,
   `MultiWindowDriftReport` / `WindowFeatureDrift` data models, and `fraud-detect multi-window-drift`
   CLI command computing short-window PSI, long-window PSI, and drift velocity/acceleration
