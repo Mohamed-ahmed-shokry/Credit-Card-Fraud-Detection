@@ -18,6 +18,7 @@ import joblib
 import numpy as np
 import pandas as pd
 import sklearn
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
 from sklearn.exceptions import InconsistentVersionWarning
@@ -41,6 +42,7 @@ from fraud_detection.explanations import (
     ExplanationRequest,
     TemplateExplanationProvider,
 )
+from fraud_detection.signing import sign_payload
 
 ARTIFACT_VERSION = 2
 MODEL_FILENAME = "model.joblib"
@@ -789,15 +791,21 @@ class ArtifactValidationReport:
             "metadata_summary": self.metadata_summary,
         }
 
-    def to_attestation(self, *, signer: str | None = None) -> dict[str, Any]:
+    def to_attestation(
+        self,
+        *,
+        signer: str | None = None,
+        signing_key: Ed25519PrivateKey | None = None,
+    ) -> dict[str, Any]:
         """Convert the validation report into a signed, tamper-evident attestation manifest."""
-        return generate_attestation(self, signer=signer)
+        return generate_attestation(self, signer=signer, signing_key=signing_key)
 
 
 def generate_attestation(
     report: ArtifactValidationReport,
     *,
     signer: str | None = None,
+    signing_key: Ed25519PrivateKey | None = None,
 ) -> dict[str, Any]:
     """Generate a tamper-evident machine-readable attestation manifest from a validation report."""
     lineage_block: dict[str, Any] | None = None
@@ -829,6 +837,8 @@ def generate_attestation(
 
     full_attestation = dict(payload)
     full_attestation["attestation_digest"] = attestation_digest
+    if signing_key is not None:
+        full_attestation["signature"] = sign_payload(full_attestation, signing_key)
     return full_attestation
 
 
@@ -858,7 +868,7 @@ def verify_attestation(
     if not claimed_digest or not isinstance(claimed_digest, str):
         return False, "Missing or invalid 'attestation_digest' field"
 
-    payload = {k: v for k, v in attestation.items() if k != "attestation_digest"}
+    payload = {k: v for k, v in attestation.items() if k not in {"attestation_digest", "signature"}}
     try:
         canonical_body = json.dumps(payload, allow_nan=False, sort_keys=True, separators=(",", ":"))
     except (TypeError, ValueError) as exc:
