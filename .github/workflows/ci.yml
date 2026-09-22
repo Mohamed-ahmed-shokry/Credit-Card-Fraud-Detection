@@ -55,6 +55,54 @@ jobs:
       - name: Check package metadata
         run: python -m twine check dist/*
 
+  admission:
+    name: Signed artifact admission
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+
+      - name: Install project
+        run: python -m pip install --upgrade pip && python -m pip install -e .
+
+      - name: Generate, sign, rotate, and verify admission evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/fraud-admission
+          fraud-detect generate-data --output /tmp/fraud-admission/data.csv --rows 800 --seed 19
+          fraud-detect train /tmp/fraud-admission/data.csv --output /tmp/fraud-admission/model
+          fraud-detect generate-signing-key \
+            --private-key /tmp/fraud-admission/private.pem \
+            --public-key /tmp/fraud-admission/public.pem
+          fraud-detect generate-signing-key \
+            --private-key /tmp/fraud-admission/next-private.pem \
+            --public-key /tmp/fraud-admission/next-public.pem
+          fraud-detect generate-trust-bundle \
+            --output /tmp/fraud-admission/trust.json \
+            --public-key /tmp/fraud-admission/public.pem
+          old_key_id=$(python -c "import json; print(json.load(open('/tmp/fraud-admission/trust.json'))['active_key_ids'][0])")
+          fraud-detect validate-artifact /tmp/fraud-admission/model --strict \
+            --attestation-output /tmp/fraud-admission/attestation.json \
+            --signer ci-admission \
+            --signing-key /tmp/fraud-admission/private.pem
+          fraud-detect verify-attestation /tmp/fraud-admission/attestation.json \
+            --trust-bundle /tmp/fraud-admission/trust.json
+          fraud-detect rotate-trust-bundle /tmp/fraud-admission/trust.json \
+            --output /tmp/fraud-admission/rotated-trust.json \
+            --add-public-key /tmp/fraud-admission/next-public.pem \
+            --revoke-key-id "$old_key_id"
+          if fraud-detect verify-attestation /tmp/fraud-admission/attestation.json \
+            --trust-bundle /tmp/fraud-admission/rotated-trust.json; then
+            echo "Revoked signing key was incorrectly admitted." >&2
+            exit 1
+          fi
+
   container:
     name: Container
     runs-on: ubuntu-latest
