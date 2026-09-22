@@ -105,7 +105,7 @@ produced the attestation.
 
 The optional authenticity layer works as follows:
 
-- `generate-signing-key` writes a PKCS#8 Ed25519 private PEM and a public PEM key
+- `generate-signing-key` writes a self-describing Ed25519 private PEM and a public PEM key
   using atomic replacement. Private output is never printed or included in an
   attestation.
 - `validate-artifact --strict --signing-key ... --attestation-output ...` adds a

@@ -47,7 +47,8 @@ checks for production serving.
 
 ### Attestation signatures
 
-`fraud-detect generate-signing-key` creates an Ed25519 keypair. The private PEM
+`fraud-detect generate-signing-key` creates an Ed25519 keypair through the
+audited PyNaCl backend. The private PEM
 is unencrypted by design so it can be supplied by a controlled CI secret-file
 mount; it must never be committed, logged, or placed in an artifact directory.
 Protect it with the CI secret store or an external KMS workflow and rotate it
