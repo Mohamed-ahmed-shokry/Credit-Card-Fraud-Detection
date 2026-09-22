@@ -18,7 +18,7 @@ import joblib
 import numpy as np
 import pandas as pd
 import sklearn
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from nacl.signing import SigningKey
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
 from sklearn.exceptions import InconsistentVersionWarning
@@ -795,7 +795,7 @@ class ArtifactValidationReport:
         self,
         *,
         signer: str | None = None,
-        signing_key: Ed25519PrivateKey | None = None,
+        signing_key: SigningKey | None = None,
     ) -> dict[str, Any]:
         """Convert the validation report into a signed, tamper-evident attestation manifest."""
         return generate_attestation(self, signer=signer, signing_key=signing_key)
@@ -805,7 +805,7 @@ def generate_attestation(
     report: ArtifactValidationReport,
     *,
     signer: str | None = None,
-    signing_key: Ed25519PrivateKey | None = None,
+    signing_key: SigningKey | None = None,
 ) -> dict[str, Any]:
     """Generate a tamper-evident machine-readable attestation manifest from a validation report."""
     lineage_block: dict[str, Any] | None = None

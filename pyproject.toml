@@ -136,6 +136,6 @@ enable_error_code = [
 ]
 
 [[tool.mypy.overrides]]
-module = ["joblib.*", "sklearn.*"]
+module = ["joblib.*", "nacl.*", "sklearn.*"]
 ignore_missing_imports = true
 

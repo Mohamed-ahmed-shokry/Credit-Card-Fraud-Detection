@@ -9,15 +9,13 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from cryptography.exceptions import InvalidSignature
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric.ed25519 import (
-    Ed25519PrivateKey,
-    Ed25519PublicKey,
-)
+from nacl.exceptions import BadSignatureError
+from nacl.signing import SigningKey, VerifyKey
 
 SIGNATURE_SCHEMA = "1.0"
 SIGNATURE_ALGORITHM = "Ed25519"
+PRIVATE_KEY_LABEL = "ED25519 PRIVATE KEY"
+PUBLIC_KEY_LABEL = "ED25519 PUBLIC KEY"
 
 
 class SigningError(ValueError):
@@ -26,17 +24,10 @@ class SigningError(ValueError):
 
 def generate_keypair_bytes() -> tuple[bytes, bytes]:
     """Return a new Ed25519 private PEM and public PEM keypair."""
-    private_key = Ed25519PrivateKey.generate()
-    private_pem = private_key.private_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.PKCS8,
-        encryption_algorithm=serialization.NoEncryption(),
+    private_key = SigningKey.generate()
+    return _pem(PRIVATE_KEY_LABEL, private_key.encode()), _pem(
+        PUBLIC_KEY_LABEL, private_key.verify_key.encode()
     )
-    public_pem = private_key.public_key().public_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PublicFormat.SubjectPublicKeyInfo,
-    )
-    return private_pem, public_pem
 
 
 def write_keypair(
@@ -65,40 +56,33 @@ def write_keypair(
     return public_key_fingerprint(load_public_key(public_destination))
 
 
-def load_private_key(path: Path | str) -> Ed25519PrivateKey:
+def load_private_key(path: Path | str) -> SigningKey:
     """Load an Ed25519 private key from PEM without exposing its contents."""
     key_path = Path(path)
     try:
-        loaded = serialization.load_pem_private_key(key_path.read_bytes(), password=None)
+        loaded = SigningKey(_read_pem(key_path, PRIVATE_KEY_LABEL))
     except (OSError, ValueError, TypeError) as exc:
         raise SigningError(f"Could not load Ed25519 private key {key_path}: {exc}") from exc
-    if not isinstance(loaded, Ed25519PrivateKey):
-        raise SigningError(f"Signing key {key_path} is not an Ed25519 private key.")
     return loaded
 
 
-def load_public_key(path: Path | str) -> Ed25519PublicKey:
+def load_public_key(path: Path | str) -> VerifyKey:
     """Load an Ed25519 public key from PEM without trusting attestation metadata."""
     key_path = Path(path)
     try:
-        loaded = serialization.load_pem_public_key(key_path.read_bytes())
+        loaded = VerifyKey(_read_pem(key_path, PUBLIC_KEY_LABEL))
     except (OSError, ValueError, TypeError) as exc:
         raise SigningError(f"Could not load Ed25519 public key {key_path}: {exc}") from exc
-    if not isinstance(loaded, Ed25519PublicKey):
-        raise SigningError(f"Verification key {key_path} is not an Ed25519 public key.")
     return loaded
 
 
-def sign_payload(payload: dict[str, Any], private_key: Ed25519PrivateKey) -> dict[str, str]:
+def sign_payload(payload: dict[str, Any], private_key: SigningKey) -> dict[str, str]:
     """Sign canonical JSON and return a self-describing signature envelope."""
-    signature = private_key.sign(canonical_json(payload))
-    public_key = private_key.public_key()
+    signature = private_key.sign(canonical_json(payload)).signature
     return {
         "schema": SIGNATURE_SCHEMA,
         "algorithm": SIGNATURE_ALGORITHM,
-        "public_key": _encode(
-            public_key.public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
-        ),
+        "public_key": _encode(private_key.verify_key.encode()),
         "signature": _encode(signature),
     }
 
@@ -106,7 +90,7 @@ def sign_payload(payload: dict[str, Any], private_key: Ed25519PrivateKey) -> dic
 def verify_payload_signature(
     payload: dict[str, Any],
     envelope: object,
-    public_key: Ed25519PublicKey,
+    public_key: VerifyKey,
 ) -> tuple[bool, str]:
     """Verify a signature envelope against an independently trusted public key."""
     if not isinstance(envelope, dict):
@@ -121,16 +105,14 @@ def verify_payload_signature(
     except (KeyError, TypeError, ValueError) as exc:
         return False, f"Malformed signature envelope: {exc}"
 
-    trusted_public = public_key.public_bytes(
-        serialization.Encoding.Raw, serialization.PublicFormat.Raw
-    )
+    trusted_public = public_key.encode()
     if embedded_public != trusted_public:
         return False, "Signature public key does not match the trusted verification key."
     if len(signature) != 64:
         return False, "Ed25519 signatures must contain 64 decoded bytes."
     try:
-        public_key.verify(signature, canonical_json(payload))
-    except (InvalidSignature, TypeError, ValueError) as exc:
+        public_key.verify(canonical_json(payload), signature)
+    except (BadSignatureError, TypeError, ValueError) as exc:
         detail = str(exc) or "invalid signature"
         return False, f"Signature verification failed: {detail}"
     return True, "Ed25519 signature verified successfully."
@@ -138,7 +120,7 @@ def verify_payload_signature(
 
 def verify_attestation_signature(
     attestation: object,
-    public_key: Ed25519PublicKey,
+    public_key: VerifyKey,
 ) -> tuple[bool, str]:
     """Verify the signature field on an attestation without trusting its embedded key."""
     if not isinstance(attestation, dict):
@@ -148,10 +130,9 @@ def verify_attestation_signature(
     return verify_payload_signature(payload, envelope, public_key)
 
 
-def public_key_fingerprint(public_key: Ed25519PublicKey) -> str:
+def public_key_fingerprint(public_key: VerifyKey) -> str:
     """Return a short stable identifier for a public key."""
-    raw_key = public_key.public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
-    return sha256(raw_key).hexdigest()[:16]
+    return sha256(public_key.encode()).hexdigest()[:16]
 
 
 def canonical_json(payload: dict[str, Any]) -> bytes:
@@ -172,6 +153,25 @@ def _decode(value: object) -> bytes:
     if not isinstance(value, str):
         raise TypeError("signature fields must be base64 strings")
     return base64.b64decode(value, validate=True)
+
+
+def _pem(label: str, value: bytes) -> bytes:
+    encoded = base64.b64encode(value).decode("ascii")
+    lines = [encoded[index : index + 64] for index in range(0, len(encoded), 64)]
+    body = f"-----BEGIN {label}-----\n" + "".join(f"{line}\n" for line in lines)
+    return f"{body}-----END {label}-----\n".encode("ascii")
+
+
+def _read_pem(path: Path, label: str) -> bytes:
+    content = path.read_text(encoding="ascii").strip().splitlines()
+    begin = f"-----BEGIN {label}-----"
+    end = f"-----END {label}-----"
+    if len(content) < 3 or content[0] != begin or content[-1] != end:
+        raise ValueError(f"PEM does not contain an {label} key.")
+    decoded = base64.b64decode("".join(content[1:-1]), validate=True)
+    if len(decoded) != 32:
+        raise ValueError(f"Ed25519 keys must contain 32 decoded bytes, got {len(decoded)}.")
+    return decoded
 
 
 def _atomic_write(destination: Path, content: bytes, *, mode: int) -> None:
