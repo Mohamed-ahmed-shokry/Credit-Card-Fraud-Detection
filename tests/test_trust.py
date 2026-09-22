@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import base64
+import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
+import fraud_detection.trust as trust_module
 from fraud_detection.signing import (
     generate_keypair_bytes,
     load_private_key,
@@ -15,6 +19,7 @@ from fraud_detection.trust import (
     TrustBundleError,
     TrustedKey,
     load_trust_bundle,
+    verify_admission_files,
     verify_attestation_with_bundle,
     write_trust_bundle,
 )
@@ -126,3 +131,126 @@ def test_trust_bundle_output_protection_and_signature_legacy_failure(tmp_path: P
     valid, message, _selected = verify_attestation_with_bundle({"status": "PASSED"}, bundle)
     assert valid is False
     assert "signature" in message
+
+
+def test_trusted_key_rejects_invalid_fields_and_encoded_keys(tmp_path: Path) -> None:
+    _private_path, public_path = _key_files(tmp_path, "key")
+    raw = TrustedKey.from_verify_key(load_public_key(public_path)).to_dict()
+
+    invalid_payloads = (
+        None,
+        {**raw, "extra": True},
+        {**raw, "key_id": 123},
+        {**raw, "key_id": "A" * 16},
+        {**raw, "public_key": None},
+        {**raw, "added_at": None},
+        {**raw, "revoked_at": 123},
+        {**raw, "public_key": "not-base64"},
+        {**raw, "public_key": base64.b64encode(b"short").decode("ascii")},
+        {**raw, "status": "active", "revoked_at": "now"},
+    )
+    for payload in invalid_payloads:
+        with pytest.raises(TrustBundleError):
+            TrustedKey.from_dict(payload)
+
+    invalid_key = TrustedKey(
+        key_id=raw["key_id"],  # type: ignore[arg-type]
+        public_key="!",
+        status="active",
+        added_at="now",
+    )
+    with pytest.raises(TrustBundleError, match="Invalid trust-bundle public key"):
+        invalid_key.verify_key()
+
+
+def test_trust_bundle_rejects_invalid_roots_duplicates_and_duplicate_rotation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _private_path, public_path = _key_files(tmp_path, "key")
+    _other_private_path, other_public_path = _key_files(tmp_path, "other")
+    public = load_public_key(public_path)
+    other_public = load_public_key(other_public_path)
+    first = TrustedKey.from_verify_key(public)
+    other = TrustedKey.from_verify_key(other_public)
+
+    with pytest.raises(TrustBundleError, match="fields"):
+        TrustBundle.from_dict({"schema": "1.0", "created_at": "now", "updated_at": "now"})
+    with pytest.raises(TrustBundleError, match="must be strings"):
+        TrustBundle.from_dict(
+            {"schema": "1.0", "created_at": None, "updated_at": "now", "keys": []}
+        )
+    with pytest.raises(TrustBundleError, match="At least one public key"):
+        TrustBundle.from_public_keys(())
+    with pytest.raises(TrustBundleError, match="duplicate key IDs"):
+        TrustBundle((first, replace(other, key_id=first.key_id)), "now", "now")
+    alternate_id = "0" * 16 if first.key_id != "0" * 16 else "1" * 16
+    with pytest.raises(TrustBundleError, match="duplicate public keys"):
+        TrustBundle((first, replace(first, key_id=alternate_id)), "now", "now")
+
+    bundle = TrustBundle.from_public_keys((public,))
+    with pytest.raises(TrustBundleError, match="already exists"):
+        bundle.rotate((public,))
+    with pytest.raises(TrustBundleError, match="revocation list contains duplicates"):
+        bundle.rotate(revoked_key_ids=(bundle.keys[0].key_id, bundle.keys[0].key_id))
+    multi_bundle = TrustBundle.from_public_keys((public, other_public))
+    revoked = multi_bundle.rotate(revoked_key_ids=(multi_bundle.keys[0].key_id,))
+    with pytest.raises(TrustBundleError, match="not active"):
+        revoked.rotate(revoked_key_ids=(multi_bundle.keys[0].key_id,))
+
+    monkeypatch.setattr(trust_module, "public_key_fingerprint", lambda _key: alternate_id)
+    with pytest.raises(TrustBundleError, match="public key already exists"):
+        bundle.rotate((public,))
+
+
+def test_trust_bundle_read_and_write_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with pytest.raises(TrustBundleError, match="Could not read trust bundle"):
+        load_trust_bundle(tmp_path / "missing.json")
+    invalid_path = tmp_path / "invalid.json"
+    invalid_path.write_text("{", encoding="utf-8")
+    with pytest.raises(TrustBundleError, match="Could not read trust bundle"):
+        load_trust_bundle(invalid_path)
+
+    _private_path, public_path = _key_files(tmp_path, "key")
+    bundle = TrustBundle.from_public_keys((load_public_key(public_path),))
+
+    def fail_replace(_source: Path, _destination: Path) -> Path:
+        raise OSError("replace failed")
+
+    monkeypatch.setattr(Path, "replace", fail_replace)
+    with pytest.raises(TrustBundleError, match="Failed to write trust bundle"):
+        write_trust_bundle(tmp_path / "failed.json", bundle)
+
+
+def test_bundle_verification_rejects_malformed_signature_envelopes(tmp_path: Path) -> None:
+    _private_path, public_path = _key_files(tmp_path, "key")
+    bundle = TrustBundle.from_public_keys((load_public_key(public_path),))
+    malformed = (
+        None,
+        {"signature": "not-an-object"},
+        {"signature": {"algorithm": "RSA"}},
+        {"signature": {"algorithm": "Ed25519"}},
+        {"signature": {"algorithm": "Ed25519", "key_id": "0" * 16}},
+    )
+    for attestation in malformed:
+        valid, _message, selected = verify_attestation_with_bundle(attestation, bundle)
+        assert valid is False
+        assert selected is None
+
+
+def test_admission_file_loading_rejects_missing_and_non_object_attestations(tmp_path: Path) -> None:
+    _private_path, public_path = _key_files(tmp_path, "key")
+    bundle_path = tmp_path / "trust.json"
+    write_trust_bundle(
+        bundle_path,
+        TrustBundle.from_public_keys((load_public_key(public_path),)),
+    )
+    missing = verify_admission_files(tmp_path / "missing-attestation.json", bundle_path)
+    assert missing[0] is False
+
+    attestation_path = tmp_path / "attestation.json"
+    attestation_path.write_text(json.dumps([]), encoding="utf-8")
+    non_object = verify_admission_files(attestation_path, bundle_path)
+    assert non_object == (False, "Attestation root must be a JSON object.")
