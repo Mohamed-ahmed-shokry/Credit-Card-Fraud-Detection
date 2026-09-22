@@ -37,6 +37,13 @@ financial-services platform.
    LLM calls with timeouts, prompt redaction, cost controls, and fallback.
 9. `model.py` provides `generate_attestation` and `verify_attestation` to export
    and verify tamper-evident, canonical SHA-256 digested attestation manifests.
+10. `edge.py` defines a versioned, dependency-light int8 runtime for the supported
+    uncalibrated logistic artifact contract. `cli.py` builds and validates this
+    representation with `export-edge`; the runtime scorer itself does not import
+    scikit-learn.
+11. `telemetry.py` parses W3C `traceparent` contexts and provides an injectable
+    trace exporter plus best-effort OTLP/HTTP JSON export. `api.py` creates one
+    server span per HTTP request and isolates exporter failures from scoring.
 
 ## Artifact contract
 
@@ -52,6 +59,27 @@ model.joblib    trusted-process pickle containing the fitted FraudModel
 metadata and manifest are complete. `load_model` verifies the manifest before
 deserialization, checks the scikit-learn runtime, validates the embedded model,
 and confirms that embedded and readable metadata agree.
+
+An edge export is a separate JSON artifact and is not a replacement for the trusted
+`model.joblib` artifact:
+
+```text
+schema_version       Edge format version (currently 1)
+feature_names        Ordered numeric input contract
+scaler_mean/scale    Standardization statistics
+quantized_weights    Signed int8 logistic coefficients
+weight_scale         Coefficient dequantization scale
+intercept/threshold  Decision policy values
+pruned_features      Coefficients removed by the export policy
+```
+
+Only `logistic_regression` artifacts with `calibration_method=none` are exportable.
+The edge loader validates the schema, exact feature mapping, finite numeric values,
+positive scaler scales, and int8 bounds. The exporter can compare edge and source
+probabilities against validation data and refuses output when the configured error
+tolerance is exceeded. The JSON runtime is suitable for a constrained scorer, but
+the source model remains authoritative for retraining, audit replay, and calibrated
+probability reporting.
 
 `validate_artifact` (and the `validate-artifact` CLI command) provides a
 safe, read-only validation pass verifying manifest integrity, runtime
@@ -80,12 +108,18 @@ loadable, but their model cards identify the missing provenance.
 numeric validation, optional API-key and in-memory rate limiting middleware,
 request correlation headers, structured logging, opt-in JSONL audit event export
 (`FRAUD_AUDIT_LOG_PATH`), pluggable explanation providers, and isolated Prometheus
-metrics. Serving guardrails support degraded-state fallback policies (`constant`,
+metrics. It also returns a W3C `traceparent` response header and can export request
+spans through an injected `TraceExporter` or optional OTLP/HTTP collector configured
+with `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, `OTEL_SERVICE_NAME`, and
+`FRAUD_OTLP_TIMEOUT_SECONDS`. Trace export is disabled by default, sends only
+operational attributes (method, path, status, request ID, and model version), and
+contains no transaction features. Exporter/network failures are isolated from
+requests. Serving guardrails support degraded-state fallback policies (`constant`,
 `rule`, `raise`) configurable via environment variables or header simulation
 (`X-Simulate-Degraded`), with fallback executions tracked by Prometheus counters
 (`fraud_fallback_predictions_total`). Authentication, network policy, durable
-rate limiting, secret management, and audit-log retention remain deployment
-responsibilities.
+rate limiting, collector authentication, secret management, trace retention, and
+audit-log retention remain deployment responsibilities.
 
 For operational resiliency and safe challenger evaluation:
 - `CircuitBreaker` maintains scoring stability. Consecutive failures exceeding
@@ -129,6 +163,10 @@ the request and response, while the tuned artifact threshold remains visible as
 - Traffic shadowing never blocks, delays, or fails primary scoring responses.
 - Circuit breakers fail fast to safe deterministic fallback policies when upstream
   or model degradations occur.
+- Trace propagation preserves a valid incoming W3C trace ID while creating a new
+  server span ID; malformed contexts start a fresh trace.
+- OTLP collection is optional and best effort. It must never become a scoring
+  availability dependency.
 
 ## Extension guidance
 
