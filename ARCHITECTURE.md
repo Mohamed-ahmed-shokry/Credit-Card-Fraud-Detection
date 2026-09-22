@@ -47,6 +47,9 @@ financial-services platform.
 12. `signing.py` owns Ed25519 key loading, canonical JSON signing, and trusted
     public-key verification. The CLI uses it to turn validation reports into
     deployment admission evidence without coupling signatures to inference.
+13. `trust.py` validates rotation-aware public-key bundles, performs add/revoke
+    operations, and exposes the admission check used by API startup. Revocation
+    is evaluated before the model artifact is loaded.
 
 ## Artifact contract
 
@@ -141,7 +144,11 @@ requests. Serving guardrails support degraded-state fallback policies (`constant
 (`X-Simulate-Degraded`), with fallback executions tracked by Prometheus counters
 (`fraud_fallback_predictions_total`). Authentication, network policy, durable
 rate limiting, collector authentication, secret management, trace retention, and
-audit-log retention remain deployment responsibilities.
+audit-log retention remain deployment responsibilities. When both
+`FRAUD_ATTESTATION_PATH` and `FRAUD_TRUST_BUNDLE_PATH` are configured, startup
+first verifies the attestation digest, `PASSED` status, signing key ID, active
+bundle status, and Ed25519 signature; only then does it deserialize the model.
+Partial admission configuration or failed verification stops startup.
 
 For operational resiliency and safe challenger evaluation:
 - `CircuitBreaker` maintains scoring stability. Consecutive failures exceeding
