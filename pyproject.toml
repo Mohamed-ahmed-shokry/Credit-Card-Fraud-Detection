@@ -25,6 +25,7 @@ classifiers = [
 ]
 dependencies = [
   "fastapi>=0.110,<1",
+  "cryptography>=42,<47",
   "joblib>=1.3,<2",
   "numpy>=1.24,<3",
   "pandas>=2.0,<4",
