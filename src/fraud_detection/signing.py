@@ -82,6 +82,7 @@ def sign_payload(payload: dict[str, Any], private_key: SigningKey) -> dict[str, 
     return {
         "schema": SIGNATURE_SCHEMA,
         "algorithm": SIGNATURE_ALGORITHM,
+        "key_id": public_key_fingerprint(private_key.verify_key),
         "public_key": _encode(private_key.verify_key.encode()),
         "signature": _encode(signature),
     }
