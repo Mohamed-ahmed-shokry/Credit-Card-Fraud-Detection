@@ -44,6 +44,9 @@ financial-services platform.
 11. `telemetry.py` parses W3C `traceparent` contexts and provides an injectable
     trace exporter plus best-effort OTLP/HTTP JSON export. `api.py` creates one
     server span per HTTP request and isolates exporter failures from scoring.
+12. `signing.py` owns Ed25519 key loading, canonical JSON signing, and trusted
+    public-key verification. The CLI uses it to turn validation reports into
+    deployment admission evidence without coupling signatures to inference.
 
 ## Artifact contract
 
@@ -94,9 +97,28 @@ The lineage block on newly trained artifacts contains:
   version;
 - optional `git_commit` and `git_repository` values from CLI training.
 
-Artifact validation reports can be exported as signed machine-readable JSON
-attestation manifests via `generate_attestation()` / `validate-artifact --attestation-output`,
-providing a verifiable SHA-256 cryptographic digest over the full verification state for admission controllers.
+Artifact validation reports can be exported as machine-readable JSON attestation
+manifests via `generate_attestation()` / `validate-artifact --attestation-output`,
+providing a verifiable SHA-256 digest over the full verification state for admission
+controllers. The digest detects payload modification but does not establish who
+produced the attestation.
+
+The optional authenticity layer works as follows:
+
+- `generate-signing-key` writes a PKCS#8 Ed25519 private PEM and a public PEM key
+  using atomic replacement. Private output is never printed or included in an
+  attestation.
+- `validate-artifact --strict --signing-key ... --attestation-output ...` adds a
+  `signature` envelope. The signature covers the complete payload after the
+  SHA-256 `attestation_digest` is attached.
+- `verify-attestation` independently loads a pinned public key, validates the
+  digest, verifies the Ed25519 signature, and requires `status=PASSED` by default.
+  It exits `1` for any failed admission condition.
+
+Unsigned attestations remain digest-verifiable for backward compatibility, but
+deployment admission must keep the required-signature default. Public keys are
+trust anchors and must come from access-controlled deployment configuration
+rather than from the attestation being verified.
 
 Lineage is additive. Artifacts created before lineage was introduced remain
 loadable, but their model cards identify the missing provenance.
