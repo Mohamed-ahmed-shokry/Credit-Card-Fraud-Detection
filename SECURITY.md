@@ -70,6 +70,22 @@ signatures. `--allow-unsigned` exists only for legacy migration and must not be
 used as the production admission policy. Signatures authenticate the validation
 evidence; they do not make an untrusted `model.joblib` safe to deserialize.
 
+### Key rotation and startup admission
+
+Trust bundles contain the public key ID, raw public key, and lifecycle status for
+each verification key. Rotate in two stages: add the replacement key while the
+old key remains active, deploy the updated bundle, move signing to the replacement,
+then revoke the old key with `rotate-trust-bundle`. Revocation is fail-closed and
+does not rewrite existing attestations. Keep old bundles available for historical
+verification, but do not use them for new deployment admission.
+
+When `FRAUD_ATTESTATION_PATH` and `FRAUD_TRUST_BUNDLE_PATH` are both configured,
+the API verifies the attestation before deserializing `model.joblib`. A failed,
+missing, tampered, revoked, or unknown-key attestation prevents startup. The two
+variables are intentionally all-or-nothing; leaving both unset is the explicit
+local-development mode. Mount both files read-only and distribute the bundle
+through an access-controlled deployment channel.
+
 ### Transaction data
 
 Raw datasets, generated predictions, and trained artifacts are excluded by
