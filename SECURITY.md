@@ -31,8 +31,8 @@ can execute arbitrary code. Only load artifacts from a trusted training pipeline
 
 Directory-based loading checks SHA-256 hashes from `manifest.json` before unpickling.
 These hashes detect accidental or unauthorized modification, but they are not a
-digital signature. Store artifacts in access-controlled, immutable storage and add
-signature verification when crossing a trust boundary.
+digital signature. Store artifacts in access-controlled, immutable storage and
+require a signed validation attestation when crossing a trust boundary.
 
 Before publication and after deserialization, artifact handling also validates the
 estimator interface, decision threshold, feature schema, finite standards-compliant
@@ -44,6 +44,30 @@ Directory artifacts are checked for an exact scikit-learn runtime match before
 deserialization. Direct-file loading converts scikit-learn version warnings into
 errors. Retrain artifacts after dependency upgrades; do not suppress compatibility
 checks for production serving.
+
+### Attestation signatures
+
+`fraud-detect generate-signing-key` creates an Ed25519 keypair. The private PEM
+is unencrypted by design so it can be supplied by a controlled CI secret-file
+mount; it must never be committed, logged, or placed in an artifact directory.
+Protect it with the CI secret store or an external KMS workflow and rotate it
+through an operator-controlled process. The public PEM is the deployment trust
+anchor and should be distributed through access-controlled configuration or
+image metadata with an explicit rotation policy.
+
+Use strict validation to sign only a report that passed artifact checks:
+
+```text
+validate-artifact --strict --signing-key PRIVATE --attestation-output ATTESTATION
+verify-attestation ATTESTATION TRUSTED_PUBLIC_KEY
+```
+
+Admission verification checks the canonical SHA-256 digest, Ed25519 signature,
+trusted public-key match, and `PASSED` validation status. It fails closed for
+modified payloads, wrong keys, malformed signatures, failed reports, and missing
+signatures. `--allow-unsigned` exists only for legacy migration and must not be
+used as the production admission policy. Signatures authenticate the validation
+evidence; they do not make an untrusted `model.joblib` safe to deserialize.
 
 ### Transaction data
 
