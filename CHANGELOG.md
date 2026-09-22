@@ -8,6 +8,9 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- Rotation-aware deployment admission: added validated trust bundles, add/revoke
+  key rotation workflows, key IDs in new signatures, API/serve startup verification
+  before model loading, Compose mount guidance, and a CI admission smoke job.
 - Deployment artifact trust: added Ed25519 keypair generation, canonical signed
   validation attestations, and fail-closed `verify-attestation` admission checks
   for trusted public keys, passed artifact status, digest integrity, and signature
