@@ -370,10 +370,10 @@ that result as an explicit admission decision without changing model scoring.
 
 ### Scope
 
-- **Signing primitive** — add a small `cryptography`-backed Ed25519 boundary
-  with PEM key loading, raw public-key encoding, canonical JSON signing, and
-  actionable failures. Private keys are accepted only as explicit signing
-  inputs and are never written into artifacts or logs.
+- **Signing primitive** — add a small PyNaCl-backed Ed25519 boundary with
+  self-describing PEM key loading, raw public-key encoding, canonical JSON
+  signing, and actionable failures. Private keys are accepted only as explicit
+  signing inputs and are never written into artifacts or logs.
 - **Attestation signatures** — extend the existing digest attestation with a
   versioned signature envelope covering the complete digest-bearing payload,
   while preserving verification of unsigned legacy attestations.
