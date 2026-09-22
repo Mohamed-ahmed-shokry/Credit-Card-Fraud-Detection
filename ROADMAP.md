@@ -418,7 +418,7 @@ admission result into their deployment system.
 
 ### Delivery record
 
-- Added `cryptography`-backed Ed25519 key generation, PEM loading, canonical JSON
+- Added PyNaCl-backed Ed25519 key generation, PEM loading, canonical JSON
   signing, trusted public-key matching, and actionable verification failures.
 - Extended validation attestations with an optional signature envelope while
   preserving digest verification for unsigned legacy attestations.
@@ -436,7 +436,7 @@ admission result into their deployment system.
 - Docker validation remains unavailable in this environment because the Docker
   executable is not installed; CI remains responsible for container smoke checks.
 
-## Phase 19 — Key Rotation and Automated Admission Enforcement (In progress)
+## Phase 19 — Key Rotation and Automated Admission Enforcement (Done)
 
 ### Objective
 
@@ -494,6 +494,29 @@ This phase does not implement a hosted KMS, remote trust-bundle distribution,
 hardware-backed keys, transparency logs, or automatic key generation in
 production deployments. Private-key custody, bundle distribution, and rotation
 authorization remain operator responsibilities.
+
+### Delivery record
+
+- Added schema-validated, atomic Ed25519 trust bundles with stable key IDs,
+  active/revoked lifecycle status, duplicate detection, and staged add/revoke
+  rotation operations.
+- Added key IDs to new signature envelopes while preserving the Phase 18
+  single-public-key verification path; bundle verification fails closed for
+  unknown, revoked, mismatched, and legacy-without-key-ID signatures.
+- Added `generate-trust-bundle`, `rotate-trust-bundle`, bundle-aware
+  `verify-attestation`, and startup admission enforcement before API model
+  deserialization, including `serve` and environment configuration.
+- Added Compose read-only mount guidance, a GitHub Actions generate/sign/rotate/
+  revoke admission smoke job, and operator documentation across README,
+  SECURITY, ARCHITECTURE, and CHANGELOG.
+- Added trust, CLI, API, and workflow coverage for rotation, revocation, malformed
+  bundles, legacy mode, startup success/failure, and model-load ordering.
+- Final validation: 476 tests passed with 97.29% branch coverage; Ruff checks and
+  formatting passed; strict mypy passed; package build and Twine checks passed;
+  isolated project dependency audit reported no known vulnerabilities; the local
+  generate/sign/rotate/revoke admission smoke sequence passed.
+- Docker validation remains unavailable in this environment because the Docker
+  executable is not installed; CI remains responsible for container smoke checks.
 
 ## Contributing to the roadmap
 
