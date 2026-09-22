@@ -289,6 +289,34 @@ def verify_attestation_with_bundle(
     return valid, message, trusted_key
 
 
+def verify_admission_files(
+    attestation_path: Path | str,
+    bundle_path: Path | str,
+) -> tuple[bool, str]:
+    """Verify a passed signed attestation before a deployment loads its model."""
+    try:
+        payload = json.loads(Path(attestation_path).read_text(encoding="utf-8"))
+        bundle = load_trust_bundle(bundle_path)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, TrustBundleError) as exc:
+        return False, str(exc)
+    if not isinstance(payload, dict):
+        return False, "Attestation root must be a JSON object."
+
+    from fraud_detection.model import verify_attestation
+
+    digest_valid, digest_message = verify_attestation(payload)
+    if not digest_valid:
+        return False, digest_message
+    if payload.get("status") != "PASSED":
+        return False, f"Attestation status is not PASSED: {payload.get('status')!r}."
+    signature_valid, signature_message, _selected_key = verify_attestation_with_bundle(
+        payload, bundle
+    )
+    if not signature_valid:
+        return False, signature_message
+    return True, "Deployment attestation admission verified successfully."
+
+
 def load_public_keys(paths: tuple[Path, ...]) -> tuple[VerifyKey, ...]:
     """Load public keys for trust-bundle construction."""
     try:

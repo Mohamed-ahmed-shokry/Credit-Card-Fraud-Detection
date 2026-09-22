@@ -4,6 +4,7 @@ import json
 import logging
 import time
 from collections.abc import Iterator
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, cast
 from unittest.mock import MagicMock
@@ -30,8 +31,10 @@ from fraud_detection.api import (
 )
 from fraud_detection.audit import JsonlAuditSink
 from fraud_detection.data import ValidatedDataset, generate_synthetic_data, validate_frame
-from fraud_detection.model import FraudModel, save_model, train_model
+from fraud_detection.model import FraudModel, save_model, train_model, validate_artifact
+from fraud_detection.signing import load_private_key, load_public_key, write_keypair
 from fraud_detection.telemetry import TraceContext, TraceSpan
+from fraud_detection.trust import TrustBundle, write_trust_bundle
 
 
 class _RecordingTraceExporter:
@@ -152,6 +155,62 @@ def test_otlp_environment_configures_optional_exporter(
         "service_name": "fraud-api",
         "timeout_seconds": 0.25,
     }
+
+
+def test_admission_gate_runs_before_model_load(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+    tmp_path: Path,
+) -> None:
+    _, model, _ = api_context
+    signed_model = deepcopy(model)
+    signed_model.metadata["lineage"].update(
+        {"git_commit": "b" * 40, "git_repository": "https://example.test/admission.git"}
+    )
+    artifact_path = tmp_path / "artifact"
+    save_model(signed_model, artifact_path)
+    private_key_path = tmp_path / "private.pem"
+    public_key_path = tmp_path / "public.pem"
+    write_keypair(private_key_path, public_key_path)
+    report = validate_artifact(artifact_path, strict=True)
+    attestation_path = tmp_path / "attestation.json"
+    attestation_path.write_text(
+        json.dumps(
+            report.to_attestation(signing_key=load_private_key(private_key_path)),
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    bundle_path = tmp_path / "trust-bundle.json"
+    write_trust_bundle(
+        bundle_path,
+        TrustBundle.from_public_keys((load_public_key(public_key_path),)),
+    )
+
+    with TestClient(
+        create_app(
+            model_path=artifact_path,
+            attestation_path=attestation_path,
+            trust_bundle_path=bundle_path,
+        )
+    ) as admitted_client:
+        assert admitted_client.get("/health").status_code == 200
+
+    tampered = json.loads(attestation_path.read_text(encoding="utf-8"))
+    tampered["status"] = "FAILED"
+    attestation_path.write_text(json.dumps(tampered), encoding="utf-8")
+    blocked_app = create_app(
+        model_path=tmp_path / "missing-model",
+        attestation_path=attestation_path,
+        trust_bundle_path=bundle_path,
+    )
+    with pytest.raises(RuntimeError, match="Deployment admission failed"), TestClient(blocked_app):
+        pass
+
+
+def test_admission_paths_must_be_configured_together(api_context) -> None:
+    _, model, _ = api_context
+    with pytest.raises(ValueError, match="must be configured together"):
+        create_app(model=model, attestation_path="attestation.json")
 
 
 def test_predict_scores_ordered_batch(

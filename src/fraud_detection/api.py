@@ -61,6 +61,8 @@ FALLBACK_SCORE_ENVIRONMENT_VARIABLE = "FRAUD_FALLBACK_SCORE"
 FALLBACK_AMOUNT_THRESHOLD_ENVIRONMENT_VARIABLE = "FRAUD_FALLBACK_AMOUNT_THRESHOLD"
 DEGRADED_MODE_ENVIRONMENT_VARIABLE = "FRAUD_DEGRADED_MODE"
 SHADOW_MODEL_PATH_ENVIRONMENT_VARIABLE = "FRAUD_SHADOW_MODEL_PATH"
+ATTESTATION_PATH_ENVIRONMENT_VARIABLE = "FRAUD_ATTESTATION_PATH"
+TRUST_BUNDLE_PATH_ENVIRONMENT_VARIABLE = "FRAUD_TRUST_BUNDLE_PATH"
 CIRCUIT_BREAKER_ENABLED_ENVIRONMENT_VARIABLE = "FRAUD_CIRCUIT_BREAKER_ENABLED"
 CIRCUIT_BREAKER_FAILURE_THRESHOLD_ENVIRONMENT_VARIABLE = "FRAUD_CIRCUIT_BREAKER_FAILURE_THRESHOLD"
 CIRCUIT_BREAKER_RECOVERY_TIMEOUT_ENVIRONMENT_VARIABLE = "FRAUD_CIRCUIT_BREAKER_RECOVERY_TIMEOUT"
@@ -317,6 +319,8 @@ def create_app(
     otlp_endpoint: str | None = None,
     otlp_service_name: str | None = None,
     otlp_timeout_seconds: float = DEFAULT_OTLP_TIMEOUT_SECONDS,
+    attestation_path: Path | str | None = None,
+    trust_bundle_path: Path | str | None = None,
 ) -> FastAPI:
     """Create an application using an injected model or a trusted artifact path.
 
@@ -348,6 +352,8 @@ def create_app(
             ``OTEL_EXPORTER_OTLP_TRACES_ENDPOINT``.
         otlp_service_name: Service name included in exported spans.
         otlp_timeout_seconds: Collector request timeout for the optional OTLP exporter.
+        attestation_path: Optional signed deployment attestation required before model load.
+        trust_bundle_path: Optional rotation-aware trust bundle paired with attestation_path.
     """
     logging.basicConfig(level=logging.INFO)
 
@@ -388,6 +394,15 @@ def create_app(
     )
 
     resolved_shadow_path = shadow_model_path or os.getenv(SHADOW_MODEL_PATH_ENVIRONMENT_VARIABLE)
+    resolved_attestation_path = attestation_path or os.getenv(ATTESTATION_PATH_ENVIRONMENT_VARIABLE)
+    resolved_trust_bundle_path = trust_bundle_path or os.getenv(
+        TRUST_BUNDLE_PATH_ENVIRONMENT_VARIABLE
+    )
+    if (resolved_attestation_path is None) != (resolved_trust_bundle_path is None):
+        raise ValueError(
+            f"{ATTESTATION_PATH_ENVIRONMENT_VARIABLE} and "
+            f"{TRUST_BUNDLE_PATH_ENVIRONMENT_VARIABLE} must be configured together."
+        )
 
     cb_enabled = (
         circuit_breaker is not None
@@ -511,6 +526,16 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
+        if resolved_attestation_path is not None and resolved_trust_bundle_path is not None:
+            from fraud_detection.trust import verify_admission_files
+
+            admission_valid, admission_message = verify_admission_files(
+                resolved_attestation_path,
+                resolved_trust_bundle_path,
+            )
+            if not admission_valid:
+                raise RuntimeError(f"Deployment admission failed: {admission_message}")
+
         loaded_model = model
         if loaded_model is None:
             configured_path = model_path or os.getenv(MODEL_PATH_ENVIRONMENT_VARIABLE)
