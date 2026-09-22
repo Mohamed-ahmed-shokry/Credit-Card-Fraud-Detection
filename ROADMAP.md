@@ -436,6 +436,65 @@ admission result into their deployment system.
 - Docker validation remains unavailable in this environment because the Docker
   executable is not installed; CI remains responsible for container smoke checks.
 
+## Phase 19 — Key Rotation and Automated Admission Enforcement (In progress)
+
+### Objective
+
+Make signed artifact trust operable beyond a single pinned key. Operators must
+be able to introduce and revoke verification keys without rewriting attestations,
+and configured API/container startup must reject an artifact before model
+deserialization when its signed validation evidence is absent or untrusted.
+
+### Scope
+
+- **Versioned trust bundles** — add a validated JSON trust-bundle format holding
+  multiple Ed25519 public keys, stable key IDs, active/revoked status, and
+  rotation metadata. Add CLI workflows to create a bundle and atomically add or
+  revoke keys without exposing private material.
+- **Rotation-aware signatures** — include the signing key ID in new signature
+  envelopes, preserve verification of Phase 18 envelopes without key IDs, and
+  select the trusted bundle key by ID. Revoked, unknown, mismatched, and
+  ambiguous keys must fail closed.
+- **Serving admission gate** — add optional `create_app`, `serve`, and
+  environment configuration for an attestation plus trust bundle. Verify the
+  digest, `PASSED` status, signature, and key status before loading the model;
+  reject partial configuration and startup verification failures.
+- **CI and deployment integration** — add a GitHub Actions admission smoke job,
+  Compose/Docker configuration examples, and operator documentation for staged
+  rotation: add new key, deploy trust bundle, sign with new key, revoke old key.
+
+### Acceptance criteria
+
+- Trust bundles reject malformed schemas, duplicate IDs, duplicate public keys,
+  invalid key material, unknown statuses, and bundles with no active key.
+- A bundle can be generated, atomically rotated by adding a key, and rotated by
+  revoking an existing key; output overwrite protection remains explicit.
+- New attestations identify their signing key; verification accepts active bundle
+  keys and rejects revoked or unknown keys, wrong embedded IDs, and Phase 18
+  signature envelopes only when the required legacy single-key mode is used.
+- `verify-attestation` supports either the existing single public key or a trust
+  bundle and emits machine-readable key ID/status details with non-zero admission
+  exits on failure.
+- Configured `create_app`/`serve` startup verifies admission before model loading,
+  requires attestation and trust-bundle paths together, and leaves existing
+  unconfigured development behavior unchanged.
+- CI executes a real generate, sign, rotate, and verify admission workflow on a
+  supported Python version; Compose documents the read-only attestation and
+  trust-bundle mounts.
+- Focused unit/API/CLI/workflow tests cover rotation, revocation, legacy mode,
+  startup failure, startup success, and model-load ordering.
+- README, SECURITY, ARCHITECTURE, CHANGELOG, and roadmap progress document key
+  rotation and enforcement boundaries.
+- Full quality gates, package build, dependency audit, and available smoke checks
+  pass before this phase is marked `Done`.
+
+### Explicit exclusions
+
+This phase does not implement a hosted KMS, remote trust-bundle distribution,
+hardware-backed keys, transparency logs, or automatic key generation in
+production deployments. Private-key custody, bundle distribution, and rotation
+authorization remain operator responsibilities.
+
 ## Contributing to the roadmap
 
 Open an issue or a pull request that references the relevant phase item.
