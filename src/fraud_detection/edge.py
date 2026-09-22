@@ -8,9 +8,10 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from numbers import Real
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from fraud_detection.model import FraudModel
+if TYPE_CHECKING:
+    from fraud_detection.model import FraudModel
 
 EDGE_SCHEMA_VERSION = 1
 SUPPORTED_QUANTIZATION_BITS = 8
