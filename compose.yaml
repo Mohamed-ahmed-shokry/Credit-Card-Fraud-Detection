@@ -5,10 +5,15 @@ services:
     image: credit-card-fraud-detection:local
     environment:
       FRAUD_MODEL_PATH: /app/artifacts/model
+      # Enable fail-closed startup admission by setting both paths together.
+      # FRAUD_ATTESTATION_PATH: /app/admission/attestation.json
+      # FRAUD_TRUST_BUNDLE_PATH: /app/admission/trust-bundle.json
     ports:
       - "8000:8000"
     volumes:
       - ./artifacts/model:/app/artifacts/model:ro
+      # Mount admission evidence and its rotation-aware trust bundle read-only.
+      # - ./admission:/app/admission:ro
     restart: unless-stopped
     read_only: true
     tmpfs:
