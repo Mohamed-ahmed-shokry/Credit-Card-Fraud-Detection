@@ -273,9 +273,7 @@ def test_multi_window_drift_detects_sudden_acceleration() -> None:
     current = pd.DataFrame(
         {
             "stable_feat": rng.normal(0, 1, 1_000),
-            "spiking_feat": np.concatenate(
-                [rng.normal(0, 1, 850), rng.normal(15, 1, 150)]
-            ),
+            "spiking_feat": np.concatenate([rng.normal(0, 1, 850), rng.normal(15, 1, 150)]),
         }
     )
 
@@ -405,6 +403,3 @@ def test_streaming_profile_empty_to_reference_profile() -> None:
     assert len(ref["feature_a"]["proportions"]) == 3
     assert pytest.approx(sum(ref["feature_a"]["proportions"])) == 1.0
     assert ref["feature_a"]["standard_deviation"] == 0.0
-
-
-

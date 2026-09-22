@@ -448,5 +448,3 @@ def test_replay_audit_log_skip_edge_cases(tmp_path: Path) -> None:
     )
     report_fail = replay_audit_log(fail_log, FailingModel())
     assert report_fail.skipped_events == 1
-
-

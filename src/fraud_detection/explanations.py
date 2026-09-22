@@ -52,9 +52,7 @@ class ExplanationProvider(Protocol):
         """Generate an explanation for a single transaction request."""
         ...
 
-    def explain_batch(
-        self, requests: Sequence[ExplanationRequest]
-    ) -> list[ExplanationResult]:
+    def explain_batch(self, requests: Sequence[ExplanationRequest]) -> list[ExplanationResult]:
         """Generate explanations for a sequence of transaction requests."""
         ...
 
@@ -94,9 +92,7 @@ class TemplateExplanationProvider:
             latency_ms=duration_ms,
         )
 
-    def explain_batch(
-        self, requests: Sequence[ExplanationRequest]
-    ) -> list[ExplanationResult]:
+    def explain_batch(self, requests: Sequence[ExplanationRequest]) -> list[ExplanationResult]:
         """Generate explanations for all requests."""
         return [self.explain(req) for req in requests]
 
@@ -169,9 +165,7 @@ class ExternalExplanationProvider:
         if self.cost_controller is not None:
             allowed, reason = self.cost_controller.check_and_record()
             if not allowed:
-                logger.warning(
-                    "Cost controller blocked external explanation: %s", reason
-                )
+                logger.warning("Cost controller blocked external explanation: %s", reason)
                 fb_res = self.fallback_provider.explain(request)
                 return ExplanationResult(
                     explanation=fb_res.explanation,
@@ -232,8 +226,6 @@ class ExternalExplanationProvider:
                     fallback_reason=str(exc),
                 )
 
-    def explain_batch(
-        self, requests: Sequence[ExplanationRequest]
-    ) -> list[ExplanationResult]:
+    def explain_batch(self, requests: Sequence[ExplanationRequest]) -> list[ExplanationResult]:
         """Generate explanations for all requests sequentially or via pool."""
         return [self.explain(req) for req in requests]

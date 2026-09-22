@@ -187,4 +187,3 @@ def test_inject_drift_validation_errors() -> None:
 
     with pytest.raises(DataValidationError, match="sample_fraction must be in"):
         inject_drift(frame, sample_fraction=0.0)
-

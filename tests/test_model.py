@@ -1206,7 +1206,3 @@ def test_attestation_generation_and_verification(
     is_valid_br, msg_br = verify_attestation(bad_root_file)
     assert is_valid_br is False
     assert "must be a JSON object" in msg_br
-
-
-
-

@@ -223,9 +223,7 @@ def test_model_explain_with_custom_provider() -> None:
                 provider=self.name,
             )
 
-        def explain_batch(
-            self, requests: list[ExplanationRequest]
-        ) -> list[ExplanationResult]:
+        def explain_batch(self, requests: list[ExplanationRequest]) -> list[ExplanationResult]:
             return [self.explain(r) for r in requests]
 
     exps = model.explain_local_natural_language(
@@ -250,9 +248,7 @@ def test_api_predict_with_custom_explanation_provider() -> None:
                 provider=self.name,
             )
 
-        def explain_batch(
-            self, requests: list[ExplanationRequest]
-        ) -> list[ExplanationResult]:
+        def explain_batch(self, requests: list[ExplanationRequest]) -> list[ExplanationResult]:
             return [self.explain(r) for r in requests]
 
     app = create_app(

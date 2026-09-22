@@ -65,6 +65,7 @@ def _is_luhn_valid(candidate: str) -> bool:
 
 def _mask_pans_in_string(text: str, mask_replacement: str = "[REDACTED_PAN]") -> str:
     """Detect and mask Luhn-valid primary account numbers (PANs) within a string."""
+
     def _replace_match(match: re.Match[str]) -> str:
         raw_match = match.group(0)
         if _is_luhn_valid(raw_match):
@@ -94,9 +95,7 @@ def redact_data(
         for key, value in data.items():
             str_key = str(key)
             normalized_key = str_key.lower().replace("-", "_").strip()
-            is_sensitive = any(
-                sensitive in normalized_key for sensitive in sensitive_keys
-            )
+            is_sensitive = any(sensitive in normalized_key for sensitive in sensitive_keys)
             if is_sensitive:
                 redacted_dict[str_key] = mask_value
             else:
@@ -137,9 +136,7 @@ class AuditEvent:
     """Structured audit event recording an operational decision or scoring action."""
 
     event_type: str
-    timestamp: str = field(
-        default_factory=lambda: datetime.now(UTC).isoformat()
-    )
+    timestamp: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
     event_id: str = field(default_factory=lambda: uuid4().hex)
     model_version: str | None = None
     dataset_fingerprint: str | None = None
@@ -292,7 +289,6 @@ def build_shadow_scoring_audit_event(
         dataset_fingerprint=shadow_dataset_fingerprint,
         payload=payload,
     )
-
 
 
 @dataclass(frozen=True)
@@ -482,10 +478,9 @@ def replay_audit_log(
                 if flipped:
                     decision_flips += 1
 
-                can_record = (
-                    (is_score_disc or flipped)
-                    and len(discrepancies_list) < max_discrepancies_to_record
-                )
+                can_record = (is_score_disc or flipped) and len(
+                    discrepancies_list
+                ) < max_discrepancies_to_record
                 if can_record:
                     discrepancies_list.append(
                         DiscrepancyDetail(
@@ -526,4 +521,3 @@ def replay_audit_log(
         status=status,
         discrepancies=tuple(discrepancies_list),
     )
-

@@ -293,8 +293,7 @@ class StreamingProfile:
             raise DriftError("Profiler state 'features' must be a non-empty mapping.")
 
         feature_edges = {
-            feature: [float(e) for e in spec["edges"]]
-            for feature, spec in raw_features.items()
+            feature: [float(e) for e in spec["edges"]] for feature, spec in raw_features.items()
         }
         instance = cls(feature_edges)
         for feature, spec in raw_features.items():
@@ -303,7 +302,6 @@ class StreamingProfile:
             instance.means[feature] = float(spec["mean"])
             instance.m2s[feature] = float(spec["m2"])
         return instance
-
 
 
 def assess_drift(
@@ -475,7 +473,6 @@ def assess_multi_window_drift(
         warning_at=warning_at,
         drift_at=drift_at,
     )
-
 
 
 _SURVEILLANCE_SEVERITY = {"stable": 0, "warning": 1, "drifted": 2}

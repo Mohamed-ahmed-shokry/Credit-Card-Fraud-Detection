@@ -1922,9 +1922,7 @@ def test_validate_artifact_cli_strict_fails_without_git(
     assert strict_report["valid"] is False
 
 
-def test_predict_cli_with_audit_log(
-    tmp_path: Path, trained_artifact: Path
-) -> None:
+def test_predict_cli_with_audit_log(tmp_path: Path, trained_artifact: Path) -> None:
     data_path = tmp_path / "transactions.csv"
     output_path = tmp_path / "predictions.csv"
     audit_log = tmp_path / "audit" / "predict_audit.jsonl"
@@ -1954,9 +1952,7 @@ def test_predict_cli_with_audit_log(
     assert len(record["payload"]["predictions"]) == 200
 
 
-def test_promote_cli_with_audit_log(
-    tmp_path: Path, trained_artifact: Path
-) -> None:
+def test_promote_cli_with_audit_log(tmp_path: Path, trained_artifact: Path) -> None:
     heldout_path = tmp_path / "heldout.csv"
     recent_path = tmp_path / "recent.csv"
     audit_log = tmp_path / "audit" / "promote_audit.jsonl"
@@ -2609,7 +2605,6 @@ def test_stream_profile_cli_errors(tmp_path: Path, trained_artifact: Path) -> No
     assert "No valid transaction records" in res3.output
 
 
-
 def test_simulate_drift_cli_success(tmp_path: Path) -> None:
     csv_path = tmp_path / "input.csv"
     generate_synthetic_data(rows=250, random_state=42).to_csv(csv_path, index=False)
@@ -2721,8 +2716,3 @@ def test_simulate_drift_e2e_with_multi_window_surveillance(
     )
     assert mw_res.exit_code == 1
     assert "Multi-window drift surveillance tripped" in mw_res.output
-
-
-
-
-

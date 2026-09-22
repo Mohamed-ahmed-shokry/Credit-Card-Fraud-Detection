@@ -981,9 +981,7 @@ def validate_artifact(
             )
         except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
             errors.append(f"Failed to read or parse manifest: {exc}")
-            checks.append(
-                CheckResult(name="integrity", status="failed", details=str(exc))
-            )
+            checks.append(CheckResult(name="integrity", status="failed", details=str(exc)))
 
     # Read metadata.json if present
     if metadata_file and metadata_file.is_file():
@@ -1180,7 +1178,6 @@ def validate_artifact(
         warnings=tuple(warnings_list),
         metadata_summary=metadata_summary,
     )
-
 
 
 def _dataset_fingerprint(dataset: ValidatedDataset) -> str:

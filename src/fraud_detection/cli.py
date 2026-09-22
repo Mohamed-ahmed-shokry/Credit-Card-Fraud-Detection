@@ -727,9 +727,7 @@ def retrain_command(
             },
             "challenger": {
                 "path": str(challenger_path),
-                "model_version": str(
-                    challenger_model.metadata.get("dataset_fingerprint", "")
-                )[:12],
+                "model_version": str(challenger_model.metadata.get("dataset_fingerprint", ""))[:12],
                 "estimator": challenger_model.metadata.get("estimator"),
                 "threshold": challenger_model.threshold,
                 "test_metrics": chall_metrics_dict,
@@ -1878,8 +1876,7 @@ def _send_multi_window_drift_alert(
     if webhook_slack:
         slack_payload = {
             "text": (
-                f"Multi-Window Drift Alert: Model {model_version} - "
-                f"{report.overall_status.upper()}"
+                f"Multi-Window Drift Alert: Model {model_version} - {report.overall_status.upper()}"
             ),
             "blocks": [
                 {
@@ -2060,9 +2057,7 @@ def stream_profile_command(
 
         if checkpoint_output is not None:
             checkpoint_output.parent.mkdir(parents=True, exist_ok=True)
-            checkpoint_output.write_text(
-                json.dumps(profiler.to_dict(), indent=2), encoding="utf-8"
-            )
+            checkpoint_output.write_text(json.dumps(profiler.to_dict(), indent=2), encoding="utf-8")
 
         typer.echo(
             f"Successfully updated streaming profile for {len(ref_profile)} features "
@@ -2096,9 +2091,7 @@ def simulate_drift_command(
     ],
     features: Annotated[
         list[str] | None,
-        typer.Option(
-            help="Specific features to drift (repeat flag; defaults to all non-target)."
-        ),
+        typer.Option(help="Specific features to drift (repeat flag; defaults to all non-target)."),
     ] = None,
     mean_offset: Annotated[
         float,
@@ -2151,8 +2144,8 @@ def simulate_drift_command(
         )
         output.parent.mkdir(parents=True, exist_ok=True)
         drifted.to_csv(output, index=False)
-        num_drifted_features = len(features) if features else len(
-            [c for c in frame.columns if c != target]
+        num_drifted_features = (
+            len(features) if features else len([c for c in frame.columns if c != target])
         )
         affected_rows = max(1, round(len(frame) * sample_fraction))
         typer.echo(

@@ -1122,8 +1122,3 @@ def test_traffic_shadowing_exception_handling(
         assert len(res.json()["predictions"]) == 2
 
     sink.close()
-
-
-
-
-

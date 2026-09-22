@@ -50,15 +50,9 @@ FALLBACK_AMOUNT_THRESHOLD_ENVIRONMENT_VARIABLE = "FRAUD_FALLBACK_AMOUNT_THRESHOL
 DEGRADED_MODE_ENVIRONMENT_VARIABLE = "FRAUD_DEGRADED_MODE"
 SHADOW_MODEL_PATH_ENVIRONMENT_VARIABLE = "FRAUD_SHADOW_MODEL_PATH"
 CIRCUIT_BREAKER_ENABLED_ENVIRONMENT_VARIABLE = "FRAUD_CIRCUIT_BREAKER_ENABLED"
-CIRCUIT_BREAKER_FAILURE_THRESHOLD_ENVIRONMENT_VARIABLE = (
-    "FRAUD_CIRCUIT_BREAKER_FAILURE_THRESHOLD"
-)
-CIRCUIT_BREAKER_RECOVERY_TIMEOUT_ENVIRONMENT_VARIABLE = (
-    "FRAUD_CIRCUIT_BREAKER_RECOVERY_TIMEOUT"
-)
-CIRCUIT_BREAKER_LATENCY_BUDGET_ENVIRONMENT_VARIABLE = (
-    "FRAUD_CIRCUIT_BREAKER_LATENCY_BUDGET_MS"
-)
+CIRCUIT_BREAKER_FAILURE_THRESHOLD_ENVIRONMENT_VARIABLE = "FRAUD_CIRCUIT_BREAKER_FAILURE_THRESHOLD"
+CIRCUIT_BREAKER_RECOVERY_TIMEOUT_ENVIRONMENT_VARIABLE = "FRAUD_CIRCUIT_BREAKER_RECOVERY_TIMEOUT"
+CIRCUIT_BREAKER_LATENCY_BUDGET_ENVIRONMENT_VARIABLE = "FRAUD_CIRCUIT_BREAKER_LATENCY_BUDGET_MS"
 REQUEST_ID_HEADER = "X-Request-ID"
 PROCESS_TIME_HEADER = "X-Process-Time-Ms"
 MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024
@@ -287,8 +281,6 @@ class HealthResponse(BaseModel):
     shadow_model_version: str | None = None
 
 
-
-
 def create_app(
     *,
     model: FraudModel | None = None,
@@ -338,10 +330,14 @@ def create_app(
     logging.basicConfig(level=logging.INFO)
 
     raw_mode = (
-        fallback_mode
-        if fallback_mode is not None
-        else os.getenv(FALLBACK_MODE_ENVIRONMENT_VARIABLE, "raise")
-    ).lower().strip()
+        (
+            fallback_mode
+            if fallback_mode is not None
+            else os.getenv(FALLBACK_MODE_ENVIRONMENT_VARIABLE, "raise")
+        )
+        .lower()
+        .strip()
+    )
     if raw_mode not in {"raise", "rule", "constant"}:
         raise ValueError(
             f"Invalid fallback_mode '{raw_mode}'; must be 'raise', 'rule', or 'constant'."
@@ -647,9 +643,7 @@ def create_app(
         fb_mode = str(getattr(request.app.state, "fallback_mode", "raise"))
         sh_model: FraudModel | None = getattr(request.app.state, "shadow_model", None)
         sh_ver = (
-            str(sh_model.metadata["dataset_fingerprint"])[:12]
-            if sh_model is not None
-            else None
+            str(sh_model.metadata["dataset_fingerprint"])[:12] if sh_model is not None else None
         )
         return HealthResponse(
             status="degraded" if is_degraded else "ready",
@@ -705,9 +699,7 @@ def create_app(
                         circuit_breaker.record_success()
             except Exception as exc:
                 if circuit_breaker is not None:
-                    circuit_breaker.record_failure(
-                        reason=f"model_exception: {type(exc).__name__}"
-                    )
+                    circuit_breaker.record_failure(reason=f"model_exception: {type(exc).__name__}")
                 if fallback_mode == "raise":
                     raise
                 logger.warning(
@@ -753,9 +745,9 @@ def create_app(
             fraud_count = sum(1 for r in results if r.is_fraud)
             prediction_counter.labels(is_fraud="true").inc(fraud_count)
             prediction_counter.labels(is_fraud="false").inc(len(results) - fraud_count)
-            fallback_counter.labels(
-                mode=fallback_mode, reason=fallback_reason or "unknown"
-            ).inc(len(results))
+            fallback_counter.labels(mode=fallback_mode, reason=fallback_reason or "unknown").inc(
+                len(results)
+            )
             return applied_threshold, results, True, fallback_reason
 
         if probabilities is None:
@@ -1010,17 +1002,13 @@ def _evaluate_shadow_traffic(
 
         has_discrepancy = discrepancies > 0
         if shadow_evaluations_counter is not None:
-            shadow_evaluations_counter.labels(
-                has_discrepancy=str(has_discrepancy).lower()
-            ).inc(len(primary_results))
+            shadow_evaluations_counter.labels(has_discrepancy=str(has_discrepancy).lower()).inc(
+                len(primary_results)
+            )
 
         shadow_event = build_shadow_scoring_audit_event(
-            shadow_model_version=str(
-                shadow_model.metadata.get("dataset_fingerprint", "")
-            )[:12],
-            shadow_dataset_fingerprint=str(
-                shadow_model.metadata.get("dataset_fingerprint", "")
-            ),
+            shadow_model_version=str(shadow_model.metadata.get("dataset_fingerprint", ""))[:12],
+            shadow_dataset_fingerprint=str(shadow_model.metadata.get("dataset_fingerprint", "")),
             evaluated_count=len(primary_results),
             discrepancy_count=discrepancies,
             discrepancies=discrepancy_details,
