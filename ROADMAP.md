@@ -286,7 +286,7 @@ This phase strengthens online operational safety, real-time diagnostic surveilla
   to inject synthetic distribution shifts (mean offsets, variance scaling, anomaly spikes) into
   validation datasets to test alerting webhooks, fallback behavior, and circuit breakers in staging.
 
-## Phase 17 — Edge Runtime Optimization and Distributed Telemetry (In progress)
+## Phase 17 — Edge Runtime Optimization and Distributed Telemetry (Done)
 
 ### Objective
 
@@ -337,6 +337,27 @@ This phase does not add ONNX/TensorFlow Lite conversion, automatic model
 architecture rewriting, a mandatory OpenTelemetry SDK, a collector deployment,
 or durable trace storage. Those require deployment-specific runtime and
 infrastructure decisions and remain later work.
+
+### Delivery record
+
+- Delivered `fraud-detect export-edge`, the schema-versioned dependency-light int8
+  runtime, source-model validation error reporting, pruning metadata, and strict
+  contract rejection for calibrated and tree artifacts.
+- Delivered W3C `traceparent` continuation/fresh-trace behavior, response headers,
+  injectable exporters, optional asynchronous OTLP/HTTP JSON spans, `create_app`
+  configuration, `serve` options, and environment configuration.
+- Added focused edge, telemetry, API, and CLI tests covering success, malformed
+  artifacts, unsupported contracts, schema failures, trace payloads, propagation,
+  and collector failure isolation.
+- Updated `README.md`, `ARCHITECTURE.md`, and `CHANGELOG.md` with usage, limits,
+  security boundaries, and deployment expectations.
+- Final validation: 451 tests passed with 97.90% branch coverage; Ruff formatting
+  and linting passed; strict mypy passed; package build and Twine metadata checks
+  passed; isolated project dependency audit passed after upgrading the audit
+  environment's pip to 26.2.1.
+- Docker validation could not run in this Windows environment because the Docker
+  executable is unavailable; CI remains responsible for Compose, image, and
+  container smoke validation.
 
 ## Contributing to the roadmap
 
