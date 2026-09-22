@@ -31,6 +31,20 @@ from fraud_detection.api import (
 from fraud_detection.audit import JsonlAuditSink
 from fraud_detection.data import ValidatedDataset, generate_synthetic_data, validate_frame
 from fraud_detection.model import FraudModel, save_model, train_model
+from fraud_detection.telemetry import TraceContext, TraceSpan
+
+
+class _RecordingTraceExporter:
+    def __init__(self) -> None:
+        self.spans: list[TraceSpan] = []
+
+    def export(self, span: TraceSpan) -> None:
+        self.spans.append(span)
+
+
+class _FailingTraceExporter:
+    def export(self, _span: TraceSpan) -> None:
+        raise RuntimeError("collector unavailable")
 
 
 @pytest.fixture(scope="module")
@@ -65,6 +79,41 @@ def test_health_reports_loaded_model(
         "feature_count": 30,
         "threshold": model.threshold,
     }
+
+
+def test_traceparent_is_continued_and_span_is_exported(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, model, _ = api_context
+    exporter = _RecordingTraceExporter()
+    incoming = "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01"
+
+    with TestClient(create_app(model=model, trace_exporter=exporter)) as trace_client:
+        response = trace_client.get("/health", headers={"traceparent": incoming})
+
+    assert response.status_code == 200
+    returned_context = TraceContext.from_traceparent(response.headers["traceparent"])
+    assert returned_context.trace_id == "0123456789abcdef0123456789abcdef"
+    assert returned_context.span_id != "0123456789abcdef"
+    assert len(exporter.spans) == 1
+    span = exporter.spans[0]
+    assert span.context == returned_context
+    assert span.parent_span_id == "0123456789abcdef"
+    assert span.attributes["http.response.status_code"] == 200
+    assert span.attributes["fraud.model_version"] == model.metadata["dataset_fingerprint"][:12]
+
+
+def test_invalid_traceparent_starts_new_trace_and_export_failure_is_isolated(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, model, _ = api_context
+
+    with TestClient(create_app(model=model, trace_exporter=_FailingTraceExporter())) as client:
+        response = client.get("/health", headers={"traceparent": "invalid"})
+
+    assert response.status_code == 200
+    context = TraceContext.from_traceparent(response.headers["traceparent"])
+    assert context.trace_id != "invalid"
 
 
 def test_predict_scores_ordered_batch(

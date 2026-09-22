@@ -41,6 +41,18 @@ from fraud_detection.audit import (
 )
 from fraud_detection.explanations import ExplanationProvider
 from fraud_detection.model import FraudModel, ModelArtifactError, load_model
+from fraud_detection.telemetry import (
+    DEFAULT_OTLP_TIMEOUT_SECONDS,
+    DEFAULT_SERVICE_NAME,
+    OTLP_ENDPOINT_ENVIRONMENT_VARIABLE,
+    OTLP_SERVICE_NAME_ENVIRONMENT_VARIABLE,
+    NullTraceExporter,
+    OTLPHttpTraceExporter,
+    TraceContext,
+    TraceExporter,
+    TraceSpan,
+    parse_traceparent,
+)
 
 MODEL_PATH_ENVIRONMENT_VARIABLE = "FRAUD_MODEL_PATH"
 AUDIT_LOG_ENVIRONMENT_VARIABLE = "FRAUD_AUDIT_LOG_PATH"
@@ -53,6 +65,7 @@ CIRCUIT_BREAKER_ENABLED_ENVIRONMENT_VARIABLE = "FRAUD_CIRCUIT_BREAKER_ENABLED"
 CIRCUIT_BREAKER_FAILURE_THRESHOLD_ENVIRONMENT_VARIABLE = "FRAUD_CIRCUIT_BREAKER_FAILURE_THRESHOLD"
 CIRCUIT_BREAKER_RECOVERY_TIMEOUT_ENVIRONMENT_VARIABLE = "FRAUD_CIRCUIT_BREAKER_RECOVERY_TIMEOUT"
 CIRCUIT_BREAKER_LATENCY_BUDGET_ENVIRONMENT_VARIABLE = "FRAUD_CIRCUIT_BREAKER_LATENCY_BUDGET_MS"
+OTLP_TIMEOUT_ENVIRONMENT_VARIABLE = "FRAUD_OTLP_TIMEOUT_SECONDS"
 REQUEST_ID_HEADER = "X-Request-ID"
 PROCESS_TIME_HEADER = "X-Process-Time-Ms"
 MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024
@@ -300,6 +313,10 @@ def create_app(
     latency_budget_ms: float | None = None,
     circuit_breaker_failure_threshold: int = 5,
     circuit_breaker_recovery_timeout: float = 30.0,
+    trace_exporter: TraceExporter | None = None,
+    otlp_endpoint: str | None = None,
+    otlp_service_name: str | None = None,
+    otlp_timeout_seconds: float = DEFAULT_OTLP_TIMEOUT_SECONDS,
 ) -> FastAPI:
     """Create an application using an injected model or a trusted artifact path.
 
@@ -326,6 +343,11 @@ def create_app(
         latency_budget_ms: Max scoring latency (ms) before tripping circuit breaker.
         circuit_breaker_failure_threshold: Consecutive failures before opening circuit breaker.
         circuit_breaker_recovery_timeout: Seconds before probing recovery in half-open state.
+        trace_exporter: Optional injectable trace exporter; defaults to NullTraceExporter.
+        otlp_endpoint: Optional OTLP/HTTP collector endpoint. Environment fallback is
+            ``OTEL_EXPORTER_OTLP_TRACES_ENDPOINT``.
+        otlp_service_name: Service name included in exported spans.
+        otlp_timeout_seconds: Collector request timeout for the optional OTLP exporter.
     """
     logging.basicConfig(level=logging.INFO)
 
@@ -450,6 +472,26 @@ def create_app(
     if resolved_cb is not None:
         resolved_cb.on_trip = circuit_breaker_tripped_counter.inc
 
+    resolved_trace_exporter = trace_exporter
+    if resolved_trace_exporter is None:
+        configured_otlp_endpoint = otlp_endpoint or os.getenv(OTLP_ENDPOINT_ENVIRONMENT_VARIABLE)
+        if configured_otlp_endpoint:
+            configured_service_name = (
+                otlp_service_name
+                or os.getenv(OTLP_SERVICE_NAME_ENVIRONMENT_VARIABLE)
+                or DEFAULT_SERVICE_NAME
+            )
+            configured_timeout = float(
+                os.getenv(OTLP_TIMEOUT_ENVIRONMENT_VARIABLE, str(otlp_timeout_seconds))
+            )
+            resolved_trace_exporter = OTLPHttpTraceExporter(
+                configured_otlp_endpoint,
+                service_name=configured_service_name,
+                timeout_seconds=configured_timeout,
+            )
+        else:
+            resolved_trace_exporter = NullTraceExporter()
+
     rate_limiter = (
         _RateLimiter(rate_limit_requests, rate_limit_window_seconds)
         if rate_limit_requests > 0
@@ -497,6 +539,7 @@ def create_app(
         application.state.shadow_discrepancies_counter = shadow_discrepancies_counter
         application.state.circuit_breaker_tripped_counter = circuit_breaker_tripped_counter
         application.state.circuit_breaker_gauge = circuit_breaker_gauge
+        application.state.trace_exporter = resolved_trace_exporter
         yield
         resolved_audit_sink.close()
 
@@ -552,6 +595,13 @@ def create_app(
         request: Request,
         call_next: RequestResponseEndpoint,
     ) -> Response:
+        incoming_trace_context = parse_traceparent(request.headers.get("traceparent"))
+        server_trace_context = (
+            incoming_trace_context.child()
+            if incoming_trace_context is not None
+            else TraceContext.new()
+        )
+        request.state.trace_context = server_trace_context
         supplied_request_id = request.headers.get(REQUEST_ID_HEADER)
         request_id = (
             supplied_request_id
@@ -561,11 +611,43 @@ def create_app(
         )
         request.state.request_id = request_id
         started_at = perf_counter()
+        started_at_unix_nano = time.time_ns()
+
+        def export_trace(status_code: int, *, error_type: str | None = None) -> None:
+            attributes: dict[str, str | int | float | bool] = {
+                "http.request.method": request.method,
+                "http.route": request.url.path,
+                "http.response.status_code": status_code,
+                "fraud.request_id": request_id,
+            }
+            loaded_model = getattr(request.app.state, "model", None)
+            if loaded_model is not None:
+                attributes["fraud.model_version"] = str(
+                    loaded_model.metadata.get("dataset_fingerprint", "")
+                )[:12]
+            if error_type is not None:
+                attributes["error.type"] = error_type
+            span = TraceSpan(
+                name=f"HTTP {request.url.path}",
+                context=server_trace_context,
+                parent_span_id=(
+                    incoming_trace_context.span_id if incoming_trace_context is not None else None
+                ),
+                start_time_unix_nano=started_at_unix_nano,
+                end_time_unix_nano=time.time_ns(),
+                attributes=attributes,
+                status_code=status_code,
+            )
+            try:
+                resolved_trace_exporter.export(span)
+            except Exception:
+                logger.exception("Failed to export request trace.")
+
         try:
             response: Response | None = await _request_body_error(request)
             if response is None:
                 response = await call_next(request)
-        except Exception:
+        except Exception as exc:
             duration_seconds = perf_counter() - started_at
             request_counter.labels(
                 method=request.method,
@@ -582,6 +664,7 @@ def create_app(
                 duration_seconds * 1_000,
                 request_id,
             )
+            export_trace(500, error_type=type(exc).__name__)
             raise
 
         duration_ms = (perf_counter() - started_at) * 1_000
@@ -595,6 +678,8 @@ def create_app(
         )
         response.headers[REQUEST_ID_HEADER] = request_id
         response.headers[PROCESS_TIME_HEADER] = f"{duration_ms:.3f}"
+        response.headers["traceparent"] = server_trace_context.traceparent
+        export_trace(response.status_code)
         logger.info(
             "request_completed method=%s path=%s status_code=%d duration_ms=%.3f request_id=%s",
             request.method,
