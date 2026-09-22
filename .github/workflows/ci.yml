@@ -86,7 +86,7 @@ jobs:
           fraud-detect generate-trust-bundle \
             --output /tmp/fraud-admission/trust.json \
             --public-key /tmp/fraud-admission/public.pem
-          old_key_id=$(python -c "import json; print(json.load(open('/tmp/fraud-admission/trust.json'))['active_key_ids'][0])")
+          old_key_id=$(python -c "from fraud_detection.signing import load_public_key, public_key_fingerprint; print(public_key_fingerprint(load_public_key('/tmp/fraud-admission/public.pem')))" )
           fraud-detect validate-artifact /tmp/fraud-admission/model --strict \
             --attestation-output /tmp/fraud-admission/attestation.json \
             --signer ci-admission \
