@@ -359,7 +359,7 @@ infrastructure decisions and remain later work.
   executable is unavailable; CI remains responsible for Compose, image, and
   container smoke validation.
 
-## Phase 18 — Artifact Trust and Deployment Admission (In progress)
+## Phase 18 — Artifact Trust and Deployment Admission (Done)
 
 ### Objective
 
@@ -415,6 +415,26 @@ rotation, remote signature transparency logs, hardware-backed signing, or
 automatic deployment orchestration. Operators remain responsible for protecting
 private keys, distributing and pinning public keys, and integrating the CLI
 admission result into their deployment system.
+
+### Delivery record
+
+- Added `cryptography`-backed Ed25519 key generation, PEM loading, canonical JSON
+  signing, trusted public-key matching, and actionable verification failures.
+- Extended validation attestations with an optional signature envelope while
+  preserving digest verification for unsigned legacy attestations.
+- Added `generate-signing-key`, signed `validate-artifact`, and fail-closed
+  `verify-attestation` CLI workflows with overwrite protection and machine-readable
+  admission results.
+- Added focused signing, model, and CLI tests for key generation, tampering,
+  wrong keys, malformed envelopes, legacy compatibility, and admission exits.
+- Updated README, SECURITY, ARCHITECTURE, and CHANGELOG with key custody,
+  trust-anchor, migration, and deployment guidance.
+- Final validation: 461 tests passed with 97.45% branch coverage; Ruff formatting
+  and linting passed; strict mypy passed; package build and Twine checks passed;
+  isolated project dependency audit passed after upgrading the temporary audit
+  environment's pip to 26.2.1.
+- Docker validation remains unavailable in this environment because the Docker
+  executable is not installed; CI remains responsible for container smoke checks.
 
 ## Contributing to the roadmap
 
