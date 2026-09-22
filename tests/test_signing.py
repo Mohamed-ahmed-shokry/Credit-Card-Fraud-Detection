@@ -14,6 +14,7 @@ from fraud_detection.signing import (
     load_public_key,
     public_key_fingerprint,
     sign_payload,
+    verify_attestation_signature,
     verify_payload_signature,
     write_keypair,
 )
@@ -124,3 +125,15 @@ def test_signature_envelope_rejects_invalid_base64_length(tmp_path: Path) -> Non
 
     assert valid is False
     assert "64 decoded bytes" in message
+
+
+def test_attestation_signature_helper_requires_object_and_signature(tmp_path: Path) -> None:
+    private_pem, public_pem = generate_keypair_bytes()
+    private_path = tmp_path / "private.pem"
+    public_path = tmp_path / "public.pem"
+    private_path.write_bytes(private_pem)
+    public_path.write_bytes(public_pem)
+    public_key = load_public_key(public_path)
+
+    assert verify_attestation_signature([], public_key)[0] is False
+    assert verify_attestation_signature({"status": "PASSED"}, public_key)[0] is False

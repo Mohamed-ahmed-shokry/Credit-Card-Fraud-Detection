@@ -136,6 +136,18 @@ def verify_payload_signature(
     return True, "Ed25519 signature verified successfully."
 
 
+def verify_attestation_signature(
+    attestation: object,
+    public_key: Ed25519PublicKey,
+) -> tuple[bool, str]:
+    """Verify the signature field on an attestation without trusting its embedded key."""
+    if not isinstance(attestation, dict):
+        return False, "Attestation root must be a JSON object."
+    envelope = attestation.get("signature")
+    payload = {key: value for key, value in attestation.items() if key != "signature"}
+    return verify_payload_signature(payload, envelope, public_key)
+
+
 def public_key_fingerprint(public_key: Ed25519PublicKey) -> str:
     """Return a short stable identifier for a public key."""
     raw_key = public_key.public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
