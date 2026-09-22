@@ -286,12 +286,57 @@ This phase strengthens online operational safety, real-time diagnostic surveilla
   to inject synthetic distribution shifts (mean offsets, variance scaling, anomaly spikes) into
   validation datasets to test alerting webhooks, fallback behavior, and circuit breakers in staging.
 
-## Phase 17 — Edge Runtime Optimization and Distributed Telemetry (next)
+## Phase 17 — Edge Runtime Optimization and Distributed Telemetry (In progress)
 
-- **Quantized & pruned edge runtime export** (`Proposed`) — optional export of validated
-  models into lightweight, optimized runtime representations for sub-millisecond edge gateways.
-- **Distributed OTLP trace propagation** (`Proposed`) — OpenTelemetry span export linking
-  gateway requests to scoring pipelines and shadow evaluations.
+### Objective
+
+Make a validated model usable at constrained edge boundaries and make online
+requests traceable across gateway and scoring services without imposing a new
+mandatory runtime dependency or changing the default serving path.
+
+### Scope
+
+- **Quantized and pruned edge runtime export** — add an `export-edge` command
+  and versioned JSON runtime format for the supported logistic-regression
+  artifact contract. The format stores int8 weights, a quantization scale,
+  optional coefficient pruning, the feature schema, scaler statistics, and
+  decision threshold. A small runtime scorer validates the format without
+  importing scikit-learn and reports source-model agreement when validation
+  data is supplied.
+- **Distributed OTLP trace propagation** — add W3C `traceparent` parsing and
+  response propagation plus optional OTLP/HTTP span export for API request
+  lifecycles. Export is disabled by default, injectable for tests, and must
+  never make scoring fail when a collector is unavailable.
+- **Integration and documentation** — expose configuration through
+  `create_app`, `serve`, and environment variables; document the edge format,
+  approximation limits, trace configuration, collector expectations, and
+  security boundaries.
+
+### Acceptance criteria
+
+- `export-edge` rejects unsupported estimator/calibration contracts with an
+  actionable error and produces a schema-versioned artifact for supported
+  logistic models.
+- The edge runtime validates schemas, scores finite numeric records, applies
+  the persisted threshold, and records quantization/pruning metadata.
+- Export can measure maximum and mean probability error against supplied
+  validation data and refuses output when the configured error tolerance is
+  exceeded.
+- Valid incoming `traceparent` headers are continued, invalid headers create a
+  fresh trace, and responses return a valid trace context.
+- Optional OTLP export emits request spans with timing, route, status, and
+  model attributes; exporter/network failures are isolated from requests.
+- Focused unit/API/CLI tests cover success, unsupported contracts, malformed
+  edge artifacts, trace propagation, exporter payloads, and collector failure.
+- Full project quality gates, package build, documentation, and roadmap status
+  are updated before the phase is marked `Done`.
+
+### Explicit exclusions
+
+This phase does not add ONNX/TensorFlow Lite conversion, automatic model
+architecture rewriting, a mandatory OpenTelemetry SDK, a collector deployment,
+or durable trace storage. Those require deployment-specific runtime and
+infrastructure decisions and remain later work.
 
 ## Contributing to the roadmap
 
@@ -299,4 +344,3 @@ Open an issue or a pull request that references the relevant phase item.
 Proposing a new item is welcome; keep it scoped to this project's stated
 mission rather than general production-readiness concerns already assigned
 to the deploying operator in SECURITY.md.
-
