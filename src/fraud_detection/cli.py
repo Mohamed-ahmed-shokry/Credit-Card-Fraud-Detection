@@ -2819,15 +2819,36 @@ def serve_command(
     ],
     host: Annotated[str, typer.Option(help="Interface to bind.")] = "127.0.0.1",
     port: Annotated[int, typer.Option(min=1, max=65_535, help="TCP port.")] = 8000,
+    otlp_endpoint: Annotated[
+        str | None,
+        typer.Option(help="Optional OTLP/HTTP traces endpoint; env fallback is supported."),
+    ] = None,
+    otlp_service_name: Annotated[
+        str | None,
+        typer.Option(help="Service name included in optional OTLP spans."),
+    ] = None,
+    otlp_timeout_seconds: Annotated[
+        float,
+        typer.Option(min=0.01, help="Optional OTLP collector request timeout in seconds."),
+    ] = 0.5,
 ) -> None:
-    """Run the versioned HTTP prediction service."""
+    """Run the versioned HTTP prediction service with optional trace export."""
     from fraud_detection.api import create_app
 
     try:
         model = load_model(model_path)
     except ModelArtifactError as exc:
         _abort(str(exc))
-    uvicorn.run(create_app(model=model), host=host, port=port)
+    uvicorn.run(
+        create_app(
+            model=model,
+            otlp_endpoint=otlp_endpoint,
+            otlp_service_name=otlp_service_name,
+            otlp_timeout_seconds=otlp_timeout_seconds,
+        ),
+        host=host,
+        port=port,
+    )
 
 
 def _abort(message: str) -> NoReturn:
