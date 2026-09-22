@@ -359,6 +359,63 @@ infrastructure decisions and remain later work.
   executable is unavailable; CI remains responsible for Compose, image, and
   container smoke validation.
 
+## Phase 18 — Artifact Trust and Deployment Admission (In progress)
+
+### Objective
+
+Turn the existing integrity and validation reports into verifiable deployment
+evidence. Operators must be able to sign a validated artifact attestation with
+an Ed25519 key, verify it against an independently trusted public key, and use
+that result as an explicit admission decision without changing model scoring.
+
+### Scope
+
+- **Signing primitive** — add a small `cryptography`-backed Ed25519 boundary
+  with PEM key loading, raw public-key encoding, canonical JSON signing, and
+  actionable failures. Private keys are accepted only as explicit signing
+  inputs and are never written into artifacts or logs.
+- **Attestation signatures** — extend the existing digest attestation with a
+  versioned signature envelope covering the complete digest-bearing payload,
+  while preserving verification of unsigned legacy attestations.
+- **CLI workflows** — add `generate-signing-key` for controlled keypair
+  creation, add signing options to `validate-artifact`, and add
+  `verify-attestation` with required public-key and passed-status checks for
+  deployment admission.
+- **Deployment guidance** — document key custody, rotation, public-key pinning,
+  CI admission behavior, failure modes, and the distinction between artifact
+  integrity hashes and authenticity signatures.
+
+### Acceptance criteria
+
+- Ed25519 keypairs can be generated into caller-selected files with overwrite
+  protection and never expose private key material in command output.
+- A valid strict artifact validation can emit a signed attestation whose
+  signature covers the canonical payload and whose embedded public key is
+  independently checkable.
+- Signature verification rejects modified payloads, wrong public keys,
+  malformed envelopes, unsupported algorithms, and unsigned attestations when
+  `--require-signature` is supplied.
+- `verify-attestation` exits non-zero for failed validation status, invalid
+  digest, invalid signature, or an untrusted public key, and emits a concise
+  machine-readable result.
+- Existing unsigned attestation verification and all model/API/edge behavior
+  remain backward compatible.
+- Focused unit/CLI tests cover key generation, permissions-safe output,
+  canonical signing, tampering, wrong-key rejection, legacy compatibility, and
+  admission exit codes.
+- README, SECURITY, ARCHITECTURE, CHANGELOG, and this roadmap document the
+  trust model and deployment workflow.
+- Full quality gates, package build, dependency audit, and available smoke
+  checks pass before this phase is marked `Done`.
+
+### Explicit exclusions
+
+This phase does not provide a hosted key-management service, automatic key
+rotation, remote signature transparency logs, hardware-backed signing, or
+automatic deployment orchestration. Operators remain responsible for protecting
+private keys, distributing and pinning public keys, and integrating the CLI
+admission result into their deployment system.
+
 ## Contributing to the roadmap
 
 Open an issue or a pull request that references the relevant phase item.
