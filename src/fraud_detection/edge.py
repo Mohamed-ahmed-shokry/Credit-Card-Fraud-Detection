@@ -6,6 +6,7 @@ import json
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from numbers import Real
 from pathlib import Path
 from typing import Any
 
@@ -144,7 +145,7 @@ class EdgeModel:
         values: list[float] = []
         for feature in self.feature_names:
             raw_value = record[feature]
-            if isinstance(raw_value, bool) or not isinstance(raw_value, int | float):
+            if isinstance(raw_value, bool) or not isinstance(raw_value, Real):
                 raise EdgeArtifactError(f"Edge feature {feature!r} must be numeric.")
             value = float(raw_value)
             if not math.isfinite(value):
