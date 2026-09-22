@@ -75,6 +75,14 @@ from fraud_detection.signing import (
     verify_attestation_signature,
     write_keypair,
 )
+from fraud_detection.trust import (
+    TrustBundle,
+    TrustBundleError,
+    load_public_keys,
+    load_trust_bundle,
+    verify_attestation_with_bundle,
+    write_trust_bundle,
+)
 
 app = typer.Typer(
     name="fraud-detect",
@@ -1644,6 +1652,100 @@ def generate_signing_key_command(
     )
 
 
+@app.command("generate-trust-bundle")
+def generate_trust_bundle_command(
+    output: Annotated[
+        Path,
+        typer.Option("--output", "-o", help="Trust-bundle JSON output path."),
+    ] = Path("trust-bundle.json"),
+    public_keys: Annotated[
+        list[Path] | None,
+        typer.Option(
+            "--public-key",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="Public Ed25519 PEM key; repeat for rotation overlap.",
+        ),
+    ] = None,
+    overwrite: Annotated[bool, typer.Option(help="Replace an existing trust bundle.")] = False,
+) -> None:
+    """Create a validated trust bundle from one or more public keys."""
+    selected_public_keys = public_keys or []
+    if not selected_public_keys:
+        _abort("At least one --public-key is required.")
+    _guard_output(output, overwrite)
+    try:
+        bundle = TrustBundle.from_public_keys(load_public_keys(tuple(selected_public_keys)))
+        write_trust_bundle(output, bundle, overwrite=overwrite)
+    except TrustBundleError as exc:
+        _abort(str(exc))
+    typer.echo(
+        json.dumps(
+            {
+                "output": str(output),
+                "active_key_ids": list(bundle.active_key_ids()),
+                "revoked_key_ids": [],
+            }
+        )
+    )
+
+
+@app.command("rotate-trust-bundle")
+def rotate_trust_bundle_command(
+    bundle_path: Annotated[
+        Path,
+        typer.Argument(exists=True, dir_okay=False, readable=True, help="Existing trust bundle."),
+    ],
+    output: Annotated[
+        Path,
+        typer.Option("--output", "-o", help="Rotated trust-bundle JSON output path."),
+    ] = Path("trust-bundle.json"),
+    add_public_keys: Annotated[
+        list[Path] | None,
+        typer.Option(
+            "--add-public-key",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="Public key to add as active; repeat for multiple keys.",
+        ),
+    ] = None,
+    revoke_key_ids: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--revoke-key-id",
+            help="Existing active key ID to revoke; repeat for multiple keys.",
+        ),
+    ] = None,
+    overwrite: Annotated[bool, typer.Option(help="Replace an existing trust bundle.")] = False,
+) -> None:
+    """Rotate a trust bundle by adding and/or revoking verification keys."""
+    selected_additions = add_public_keys or []
+    selected_revocations = revoke_key_ids or []
+    if not selected_additions and not selected_revocations:
+        _abort("Provide --add-public-key or --revoke-key-id.")
+    _guard_output(output, overwrite)
+    try:
+        bundle = load_trust_bundle(bundle_path)
+        rotated = bundle.rotate(
+            additions=load_public_keys(tuple(selected_additions)),
+            revoked_key_ids=tuple(selected_revocations),
+        )
+        write_trust_bundle(output, rotated, overwrite=overwrite)
+    except TrustBundleError as exc:
+        _abort(str(exc))
+    typer.echo(
+        json.dumps(
+            {
+                "output": str(output),
+                "active_key_ids": list(rotated.active_key_ids()),
+                "revoked_key_ids": [key.key_id for key in rotated.keys if key.status == "revoked"],
+            }
+        )
+    )
+
+
 @app.command("validate-artifact")
 def validate_artifact_command(
     model_path: Annotated[
@@ -1717,9 +1819,24 @@ def verify_attestation_command(
         typer.Argument(exists=True, dir_okay=False, readable=True, help="Attestation JSON file."),
     ],
     public_key: Annotated[
-        Path,
-        typer.Argument(exists=True, dir_okay=False, readable=True, help="Trusted public PEM key."),
-    ],
+        Path | None,
+        typer.Argument(
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="Trusted public PEM key; use --trust-bundle for rotation-aware admission.",
+        ),
+    ] = None,
+    trust_bundle: Annotated[
+        Path | None,
+        typer.Option(
+            "--trust-bundle",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="Rotation-aware JSON trust bundle; mutually exclusive with public key.",
+        ),
+    ] = None,
     require_signature: Annotated[
         bool,
         typer.Option("--require-signature/--allow-unsigned", help="Require an Ed25519 signature."),
@@ -1730,10 +1847,19 @@ def verify_attestation_command(
     ] = True,
 ) -> None:
     """Verify attestation integrity, signature authenticity, and admission status."""
+    if (public_key is None) == (trust_bundle is None):
+        _abort("Provide exactly one trusted public key argument or --trust-bundle.")
     try:
         payload = json.loads(attestation.read_text(encoding="utf-8"))
-        trusted_key = load_public_key(public_key)
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError, SigningError) as exc:
+        trusted_key = load_public_key(public_key) if public_key is not None else None
+        loaded_bundle = load_trust_bundle(trust_bundle) if trust_bundle is not None else None
+    except (
+        OSError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        SigningError,
+        TrustBundleError,
+    ) as exc:
         typer.echo(json.dumps({"valid": False, "message": str(exc)}, sort_keys=True))
         raise typer.Exit(code=1) from exc
 
@@ -1746,11 +1872,21 @@ def verify_attestation_command(
     status = payload.get("status")
     status_valid = not require_passed or status == "PASSED"
     signature = payload.get("signature")
+    signature_key_id = signature.get("key_id") if isinstance(signature, dict) else None
+    signature_key_status = "external"
     if signature is None and not require_signature:
         signature_valid, signature_message = True, "Unsigned attestation accepted."
     elif signature is None:
         signature_valid, signature_message = False, "Attestation has no signature."
+    elif loaded_bundle is not None:
+        signature_valid, signature_message, selected_key = verify_attestation_with_bundle(
+            payload, loaded_bundle
+        )
+        if selected_key is not None:
+            signature_key_status = selected_key.status
     else:
+        if trusted_key is None:
+            _abort("A trusted public key is required for single-key verification.")
         signature_valid, signature_message = verify_attestation_signature(payload, trusted_key)
 
     valid = digest_valid and status_valid and signature_valid
@@ -1758,7 +1894,13 @@ def verify_attestation_command(
         "valid": valid,
         "status": {"value": status, "valid": status_valid},
         "digest": {"message": digest_message, "valid": digest_valid},
-        "signature": {"message": signature_message, "valid": signature_valid},
+        "signature": {
+            "key_id": signature_key_id,
+            "key_status": signature_key_status,
+            "message": signature_message,
+            "trust_source": "trust_bundle" if loaded_bundle is not None else "public_key",
+            "valid": signature_valid,
+        },
     }
     typer.echo(json.dumps(result, indent=2, sort_keys=True))
     if not valid:

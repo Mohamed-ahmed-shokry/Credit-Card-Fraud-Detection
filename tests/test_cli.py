@@ -1945,6 +1945,8 @@ def test_signed_attestation_cli_workflow_and_admission(
     public_key = tmp_path / "keys" / "public.pem"
     second_private = tmp_path / "keys" / "second-private.pem"
     second_public = tmp_path / "keys" / "second-public.pem"
+    bundle_path = tmp_path / "keys" / "trust-bundle.json"
+    rotated_bundle_path = tmp_path / "keys" / "trust-bundle-rotated.json"
     artifact_path = tmp_path / "artifact"
     attestation_path = tmp_path / "attestation.json"
     unsigned_path = tmp_path / "unsigned.json"
@@ -1963,6 +1965,18 @@ def test_signed_attestation_cli_workflow_and_admission(
     assert "PRIVATE KEY" not in generated.stdout
     assert private_key.is_file() and public_key.is_file()
     write_keypair(second_private, second_public)
+    bundle_generated = runner.invoke(
+        app,
+        [
+            "generate-trust-bundle",
+            "--output",
+            str(bundle_path),
+            "--public-key",
+            str(public_key),
+        ],
+    )
+    assert bundle_generated.exit_code == 0, bundle_generated.output
+    old_key_id = json.loads(bundle_generated.stdout)["active_key_ids"][0]
 
     signed_model = deepcopy(trained_model)
     signed_model.metadata["lineage"].update(
@@ -1986,9 +2000,33 @@ def test_signed_attestation_cli_workflow_and_admission(
     assert signed.exit_code == 0, signed.output
     assert "signature" in json.loads(attestation_path.read_text(encoding="utf-8"))
 
-    verified = runner.invoke(app, ["verify-attestation", str(attestation_path), str(public_key)])
+    verified = runner.invoke(
+        app,
+        ["verify-attestation", str(attestation_path), "--trust-bundle", str(bundle_path)],
+    )
     assert verified.exit_code == 0, verified.output
     assert json.loads(verified.stdout)["valid"] is True
+
+    rotated = runner.invoke(
+        app,
+        [
+            "rotate-trust-bundle",
+            str(bundle_path),
+            "--output",
+            str(rotated_bundle_path),
+            "--add-public-key",
+            str(second_public),
+            "--revoke-key-id",
+            old_key_id,
+        ],
+    )
+    assert rotated.exit_code == 0, rotated.output
+    revoked_result = runner.invoke(
+        app,
+        ["verify-attestation", str(attestation_path), "--trust-bundle", str(rotated_bundle_path)],
+    )
+    assert revoked_result.exit_code == 1
+    assert json.loads(revoked_result.stdout)["signature"]["key_status"] == "revoked"
 
     wrong_key = runner.invoke(
         app, ["verify-attestation", str(attestation_path), str(second_public)]
