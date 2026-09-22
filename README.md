@@ -431,6 +431,43 @@ digest or `PASSED` status checks. The private key is never embedded in the attes
 or printed by the CLI. Keep it in a restricted CI secret store, rotate it through an
 operator-controlled process, and pin the public key in deployment configuration.
 
+### Rotate verification keys
+
+Keep the old key active while introducing the replacement, then revoke the old key
+after all signing jobs and deployments have moved to the new key:
+
+```bash
+fraud-detect generate-signing-key \
+  --private-key secrets/next-private.pem \
+  --public-key config/next-public.pem
+fraud-detect rotate-trust-bundle config/trust-bundle.json \
+  --output config/trust-bundle-next.json \
+  --add-public-key config/next-public.pem \
+  --revoke-key-id OLD_KEY_ID
+```
+
+The bundle records active and revoked key IDs. Verification selects the signing
+key by the attestation's key ID and rejects revoked or unknown keys. A legacy
+Phase 18 signature without a key ID remains verifiable with the original single
+`--public-key` mode, but is intentionally rejected by rotation-aware bundles.
+
+### Enforce admission at startup
+
+Pass both paths to `serve`, `create_app`, or the container environment to verify
+the attestation before the model is loaded:
+
+```bash
+fraud-detect serve artifacts/model \
+  --attestation reports/attestation.json \
+  --trust-bundle config/trust-bundle.json
+```
+
+The equivalent environment variables are `FRAUD_ATTESTATION_PATH` and
+`FRAUD_TRUST_BUNDLE_PATH`. They must be configured together. A missing, failed,
+tampered, revoked, or unknown-key attestation prevents startup; leaving both
+unset preserves the existing local-development behavior. Compose includes the
+corresponding read-only mount example.
+
 Keep superseded artifact directories (for example `artifacts/model-2026-09-01/`)
 until the replacement has proven itself: reproducible `compare`, `stability`,
 and `drift` runs are only possible while the old model card, reference profile,
