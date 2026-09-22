@@ -8,6 +8,10 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- Deployment artifact trust: added Ed25519 keypair generation, canonical signed
+  validation attestations, and fail-closed `verify-attestation` admission checks
+  for trusted public keys, passed artifact status, digest integrity, and signature
+  authenticity.
 - Dependency-light edge runtime export: added `fraud-detect export-edge` and a
   schema-versioned int8 JSON scorer for supported uncalibrated logistic artifacts,
   with optional coefficient pruning, validation-set error measurement, and strict
