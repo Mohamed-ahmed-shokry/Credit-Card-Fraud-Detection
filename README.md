@@ -410,12 +410,26 @@ Pass `--strict` in deployment CI/CD pipelines to fail if Git commit provenance i
 To export a machine-readable, tamper-evident attestation manifest for deployment admission gates:
 
 ```bash
+fraud-detect generate-signing-key \
+  --private-key secrets/release-signing-private.pem \
+  --public-key config/release-signing-public.pem
 fraud-detect validate-artifact artifacts/model \
+  --strict \
   --attestation-output reports/attestation.json \
-  --signer release-bot-v1
+  --signer release-bot-v1 \
+  --signing-key secrets/release-signing-private.pem
+fraud-detect verify-attestation reports/attestation.json \
+  config/release-signing-public.pem
 ```
 
-The resulting manifest contains the validation checks, runtime environment, and a canonical SHA-256 digest over the entire verification payload that can be verified programmatically via `verify_attestation()`.
+The resulting manifest contains the validation checks, runtime environment, a canonical
+SHA-256 digest, and an Ed25519 signature over the digest-bearing payload. The verification
+command requires the independently distributed public key and exits `1` for a failed
+digest, failed validation status, missing signature, modified payload, or wrong key.
+Use `--allow-unsigned` only for legacy attestations during migration; it does not bypass
+digest or `PASSED` status checks. The private key is never embedded in the attestation
+or printed by the CLI. Keep it in a restricted CI secret store, rotate it through an
+operator-controlled process, and pin the public key in deployment configuration.
 
 Keep superseded artifact directories (for example `artifacts/model-2026-09-01/`)
 until the replacement has proven itself: reproducible `compare`, `stability`,
