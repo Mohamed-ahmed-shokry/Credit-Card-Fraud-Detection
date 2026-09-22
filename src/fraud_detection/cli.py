@@ -65,8 +65,16 @@ from fraud_detection.model import (
     split_dataset,
     train_model,
     validate_artifact,
+    verify_attestation,
 )
 from fraud_detection.reporting import ComplianceReportError, render_compliance_report
+from fraud_detection.signing import (
+    SigningError,
+    load_private_key,
+    load_public_key,
+    verify_attestation_signature,
+    write_keypair,
+)
 
 app = typer.Typer(
     name="fraud-detect",
@@ -1606,6 +1614,36 @@ def replay_audit_command(
         raise typer.Exit(code=1)
 
 
+@app.command("generate-signing-key")
+def generate_signing_key_command(
+    private_key: Annotated[
+        Path,
+        typer.Option("--private-key", "-k", help="Private Ed25519 PEM output path."),
+    ] = Path("signing-private.pem"),
+    public_key: Annotated[
+        Path,
+        typer.Option("--public-key", "-p", help="Public Ed25519 PEM output path."),
+    ] = Path("signing-public.pem"),
+    overwrite: Annotated[bool, typer.Option(help="Replace existing key files.")] = False,
+) -> None:
+    """Generate an Ed25519 keypair for signing and verifying attestations."""
+    _guard_output(private_key, overwrite)
+    _guard_output(public_key, overwrite)
+    try:
+        fingerprint = write_keypair(private_key, public_key, overwrite=overwrite)
+    except SigningError as exc:
+        _abort(str(exc))
+    typer.echo(
+        json.dumps(
+            {
+                "private_key": str(private_key),
+                "public_key": str(public_key),
+                "public_key_fingerprint": fingerprint,
+            }
+        )
+    )
+
+
 @app.command("validate-artifact")
 def validate_artifact_command(
     model_path: Annotated[
@@ -1631,6 +1669,16 @@ def validate_artifact_command(
         str | None,
         typer.Option(help="Identifier or entity signing the verification attestation."),
     ] = None,
+    signing_key: Annotated[
+        Path | None,
+        typer.Option(
+            "--signing-key",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="Ed25519 private PEM key used to sign the attestation.",
+        ),
+    ] = None,
     overwrite: Annotated[
         bool,
         typer.Option(help="Replace an existing attestation output file."),
@@ -1638,10 +1686,20 @@ def validate_artifact_command(
 ) -> None:
     """Validate artifact integrity, runtime compatibility, lineage, and report readiness."""
     _guard_output(attestation_output, overwrite)
+    if signing_key is not None and attestation_output is None:
+        _abort("--signing-key requires --attestation-output.")
+    if signing_key is not None and not strict:
+        _abort("--signing-key requires --strict validation.")
+    private_key = None
+    if signing_key is not None:
+        try:
+            private_key = load_private_key(signing_key)
+        except SigningError as exc:
+            _abort(str(exc))
     report = validate_artifact(model_path, strict=strict)
 
     if attestation_output is not None:
-        attestation = report.to_attestation(signer=signer)
+        attestation = report.to_attestation(signer=signer, signing_key=private_key)
         _atomic_write_text(
             json.dumps(attestation, indent=2, sort_keys=True) + "\n",
             attestation_output,
@@ -1649,6 +1707,61 @@ def validate_artifact_command(
 
     typer.echo(json.dumps(report.to_dict(), indent=2, sort_keys=True))
     if not report.valid:
+        raise typer.Exit(code=1)
+
+
+@app.command("verify-attestation")
+def verify_attestation_command(
+    attestation: Annotated[
+        Path,
+        typer.Argument(exists=True, dir_okay=False, readable=True, help="Attestation JSON file."),
+    ],
+    public_key: Annotated[
+        Path,
+        typer.Argument(exists=True, dir_okay=False, readable=True, help="Trusted public PEM key."),
+    ],
+    require_signature: Annotated[
+        bool,
+        typer.Option("--require-signature/--allow-unsigned", help="Require an Ed25519 signature."),
+    ] = True,
+    require_passed: Annotated[
+        bool,
+        typer.Option("--require-passed/--allow-failed", help="Require PASSED artifact status."),
+    ] = True,
+) -> None:
+    """Verify attestation integrity, signature authenticity, and admission status."""
+    try:
+        payload = json.loads(attestation.read_text(encoding="utf-8"))
+        trusted_key = load_public_key(public_key)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, SigningError) as exc:
+        typer.echo(json.dumps({"valid": False, "message": str(exc)}, sort_keys=True))
+        raise typer.Exit(code=1) from exc
+
+    if not isinstance(payload, dict):
+        result = {"valid": False, "message": "Attestation root must be a JSON object."}
+        typer.echo(json.dumps(result, sort_keys=True))
+        raise typer.Exit(code=1)
+
+    digest_valid, digest_message = verify_attestation(payload)
+    status = payload.get("status")
+    status_valid = not require_passed or status == "PASSED"
+    signature = payload.get("signature")
+    if signature is None and not require_signature:
+        signature_valid, signature_message = True, "Unsigned attestation accepted."
+    elif signature is None:
+        signature_valid, signature_message = False, "Attestation has no signature."
+    else:
+        signature_valid, signature_message = verify_attestation_signature(payload, trusted_key)
+
+    valid = digest_valid and status_valid and signature_valid
+    result = {
+        "valid": valid,
+        "status": {"value": status, "valid": status_valid},
+        "digest": {"message": digest_message, "valid": digest_valid},
+        "signature": {"message": signature_message, "valid": signature_valid},
+    }
+    typer.echo(json.dumps(result, indent=2, sort_keys=True))
+    if not valid:
         raise typer.Exit(code=1)
 
 

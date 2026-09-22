@@ -32,6 +32,7 @@ from fraud_detection.model import (
     train_model,
     verify_attestation,
 )
+from fraud_detection.signing import write_keypair
 
 runner = CliRunner()
 
@@ -1934,6 +1935,92 @@ def test_validate_artifact_cli_attestation_output(
     assert res_ow.exit_code == 0, res_ow.output
     att2 = json.loads(att_path.read_text(encoding="utf-8"))
     assert att2["verifier"]["signer"] == "release-bot-v2"
+
+
+def test_signed_attestation_cli_workflow_and_admission(
+    tmp_path: Path,
+    trained_model: FraudModel,
+) -> None:
+    private_key = tmp_path / "keys" / "private.pem"
+    public_key = tmp_path / "keys" / "public.pem"
+    second_private = tmp_path / "keys" / "second-private.pem"
+    second_public = tmp_path / "keys" / "second-public.pem"
+    artifact_path = tmp_path / "artifact"
+    attestation_path = tmp_path / "attestation.json"
+    unsigned_path = tmp_path / "unsigned.json"
+
+    generated = runner.invoke(
+        app,
+        [
+            "generate-signing-key",
+            "--private-key",
+            str(private_key),
+            "--public-key",
+            str(public_key),
+        ],
+    )
+    assert generated.exit_code == 0, generated.output
+    assert "PRIVATE KEY" not in generated.stdout
+    assert private_key.is_file() and public_key.is_file()
+    write_keypair(second_private, second_public)
+
+    signed_model = deepcopy(trained_model)
+    signed_model.metadata["lineage"].update(
+        {"git_commit": "a" * 40, "git_repository": "https://example.test/repo.git"}
+    )
+    save_model(signed_model, artifact_path)
+    signed = runner.invoke(
+        app,
+        [
+            "validate-artifact",
+            str(artifact_path),
+            "--strict",
+            "--attestation-output",
+            str(attestation_path),
+            "--signing-key",
+            str(private_key),
+            "--signer",
+            "release-key-1",
+        ],
+    )
+    assert signed.exit_code == 0, signed.output
+    assert "signature" in json.loads(attestation_path.read_text(encoding="utf-8"))
+
+    verified = runner.invoke(app, ["verify-attestation", str(attestation_path), str(public_key)])
+    assert verified.exit_code == 0, verified.output
+    assert json.loads(verified.stdout)["valid"] is True
+
+    wrong_key = runner.invoke(
+        app, ["verify-attestation", str(attestation_path), str(second_public)]
+    )
+    assert wrong_key.exit_code == 1
+    assert json.loads(wrong_key.stdout)["valid"] is False
+
+    tampered = json.loads(attestation_path.read_text(encoding="utf-8"))
+    tampered["status"] = "FAILED"
+    attestation_path.write_text(json.dumps(tampered), encoding="utf-8")
+    tampered_result = runner.invoke(
+        app, ["verify-attestation", str(attestation_path), str(public_key)]
+    )
+    assert tampered_result.exit_code == 1
+    assert json.loads(tampered_result.stdout)["valid"] is False
+
+    unsigned = runner.invoke(
+        app,
+        [
+            "validate-artifact",
+            str(artifact_path),
+            "--attestation-output",
+            str(unsigned_path),
+            "--overwrite",
+        ],
+    )
+    assert unsigned.exit_code == 0, unsigned.output
+    unsigned_result = runner.invoke(
+        app,
+        ["verify-attestation", str(unsigned_path), str(public_key), "--allow-unsigned"],
+    )
+    assert unsigned_result.exit_code == 0, unsigned_result.output
 
 
 def test_validate_artifact_cli_failure_on_corrupted_file(
