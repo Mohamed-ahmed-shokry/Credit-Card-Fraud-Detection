@@ -519,7 +519,7 @@ authorization remain operator responsibilities.
 - Docker validation remains unavailable in this environment because the Docker
   executable is not installed; CI remains responsible for container smoke checks.
 
-## Phase 20 — Reproducible Release Engineering (In progress)
+## Phase 20 — Reproducible Release Engineering (Done)
 
 ### Objective
 
@@ -572,6 +572,32 @@ This phase does not create or configure PyPI/TestPyPI accounts, trusted publishe
 GitHub environments, or release credentials. Those require maintainer ownership of
 external services. It does not change the package version, publish a real release,
 or introduce a dependency lockfile; dependency freshness remains Dependabot's job.
+
+### Delivery record
+
+- Repaired TestPyPI and release SBOM generation by creating the output directory,
+  requiring a non-empty CycloneDX file, and failing before publication when the
+  inventory is missing. TestPyPI repeated uploads now use `skip-existing` for the
+  immutable development version.
+- Updated release artifact actions to `download-artifact@v8` and
+  `upload-artifact@v7`; the two superseded Dependabot PRs were resolved after the
+  changes passed CI.
+- Added a CI wheel-install smoke gate that builds the package, installs the wheel
+  into a clean environment outside the checkout, and verifies the installed
+  `fraud-detect --version` entry point against package metadata.
+- Updated README, CONTRIBUTING, SECURITY, ARCHITECTURE, CHANGELOG, and the source
+  module map with SBOM, repeat-upload, wheel verification, and trusted-publisher
+  guidance.
+- Final validation: 476 tests passed with 97.29% branch coverage; Ruff checks and
+  formatting passed; strict mypy passed; package build and Twine checks passed;
+  isolated project dependency audit reported no known vulnerabilities; the local
+  wheel-install smoke and 133402-byte CycloneDX SBOM generation checks passed; and
+  remote CI run `35804224031` passed Python 3.12/3.14 quality, admission, container,
+  and wheel smoke jobs.
+- The pushed TestPyPI run reached and passed build, metadata, wheel installation,
+  and SBOM generation, then stopped at the external OIDC publisher with
+  `invalid-publisher`; configuring the TestPyPI trusted publisher remains the
+  documented maintainer-only prerequisite.
 
 ## Contributing to the roadmap
 
