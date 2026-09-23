@@ -8,6 +8,9 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- Release workflow hardening: TestPyPI uploads tolerate repeated immutable-version
+  runs, release and dry-run SBOM output is created and validated explicitly, and
+  CI smoke-tests the built wheel from an isolated environment outside the checkout.
 - Rotation-aware deployment admission: added validated trust bundles, add/revoke
   key rotation workflows, key IDs in new signatures, API/serve startup verification
   before model loading, Compose mount guidance, and a CI admission smoke job.
