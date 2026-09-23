@@ -103,6 +103,13 @@ pushes that contain a recognizable credential or API key. `pip-audit` runs in CI
 against every change, and Dependabot opens pull requests both for routine dependency
 updates and for advisories against dependencies already in use.
 
+Release workflows build the distributions before publishing, install the exact
+wheel for a CycloneDX SBOM, and retain the non-empty `sbom/sbom.cdx.json` output
+as a release artifact. TestPyPI reruns may skip an already uploaded immutable
+development version, but they do not skip build, metadata, or SBOM failures.
+Publishing uses OIDC trusted publishers, so PyPI/TestPyPI account and environment
+configuration must be reviewed and controlled outside the repository.
+
 ### API deployment
 
 The supplied container runs without root privileges or Linux capabilities and uses
