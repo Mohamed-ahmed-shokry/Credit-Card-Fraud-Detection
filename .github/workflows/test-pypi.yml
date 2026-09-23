@@ -51,14 +51,17 @@ jobs:
 
       - name: Generate SBOM
         run: >
+          mkdir -p sbom &&
           python -m cyclonedx_py environment
           --pyproject pyproject.toml
           --mc-type library
           --output-reproducible
           --output-format JSON
           --output-file sbom/sbom.cdx.json
+          && test -s sbom/sbom.cdx.json
 
       - name: Publish to TestPyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           repository-url: https://test.pypi.org/legacy/
+          skip-existing: true
