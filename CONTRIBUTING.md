@@ -78,13 +78,15 @@ so no API token is stored in repository secrets.
 1. Update `__version__`, `CHANGELOG.md` (move `Unreleased` entries under the
    new version with today's date), and `ROADMAP.md` statuses.
 2. Run the full quality gates above; all must pass, including the 97%
-   branch-coverage floor and `twine check`.
-3. Confirm the TestPyPI dry-run workflow is green on `main` (it needs its own
-   trusted publisher linked on test.pypi.org first; see the header comment in
-   `test-pypi.yml`).
+   branch-coverage floor, `twine check`, and the clean wheel-install smoke test.
+3. Confirm the TestPyPI dry-run workflow is green on `main`. It builds the
+   immutable development version, creates `sbom/sbom.cdx.json`, and uses
+   `skip-existing` so rerunning an unchanged version is safe. A trusted publisher
+   must still be linked on test.pypi.org before the publish step can succeed; see
+   the header comment in `test-pypi.yml`.
 4. Tag the release (`git tag vX.Y.Z && git push origin vX.Y.Z`) and publish a
-   GitHub Release; the `publish.yml` workflow builds, uploads to PyPI, and
-   records a CycloneDX SBOM.
+   GitHub Release; the `publish.yml` workflow builds once, uploads the exact
+   distributions, and records a non-empty CycloneDX SBOM artifact.
 5. Verify the release on PyPI, confirm the trusted-publisher link on
    pypi.org is still configured for this repository and workflow, and confirm
    the `sbom` workflow artifact is present on the release run.
