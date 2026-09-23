@@ -52,6 +52,16 @@ jobs:
       - name: Build distributions
         run: python -m build
 
+      - name: Smoke test installed wheel
+        run: |
+          smoke_venv=/tmp/fraud-wheel-smoke
+          python -m venv "$smoke_venv"
+          "$smoke_venv/bin/python" -m pip install --quiet dist/*.whl
+          (
+            cd /tmp
+            test "$("$smoke_venv/bin/fraud-detect" --version)" = "0.1.0"
+          )
+
       - name: Check package metadata
         run: python -m twine check dist/*
 
