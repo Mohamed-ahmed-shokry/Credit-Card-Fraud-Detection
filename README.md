@@ -1064,9 +1064,13 @@ src/fraud_detection/
 ├── cli.py          # training, comparison, surveillance, profiling, simulation, and serving CLI
 ├── data.py         # ingestion, schema validation, and synthetic data
 ├── drift.py        # multi-window drift surveillance and streaming quantile profiler
+├── edge.py         # dependency-light quantized logistic runtime
 ├── evaluation.py   # threshold tuning, imbalance-aware metrics, and calibration reports
 ├── explanations.py # isolated explanation provider protocols and cost controls
 ├── reporting.py    # self-contained HTML compliance report rendering
+├── signing.py      # Ed25519 signing and trusted public-key verification
+├── telemetry.py    # trace propagation and optional OTLP export
+├── trust.py        # rotating trust bundles and deployment admission
 └── model.py        # training, model card, inference, and cryptographic attestation
 tests/              # unit, integration, CLI, and API tests
 ```
