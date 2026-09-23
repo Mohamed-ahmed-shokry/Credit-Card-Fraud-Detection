@@ -955,6 +955,21 @@ cosign verify ghcr.io/mohamed-ahmed-shokry/credit-card-fraud-detection:vX.Y.Z \
 
 Mount the trained model read-only the same way regardless of image source.
 
+## Package releases and SBOMs
+
+Every CI run builds the wheel and source distribution, checks their metadata, and
+installs the wheel in a clean environment outside the checkout before reporting
+the package version. The TestPyPI workflow repeats the build and CycloneDX SBOM
+generation on `main`; its `skip-existing` setting makes reruns of the immutable
+development version safe without hiding build or metadata failures.
+
+Release builds write `sbom/sbom.cdx.json` and retain it as a workflow artifact
+alongside the exact distributions sent to PyPI. Both publishing workflows use
+OIDC trusted publishing rather than long-lived upload tokens. A maintainer must
+link the repository and workflow to trusted publishers on TestPyPI and PyPI
+before either external upload can succeed; see the release checklist in
+`CONTRIBUTING.md` and the comments at the top of the workflow files.
+
 ## Streaming surveillance and traffic shadowing
 
 ### Dual-window drift surveillance
@@ -1072,9 +1087,8 @@ model artifacts produced by a trusted training process.**
 
 ## Roadmap
 
-See [ROADMAP.md](ROADMAP.md) for what's planned beyond `v0.1.0`, including
-the PyPI release, the threshold tradeoff report, and the artifact retention
-policy.
+See [ROADMAP.md](ROADMAP.md) for what's planned beyond `v0.1.0`, including the
+release-engineering status and the maintainer-only PyPI publisher setup.
 
 ## License
 
