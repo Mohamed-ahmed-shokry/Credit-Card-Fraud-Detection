@@ -519,6 +519,60 @@ authorization remain operator responsibilities.
 - Docker validation remains unavailable in this environment because the Docker
   executable is not installed; CI remains responsible for container smoke checks.
 
+## Phase 20 — Reproducible Release Engineering (In progress)
+
+### Objective
+
+Make the package distribution path reliable enough for every verified commit and
+for the first real release. Release workflows must build the same artifacts they
+publish, produce their promised SBOM, tolerate the repository's immutable
+`0.1.0` development version on repeated TestPyPI runs, and prove that the wheel
+works outside the source checkout.
+
+### Scope
+
+- **Release workflow repair** — fix the currently failing TestPyPI and release
+  SBOM steps, make missing SBOM output fail clearly, and keep the TestPyPI dry run
+  idempotent when an unchanged version already exists.
+- **Action dependency maintenance** — consume the verified Dependabot updates for
+  `actions/download-artifact` and `actions/upload-artifact`, keeping the release
+  workflow on the current supported major versions.
+- **Wheel installation smoke test** — install the built wheel into a clean virtual
+  environment in CI, run the installed `fraud-detect --version` entry point from
+  outside the repository, and fail if the package is only working because of the
+  source checkout.
+- **Release documentation** — align README, CONTRIBUTING, SECURITY, CHANGELOG,
+  and this roadmap with the repaired workflow, SBOM location, repeat-upload
+  behavior, and maintainer-only trusted-publisher setup.
+
+### Acceptance criteria
+
+- The TestPyPI workflow creates and validates its SBOM output before invoking the
+  publisher; the release workflow applies the same guarantee and uploads a
+  non-empty SBOM artifact.
+- Re-running the TestPyPI workflow for an already published `0.1.0` artifact does
+  not fail solely because the file exists, while new build and metadata failures
+  remain fatal.
+- The release workflow uses `actions/download-artifact@v8` and
+  `actions/upload-artifact@v7`, and both existing Dependabot action updates are
+  resolved without bypassing CI.
+- CI installs the wheel into a clean environment outside the checkout and the
+  installed CLI reports the package version successfully.
+- Build, Twine metadata, SBOM generation, and package-install smoke behavior are
+  covered by workflow checks or deterministic local equivalents.
+- README, CONTRIBUTING, SECURITY, CHANGELOG, and this roadmap accurately describe
+  the release path and identify trusted-publisher account linking as the only
+  maintainer-side prerequisite for an external PyPI/TestPyPI upload.
+- Full project quality gates pass and every implementation/documentation change is
+  committed and pushed before this phase is marked `Done`.
+
+### Explicit exclusions
+
+This phase does not create or configure PyPI/TestPyPI accounts, trusted publishers,
+GitHub environments, or release credentials. Those require maintainer ownership of
+external services. It does not change the package version, publish a real release,
+or introduce a dependency lockfile; dependency freshness remains Dependabot's job.
+
 ## Contributing to the roadmap
 
 Open an issue or a pull request that references the relevant phase item.
