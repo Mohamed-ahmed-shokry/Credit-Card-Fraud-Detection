@@ -150,6 +150,18 @@ first verifies the attestation digest, `PASSED` status, signing key ID, active
 bundle status, and Ed25519 signature; only then does it deserialize the model.
 Partial admission configuration or failed verification stops startup.
 
+## Distribution boundary
+
+GitHub Actions builds the wheel and source distribution once per release workflow.
+The release candidate wheel is installed before CycloneDX generates the
+`sbom/sbom.cdx.json` artifact, so the recorded dependency inventory describes
+what is being published rather than an unrelated source-only environment. CI
+also installs that wheel from outside the checkout and runs the versioned CLI.
+TestPyPI uses `skip-existing` only for immutable already-uploaded development
+files; build, metadata, and SBOM failures remain fatal. PyPI and TestPyPI
+publishing authenticate through OIDC trusted publishers, which are deployment
+configuration rather than application code.
+
 For operational resiliency and safe challenger evaluation:
 - `CircuitBreaker` maintains scoring stability. Consecutive failures exceeding
   `failure_threshold` or execution times exceeding `latency_budget_ms` trip the
