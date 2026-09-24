@@ -698,6 +698,71 @@ deploying operator's responsibility as SECURITY.md already states.
   run still stops only at the external trusted-publisher step (`environment`
   missing), the documented maintainer-only prerequisite.
 
+## Phase 22 — Serving Concurrency and Credential Hardening (In progress)
+
+### Objective
+
+Keep the async scoring service honest under load. Scoring is CPU- and
+I/O-bound work that currently runs directly on the event loop inside
+`async def` handlers, so one slow batch freezes probes, middleware, and every
+other in-flight request. Verification of that path, add an optional reference
+backpressure guard so operators can shed overload instead of queueing
+unboundedly, and make API-key verification timing-safe.
+
+### Scope
+
+- **Event-loop offload** — execute `score_frame` (model inference, fallback,
+  explanation providers) and the synchronous audit-sink emit through Starlette's
+  threadpool in both `POST /v1/predict` and `POST /v1/score`, so liveness,
+  readiness, health, metrics, and concurrent scoring requests stay responsive
+  while a batch is in flight. Shadow evaluation stays in background tasks.
+- **Timing-safe API-key verification** — replace set membership (`in`) with a
+  `secrets.compare_digest` check across all configured keys without early exit,
+  preserving current accept/reject semantics including missing or empty headers.
+- **Optional concurrency guard** — a `max_concurrent_scoring` cap (default
+  disabled), configurable through `create_app`, `FRAUD_MAX_CONCURRENT_SCORING`,
+  and `fraud-detect serve --max-concurrent-scoring`. When the cap is reached,
+  scoring endpoints return `503` with `Retry-After` while operational endpoints
+  remain unaffected. This is defense in depth, not a substitute for gateway
+  concurrency limits.
+- **Documentation** — README (serving/concurrency notes and configuration),
+  SECURITY (timing-safe comparison and backpressure framing), ARCHITECTURE
+  (serving boundary), CHANGELOG, and this roadmap.
+
+### Acceptance criteria
+
+- While a scoring request is blocked in a deliberately slow model, `GET /live`
+  (and `GET /ready`) complete promptly, proving scoring no longer blocks the
+  event loop.
+- Two scoring requests run concurrently through the threadpool (their
+  slow-model sections overlap) instead of serializing on the event loop.
+- API-key middleware still accepts valid keys and rejects invalid or missing
+  keys; verification goes through `secrets.compare_digest` over every
+  configured key.
+- With `max_concurrent_scoring=1` (or `FRAUD_MAX_CONCURRENT_SCORING=1`), a
+  second concurrent scoring request receives `503` with `Retry-After` while
+  `/health`/`/live` still return `200`; the default configuration caps nothing
+  and behaves as before.
+- The cap is settable from `serve` and the environment with clear validation
+  of invalid values.
+- Scoring response contracts, audit event content, circuit-breaker behavior,
+  and rate-limit/API-key exemptions for operational endpoints are unchanged.
+- Full test suite, Ruff format/check, strict mypy, package build, and Twine
+  checks pass; every change is committed and pushed before the phase is marked
+  `Done`.
+
+### Explicit exclusions
+
+This phase does not add TLS, replace the gateway with a real auth product,
+change scoring request/response schemas, introduce per-feature CPU quotas or
+autoscaling, or publish a release. Gateway authentication, durable rate
+limiting, and network-level concurrency limits remain the deploying
+operator's responsibility as SECURITY.md already states.
+
+### Delivery record
+
+Filled in when the phase completes.
+
 ## Contributing to the roadmap
 
 Open an issue or a pull request that references the relevant phase item.
