@@ -516,7 +516,9 @@ fraud-detect serve artifacts/model --host 0.0.0.0 --port 8000
 ```
 
 Interactive OpenAPI documentation is available at `http://localhost:8000/docs`,
-readiness at `GET /health`, and Prometheus metrics at `GET /metrics`.
+operational health at `GET /health`, liveness at `GET /live`, readiness at
+`GET /ready`, and Prometheus metrics at `GET /metrics`. Probes and metrics stay
+reachable without an API key when the optional middleware is enabled.
 
 Score one or more transactions (all trained features are required):
 
