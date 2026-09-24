@@ -126,8 +126,10 @@ depth, not a replacement for gateway authentication: responses carry
 `Retry-After` and `X-RateLimit-*` headers, but key storage, rotation, and
 perimeter enforcement remain the operator's job.
 
-`GET /metrics` and `GET /health` are unauthenticated, like most Prometheus
-exposition endpoints. They report counts, labels, and timing only, never
-transaction values, but should still be reachable only from a trusted scrape
+`GET /metrics`, `GET /health`, `GET /live`, and `GET /ready` are
+unauthenticated even when the optional API-key middleware is enabled, and they
+are never rate limited, like most Prometheus and orchestrator probe endpoints.
+They report counts, labels, timing, and readiness only, never transaction
+values, but should still be reachable only from a trusted scrape or probe
 network rather than exposed publicly, the same as any other operational
 endpoint.
