@@ -923,6 +923,66 @@ def test_invalid_rate_limit_environment_is_rejected(
         create_app(model=model)
 
 
+def test_negative_rate_limit_requests_environment_is_rejected(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, model, _ = api_context
+    monkeypatch.setenv(RATE_LIMIT_REQUESTS_ENVIRONMENT_VARIABLE, "-1")
+
+    with pytest.raises(ValueError, match=">= 0"):
+        create_app(model=model)
+
+
+def test_invalid_rate_limit_window_environment_is_rejected(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, model, _ = api_context
+    monkeypatch.setenv(RATE_LIMIT_WINDOW_SECONDS_ENVIRONMENT_VARIABLE, "not-a-number")
+
+    with pytest.raises(ValueError, match=RATE_LIMIT_WINDOW_SECONDS_ENVIRONMENT_VARIABLE):
+        create_app(model=model)
+
+
+def test_non_positive_rate_limit_window_environment_is_rejected(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, model, _ = api_context
+    monkeypatch.setenv(RATE_LIMIT_WINDOW_SECONDS_ENVIRONMENT_VARIABLE, "0")
+
+    with pytest.raises(ValueError, match="> 0"):
+        create_app(model=model)
+
+
+def test_explicit_rate_limit_window_overrides_environment(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, model, _ = api_context
+    monkeypatch.setenv(RATE_LIMIT_WINDOW_SECONDS_ENVIRONMENT_VARIABLE, "not-a-number")
+
+    app = create_app(model=model, rate_limit_requests=1, rate_limit_window_seconds=15.0)
+
+    assert app is not None
+
+
+def test_ready_returns_503_when_model_missing(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, model, _ = api_context
+
+    with TestClient(create_app(model=model)) as test_client:
+        del test_client.app.state.model
+        response = test_client.get("/ready")
+
+    assert response.status_code == 503
+    body = response.json()
+    assert body["status"] == "not_ready"
+    assert body["detail"] == "Model not loaded."
+
+
 def test_predict_emits_audit_event_to_configured_sink(
     tmp_path: Path,
     api_context: tuple[TestClient, FraudModel, ValidatedDataset],
