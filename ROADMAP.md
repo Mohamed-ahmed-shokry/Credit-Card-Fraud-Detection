@@ -20,7 +20,7 @@ Status legend: `Proposed` (not started), `In progress`, `Done`.
 ## Current state
 
 The project is a production-grade reference implementation with the implementation work in
-Phases 2 through 20 complete. Phase 1's workflows are in place, but the first
+Phases 2 through 21 complete. Phase 1's workflows are in place, but the first
 real PyPI release still requires maintainer-side trusted-publisher setup. The
 shipped system covers leakage-safe training, multiple calibrated estimators,
 threshold and calibration analysis, label-delay temporal gaps, drift surveillance,
@@ -29,8 +29,9 @@ artifacts and rotation-aware admission, online scoring, structured audit event
 export, an isolated explanation provider boundary with deterministic fallback,
 persisted lineage, HTML compliance reports, historical audit log replay, degraded
 serving fallback guardrails, an automated champion-challenger retraining pipeline,
-edge runtime export, distributed telemetry, and continuous operational
-surveillance.
+edge runtime export, distributed telemetry, continuous operational
+surveillance, and an operational serving contract with liveness/readiness probes
+plus deployable reference middleware.
 
 ## Phase 1 — Distribution
 
@@ -599,7 +600,7 @@ or introduce a dependency lockfile; dependency freshness remains Dependabot's jo
   `invalid-publisher`; configuring the TestPyPI trusted publisher remains the
   documented maintainer-only prerequisite.
 
-## Phase 21 — Operational Serving Contract (In progress)
+## Phase 21 — Operational Serving Contract (Done)
 
 ### Objective
 
@@ -671,7 +672,31 @@ deploying operator's responsibility as SECURITY.md already states.
 
 ### Delivery record
 
-Filled in when the phase completes.
+- Exempted `/health`, `/metrics`, `/live`, and `/ready` from the optional
+  API-key and per-client rate-limit middleware, matching SECURITY.md's statement
+  that operational endpoints are unauthenticated and keeping probes/scrapes from
+  receiving `401`/`429` when those defenses are enabled.
+- Added `GET /live` (always `200` while serving) and `GET /ready` (`200` with
+  model/health detail when scoring can proceed, `503` when the model is missing
+  or the circuit is open with `fallback_mode=raise`), with OpenAPI responses and
+  failure-path tests; `/health` behavior is unchanged for existing callers.
+- Made the reference middleware deployable without Python embeds: API keys and
+  rate limits resolve from `FRAUD_API_KEYS`, `FRAUD_RATE_LIMIT_REQUESTS`, and
+  `FRAUD_RATE_LIMIT_WINDOW_SECONDS` with clear rejection of invalid values, and
+  `fraud-detect serve` gained `--api-key`, `--rate-limit-requests`, and
+  `--rate-limit-window-seconds` options that flow into `create_app`.
+- Pointed the Docker `HEALTHCHECK` at `/ready`, added a matching Compose
+  healthcheck, and extended the CI container smoke to verify `/ready`, `/live`,
+  `/health`, and `/metrics`.
+- Fixed the broken `uvicorn fraud_detection.api:app` README example to the
+  working `uvicorn --factory fraud_detection.api:app_from_environment` form and
+  updated README, SECURITY, ARCHITECTURE, and CHANGELOG for probes, exemptions,
+  and configuration.
+- Final validation: 492 tests passed with 97.36% branch coverage; Ruff format
+  and check passed; strict mypy passed on 14 source files; package build and
+  Twine checks passed; remote CI run `35953894857` succeeded. The TestPyPI dry
+  run still stops only at the external trusted-publisher step (`environment`
+  missing), the documented maintainer-only prerequisite.
 
 ## Contributing to the roadmap
 
