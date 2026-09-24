@@ -726,6 +726,24 @@ Excess requests return `429 Too Many Requests` with `Retry-After`,
 carry `X-RateLimit-Limit` and `X-RateLimit-Remaining` so clients can back off
 before hitting the cap.
 
+### Optional scoring concurrency cap
+
+Scoring runs on a worker threadpool, so probes and other requests stay
+responsive while a batch is in flight. To shed overload instead of queueing
+unboundedly, set `max_concurrent_scoring` on `create_app`, pass
+`--max-concurrent-scoring` to `fraud-detect serve`, or set
+`FRAUD_MAX_CONCURRENT_SCORING`. The cap is disabled by default and, like rate
+limiting, is defense in depth rather than a replacement for gateway
+concurrency limits.
+
+```bash
+fraud-detect serve artifacts/model --max-concurrent-scoring 8
+```
+
+When the cap is reached, `/v1/predict` and `/v1/score` return
+`503 Service Unavailable` with `Retry-After` while `/health`, `/live`,
+`/ready`, and `/metrics` continue to answer.
+
 ### Serving guardrails and degraded-state fallback
 
 Configure resilient fallback policies when runtime exceptions occur or during degraded upstream conditions:
