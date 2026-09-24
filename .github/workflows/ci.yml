@@ -146,13 +146,15 @@ jobs:
             --volume "$PWD/artifacts/model:/app/artifacts/model:ro" \
             credit-card-fraud-detection:test
           for _ in $(seq 1 30); do
-            if curl --fail --silent http://localhost:8000/health; then
-              exit 0
+            if curl --fail --silent http://localhost:8000/ready; then
+              break
             fi
             sleep 1
           done
-          echo "Container did not become healthy in time." >&2
-          exit 1
+          curl --fail --silent http://localhost:8000/ready
+          curl --fail --silent http://localhost:8000/live
+          curl --fail --silent http://localhost:8000/health
+          curl --fail --silent http://localhost:8000/metrics
 
       - name: Show container logs
         if: always()
