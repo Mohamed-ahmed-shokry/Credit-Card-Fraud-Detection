@@ -6,8 +6,9 @@ import logging
 import math
 import os
 import re
+import secrets
 import time
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Collection
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -124,6 +125,22 @@ def _resolve_api_keys(api_keys: list[str] | None) -> list[str] | None:
     raw = os.getenv(API_KEYS_ENVIRONMENT_VARIABLE, "")
     keys = [part.strip() for part in raw.split(",") if part.strip()]
     return keys or None
+
+
+def _api_key_is_valid(candidate: str | None, accepted: Collection[str]) -> bool:
+    """Check a candidate key against every accepted key in constant time.
+
+    Every configured key is compared even after a match so the loop duration
+    does not depend on which key (if any) matched.
+    """
+    if not candidate:
+        return False
+    candidate_bytes = candidate.encode()
+    matched = False
+    for accepted_key in accepted:
+        if secrets.compare_digest(candidate_bytes, accepted_key.encode()):
+            matched = True
+    return matched
 
 
 def _resolve_rate_limit_requests(rate_limit_requests: int) -> int:
@@ -689,13 +706,15 @@ def create_app(
         request: Request,
         call_next: RequestResponseEndpoint,
     ) -> Response:
-        if api_key_set is not None and request.url.path not in OPERATIONAL_PATHS:
-            api_key = request.headers.get("X-API-Key")
-            if api_key not in api_key_set:
-                return JSONResponse(
-                    status_code=401,
-                    content={"detail": "Invalid or missing API key"},
-                )
+        if (
+            api_key_set is not None
+            and request.url.path not in OPERATIONAL_PATHS
+            and not _api_key_is_valid(request.headers.get("X-API-Key"), api_key_set)
+        ):
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "Invalid or missing API key"},
+            )
         return await call_next(request)
 
     @application.middleware("http")

@@ -29,6 +29,7 @@ from fraud_detection.api import (
     REQUEST_ID_HEADER,
     SHADOW_MODEL_PATH_ENVIRONMENT_VARIABLE,
     CircuitBreaker,
+    _api_key_is_valid,
     app_from_environment,
     create_app,
 )
@@ -789,6 +790,35 @@ def test_api_key_middleware_exempts_operational_endpoints(
     assert metrics.status_code == 200
     assert live.status_code == 200
     assert ready.status_code == 200
+
+
+def test_api_key_validation_semantics() -> None:
+    accepted = {"first-key", "second-key"}
+
+    assert _api_key_is_valid("first-key", accepted) is True
+    assert _api_key_is_valid("second-key", accepted) is True
+    assert _api_key_is_valid("wrong-key", accepted) is False
+    assert _api_key_is_valid(None, accepted) is False
+    assert _api_key_is_valid("", accepted) is False
+    assert _api_key_is_valid("first-key", set()) is False
+
+
+def test_api_key_comparison_checks_every_configured_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import secrets as real_secrets
+
+    original_compare_digest = real_secrets.compare_digest
+    comparisons: list[tuple[bytes, bytes]] = []
+
+    def counting_compare_digest(a: bytes, b: bytes) -> bool:
+        comparisons.append((a, b))
+        return original_compare_digest(a, b)
+
+    monkeypatch.setattr("fraud_detection.api.secrets.compare_digest", counting_compare_digest)
+
+    assert _api_key_is_valid("second-key", {"first-key", "second-key", "third-key"}) is True
+    assert len(comparisons) == 3
 
 
 def test_rate_limit_middleware_allows_within_limit(
