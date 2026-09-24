@@ -3106,6 +3106,30 @@ def serve_command(
             help="Optional rotation-aware trust bundle paired with --attestation.",
         ),
     ] = None,
+    api_key: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--api-key",
+            help="Valid X-API-Key value; repeat for multiple keys. Env fallback is FRAUD_API_KEYS.",
+        ),
+    ] = None,
+    rate_limit_requests: Annotated[
+        int,
+        typer.Option(
+            min=0,
+            help=(
+                "Max requests per client IP per window; 0 disables. "
+                "Env fallback is FRAUD_RATE_LIMIT_REQUESTS."
+            ),
+        ),
+    ] = 0,
+    rate_limit_window_seconds: Annotated[
+        float,
+        typer.Option(
+            min=0.01,
+            help="Rate-limit window in seconds. Env fallback is FRAUD_RATE_LIMIT_WINDOW_SECONDS.",
+        ),
+    ] = 60.0,
 ) -> None:
     """Run the versioned HTTP prediction service with optional trace export."""
     from fraud_detection.api import create_app
@@ -3117,6 +3141,9 @@ def serve_command(
     uvicorn.run(
         create_app(
             model=model,
+            api_keys=api_key,
+            rate_limit_requests=rate_limit_requests,
+            rate_limit_window_seconds=rate_limit_window_seconds,
             otlp_endpoint=otlp_endpoint,
             otlp_service_name=otlp_service_name,
             otlp_timeout_seconds=otlp_timeout_seconds,

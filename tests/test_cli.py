@@ -244,6 +244,50 @@ def test_cli_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     assert "Pass --overwrite" in protected.stderr
 
 
+def test_serve_passes_middleware_options_to_create_app(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact_path = tmp_path / "artifact"
+    artifact_path.mkdir()
+    created: dict[str, Any] = {}
+
+    def fake_load_model(_path: Path | str) -> object:
+        return object()
+
+    def fake_create_app(**kwargs: Any) -> object:
+        created.update(kwargs)
+        return object()
+
+    def fake_run(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr("fraud_detection.cli.load_model", fake_load_model)
+    monkeypatch.setattr("fraud_detection.api.create_app", fake_create_app)
+    monkeypatch.setattr("fraud_detection.cli.uvicorn.run", fake_run)
+
+    served = runner.invoke(
+        app,
+        [
+            "serve",
+            str(artifact_path),
+            "--api-key",
+            "key-one",
+            "--api-key",
+            "key-two",
+            "--rate-limit-requests",
+            "25",
+            "--rate-limit-window-seconds",
+            "15",
+        ],
+    )
+
+    assert served.exit_code == 0, served.output
+    assert created["api_keys"] == ["key-one", "key-two"]
+    assert created["rate_limit_requests"] == 25
+    assert created["rate_limit_window_seconds"] == 15.0
+
+
 def test_train_and_explain_support_random_forest_estimator(tmp_path: Path) -> None:
     data_path = tmp_path / "transactions.csv"
     artifact_path = tmp_path / "artifact"
