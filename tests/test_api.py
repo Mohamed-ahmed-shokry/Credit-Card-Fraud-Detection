@@ -84,6 +84,66 @@ def test_health_reports_loaded_model(
     }
 
 
+def test_live_reports_process_liveness(client: TestClient) -> None:
+    response = client.get("/live")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "alive", "service_version": __version__}
+
+
+def test_ready_reports_loaded_model(
+    client: TestClient,
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, model, _ = api_context
+
+    response = client.get("/ready")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "ready"
+    assert body["service_version"] == __version__
+    assert body["model_created_at"] == model.metadata["created_at"]
+    assert body["feature_count"] == 30
+    assert body["threshold"] == model.threshold
+
+
+def test_ready_returns_503_when_circuit_open_with_raise_fallback(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, model, _ = api_context
+    cb = CircuitBreaker(failure_threshold=1)
+    cb.trip()
+    app = create_app(model=model, circuit_breaker=cb, fallback_mode="raise")
+
+    with TestClient(app) as test_client:
+        response = test_client.get("/ready")
+
+    assert response.status_code == 503
+    body = response.json()
+    assert body["status"] == "not_ready"
+    assert "Circuit breaker is open" in body["detail"]
+    assert body["circuit_breaker"]["state"] == "open"
+
+
+def test_ready_stays_available_with_open_circuit_and_constant_fallback(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, model, _ = api_context
+    cb = CircuitBreaker(failure_threshold=1)
+    cb.trip()
+    app = create_app(model=model, circuit_breaker=cb, fallback_mode="constant")
+
+    with TestClient(app) as test_client:
+        response = test_client.get("/ready")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "ready"
+    assert body["degraded_mode"] is True
+    assert body["circuit_breaker"]["state"] == "open"
+
+
 def test_traceparent_is_continued_and_span_is_exported(
     api_context: tuple[TestClient, FraudModel, ValidatedDataset],
 ) -> None:
@@ -576,6 +636,8 @@ def test_openapi_describes_versioned_prediction_endpoint(client: TestClient) -> 
     assert document["info"]["version"] == __version__
     assert "/v1/predict" in document["paths"]
     assert "/v1/score" in document["paths"]
+    assert "/live" in document["paths"]
+    assert "/ready" in document["paths"]
 
 
 def test_request_context_propagates_safe_correlation_id(client: TestClient) -> None:
@@ -717,9 +779,13 @@ def test_api_key_middleware_exempts_operational_endpoints(
     with TestClient(app) as test_client:
         health = test_client.get("/health")
         metrics = test_client.get("/metrics")
+        live = test_client.get("/live")
+        ready = test_client.get("/ready")
 
     assert health.status_code == 200
     assert metrics.status_code == 200
+    assert live.status_code == 200
+    assert ready.status_code == 200
 
 
 def test_rate_limit_middleware_allows_within_limit(
@@ -766,10 +832,14 @@ def test_rate_limit_middleware_exempts_operational_endpoints(
     with TestClient(app) as test_client:
         first = test_client.get("/health")
         second = test_client.get("/health")
+        live = test_client.get("/live")
+        ready = test_client.get("/ready")
         metrics = test_client.get("/metrics")
 
     assert first.status_code == 200
     assert second.status_code == 200
+    assert live.status_code == 200
+    assert ready.status_code == 200
     assert metrics.status_code == 200
     assert "X-RateLimit-Limit" not in first.headers
 

@@ -297,6 +297,28 @@ class HealthResponse(BaseModel):
     shadow_model_version: str | None = None
 
 
+class LivenessResponse(BaseModel):
+    """Process liveness information."""
+
+    status: str
+    service_version: str
+
+
+class ReadinessResponse(BaseModel):
+    """Scoring-path readiness information."""
+
+    status: str
+    service_version: str
+    detail: str | None = None
+    model_created_at: str | None = None
+    feature_count: int | None = None
+    threshold: float | None = None
+    degraded_mode: bool | None = None
+    fallback_mode: str | None = None
+    circuit_breaker: dict[str, Any] | None = None
+    shadow_model_version: str | None = None
+
+
 def create_app(
     *,
     model: FraudModel | None = None,
@@ -759,6 +781,60 @@ def create_app(
         return HealthResponse(
             status="degraded" if is_degraded else "ready",
             service_version=__version__,
+            model_created_at=str(loaded.metadata["created_at"]),
+            feature_count=len(loaded.feature_names),
+            threshold=loaded.threshold,
+            degraded_mode=True if is_degraded else None,
+            fallback_mode=fb_mode if fb_mode != "raise" else None,
+            circuit_breaker=cb_dict,
+            shadow_model_version=sh_ver,
+        )
+
+    @application.get(
+        "/live",
+        response_model=LivenessResponse,
+        response_model_exclude_none=True,
+        tags=["operations"],
+    )
+    async def live() -> LivenessResponse:
+        return LivenessResponse(status="alive", service_version=__version__)
+
+    @application.get(
+        "/ready",
+        response_model=ReadinessResponse,
+        response_model_exclude_none=True,
+        responses={
+            200: {"description": "Service can accept scoring traffic."},
+            503: {"description": "Service cannot accept scoring traffic."},
+        },
+        tags=["operations"],
+    )
+    async def ready(request: Request, response: Response) -> ReadinessResponse:
+        loaded = getattr(request.app.state, "model", None)
+        if loaded is None:
+            response.status_code = 503
+            return ReadinessResponse(
+                status="not_ready",
+                service_version=__version__,
+                detail="Model not loaded.",
+            )
+        fb_mode = str(getattr(request.app.state, "fallback_mode", "raise"))
+        cb: CircuitBreaker | None = getattr(request.app.state, "circuit_breaker", None)
+        cb_dict = cb.to_dict() if cb is not None else None
+        is_degraded = bool(getattr(request.app.state, "degraded_mode", False))
+        if cb is not None and cb.state == "open":
+            is_degraded = True
+        sh_model: FraudModel | None = getattr(request.app.state, "shadow_model", None)
+        sh_ver = (
+            str(sh_model.metadata["dataset_fingerprint"])[:12] if sh_model is not None else None
+        )
+        cannot_serve = cb is not None and cb.state == "open" and fb_mode == "raise"
+        if cannot_serve:
+            response.status_code = 503
+        return ReadinessResponse(
+            status="not_ready" if cannot_serve else "ready",
+            service_version=__version__,
+            detail="Circuit breaker is open and fallback mode is raise." if cannot_serve else None,
             model_created_at=str(loaded.metadata["created_at"]),
             feature_count=len(loaded.feature_names),
             threshold=loaded.threshold,
