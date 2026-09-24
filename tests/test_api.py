@@ -921,6 +921,42 @@ def test_concurrent_scoring_requests_overlap_in_threadpool(
     assert max_active >= 2, "scoring requests did not overlap on the threadpool"
 
 
+def test_slow_audit_emit_does_not_block_probes(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    from fraud_detection.audit import AuditEvent, AuditSink
+
+    _, model, dataset = api_context
+    record = dataset.features.iloc[0].to_dict()
+    emit_started = threading.Event()
+    emit_release = threading.Event()
+
+    class SlowSink:
+        def emit(self, _event: AuditEvent) -> None:
+            emit_started.set()
+            assert emit_release.wait(timeout=10), "audit emit release was never set"
+
+        def close(self) -> None:
+            return None
+
+    sink = SlowSink()
+    app = create_app(model=model, audit_sink=cast(AuditSink, sink))
+
+    with TestClient(app) as test_client, ThreadPoolExecutor(max_workers=1) as pool:
+        scoring = pool.submit(
+            test_client.post,
+            "/v1/predict",
+            json={"transactions": [record]},
+        )
+        assert emit_started.wait(timeout=10), "audit emit never started"
+        live = test_client.get("/live")
+        emit_release.set()
+        response = scoring.result(timeout=15)
+
+    assert live.status_code == 200
+    assert response.status_code == 200
+
+
 def test_rate_limit_middleware_allows_within_limit(
     api_context: tuple[TestClient, FraudModel, ValidatedDataset],
 ) -> None:

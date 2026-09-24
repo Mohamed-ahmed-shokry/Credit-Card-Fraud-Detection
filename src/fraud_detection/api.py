@@ -1103,7 +1103,7 @@ def create_app(
                 ],
                 request_id=getattr(request.state, "request_id", None),
             )
-            sink.emit(audit_event)
+            await run_in_threadpool(sink.emit, audit_event)
         except Exception:
             logger.exception("Failed to emit scoring audit event.")
 
@@ -1185,7 +1185,7 @@ def create_app(
                 ],
                 request_id=getattr(request.state, "request_id", None),
             )
-            sink.emit(audit_event)
+            await run_in_threadpool(sink.emit, audit_event)
         except Exception:
             logger.exception("Failed to emit scoring audit event.")
 
