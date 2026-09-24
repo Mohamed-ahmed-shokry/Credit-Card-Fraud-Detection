@@ -279,6 +279,8 @@ def test_serve_passes_middleware_options_to_create_app(
             "25",
             "--rate-limit-window-seconds",
             "15",
+            "--max-concurrent-scoring",
+            "4",
         ],
     )
 
@@ -286,6 +288,7 @@ def test_serve_passes_middleware_options_to_create_app(
     assert created["api_keys"] == ["key-one", "key-two"]
     assert created["rate_limit_requests"] == 25
     assert created["rate_limit_window_seconds"] == 15.0
+    assert created["max_concurrent_scoring"] == 4
 
 
 def test_train_and_explain_support_random_forest_estimator(tmp_path: Path) -> None:

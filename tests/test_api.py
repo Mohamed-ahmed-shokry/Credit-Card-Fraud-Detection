@@ -23,6 +23,7 @@ from fraud_detection.api import (
     CIRCUIT_BREAKER_FAILURE_THRESHOLD_ENVIRONMENT_VARIABLE,
     CIRCUIT_BREAKER_LATENCY_BUDGET_ENVIRONMENT_VARIABLE,
     CIRCUIT_BREAKER_RECOVERY_TIMEOUT_ENVIRONMENT_VARIABLE,
+    MAX_CONCURRENT_SCORING_ENVIRONMENT_VARIABLE,
     MAX_REQUEST_BODY_BYTES,
     MODEL_PATH_ENVIRONMENT_VARIABLE,
     PROCESS_TIME_HEADER,
@@ -955,6 +956,80 @@ def test_slow_audit_emit_does_not_block_probes(
 
     assert live.status_code == 200
     assert response.status_code == 200
+
+
+def test_concurrency_cap_sheds_load_with_503(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, model, dataset = api_context
+    record = dataset.features.iloc[0].to_dict()
+    started = threading.Event()
+    release = threading.Event()
+    slow_model = _slow_wrapper(model, started=started, release=release)
+    app = create_app(model=slow_model, max_concurrent_scoring=1)
+
+    with TestClient(app) as test_client, ThreadPoolExecutor(max_workers=1) as pool:
+        first = pool.submit(
+            test_client.post,
+            "/v1/predict",
+            json={"transactions": [record]},
+        )
+        assert started.wait(timeout=10), "first scoring never started"
+        rejected = test_client.post("/v1/predict", json={"transactions": [record]})
+        live = test_client.get("/live")
+        release.set()
+        accepted = first.result(timeout=15)
+
+    assert accepted.status_code == 200
+    assert rejected.status_code == 503
+    assert rejected.json()["detail"] == "Too many concurrent scoring requests."
+    assert rejected.headers["Retry-After"] == "1"
+    assert live.status_code == 200
+
+
+def test_concurrency_cap_reads_environment(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, model, dataset = api_context
+    record = dataset.features.iloc[0].to_dict()
+    started = threading.Event()
+    release = threading.Event()
+    slow_model = _slow_wrapper(model, started=started, release=release)
+    monkeypatch.setenv(MAX_CONCURRENT_SCORING_ENVIRONMENT_VARIABLE, "1")
+    app = create_app(model=slow_model)
+
+    with TestClient(app) as test_client, ThreadPoolExecutor(max_workers=1) as pool:
+        first = pool.submit(
+            test_client.post,
+            "/v1/predict",
+            json={"transactions": [record]},
+        )
+        assert started.wait(timeout=10), "first scoring never started"
+        rejected = test_client.post("/v1/score", json={"transaction": record})
+        release.set()
+        accepted = first.result(timeout=15)
+
+    assert accepted.status_code == 200
+    assert rejected.status_code == 503
+
+
+def test_invalid_concurrency_configuration_is_rejected(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, model, _ = api_context
+
+    with pytest.raises(ValueError, match="max_concurrent_scoring must be >= 0"):
+        create_app(model=model, max_concurrent_scoring=-1)
+
+    monkeypatch.setenv(MAX_CONCURRENT_SCORING_ENVIRONMENT_VARIABLE, "not-a-number")
+    with pytest.raises(ValueError, match=MAX_CONCURRENT_SCORING_ENVIRONMENT_VARIABLE):
+        create_app(model=model)
+
+    monkeypatch.setenv(MAX_CONCURRENT_SCORING_ENVIRONMENT_VARIABLE, "-2")
+    with pytest.raises(ValueError, match=">= 0"):
+        create_app(model=model)
 
 
 def test_rate_limit_middleware_allows_within_limit(

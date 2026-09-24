@@ -3127,9 +3127,19 @@ def serve_command(
         float,
         typer.Option(
             min=0.01,
-            help="Rate-limit window in seconds. Env fallback is FRAUD_RATE_LIMIT_WINDOW_SECONDS.",
+            help=("Rate-limit window in seconds. Env fallback is FRAUD_RATE_LIMIT_WINDOW_SECONDS."),
         ),
     ] = 60.0,
+    max_concurrent_scoring: Annotated[
+        int,
+        typer.Option(
+            min=0,
+            help=(
+                "Max scoring requests running at once; 0 disables. "
+                "Env fallback is FRAUD_MAX_CONCURRENT_SCORING."
+            ),
+        ),
+    ] = 0,
 ) -> None:
     """Run the versioned HTTP prediction service with optional trace export."""
     from fraud_detection.api import create_app
@@ -3144,6 +3154,7 @@ def serve_command(
             api_keys=api_key,
             rate_limit_requests=rate_limit_requests,
             rate_limit_window_seconds=rate_limit_window_seconds,
+            max_concurrent_scoring=max_concurrent_scoring,
             otlp_endpoint=otlp_endpoint,
             otlp_service_name=otlp_service_name,
             otlp_timeout_seconds=otlp_timeout_seconds,

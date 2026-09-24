@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 import os
@@ -73,6 +74,7 @@ OTLP_TIMEOUT_ENVIRONMENT_VARIABLE = "FRAUD_OTLP_TIMEOUT_SECONDS"
 API_KEYS_ENVIRONMENT_VARIABLE = "FRAUD_API_KEYS"
 RATE_LIMIT_REQUESTS_ENVIRONMENT_VARIABLE = "FRAUD_RATE_LIMIT_REQUESTS"
 RATE_LIMIT_WINDOW_SECONDS_ENVIRONMENT_VARIABLE = "FRAUD_RATE_LIMIT_WINDOW_SECONDS"
+MAX_CONCURRENT_SCORING_ENVIRONMENT_VARIABLE = "FRAUD_MAX_CONCURRENT_SCORING"
 REQUEST_ID_HEADER = "X-Request-ID"
 PROCESS_TIME_HEADER = "X-Process-Time-Ms"
 MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024
@@ -180,6 +182,28 @@ def _resolve_rate_limit_window_seconds(rate_limit_window_seconds: float) -> floa
     if resolved <= 0:
         raise ValueError(
             f"{RATE_LIMIT_WINDOW_SECONDS_ENVIRONMENT_VARIABLE} must be > 0, got {resolved}."
+        )
+    return resolved
+
+
+def _resolve_max_concurrent_scoring(max_concurrent_scoring: int) -> int:
+    """Resolve the scoring concurrency cap from an explicit argument or the environment."""
+    if max_concurrent_scoring < 0:
+        raise ValueError(f"max_concurrent_scoring must be >= 0, got {max_concurrent_scoring}.")
+    if max_concurrent_scoring > 0:
+        return max_concurrent_scoring
+    raw = os.getenv(MAX_CONCURRENT_SCORING_ENVIRONMENT_VARIABLE, "").strip()
+    if not raw:
+        return 0
+    try:
+        resolved = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"{MAX_CONCURRENT_SCORING_ENVIRONMENT_VARIABLE} must be an integer, got {raw!r}."
+        ) from exc
+    if resolved < 0:
+        raise ValueError(
+            f"{MAX_CONCURRENT_SCORING_ENVIRONMENT_VARIABLE} must be >= 0, got {resolved}."
         )
     return resolved
 
@@ -396,6 +420,7 @@ def create_app(
     api_keys: list[str] | None = None,
     rate_limit_requests: int = 0,
     rate_limit_window_seconds: float = 60.0,
+    max_concurrent_scoring: int = 0,
     audit_sink: AuditSink | None = None,
     explanation_provider: ExplanationProvider | None = None,
     fallback_mode: str | None = None,
@@ -428,6 +453,9 @@ def create_app(
             is used.
         rate_limit_window_seconds: Time window for rate limiting in seconds.
             When left at the default, `FRAUD_RATE_LIMIT_WINDOW_SECONDS` is used.
+        max_concurrent_scoring: Maximum scoring requests allowed to run at the
+            same time; 0 disables the cap. When 0, `FRAUD_MAX_CONCURRENT_SCORING`
+            is used. Excess scoring requests receive HTTP 503 with `Retry-After`.
         audit_sink: Optional structured audit sink. If omitted, checks
             the `FRAUD_AUDIT_LOG_PATH` environment variable or defaults to NullAuditSink.
         explanation_provider: Optional explanation provider for natural language risk
@@ -614,6 +642,12 @@ def create_app(
     )
     resolved_api_keys = _resolve_api_keys(api_keys)
     api_key_set = set(resolved_api_keys) if resolved_api_keys else None
+    resolved_max_concurrent_scoring = _resolve_max_concurrent_scoring(max_concurrent_scoring)
+    scoring_semaphore = (
+        asyncio.Semaphore(resolved_max_concurrent_scoring)
+        if resolved_max_concurrent_scoring > 0
+        else None
+    )
 
     resolved_audit_sink: AuditSink
     if audit_sink is not None:
@@ -1053,13 +1087,14 @@ def create_app(
     @application.post(
         "/v1/predict",
         response_model=PredictionResponse,
+        responses={503: {"description": "Scoring concurrency cap reached."}},
         tags=["predictions"],
     )
     async def predict(
         payload: PredictionRequest,
         request: Request,
         background_tasks: BackgroundTasks,
-    ) -> PredictionResponse:
+    ) -> PredictionResponse | JSONResponse:
         loaded = _model_from_request(request)
         frame = pd.DataFrame(payload.transactions)
         force_degraded = bool(getattr(request.app.state, "degraded_mode", False)) or (
@@ -1070,19 +1105,31 @@ def create_app(
         fb_amount = float(getattr(request.app.state, "fallback_amount_threshold", 1000.0))
         cb: CircuitBreaker | None = getattr(request.app.state, "circuit_breaker", None)
 
-        applied_threshold, results, fallback_applied, fallback_reason = await run_in_threadpool(
-            score_frame,
-            loaded,
-            frame,
-            explain=payload.explain,
-            explain_llm=payload.explain_llm,
-            threshold=payload.threshold,
-            fallback_mode=fb_mode,
-            fallback_score=fb_score,
-            fallback_amount_threshold=fb_amount,
-            force_degraded=force_degraded,
-            circuit_breaker=cb,
-        )
+        if scoring_semaphore is not None:
+            if scoring_semaphore.locked():
+                return JSONResponse(
+                    status_code=503,
+                    content={"detail": "Too many concurrent scoring requests."},
+                    headers={"Retry-After": "1"},
+                )
+            await scoring_semaphore.acquire()
+        try:
+            applied_threshold, results, fallback_applied, fallback_reason = await run_in_threadpool(
+                score_frame,
+                loaded,
+                frame,
+                explain=payload.explain,
+                explain_llm=payload.explain_llm,
+                threshold=payload.threshold,
+                fallback_mode=fb_mode,
+                fallback_score=fb_score,
+                fallback_amount_threshold=fb_amount,
+                force_degraded=force_degraded,
+                circuit_breaker=cb,
+            )
+        finally:
+            if scoring_semaphore is not None:
+                scoring_semaphore.release()
         sink: AuditSink = getattr(request.app.state, "audit_sink", resolved_audit_sink)
         try:
             audit_event = build_scoring_audit_event(
@@ -1136,13 +1183,14 @@ def create_app(
     @application.post(
         "/v1/score",
         response_model=ScoreResponse,
+        responses={503: {"description": "Scoring concurrency cap reached."}},
         tags=["predictions"],
     )
     async def score(
         payload: ScoreRequest,
         request: Request,
         background_tasks: BackgroundTasks,
-    ) -> ScoreResponse:
+    ) -> ScoreResponse | JSONResponse:
         loaded = _model_from_request(request)
         frame = pd.DataFrame([payload.transaction])
         force_degraded = bool(getattr(request.app.state, "degraded_mode", False)) or (
@@ -1153,19 +1201,31 @@ def create_app(
         fb_amount = float(getattr(request.app.state, "fallback_amount_threshold", 1000.0))
         cb: CircuitBreaker | None = getattr(request.app.state, "circuit_breaker", None)
 
-        applied_threshold, results, fallback_applied, fallback_reason = await run_in_threadpool(
-            score_frame,
-            loaded,
-            frame,
-            explain=payload.explain,
-            explain_llm=payload.explain_llm,
-            threshold=payload.threshold,
-            fallback_mode=fb_mode,
-            fallback_score=fb_score,
-            fallback_amount_threshold=fb_amount,
-            force_degraded=force_degraded,
-            circuit_breaker=cb,
-        )
+        if scoring_semaphore is not None:
+            if scoring_semaphore.locked():
+                return JSONResponse(
+                    status_code=503,
+                    content={"detail": "Too many concurrent scoring requests."},
+                    headers={"Retry-After": "1"},
+                )
+            await scoring_semaphore.acquire()
+        try:
+            applied_threshold, results, fallback_applied, fallback_reason = await run_in_threadpool(
+                score_frame,
+                loaded,
+                frame,
+                explain=payload.explain,
+                explain_llm=payload.explain_llm,
+                threshold=payload.threshold,
+                fallback_mode=fb_mode,
+                fallback_score=fb_score,
+                fallback_amount_threshold=fb_amount,
+                force_degraded=force_degraded,
+                circuit_breaker=cb,
+            )
+        finally:
+            if scoring_semaphore is not None:
+                scoring_semaphore.release()
         sink: AuditSink = getattr(request.app.state, "audit_sink", resolved_audit_sink)
         try:
             audit_event = build_scoring_audit_event(
