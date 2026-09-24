@@ -29,6 +29,7 @@ from prometheus_client import (
     generate_latest,
 )
 from pydantic import BaseModel, ConfigDict, Field
+from starlette.concurrency import run_in_threadpool
 from starlette.middleware.base import RequestResponseEndpoint
 from starlette.responses import Response
 
@@ -1069,7 +1070,8 @@ def create_app(
         fb_amount = float(getattr(request.app.state, "fallback_amount_threshold", 1000.0))
         cb: CircuitBreaker | None = getattr(request.app.state, "circuit_breaker", None)
 
-        applied_threshold, results, fallback_applied, fallback_reason = score_frame(
+        applied_threshold, results, fallback_applied, fallback_reason = await run_in_threadpool(
+            score_frame,
             loaded,
             frame,
             explain=payload.explain,
@@ -1151,7 +1153,8 @@ def create_app(
         fb_amount = float(getattr(request.app.state, "fallback_amount_threshold", 1000.0))
         cb: CircuitBreaker | None = getattr(request.app.state, "circuit_breaker", None)
 
-        applied_threshold, results, fallback_applied, fallback_reason = score_frame(
+        applied_threshold, results, fallback_applied, fallback_reason = await run_in_threadpool(
+            score_frame,
             loaded,
             frame,
             explain=payload.explain,

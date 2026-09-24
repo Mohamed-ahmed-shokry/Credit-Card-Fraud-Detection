@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import time
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, cast
@@ -819,6 +821,104 @@ def test_api_key_comparison_checks_every_configured_key(
 
     assert _api_key_is_valid("second-key", {"first-key", "second-key", "third-key"}) is True
     assert len(comparisons) == 3
+
+
+def _slow_wrapper(
+    model: FraudModel,
+    *,
+    started: threading.Event | None = None,
+    release: threading.Event | None = None,
+    delay_seconds: float = 0.0,
+) -> MagicMock:
+    wrapped = MagicMock(wraps=model)
+    wrapped.metadata = model.metadata
+    wrapped.threshold = model.threshold
+    wrapped.feature_names = model.feature_names
+
+    def slow_predict(frame: Any) -> Any:
+        if started is not None:
+            started.set()
+        if release is not None:
+            assert release.wait(timeout=10), "scoring release event was never set"
+        elif delay_seconds > 0:
+            time.sleep(delay_seconds)
+        return model.predict_probabilities(frame)
+
+    wrapped.predict_probabilities.side_effect = slow_predict
+    return wrapped
+
+
+def test_operational_probes_stay_responsive_during_scoring(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, model, dataset = api_context
+    record = dataset.features.iloc[0].to_dict()
+    started = threading.Event()
+    release = threading.Event()
+    slow_model = _slow_wrapper(model, started=started, release=release)
+    app = create_app(model=slow_model)
+
+    with TestClient(app) as test_client, ThreadPoolExecutor(max_workers=1) as pool:
+        scoring = pool.submit(
+            test_client.post,
+            "/v1/predict",
+            json={"transactions": [record]},
+        )
+        assert started.wait(timeout=10), "scoring never started"
+        live = test_client.get("/live")
+        ready = test_client.get("/ready")
+        health = test_client.get("/health")
+        release.set()
+        response = scoring.result(timeout=15)
+
+    assert live.status_code == 200
+    assert ready.status_code == 200
+    assert health.status_code == 200
+    assert response.status_code == 200
+
+
+def test_concurrent_scoring_requests_overlap_in_threadpool(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, model, dataset = api_context
+    record = dataset.features.iloc[0].to_dict()
+    lock = threading.Lock()
+    active = 0
+    max_active = 0
+
+    wrapped = MagicMock(wraps=model)
+    wrapped.metadata = model.metadata
+    wrapped.threshold = model.threshold
+    wrapped.feature_names = model.feature_names
+
+    def tracked_predict(frame: Any) -> Any:
+        nonlocal active, max_active
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+        time.sleep(0.2)
+        with lock:
+            active -= 1
+        return model.predict_probabilities(frame)
+
+    wrapped.predict_probabilities.side_effect = tracked_predict
+    app = create_app(model=wrapped)
+
+    with TestClient(app) as test_client, ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(
+            test_client.post,
+            "/v1/score",
+            json={"transaction": record},
+        )
+        second = pool.submit(
+            test_client.post,
+            "/v1/score",
+            json={"transaction": record},
+        )
+        responses = [first.result(timeout=15), second.result(timeout=15)]
+
+    assert [r.status_code for r in responses] == [200, 200]
+    assert max_active >= 2, "scoring requests did not overlap on the threadpool"
 
 
 def test_rate_limit_middleware_allows_within_limit(
