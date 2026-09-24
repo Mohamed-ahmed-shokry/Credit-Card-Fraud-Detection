@@ -124,12 +124,20 @@ The API ships optional, off-by-default API-key and rate-limiting middleware as
 a documented reference starting point (see the README). They are defense in
 depth, not a replacement for gateway authentication: responses carry
 `Retry-After` and `X-RateLimit-*` headers, but key storage, rotation, and
-perimeter enforcement remain the operator's job.
+perimeter enforcement remain the operator's job. Provided keys are checked
+with `secrets.compare_digest` against every configured value so verification
+time does not depend on which key matched.
+
+An optional scoring concurrency cap (`max_concurrent_scoring` /
+`FRAUD_MAX_CONCURRENT_SCORING`) sheds excess scoring load with `503` and
+`Retry-After` before work is queued unboundedly. It is likewise defense in
+depth; production gateways remain responsible for connection and concurrency
+limits as stated above.
 
 `GET /metrics`, `GET /health`, `GET /live`, and `GET /ready` are
 unauthenticated even when the optional API-key middleware is enabled, and they
-are never rate limited, like most Prometheus and orchestrator probe endpoints.
-They report counts, labels, timing, and readiness only, never transaction
-values, but should still be reachable only from a trusted scrape or probe
-network rather than exposed publicly, the same as any other operational
-endpoint.
+are never rate limited or counted against the scoring concurrency cap, like
+most Prometheus and orchestrator probe endpoints. They report counts, labels,
+timing, and readiness only, never transaction values, but should still be
+reachable only from a trusted scrape or probe network rather than exposed
+publicly, the same as any other operational endpoint.
