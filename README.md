@@ -666,8 +666,11 @@ values.
 ### Optional API key authentication
 
 Enable API key validation by configuring the `api_keys` parameter when creating the
-FastAPI app. This is a reference implementation for defense in depth—not a
-substitute for a proper authentication layer at the gateway level.
+FastAPI app, passing `--api-key` to `fraud-detect serve`, or setting the
+comma-separated `FRAUD_API_KEYS` environment variable. This is a reference
+implementation for defense in depth—not a substitute for a proper authentication
+layer at the gateway level. Operational endpoints (`/health`, `/live`, `/ready`,
+and `/metrics`) stay unauthenticated so probes and scrapes keep working.
 
 ```python
 from fraud_detection.api import create_app
@@ -675,6 +678,12 @@ from fraud_detection.model import load_model
 
 model = load_model("artifacts/model")
 app = create_app(model=model, api_keys=["your-secret-key-1", "your-secret-key-2"])
+```
+
+```bash
+fraud-detect serve artifacts/model --api-key your-secret-key-1 --api-key your-secret-key-2
+# or
+FRAUD_API_KEYS=your-secret-key-1,your-secret-key-2 fraud-detect serve artifacts/model
 ```
 
 Clients must include the `X-API-Key` header:
@@ -691,9 +700,12 @@ Invalid or missing keys return `401 Unauthorized`.
 ### Optional rate limiting
 
 Enable per-client-IP rate limiting with the `rate_limit_requests` and
-`rate_limit_window_seconds` parameters. This is a reference implementation using
-an in-memory fixed-window algorithm—not a substitute for a proper rate limiter at
-the gateway level.
+`rate_limit_window_seconds` parameters, the matching `fraud-detect serve`
+options, or the `FRAUD_RATE_LIMIT_REQUESTS` and
+`FRAUD_RATE_LIMIT_WINDOW_SECONDS` environment variables. This is a reference
+implementation using an in-memory fixed-window algorithm—not a substitute for a
+proper rate limiter at the gateway level. Operational endpoints are never rate
+limited.
 
 ```python
 app = create_app(
@@ -701,6 +713,12 @@ app = create_app(
     rate_limit_requests=100,
     rate_limit_window_seconds=60.0,  # 100 requests per minute per IP
 )
+```
+
+```bash
+fraud-detect serve artifacts/model \
+  --rate-limit-requests 100 \
+  --rate-limit-window-seconds 60
 ```
 
 Excess requests return `429 Too Many Requests` with `Retry-After`,
