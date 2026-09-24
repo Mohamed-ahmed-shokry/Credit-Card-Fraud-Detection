@@ -8,6 +8,10 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- Optional scoring overload protection: `max_concurrent_scoring` /
+  `FRAUD_MAX_CONCURRENT_SCORING` / `serve --max-concurrent-scoring` shed excess
+  `/v1/predict` and `/v1/score` traffic with `503` and `Retry-After` while
+  operational endpoints stay unaffected.
 - Operational serving probes: added `GET /live` and `GET /ready` endpoints,
   exempted `/health`, `/live`, `/ready`, and `/metrics` from the optional
   API-key and rate-limit middleware, and wired Compose and Docker healthchecks
@@ -267,6 +271,11 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- `/v1/predict` and `/v1/score` now run model inference and audit-sink writes
+  on the Starlette threadpool instead of the event loop, so slow scoring
+  batches no longer freeze probes, middleware, and concurrent requests.
+- API-key middleware verifies keys with `secrets.compare_digest` across every
+  configured value instead of non-constant-time set membership.
 - Random-forest training now actually applies the configured `n_estimators` and
   `max_depth` instead of silently using library defaults.
 - `compare` no longer leaks an unhandled `TypeError` traceback for unknown
