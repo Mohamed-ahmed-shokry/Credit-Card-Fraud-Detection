@@ -71,6 +71,7 @@ OTLP_TIMEOUT_ENVIRONMENT_VARIABLE = "FRAUD_OTLP_TIMEOUT_SECONDS"
 REQUEST_ID_HEADER = "X-Request-ID"
 PROCESS_TIME_HEADER = "X-Process-Time-Ms"
 MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024
+OPERATIONAL_PATHS = frozenset({"/health", "/metrics", "/live", "/ready"})
 _REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 _BODY_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 logger = logging.getLogger(__name__)
@@ -582,7 +583,7 @@ def create_app(
         request: Request,
         call_next: RequestResponseEndpoint,
     ) -> Response:
-        if rate_limiter is None:
+        if rate_limiter is None or request.url.path in OPERATIONAL_PATHS:
             return await call_next(request)
         client_ip = request.client.host if request.client else "unknown"
         decision = rate_limiter.check(client_ip)
@@ -606,7 +607,7 @@ def create_app(
         request: Request,
         call_next: RequestResponseEndpoint,
     ) -> Response:
-        if api_key_set is not None:
+        if api_key_set is not None and request.url.path not in OPERATIONAL_PATHS:
             api_key = request.headers.get("X-API-Key")
             if api_key not in api_key_set:
                 return JSONResponse(

@@ -708,6 +708,20 @@ def test_api_key_middleware_rejects_missing_key(
     assert response.json()["detail"] == "Invalid or missing API key"
 
 
+def test_api_key_middleware_exempts_operational_endpoints(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, model, _ = api_context
+    app = create_app(model=model, api_keys=["valid-key"])
+
+    with TestClient(app) as test_client:
+        health = test_client.get("/health")
+        metrics = test_client.get("/metrics")
+
+    assert health.status_code == 200
+    assert metrics.status_code == 200
+
+
 def test_rate_limit_middleware_allows_within_limit(
     api_context: tuple[TestClient, FraudModel, ValidatedDataset],
 ) -> None:
@@ -741,6 +755,23 @@ def test_rate_limit_middleware_rejects_over_limit(
         assert response3.headers["X-RateLimit-Limit"] == "2"
         assert response3.headers["X-RateLimit-Remaining"] == "0"
         assert int(response3.headers["Retry-After"]) >= 0
+
+
+def test_rate_limit_middleware_exempts_operational_endpoints(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, model, _ = api_context
+    app = create_app(model=model, rate_limit_requests=1, rate_limit_window_seconds=60)
+
+    with TestClient(app) as test_client:
+        first = test_client.get("/health")
+        second = test_client.get("/health")
+        metrics = test_client.get("/metrics")
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert metrics.status_code == 200
+    assert "X-RateLimit-Limit" not in first.headers
 
 
 def test_predict_emits_audit_event_to_configured_sink(
