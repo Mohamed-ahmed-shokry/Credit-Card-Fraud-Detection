@@ -995,7 +995,7 @@ FRAUD_SHADOW_MODEL_PATH=artifacts/challenger \
 FRAUD_CIRCUIT_BREAKER_ENABLED=true \
 FRAUD_CIRCUIT_BREAKER_FAILURE_THRESHOLD=5 \
 FRAUD_CIRCUIT_BREAKER_LATENCY_BUDGET_MS=25.0 \
-uvicorn fraud_detection.api:app --host 0.0.0.0 --port 8000
+uvicorn --factory fraud_detection.api:app_from_environment --host 0.0.0.0 --port 8000
 ```
 
 When latency budgets or failure thresholds are breached, the circuit breaker trips from `CLOSED` to `OPEN` and executes configured safe fallback policies (`constant` or `rule`) to protect upstream callers.
