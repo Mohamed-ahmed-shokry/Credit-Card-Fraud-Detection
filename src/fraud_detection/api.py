@@ -68,6 +68,9 @@ CIRCUIT_BREAKER_FAILURE_THRESHOLD_ENVIRONMENT_VARIABLE = "FRAUD_CIRCUIT_BREAKER_
 CIRCUIT_BREAKER_RECOVERY_TIMEOUT_ENVIRONMENT_VARIABLE = "FRAUD_CIRCUIT_BREAKER_RECOVERY_TIMEOUT"
 CIRCUIT_BREAKER_LATENCY_BUDGET_ENVIRONMENT_VARIABLE = "FRAUD_CIRCUIT_BREAKER_LATENCY_BUDGET_MS"
 OTLP_TIMEOUT_ENVIRONMENT_VARIABLE = "FRAUD_OTLP_TIMEOUT_SECONDS"
+API_KEYS_ENVIRONMENT_VARIABLE = "FRAUD_API_KEYS"
+RATE_LIMIT_REQUESTS_ENVIRONMENT_VARIABLE = "FRAUD_RATE_LIMIT_REQUESTS"
+RATE_LIMIT_WINDOW_SECONDS_ENVIRONMENT_VARIABLE = "FRAUD_RATE_LIMIT_WINDOW_SECONDS"
 REQUEST_ID_HEADER = "X-Request-ID"
 PROCESS_TIME_HEADER = "X-Process-Time-Ms"
 MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024
@@ -112,6 +115,55 @@ class _RateLimiter:
             remaining=self.max_requests - len(timestamps),
             retry_after_seconds=0,
         )
+
+
+def _resolve_api_keys(api_keys: list[str] | None) -> list[str] | None:
+    """Resolve API keys from an explicit argument or the environment."""
+    if api_keys is not None:
+        return list(api_keys) or None
+    raw = os.getenv(API_KEYS_ENVIRONMENT_VARIABLE, "")
+    keys = [part.strip() for part in raw.split(",") if part.strip()]
+    return keys or None
+
+
+def _resolve_rate_limit_requests(rate_limit_requests: int) -> int:
+    """Resolve the per-window request cap from an explicit argument or the environment."""
+    if rate_limit_requests > 0:
+        return rate_limit_requests
+    raw = os.getenv(RATE_LIMIT_REQUESTS_ENVIRONMENT_VARIABLE, "").strip()
+    if not raw:
+        return 0
+    try:
+        resolved = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"{RATE_LIMIT_REQUESTS_ENVIRONMENT_VARIABLE} must be an integer, got {raw!r}."
+        ) from exc
+    if resolved < 0:
+        raise ValueError(
+            f"{RATE_LIMIT_REQUESTS_ENVIRONMENT_VARIABLE} must be >= 0, got {resolved}."
+        )
+    return resolved
+
+
+def _resolve_rate_limit_window_seconds(rate_limit_window_seconds: float) -> float:
+    """Resolve the rate-limit window from an explicit non-default argument or the environment."""
+    if rate_limit_window_seconds != 60.0:
+        return rate_limit_window_seconds
+    raw = os.getenv(RATE_LIMIT_WINDOW_SECONDS_ENVIRONMENT_VARIABLE, "").strip()
+    if not raw:
+        return rate_limit_window_seconds
+    try:
+        resolved = float(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"{RATE_LIMIT_WINDOW_SECONDS_ENVIRONMENT_VARIABLE} must be a number, got {raw!r}."
+        ) from exc
+    if resolved <= 0:
+        raise ValueError(
+            f"{RATE_LIMIT_WINDOW_SECONDS_ENVIRONMENT_VARIABLE} must be > 0, got {resolved}."
+        )
+    return resolved
 
 
 class CircuitBreaker:
@@ -351,10 +403,13 @@ def create_app(
         model: Pre-loaded model instance.
         model_path: Path to model artifact directory.
         api_keys: Optional list of valid API keys. If provided, enables API key
-            authentication via the `X-API-Key` header.
+            authentication via the `X-API-Key` header. When omitted, the
+            comma-separated `FRAUD_API_KEYS` environment variable is used.
         rate_limit_requests: Maximum requests per window. If > 0, enables rate
-            limiting per client IP.
+            limiting per client IP. When not set, `FRAUD_RATE_LIMIT_REQUESTS`
+            is used.
         rate_limit_window_seconds: Time window for rate limiting in seconds.
+            When left at the default, `FRAUD_RATE_LIMIT_WINDOW_SECONDS` is used.
         audit_sink: Optional structured audit sink. If omitted, checks
             the `FRAUD_AUDIT_LOG_PATH` environment variable or defaults to NullAuditSink.
         explanation_provider: Optional explanation provider for natural language risk
@@ -530,12 +585,17 @@ def create_app(
         else:
             resolved_trace_exporter = NullTraceExporter()
 
+    resolved_rate_limit_requests = _resolve_rate_limit_requests(rate_limit_requests)
+    resolved_rate_limit_window_seconds = _resolve_rate_limit_window_seconds(
+        rate_limit_window_seconds
+    )
     rate_limiter = (
-        _RateLimiter(rate_limit_requests, rate_limit_window_seconds)
-        if rate_limit_requests > 0
+        _RateLimiter(resolved_rate_limit_requests, resolved_rate_limit_window_seconds)
+        if resolved_rate_limit_requests > 0
         else None
     )
-    api_key_set = set(api_keys) if api_keys else None
+    resolved_api_keys = _resolve_api_keys(api_keys)
+    api_key_set = set(resolved_api_keys) if resolved_api_keys else None
 
     resolved_audit_sink: AuditSink
     if audit_sink is not None:

@@ -15,6 +15,7 @@ from fastapi.testclient import TestClient
 
 from fraud_detection import __version__
 from fraud_detection.api import (
+    API_KEYS_ENVIRONMENT_VARIABLE,
     AUDIT_LOG_ENVIRONMENT_VARIABLE,
     CIRCUIT_BREAKER_ENABLED_ENVIRONMENT_VARIABLE,
     CIRCUIT_BREAKER_FAILURE_THRESHOLD_ENVIRONMENT_VARIABLE,
@@ -23,6 +24,8 @@ from fraud_detection.api import (
     MAX_REQUEST_BODY_BYTES,
     MODEL_PATH_ENVIRONMENT_VARIABLE,
     PROCESS_TIME_HEADER,
+    RATE_LIMIT_REQUESTS_ENVIRONMENT_VARIABLE,
+    RATE_LIMIT_WINDOW_SECONDS_ENVIRONMENT_VARIABLE,
     REQUEST_ID_HEADER,
     SHADOW_MODEL_PATH_ENVIRONMENT_VARIABLE,
     CircuitBreaker,
@@ -842,6 +845,82 @@ def test_rate_limit_middleware_exempts_operational_endpoints(
     assert ready.status_code == 200
     assert metrics.status_code == 200
     assert "X-RateLimit-Limit" not in first.headers
+
+
+def test_environment_configures_api_keys(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, model, dataset = api_context
+    records = dataset.features.iloc[:1].to_dict(orient="records")
+    monkeypatch.setenv(API_KEYS_ENVIRONMENT_VARIABLE, "env-key-1, env-key-2")
+
+    app = create_app(model=model)
+    with TestClient(app) as test_client:
+        rejected = test_client.post("/v1/predict", json={"transactions": records})
+        accepted = test_client.post(
+            "/v1/predict",
+            json={"transactions": records},
+            headers={"X-API-Key": "env-key-2"},
+        )
+
+    assert rejected.status_code == 401
+    assert accepted.status_code == 200
+
+
+def test_explicit_api_keys_override_environment(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, model, dataset = api_context
+    records = dataset.features.iloc[:1].to_dict(orient="records")
+    monkeypatch.setenv(API_KEYS_ENVIRONMENT_VARIABLE, "env-key")
+
+    app = create_app(model=model, api_keys=["explicit-key"])
+    with TestClient(app) as test_client:
+        rejected = test_client.post(
+            "/v1/predict",
+            json={"transactions": records},
+            headers={"X-API-Key": "env-key"},
+        )
+        accepted = test_client.post(
+            "/v1/predict",
+            json={"transactions": records},
+            headers={"X-API-Key": "explicit-key"},
+        )
+
+    assert rejected.status_code == 401
+    assert accepted.status_code == 200
+
+
+def test_environment_configures_rate_limiting(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, model, dataset = api_context
+    records = dataset.features.iloc[:1].to_dict(orient="records")
+    monkeypatch.setenv(RATE_LIMIT_REQUESTS_ENVIRONMENT_VARIABLE, "1")
+    monkeypatch.setenv(RATE_LIMIT_WINDOW_SECONDS_ENVIRONMENT_VARIABLE, "60")
+
+    app = create_app(model=model)
+    with TestClient(app) as test_client:
+        first = test_client.post("/v1/predict", json={"transactions": records})
+        second = test_client.post("/v1/predict", json={"transactions": records})
+
+    assert first.status_code == 200
+    assert first.headers["X-RateLimit-Limit"] == "1"
+    assert second.status_code == 429
+
+
+def test_invalid_rate_limit_environment_is_rejected(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, model, _ = api_context
+    monkeypatch.setenv(RATE_LIMIT_REQUESTS_ENVIRONMENT_VARIABLE, "not-a-number")
+
+    with pytest.raises(ValueError, match=RATE_LIMIT_REQUESTS_ENVIRONMENT_VARIABLE):
+        create_app(model=model)
 
 
 def test_predict_emits_audit_event_to_configured_sink(
