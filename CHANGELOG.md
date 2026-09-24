@@ -8,6 +8,13 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- Operational serving probes: added `GET /live` and `GET /ready` endpoints,
+  exempted `/health`, `/live`, `/ready`, and `/metrics` from the optional
+  API-key and rate-limit middleware, and wired Compose and Docker healthchecks
+  plus the CI container smoke to readiness.
+- Deployable reference middleware configuration: API keys and rate limits can
+  now be set through `FRAUD_API_KEYS`, `FRAUD_RATE_LIMIT_REQUESTS`,
+  `FRAUD_RATE_LIMIT_WINDOW_SECONDS`, and matching `fraud-detect serve` options.
 - Release workflow hardening: TestPyPI uploads tolerate repeated immutable-version
   runs, release and dry-run SBOM output is created and validated explicitly, and
   CI smoke-tests the built wheel from an isolated environment outside the checkout.
