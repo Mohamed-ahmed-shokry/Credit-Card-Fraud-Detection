@@ -599,6 +599,80 @@ or introduce a dependency lockfile; dependency freshness remains Dependabot's jo
   `invalid-publisher`; configuring the TestPyPI trusted publisher remains the
   documented maintainer-only prerequisite.
 
+## Phase 21 — Operational Serving Contract (In progress)
+
+### Objective
+
+Make the serving HTTP surface match what SECURITY.md, README, and container
+tooling already claim. Operational probes and scrapes must work without gateway
+credentials, dedicated liveness/readiness endpoints must distinguish process
+health from service readiness, the optional API-key and rate-limit middleware
+must be usable from `serve` and the container without Python embeds, and every
+documented run command must actually work.
+
+### Scope
+
+- **Operational endpoint exemption** — exempt `GET /health`, `GET /metrics`,
+  `GET /live`, and `GET /ready` from the optional API-key middleware and from
+  per-client rate limiting so probes, scrapes, and healthchecks are never
+  rejected with `401`/`429` when those defenses are enabled, matching
+  [SECURITY.md](SECURITY.md)'s statement that operational endpoints are
+  unauthenticated.
+- **Liveness and readiness probes** — add `GET /live` (process is accepting
+  requests) and `GET /ready` (model loaded and scoring path able to serve);
+  readiness returns `503` when the model is absent or the circuit is open with
+  `fallback_mode=raise`, and `200` with health detail otherwise (including
+  degraded-but-serving states). Keep `/health` behavior for existing callers.
+- **Deployable middleware configuration** — resolve optional API keys and rate
+  limits from `FRAUD_API_KEYS`, `FRAUD_RATE_LIMIT_REQUESTS`, and
+  `FRAUD_RATE_LIMIT_WINDOW_SECONDS`, and expose matching `serve` options, so
+  container and CLI deployments can enable the reference defenses without
+  calling `create_app` from Python.
+- **Container and CI probes** — point the Docker `HEALTHCHECK` at readiness,
+  add a Compose healthcheck, and extend the CI container smoke to verify
+  liveness and readiness endpoints.
+- **Run-command and documentation repair** — replace the broken
+  `uvicorn fraud_detection.api:app` README example with the working factory
+  invocation, and update README, SECURITY, ARCHITECTURE, CHANGELOG, and this
+  roadmap for probes, exemptions, and configuration.
+
+### Acceptance criteria
+
+- With `api_keys` configured, unauthenticated `GET /health`, `/metrics`,
+  `/live`, and `/ready` are not rejected with `401`, while `POST /v1/predict`
+  without a key still returns `401`.
+- With rate limiting configured, operational endpoints do not consume the
+  client budget and never return `429`; scoring endpoints still return `429`
+  over the limit with `Retry-After` and `X-RateLimit-*` headers.
+- `GET /live` returns `200` with the service version whenever the app accepts
+  requests.
+- `GET /ready` returns `200` with model/health detail when scoring can proceed
+  (including degraded fallback serving), and `503` when the model is missing or
+  the circuit is open with `fallback_mode=raise`.
+- `FRAUD_API_KEYS` and rate-limit environment variables, and the corresponding
+  `serve` options, enable the middleware end to end; invalid configuration is
+  rejected clearly rather than silently ignored.
+- The README documents working `uvicorn --factory
+  fraud_detection.api:app_from_environment` startup and the probe endpoints;
+  SECURITY.md remains accurate for operational endpoint exposure.
+- Docker `HEALTHCHECK` and Compose healthcheck probe readiness; CI container
+  smoke verifies `/live` and `/ready`.
+- Full test suite, Ruff format/check, strict mypy, package build, and Twine
+  checks pass; every change is committed and pushed before the phase is marked
+  `Done`.
+
+### Explicit exclusions
+
+This phase does not add TLS, replace the gateway with a real auth product,
+publicize OpenAPI/docs endpoints, change scoring request/response contracts,
+bump the package version, publish a release, or configure external publishers.
+Authentication, durable rate limiting, and network isolation remain the
+deploying operator's responsibility as SECURITY.md already states.
+
+### Delivery record
+
+Filled in when the phase completes.
+
 ## Contributing to the roadmap
 
 Open an issue or a pull request that references the relevant phase item.
