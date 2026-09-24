@@ -130,10 +130,15 @@ loadable, but their model cards identify the missing provenance.
 
 `create_app` receives an already trusted model or resolves one from
 `FRAUD_MODEL_PATH` at startup. It applies request-size limits, strict finite
-numeric validation, optional API-key and in-memory rate limiting middleware,
-request correlation headers, structured logging, opt-in JSONL audit event export
+numeric validation, optional API-key and in-memory rate limiting middleware
+(configurable through `FRAUD_API_KEYS`, `FRAUD_RATE_LIMIT_REQUESTS`,
+`FRAUD_RATE_LIMIT_WINDOW_SECONDS`, and matching `serve` options) that exempt
+`/health`, `/live`, `/ready`, and `/metrics`, request correlation headers,
+structured logging, opt-in JSONL audit event export
 (`FRAUD_AUDIT_LOG_PATH`), pluggable explanation providers, and isolated Prometheus
-metrics. It also returns a W3C `traceparent` response header and can export request
+metrics. Dedicated probes expose process liveness (`/live`) and scoring-path
+readiness (`/ready`, HTTP 503 when the model is missing or the circuit is open
+with `fallback_mode=raise`). It also returns a W3C `traceparent` response header and can export request
 spans through an injected `TraceExporter` or optional OTLP/HTTP collector configured
 with `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, `OTEL_SERVICE_NAME`, and
 `FRAUD_OTLP_TIMEOUT_SECONDS`. Trace export is disabled by default, sends only
