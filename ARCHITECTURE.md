@@ -136,7 +136,14 @@ numeric validation, optional API-key and in-memory rate limiting middleware
 `/health`, `/live`, `/ready`, and `/metrics`, request correlation headers,
 structured logging, opt-in JSONL audit event export
 (`FRAUD_AUDIT_LOG_PATH`), pluggable explanation providers, and isolated Prometheus
-metrics. Dedicated probes expose process liveness (`/live`) and scoring-path
+metrics. Model inference and audit-sink writes run through Starlette's
+threadpool so CPU- and I/O-bound scoring never blocks the event loop that
+serves probes and other requests, and API keys are compared with
+`secrets.compare_digest` across every configured value. An optional
+`max_concurrent_scoring` semaphore (default off, also settable via
+`FRAUD_MAX_CONCURRENT_SCORING` and `serve`) returns `503` with `Retry-After`
+when the cap is reached instead of queueing unbounded work. Dedicated probes
+expose process liveness (`/live`) and scoring-path
 readiness (`/ready`, HTTP 503 when the model is missing or the circuit is open
 with `fallback_mode=raise`). It also returns a W3C `traceparent` response header and can export request
 spans through an injected `TraceExporter` or optional OTLP/HTTP collector configured
