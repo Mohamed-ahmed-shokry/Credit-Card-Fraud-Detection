@@ -649,7 +649,22 @@ def create_app(
     )
 
     if resolved_cb is not None:
-        resolved_cb.on_trip = circuit_breaker_tripped_counter.inc
+        # Keep a caller-supplied callback: the metrics counter is chained onto it
+        # instead of replacing it, so an injected breaker's own instrumentation runs.
+        caller_on_trip = resolved_cb.on_trip
+        if caller_on_trip is None:
+
+            def on_trip() -> None:
+                circuit_breaker_tripped_counter.inc()
+
+            resolved_cb.on_trip = on_trip
+        else:
+
+            def on_trip_with_caller() -> None:
+                caller_on_trip()
+                circuit_breaker_tripped_counter.inc()
+
+            resolved_cb.on_trip = on_trip_with_caller
 
     resolved_trace_exporter = trace_exporter
     if resolved_trace_exporter is None:

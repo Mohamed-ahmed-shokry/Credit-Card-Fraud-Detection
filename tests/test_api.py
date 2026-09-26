@@ -1601,6 +1601,22 @@ def test_short_probability_array_activates_the_fallback(
     assert len(response.json()["predictions"]) == 3
 
 
+def test_injected_circuit_breaker_keeps_its_trip_callback(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, model, _ = api_context
+    tripped: list[str] = []
+    circuit_breaker = CircuitBreaker(failure_threshold=1, on_trip=lambda: tripped.append("trip"))
+
+    app = create_app(model=model, circuit_breaker=circuit_breaker)
+    with TestClient(app) as test_client:
+        circuit_breaker.trip()
+        metrics = test_client.get("/metrics").text
+
+    assert tripped == ["trip"]
+    assert "fraud_circuit_breaker_tripped_total 1.0" in metrics
+
+
 def test_circuit_breaker_serializes_concurrent_state_transitions() -> None:
     trip_entered = threading.Event()
     release_trip = threading.Event()
