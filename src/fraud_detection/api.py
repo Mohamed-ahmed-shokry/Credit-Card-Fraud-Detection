@@ -17,6 +17,7 @@ from time import perf_counter
 from typing import Annotated, Any, cast
 from uuid import uuid4
 
+import numpy as np
 import pandas as pd
 from fastapi import BackgroundTasks, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -961,6 +962,64 @@ def create_app(
             **status.response_fields(),
         )
 
+    def _primary_results(
+        loaded: FraudModel,
+        frame: pd.DataFrame,
+        probabilities: np.ndarray,
+        *,
+        applied_threshold: float,
+        explain: bool,
+        explain_llm: bool,
+    ) -> list[PredictionResult]:
+        """Threshold primary probabilities and build the per-transaction results."""
+        decisions = probabilities >= applied_threshold
+        local_explanations = loaded.explain_local(frame) if explain or explain_llm else None
+        natural_language = (
+            loaded.explain_local_natural_language(
+                frame,
+                probabilities,
+                threshold=applied_threshold,
+                contributions=local_explanations,
+                provider=explanation_provider,
+            )
+            if explain_llm
+            else None
+        )
+        results: list[PredictionResult] = []
+        for index, (probability, decision) in enumerate(zip(probabilities, decisions, strict=True)):
+            results.append(
+                PredictionResult(
+                    fraud_probability=float(probability),
+                    is_fraud=bool(decision),
+                    contributions=(
+                        local_explanations[index]
+                        if explain and local_explanations is not None
+                        else None
+                    ),
+                    explanation=(natural_language[index] if natural_language else None),
+                )
+            )
+        prediction_counter.labels(is_fraud="true").inc(int(decisions.sum()))
+        prediction_counter.labels(is_fraud="false").inc(int((~decisions).sum()))
+        return results
+
+    def _require_probabilities(probabilities: Any, expected_rows: int) -> np.ndarray:
+        """Return the model's probabilities, rejecting a response that cannot answer the batch.
+
+        Raises:
+            RuntimeError: The model returned no probabilities, or one row per requested
+                transaction was not returned. Both are model failures, so they must reach
+                the circuit breaker and the fallback policy rather than fail late.
+        """
+        if probabilities is None:
+            raise RuntimeError("Primary model returned no probabilities.")
+        if len(probabilities) != expected_rows:
+            raise RuntimeError(
+                f"Primary model returned probabilities for {len(probabilities)} "
+                f"of {expected_rows} transactions."
+            )
+        return cast("np.ndarray", probabilities)
+
     def score_frame(
         loaded: FraudModel,
         frame: pd.DataFrame,
@@ -983,7 +1042,7 @@ def create_app(
         applied_threshold = loaded.threshold if threshold is None else threshold
         fallback_applied = False
         fallback_reason: str | None = None
-        probabilities = None
+        results: list[PredictionResult] = []
 
         if force_degraded and fallback_mode != "raise":
             fallback_applied = True
@@ -996,7 +1055,9 @@ def create_app(
         else:
             t0 = perf_counter()
             try:
-                probabilities = loaded.predict_probabilities(frame)
+                probabilities = _require_probabilities(
+                    loaded.predict_probabilities(frame), len(frame)
+                )
                 elapsed_ms = (perf_counter() - t0) * 1000.0
                 if circuit_breaker is not None:
                     if (
@@ -1006,6 +1067,14 @@ def create_app(
                         circuit_breaker.record_failure(reason="latency_budget_exceeded")
                     else:
                         circuit_breaker.record_success()
+                results = _primary_results(
+                    loaded,
+                    frame,
+                    probabilities,
+                    applied_threshold=applied_threshold,
+                    explain=explain,
+                    explain_llm=explain_llm,
+                )
             except Exception as exc:
                 if circuit_breaker is not None:
                     circuit_breaker.record_failure(reason=f"model_exception: {type(exc).__name__}")
@@ -1019,78 +1088,46 @@ def create_app(
                 fallback_applied = True
                 fallback_reason = f"model_exception: {type(exc).__name__}"
 
-        if fallback_applied:
-            results: list[PredictionResult] = []
-            if fallback_mode == "constant":
-                dec_const = fallback_score >= applied_threshold
-                results = [
-                    PredictionResult(
-                        fraud_probability=float(fallback_score),
-                        is_fraud=bool(dec_const),
-                        contributions=None,
-                        explanation="Fallback policy (constant) applied.",
-                    )
-                    for _ in range(len(frame))
-                ]
-            else:
-                amounts = frame["Amount"] if "Amount" in frame.columns else [0.0] * len(frame)
-                for amount in amounts:
-                    amt_val = float(amount)
-                    is_high = amt_val >= fallback_amount_threshold
-                    prob = 1.0 if is_high else 0.0
-                    is_fraud = bool(prob >= applied_threshold)
-                    rule_exp = (
-                        f"Fallback rule applied: Amount ({amt_val:.2f}) "
-                        f"{'>=' if is_high else '<'} {fallback_amount_threshold:.2f}."
-                    )
-                    results.append(
-                        PredictionResult(
-                            fraud_probability=prob,
-                            is_fraud=is_fraud,
-                            contributions=None,
-                            explanation=rule_exp,
-                        )
-                    )
-            fraud_count = sum(1 for r in results if r.is_fraud)
-            prediction_counter.labels(is_fraud="true").inc(fraud_count)
-            prediction_counter.labels(is_fraud="false").inc(len(results) - fraud_count)
-            fallback_counter.labels(mode=fallback_mode, reason=fallback_reason or "unknown").inc(
-                len(results)
-            )
-            return applied_threshold, results, True, fallback_reason
+        if not fallback_applied:
+            return applied_threshold, results, False, None
 
-        if probabilities is None:
-            raise RuntimeError("Primary model returned no probabilities.")
-        decisions = probabilities >= applied_threshold
-        local_explanations = loaded.explain_local(frame) if explain or explain_llm else None
-        natural_language = (
-            loaded.explain_local_natural_language(
-                frame,
-                probabilities,
-                threshold=applied_threshold,
-                contributions=local_explanations,
-                provider=explanation_provider,
-            )
-            if explain_llm
-            else None
-        )
-        results = []
-        for index, (probability, decision) in enumerate(zip(probabilities, decisions, strict=True)):
-            results.append(
+        if fallback_mode == "constant":
+            dec_const = fallback_score >= applied_threshold
+            results = [
                 PredictionResult(
-                    fraud_probability=float(probability),
-                    is_fraud=bool(decision),
-                    contributions=(
-                        local_explanations[index]
-                        if explain and local_explanations is not None
-                        else None
-                    ),
-                    explanation=(natural_language[index] if natural_language else None),
+                    fraud_probability=float(fallback_score),
+                    is_fraud=bool(dec_const),
+                    contributions=None,
+                    explanation="Fallback policy (constant) applied.",
                 )
-            )
-        prediction_counter.labels(is_fraud="true").inc(int(decisions.sum()))
-        prediction_counter.labels(is_fraud="false").inc(int((~decisions).sum()))
-        return applied_threshold, results, False, None
+                for _ in range(len(frame))
+            ]
+        else:
+            amounts = frame["Amount"] if "Amount" in frame.columns else [0.0] * len(frame)
+            for amount in amounts:
+                amt_val = float(amount)
+                is_high = amt_val >= fallback_amount_threshold
+                prob = 1.0 if is_high else 0.0
+                is_fraud = bool(prob >= applied_threshold)
+                rule_exp = (
+                    f"Fallback rule applied: Amount ({amt_val:.2f}) "
+                    f"{'>=' if is_high else '<'} {fallback_amount_threshold:.2f}."
+                )
+                results.append(
+                    PredictionResult(
+                        fraud_probability=prob,
+                        is_fraud=is_fraud,
+                        contributions=None,
+                        explanation=rule_exp,
+                    )
+                )
+        fraud_count = sum(1 for r in results if r.is_fraud)
+        prediction_counter.labels(is_fraud="true").inc(fraud_count)
+        prediction_counter.labels(is_fraud="false").inc(len(results) - fraud_count)
+        fallback_counter.labels(mode=fallback_mode, reason=fallback_reason or "unknown").inc(
+            len(results)
+        )
+        return applied_threshold, results, True, fallback_reason
 
     async def _score_with_guardrails(
         request: Request,

@@ -1551,6 +1551,56 @@ def test_schema_violation_is_rejected_even_when_degraded_mode_is_active(
     assert response.status_code == 422
 
 
+def test_missing_probabilities_activate_the_fallback_and_record_a_failure(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, model, dataset = api_context
+    rec = dataset.features.iloc[0].to_dict()
+    broken_model = MagicMock(wraps=model)
+    broken_model.metadata = model.metadata
+    broken_model.threshold = model.threshold
+    broken_model.feature_names = model.feature_names
+    broken_model.predict_probabilities.return_value = None
+    circuit_breaker = CircuitBreaker(failure_threshold=5)
+    app = create_app(
+        model=broken_model,
+        fallback_mode="constant",
+        fallback_score=0.31,
+        circuit_breaker=circuit_breaker,
+    )
+
+    with TestClient(app) as test_client:
+        response = test_client.post("/v1/predict", json={"transactions": [rec]})
+
+    assert response.status_code == 200
+    assert response.json()["fallback_applied"] is True
+    assert response.json()["fallback_reason"] == "model_exception: RuntimeError"
+    assert response.json()["predictions"][0]["fraud_probability"] == 0.31
+    assert circuit_breaker.consecutive_failures == 1
+    assert circuit_breaker.state == "closed"
+
+
+def test_short_probability_array_activates_the_fallback(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, model, dataset = api_context
+    records = dataset.features.iloc[:3].to_dict(orient="records")
+    short_model = MagicMock(wraps=model)
+    short_model.metadata = model.metadata
+    short_model.threshold = model.threshold
+    short_model.feature_names = model.feature_names
+    short_model.predict_probabilities.side_effect = lambda _frame: np.array([0.2, 0.4])
+    app = create_app(model=short_model, fallback_mode="constant", fallback_score=0.6)
+
+    with TestClient(app) as test_client:
+        response = test_client.post("/v1/predict", json={"transactions": records})
+
+    assert response.status_code == 200
+    assert response.json()["fallback_applied"] is True
+    assert response.json()["fallback_reason"] == "model_exception: RuntimeError"
+    assert len(response.json()["predictions"]) == 3
+
+
 def test_circuit_breaker_unit() -> None:
     tripped_count = 0
 
