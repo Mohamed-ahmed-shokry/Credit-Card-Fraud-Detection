@@ -20,7 +20,7 @@ Status legend: `Proposed` (not started), `In progress`, `Done`.
 ## Current state
 
 The project is a production-grade reference implementation with the implementation work in
-Phases 2 through 21 complete. Phase 1's workflows are in place, but the first
+Phases 2 through 22 complete. Phase 1's workflows are in place, but the first
 real PyPI release still requires maintainer-side trusted-publisher setup. The
 shipped system covers leakage-safe training, multiple calibrated estimators,
 threshold and calibration analysis, label-delay temporal gaps, drift surveillance,
@@ -30,8 +30,8 @@ export, an isolated explanation provider boundary with deterministic fallback,
 persisted lineage, HTML compliance reports, historical audit log replay, degraded
 serving fallback guardrails, an automated champion-challenger retraining pipeline,
 edge runtime export, distributed telemetry, continuous operational
-surveillance, and an operational serving contract with liveness/readiness probes
-plus deployable reference middleware.
+surveillance, and an operational serving contract with liveness/readiness probes,
+deployable reference middleware, and an optional scoring concurrency cap.
 
 ## Phase 1 — Distribution
 
@@ -698,7 +698,7 @@ deploying operator's responsibility as SECURITY.md already states.
   run still stops only at the external trusted-publisher step (`environment`
   missing), the documented maintainer-only prerequisite.
 
-## Phase 22 — Serving Concurrency and Credential Hardening (In progress)
+## Phase 22 — Serving Concurrency and Credential Hardening (Done)
 
 ### Objective
 
@@ -761,7 +761,29 @@ operator's responsibility as SECURITY.md already states.
 
 ### Delivery record
 
-Filled in when the phase completes.
+- Moved `score_frame` and the synchronous audit-sink `emit` off the event loop in
+  `POST /v1/predict` and `POST /v1/score` via Starlette's threadpool, so probes,
+  health, metrics, and concurrent scoring requests stay responsive while a batch
+  is in flight; shadow evaluation still runs as a background task.
+- Replaced API-key set membership with a `secrets.compare_digest` check across
+  every configured key with no early exit, preserving accept/reject semantics for
+  valid, invalid, missing, and empty headers, and added a test asserting the
+  comparison runs once per configured key.
+- Added the optional `max_concurrent_scoring` overload guard, settable through
+  `create_app`, `FRAUD_MAX_CONCURRENT_SCORING`, and
+  `fraud-detect serve --max-concurrent-scoring`, with clear rejection of invalid
+  values. When the cap is reached, scoring endpoints return `503` with
+  `Retry-After` while `/health`, `/live`, and `/ready` are unaffected; the
+  default configuration caps nothing and behaves exactly as before.
+- Added tests for probe responsiveness during blocked scoring, threadpool
+  overlap of two concurrent scoring requests, a slow audit emit, the `503` shed
+  path, environment resolution, and invalid-cap rejection.
+- Documented the threadpool boundary, the timing-safe comparison, and the
+  overload-shedding framing in README, SECURITY (defense in depth, not a
+  substitute for gateway concurrency limits), ARCHITECTURE, and CHANGELOG.
+- Final validation: 500 tests passed with 97.32% total branch coverage; Ruff
+  format and check passed; strict mypy passed on 14 source files; package build
+  and Twine checks passed.
 
 ## Contributing to the roadmap
 
