@@ -1601,6 +1601,26 @@ def test_short_probability_array_activates_the_fallback(
     assert len(response.json()["predictions"]) == 3
 
 
+def test_injected_circuit_breaker_adopts_the_latency_budget(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, model, _ = api_context
+    circuit_breaker = CircuitBreaker(failure_threshold=99)
+    create_app(model=model, circuit_breaker=circuit_breaker, latency_budget_ms=12.5)
+    assert circuit_breaker.latency_budget_ms == 12.5
+
+    env_breaker = CircuitBreaker(failure_threshold=99)
+    monkeypatch.setenv(CIRCUIT_BREAKER_LATENCY_BUDGET_ENVIRONMENT_VARIABLE, "7.5")
+    create_app(model=model, circuit_breaker=env_breaker)
+    assert env_breaker.latency_budget_ms == 7.5
+
+    # The effective budget is reported so an operator can see what is enforced.
+    app = create_app(model=model, circuit_breaker=env_breaker)
+    with TestClient(app) as test_client:
+        assert test_client.get("/health").json()["circuit_breaker"]["latency_budget_ms"] == 7.5
+
+
 def test_injected_circuit_breaker_keeps_its_trip_callback(
     api_context: tuple[TestClient, FraudModel, ValidatedDataset],
 ) -> None:

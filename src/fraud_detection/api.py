@@ -508,7 +508,9 @@ def create_app(
         shadow_model: Pre-loaded shadow challenger model instance.
         shadow_model_path: Path to shadow challenger model artifact directory.
         circuit_breaker: Optional pre-configured CircuitBreaker instance.
-        latency_budget_ms: Max scoring latency (ms) before tripping circuit breaker.
+        latency_budget_ms: Max scoring latency (ms) before tripping circuit breaker. Applied
+            to an injected `circuit_breaker` as well, overriding the instance's own budget
+            and making the effective budget visible in the operational endpoints.
         circuit_breaker_failure_threshold: Consecutive failures before opening circuit breaker.
         circuit_breaker_recovery_timeout: Seconds before probing recovery in half-open state.
         trace_exporter: Optional injectable trace exporter; defaults to NullTraceExporter.
@@ -574,9 +576,16 @@ def create_app(
         or os.getenv(CIRCUIT_BREAKER_ENABLED_ENVIRONMENT_VARIABLE, "false").lower()
         in {"1", "true", "yes"}
     )
+    resolved_latency_budget_ms = latency_budget_ms
+    env_latency_budget = os.getenv(CIRCUIT_BREAKER_LATENCY_BUDGET_ENVIRONMENT_VARIABLE)
+    if resolved_latency_budget_ms is None and env_latency_budget:
+        resolved_latency_budget_ms = float(env_latency_budget)
+
     resolved_cb: CircuitBreaker | None = None
     if circuit_breaker is not None:
         resolved_cb = circuit_breaker
+        if resolved_latency_budget_ms is not None:
+            resolved_cb.latency_budget_ms = resolved_latency_budget_ms
     elif cb_enabled:
         fail_thresh = int(
             os.getenv(
@@ -590,14 +599,10 @@ def create_app(
                 str(circuit_breaker_recovery_timeout),
             )
         )
-        lat_budget = latency_budget_ms
-        env_lat = os.getenv(CIRCUIT_BREAKER_LATENCY_BUDGET_ENVIRONMENT_VARIABLE)
-        if lat_budget is None and env_lat:
-            lat_budget = float(env_lat)
         resolved_cb = CircuitBreaker(
             failure_threshold=fail_thresh,
             recovery_timeout=recov_timeout,
-            latency_budget_ms=lat_budget,
+            latency_budget_ms=resolved_latency_budget_ms,
         )
 
     metrics_registry = CollectorRegistry()
