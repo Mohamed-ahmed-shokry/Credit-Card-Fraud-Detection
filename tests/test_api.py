@@ -612,6 +612,21 @@ def test_metrics_endpoint_reports_request_and_prediction_counters(
     assert fraud_count + legitimate_count == 5
 
 
+def test_metrics_do_not_create_a_series_per_undeclared_path(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, model, _ = api_context
+    app = create_app(model=model)
+
+    with TestClient(app) as test_client:
+        for index in range(5):
+            assert test_client.get(f"/nope-{index}-{'a' * 40}").status_code == 404
+        body = test_client.get("/metrics").text
+
+    assert 'http_requests_total{method="GET",path="unmatched",status_code="404"} 5.0' in body
+    assert "nope-" not in body
+
+
 def test_metrics_endpoint_records_unhandled_errors_as_500(
     api_context: tuple[TestClient, FraudModel, ValidatedDataset],
 ) -> None:

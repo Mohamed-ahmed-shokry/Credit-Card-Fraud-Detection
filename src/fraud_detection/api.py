@@ -84,6 +84,7 @@ MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024
 RATE_LIMIT_TRACKED_KEY_LIMIT = 10_000
 SHADOW_SHUTDOWN_TIMEOUT_SECONDS = 5.0
 OPERATIONAL_PATHS = frozenset({"/health", "/metrics", "/live", "/ready"})
+UNMATCHED_ROUTE_LABEL = "unmatched"
 _REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 _BODY_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 logger = logging.getLogger(__name__)
@@ -970,10 +971,10 @@ def create_app(
             duration_ms = (perf_counter() - started_at) * 1_000
             request_counter.labels(
                 method=request.method,
-                path=request.url.path,
+                path=_metric_path(request),
                 status_code="500",
             ).inc()
-            request_duration.labels(method=request.method, path=request.url.path).observe(
+            request_duration.labels(method=request.method, path=_metric_path(request)).observe(
                 duration_ms / 1_000
             )
             logger.exception(
@@ -994,10 +995,10 @@ def create_app(
         duration_ms = (perf_counter() - started_at) * 1_000
         request_counter.labels(
             method=request.method,
-            path=request.url.path,
+            path=_metric_path(request),
             status_code=str(response.status_code),
         ).inc()
-        request_duration.labels(method=request.method, path=request.url.path).observe(
+        request_duration.labels(method=request.method, path=_metric_path(request)).observe(
             duration_ms / 1_000
         )
         stamp_response(response, duration_ms)
@@ -1539,6 +1540,18 @@ def _request_too_large_response() -> JSONResponse:
         status_code=413,
         content={"detail": f"Request body exceeds the {MAX_REQUEST_BODY_BYTES}-byte limit."},
     )
+
+
+def _metric_path(request: Request) -> str:
+    """Return a bounded metric label for a request.
+
+    The matched route template is used instead of the raw path so an undeclared path
+    cannot create a new time series per request, which would let any client grow the
+    registry without limit.
+    """
+    route = request.scope.get("route")
+    route_path = getattr(route, "path", None)
+    return route_path if isinstance(route_path, str) else UNMATCHED_ROUTE_LABEL
 
 
 def _scoring_overloaded_response() -> JSONResponse:
