@@ -785,6 +785,172 @@ operator's responsibility as SECURITY.md already states.
   format and check passed; strict mypy passed on 14 source files; package build
   and Twine checks passed.
 
+## Phase 23 — Serving Correctness and Defense-in-Depth Hardening (In progress)
+
+### Objective
+
+Make the serving surface report failures honestly and keep the optional defenses
+effective under load, failure, and hostile input. An audit of the Phase 21/22
+serving layer found, and reproduced against the running app, that several failure
+paths currently fabricate results, hide from operators, or contradict documented
+contracts:
+
+- A request whose feature schema does not match the artifact is treated as a
+  *model* failure. It records a circuit-breaker failure and, under any non-`raise`
+  fallback, returns `200` with a fabricated constant score instead of `422`.
+- A model that returns no probabilities raises `500` *after* the fallback block
+  and records a breaker *success*, so the fallback policy is bypassed while the
+  breaker looks healthy.
+- Unhandled `500` responses carry no `X-Request-ID`, `X-Process-Time-Ms`, or
+  `traceparent`, contradicting the README's "every HTTP response" guarantee and
+  making the `request_failed` log line uncorrelatable with the client.
+- Shadow evaluation runs as a `BackgroundTasks` entry, which still holds the ASGI
+  request open: a 1s shadow model makes a 0s primary request take 1.017s,
+  contradicting ARCHITECTURE's and README's "never blocks" / "zero impact" claims.
+- Rate limiting runs inside API-key verification, so unauthenticated traffic
+  (including key brute force) consumes no budget at all.
+- The chaos header `X-Simulate-Degraded` is compiled in and unauthenticated: any
+  client can force fallback scoring (`0.3335` model score → `0.5` fabricated) and
+  there is no switch to disable it.
+- Prometheus `path` labels come from the raw request path, so any client can
+  create unbounded series (`/nope-<random>`), which is both a memory-growth path
+  and a caller-controlled label.
+- The circuit breaker is mutated from threadpool workers without a lock, an
+  injected breaker's `on_trip` callback is silently replaced, and
+  `latency_budget_ms` is silently dropped when a breaker instance is injected.
+- `degraded_mode=True` with `fallback_mode="raise"` is a no-op that still reports
+  `status: degraded` on `/health` while scoring the primary model.
+- `/health` raises `500` when the model is absent while `/ready` correctly `503`s.
+- The in-memory rate limiter never evicts idle client keys, so memory grows with
+  the number of distinct client IPs seen for the process lifetime.
+
+### Scope
+
+- **Shared scoring path** — extract the duplicated `POST /v1/predict` /
+  `POST /v1/score` guardrail sequence (state reads, concurrency cap, threadpool
+  scoring, audit event build/emit) into one internal coroutine and share the
+  health/readiness status computation, with no behavior change.
+- **Caller-input errors are not model failures** — validate request features
+  against the artifact schema before the circuit breaker is consulted; a
+  `ModelArtifactError` caused by caller input is re-raised (existing `422`
+  handler) and never records a breaker failure or activates the fallback policy.
+- **Model contract violations use the fallback policy** — missing or
+  length-mismatched probabilities are detected inside the guarded block, so they
+  record a breaker failure and route through the configured fallback instead of
+  raising `500` after the fallback decision was made.
+- **Circuit-breaker hardening** — guard breaker state with a lock now that
+  scoring runs concurrently, chain rather than replace a caller-supplied
+  `on_trip`, honor `latency_budget_ms` with an injected breaker, and parse the
+  circuit-breaker environment variables through named validation errors like
+  every other resolver.
+- **Honest error responses** — unhandled `500`s return a sanitized JSON body
+  carrying `X-Request-ID`, `X-Process-Time-Ms`, and `traceparent`, so the
+  documented correlation contract holds for failures too.
+- **Chaos header opt-in** — `X-Simulate-Degraded` is honored only when
+  `FRAUD_ENABLE_CHAOS_HEADER` is enabled (default off), and `degraded_mode=True`
+  combined with `fallback_mode="raise"` is rejected at startup instead of
+  silently doing nothing.
+- **Shadow evaluation off the request lifecycle** — run shadow evaluation on a
+  detached, reference-held task so it cannot extend the request or hold the
+  connection, matching the documented guarantee.
+- **Rate limiting that meters unauthenticated traffic** — order the rate-limit
+  middleware outside API-key verification, and evict idle client keys so the
+  in-memory window cannot grow without bound.
+- **Bounded, useful metrics** — label request metrics with the matched route
+  template instead of the raw path, and add counters for shed and rate-limited
+  requests.
+- **Operational endpoint agreement** — `/health` returns `503` with a reason
+  instead of raising when the model is absent, and shadow-model metadata is read
+  defensively.
+- **CI container smoke** — exercise `/v1/predict` and `/v1/score` in the image
+  smoke test, not only the operational endpoints.
+- **Documentation** — README (correlation contract, chaos-header switch, rate
+  limiting scope, metric labels, the previously undocumented
+  `FRAUD_CIRCUIT_BREAKER_RECOVERY_TIMEOUT`), SECURITY, ARCHITECTURE, CHANGELOG,
+  and this roadmap.
+
+### Acceptance criteria
+
+- A request with an unknown, missing, or extra feature returns `422` and leaves
+  the circuit breaker untouched (no failure recorded, no fallback activated),
+  while a genuine model exception still trips the breaker as before.
+- With `fallback_mode="constant"`, a model returning no probabilities (or a
+  wrong-length array) activates the fallback with `fallback_applied=true` and
+  records a breaker failure instead of returning `500`.
+- An unhandled `500` response carries `X-Request-ID` (echoing a caller-supplied
+  one), `X-Process-Time-Ms`, and `traceparent`.
+- A scoring request whose primary model returns immediately completes in well
+  under the duration of a deliberately slow shadow model.
+- `X-Simulate-Degraded` is ignored unless `FRAUD_ENABLE_CHAOS_HEADER` is enabled;
+  with it enabled the documented simulation still works; `degraded_mode=True`
+  plus `fallback_mode="raise"` fails fast with a clear configuration error.
+- With `api_keys` and `rate_limit_requests=1` configured, unauthenticated
+  requests consume the client budget and eventually return `429` with
+  `Retry-After`, while `/health`, `/live`, and `/ready` remain exempt.
+- A request to an undeclared path does not create a new `path` label series; all
+  `404`s share one label. `fraud_scoring_rejected_total` counts shed and
+  rate-limited requests.
+- The circuit breaker records state transitions safely under concurrent scoring;
+  an injected breaker's `on_trip` still runs alongside the metrics counter; and
+  `latency_budget_ms` applies to an injected breaker.
+- `GET /health` returns `503` with `{"detail": "Model not loaded."}` when the
+  model is absent, matching `/ready`.
+- Scoring request/response schemas, audit event content, `/live`, `/ready`,
+  `/metrics` success shape, and the Phase 22 concurrency cap are unchanged.
+- Full test suite, Ruff format/check, strict mypy, package build, and Twine checks
+  pass; every change is committed and pushed before the phase is marked `Done`.
+
+### Explicit exclusions
+
+This phase does not move the request-body size limit ahead of authentication
+(the outermost middleware buffers before verifying credentials; that needs a
+pure-ASGI middleware rewrite), add TLS, replace the gateway with a real auth
+product, change scoring request/response schemas, add durable or distributed
+rate limiting, change the package version, or publish a release. Findings from
+the same audit outside the serving layer (compliance-report escaping, audit
+replay validation, explanation-provider timeouts, artifact validation
+robustness, and CLI documentation errors) are recorded as Phase 24.
+
+### Delivery record
+
+Filled in when the phase completes.
+
+## Phase 24 — Evidence Rendering, Replay, and Documentation Correctness (Proposed)
+
+Recorded from the same audit that scoped Phase 23, so the verified findings are
+not lost. Every item below was reproduced against the current code.
+
+- **Compliance report escaping** — `reporting.py` interpolates drift
+  `overall_status` and the per-feature status class into HTML unescaped, so a
+  bundle carrying crafted status text injects script or event-handler markup,
+  contradicting README's "escapes evidence values before rendering".
+- **Audit replay validation** — `replay_audit_log` does not validate `tolerance`
+  or `max_discrepancies_to_record` (`tolerance=nan` silently disables score
+  comparison), crashes on a non-numeric `fraud_probability` or a null threshold,
+  silently truncates mismatched feature/prediction lists, and reports
+  `status="MATCH"` when zero transactions were compared.
+- **Explanation-provider timeouts** — `timeout_seconds` does not bound latency
+  because the threadpool context manager waits on shutdown, contradicting
+  README's "strict timeouts"; the `CostController` token budget is never
+  enforced, and `ExplanationRequest.decision` is ignored by the template
+  provider.
+- **Artifact validation robustness** — `validate_artifact` can raise instead of
+  reporting on a corrupted `model.joblib` with a matching manifest digest, and
+  raises `AttributeError` when `manifest["files"]` is a list.
+- **Streaming profiler validation** — `StreamingProfile.from_dict` performs no
+  shape checks (missing `edges`, mismatched `counts` length, non-finite `mean`),
+  and `update` commits earlier features when a later feature fails validation.
+- **Local explanation consistency** — `explain_local` is batch-dependent for
+  estimators without native importances, and for the default sigmoid-calibrated
+  model the contributions do not sum to the served score's log-odds.
+- **Documentation errors** — the README `retrain`, and `simulate-drift` examples
+  use options that do not exist; `generate-trust-bundle` is undocumented, so the
+  key-rotation runbook cannot be followed; `retrain --promote` reports
+  `PROMOTED` while silently not promoting when the champion is a file.
+- **Test debt** — `cli.py` sits at 92% coverage with untested failure paths in
+  `retrain`, `export-edge --max-error`, and the signing/attestation commands,
+  against CONTRIBUTING's rule that tests must cover failure behavior.
+
 ## Contributing to the roadmap
 
 Open an issue or a pull request that references the relevant phase item.
