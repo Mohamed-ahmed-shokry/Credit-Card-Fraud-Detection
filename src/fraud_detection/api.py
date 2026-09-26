@@ -77,6 +77,7 @@ API_KEYS_ENVIRONMENT_VARIABLE = "FRAUD_API_KEYS"
 RATE_LIMIT_REQUESTS_ENVIRONMENT_VARIABLE = "FRAUD_RATE_LIMIT_REQUESTS"
 RATE_LIMIT_WINDOW_SECONDS_ENVIRONMENT_VARIABLE = "FRAUD_RATE_LIMIT_WINDOW_SECONDS"
 MAX_CONCURRENT_SCORING_ENVIRONMENT_VARIABLE = "FRAUD_MAX_CONCURRENT_SCORING"
+ENABLE_CHAOS_HEADER_ENVIRONMENT_VARIABLE = "FRAUD_ENABLE_CHAOS_HEADER"
 REQUEST_ID_HEADER = "X-Request-ID"
 PROCESS_TIME_HEADER = "X-Process-Time-Ms"
 MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024
@@ -496,6 +497,7 @@ def create_app(
     fallback_score: float | None = None,
     fallback_amount_threshold: float | None = None,
     degraded_mode: bool | None = None,
+    enable_chaos_header: bool | None = None,
     shadow_model: FraudModel | None = None,
     shadow_model_path: Path | str | None = None,
     circuit_breaker: CircuitBreaker | None = None,
@@ -534,6 +536,11 @@ def create_app(
         fallback_score: Fixed score for 'constant' fallback mode (default: 0.5).
         fallback_amount_threshold: Amount cutoff for 'rule' fallback mode (default: 1000.0).
         degraded_mode: When True, bypasses primary model and uses fallback policy.
+        enable_chaos_header: When True, honor the `X-Simulate-Degraded` request header so a
+            degraded-state fallback can be exercised on demand. Defaults to False, and when
+            unset reads `FRAUD_ENABLE_CHAOS_HEADER`; the header is ignored unless enabled
+            because any client able to reach the service could otherwise force fallback
+            scoring for its own requests.
         shadow_model: Pre-loaded shadow challenger model instance.
         shadow_model_path: Path to shadow challenger model artifact directory.
         circuit_breaker: Optional pre-configured CircuitBreaker instance.
@@ -586,6 +593,13 @@ def create_app(
         degraded_mode
         if degraded_mode is not None
         else os.getenv(DEGRADED_MODE_ENVIRONMENT_VARIABLE, "false").lower() in {"1", "true", "yes"}
+    )
+
+    resolved_enable_chaos_header = (
+        enable_chaos_header
+        if enable_chaos_header is not None
+        else os.getenv(ENABLE_CHAOS_HEADER_ENVIRONMENT_VARIABLE, "false").lower()
+        in {"1", "true", "yes"}
     )
 
     resolved_shadow_path = shadow_model_path or os.getenv(SHADOW_MODEL_PATH_ENVIRONMENT_VARIABLE)
@@ -787,6 +801,7 @@ def create_app(
         application.state.fallback_score = resolved_fallback_score
         application.state.fallback_amount_threshold = resolved_fallback_amount
         application.state.degraded_mode = resolved_degraded_mode
+        application.state.enable_chaos_header = resolved_enable_chaos_header
         application.state.fallback_counter = fallback_counter
         application.state.shadow_evaluations_counter = shadow_evaluations_counter
         application.state.shadow_discrepancies_counter = shadow_discrepancies_counter
@@ -1224,7 +1239,8 @@ def create_app(
             _ScoringOverloadedError: The scoring concurrency cap is already saturated.
         """
         force_degraded = bool(getattr(request.app.state, "degraded_mode", False)) or (
-            request.headers.get("X-Simulate-Degraded", "").lower() == "true"
+            bool(getattr(request.app.state, "enable_chaos_header", False))
+            and request.headers.get("X-Simulate-Degraded", "").lower() == "true"
         )
         fb_mode = str(getattr(request.app.state, "fallback_mode", "raise"))
         fb_score = float(getattr(request.app.state, "fallback_score", 0.5))

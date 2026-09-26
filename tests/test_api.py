@@ -24,6 +24,7 @@ from fraud_detection.api import (
     CIRCUIT_BREAKER_FAILURE_THRESHOLD_ENVIRONMENT_VARIABLE,
     CIRCUIT_BREAKER_LATENCY_BUDGET_ENVIRONMENT_VARIABLE,
     CIRCUIT_BREAKER_RECOVERY_TIMEOUT_ENVIRONMENT_VARIABLE,
+    ENABLE_CHAOS_HEADER_ENVIRONMENT_VARIABLE,
     MAX_CONCURRENT_SCORING_ENVIRONMENT_VARIABLE,
     MAX_REQUEST_BODY_BYTES,
     MODEL_PATH_ENVIRONMENT_VARIABLE,
@@ -1430,6 +1431,7 @@ def test_simulate_degraded_header_and_health_status(
         fallback_mode="constant",
         fallback_score=0.42,
         degraded_mode=False,
+        enable_chaos_header=True,
     )
     with TestClient(app) as test_client:
         # Normal health
@@ -1452,6 +1454,14 @@ def test_simulate_degraded_header_and_health_status(
         assert p_chaos.json()["fallback_applied"] is True
         assert p_chaos.json()["predictions"][0]["fraud_probability"] == 0.42
 
+        # Single-transaction endpoint honors it too.
+        s_chaos = test_client.post(
+            "/v1/score",
+            json={"transaction": record},
+            headers={"X-Simulate-Degraded": "true"},
+        )
+        assert s_chaos.json()["fallback_applied"] is True
+
     # Now with degraded_mode=True on app
     app_degraded = create_app(
         model=model,
@@ -1463,6 +1473,35 @@ def test_simulate_degraded_header_and_health_status(
         assert h_deg.status_code == 200
         assert h_deg.json()["status"] == "degraded"
         assert h_deg.json()["degraded_mode"] is True
+
+
+def test_simulate_degraded_header_is_ignored_unless_enabled(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, model, dataset = api_context
+    record = dataset.features.iloc[0].to_dict()
+
+    default_app = create_app(model=model, fallback_mode="constant", fallback_score=0.42)
+    with TestClient(default_app) as test_client:
+        response = test_client.post(
+            "/v1/predict",
+            json={"transactions": [record]},
+            headers={"X-Simulate-Degraded": "true"},
+        )
+    assert response.status_code == 200
+    assert response.json()["fallback_applied"] is False
+
+    monkeypatch.setenv(ENABLE_CHAOS_HEADER_ENVIRONMENT_VARIABLE, "true")
+    env_app = create_app(model=model, fallback_mode="constant", fallback_score=0.42)
+    with TestClient(env_app) as test_client:
+        response = test_client.post(
+            "/v1/score",
+            json={"transaction": record},
+            headers={"X-Simulate-Degraded": "true"},
+        )
+    assert response.json()["fallback_applied"] is True
+    assert response.json()["prediction"]["fraud_probability"] == 0.42
 
 
 def test_fallback_configuration_validation(
