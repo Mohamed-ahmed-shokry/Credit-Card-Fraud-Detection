@@ -834,10 +834,28 @@ def create_app(
     )
 
     @application.middleware("http")
+    async def api_key_middleware(
+        request: Request,
+        call_next: RequestResponseEndpoint,
+    ) -> Response:
+        if (
+            api_key_set is not None
+            and request.url.path not in OPERATIONAL_PATHS
+            and not _api_key_is_valid(request.headers.get("X-API-Key"), api_key_set)
+        ):
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "Invalid or missing API key"},
+            )
+        return await call_next(request)
+
+    @application.middleware("http")
     async def rate_limit_middleware(
         request: Request,
         call_next: RequestResponseEndpoint,
     ) -> Response:
+        # Registered after the API-key middleware, so it runs outside it: unauthenticated
+        # traffic has to consume the client budget, otherwise key guessing is unmetered.
         if rate_limiter is None or request.url.path in OPERATIONAL_PATHS:
             return await call_next(request)
         client_ip = request.client.host if request.client else "unknown"
@@ -856,22 +874,6 @@ def create_app(
         response.headers["X-RateLimit-Limit"] = str(rate_limiter.max_requests)
         response.headers["X-RateLimit-Remaining"] = str(decision.remaining)
         return response
-
-    @application.middleware("http")
-    async def api_key_middleware(
-        request: Request,
-        call_next: RequestResponseEndpoint,
-    ) -> Response:
-        if (
-            api_key_set is not None
-            and request.url.path not in OPERATIONAL_PATHS
-            and not _api_key_is_valid(request.headers.get("X-API-Key"), api_key_set)
-        ):
-            return JSONResponse(
-                status_code=401,
-                content={"detail": "Invalid or missing API key"},
-            )
-        return await call_next(request)
 
     @application.middleware("http")
     async def request_context(

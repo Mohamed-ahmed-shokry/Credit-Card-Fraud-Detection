@@ -1085,6 +1085,32 @@ def test_rate_limit_middleware_rejects_over_limit(
         assert int(response3.headers["Retry-After"]) >= 0
 
 
+def test_rate_limit_meters_unauthenticated_requests(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, model, dataset = api_context
+    records = dataset.features.iloc[:1].to_dict(orient="records")
+    app = create_app(model=model, api_keys=["secret"], rate_limit_requests=1)
+
+    with TestClient(app) as test_client:
+        first = test_client.post("/v1/predict", json={"transactions": records})
+        second = test_client.post("/v1/predict", json={"transactions": records})
+        authenticated = test_client.post(
+            "/v1/predict",
+            json={"transactions": records},
+            headers={"X-API-Key": "secret"},
+        )
+        live = test_client.get("/live")
+
+    assert first.status_code == 401
+    # The unauthenticated request above consumed the single unit of budget.
+    assert second.status_code == 429
+    assert second.headers["X-RateLimit-Remaining"] == "0"
+    assert int(second.headers["Retry-After"]) >= 0
+    assert authenticated.status_code == 429
+    assert live.status_code == 200
+
+
 def test_rate_limit_middleware_exempts_operational_endpoints(
     api_context: tuple[TestClient, FraudModel, ValidatedDataset],
 ) -> None:
