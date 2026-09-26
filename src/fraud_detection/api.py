@@ -20,7 +20,7 @@ from uuid import uuid4
 
 import numpy as np
 import pandas as pd
-from fastapi import BackgroundTasks, FastAPI, Request
+from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from prometheus_client import (
@@ -81,6 +81,7 @@ ENABLE_CHAOS_HEADER_ENVIRONMENT_VARIABLE = "FRAUD_ENABLE_CHAOS_HEADER"
 REQUEST_ID_HEADER = "X-Request-ID"
 PROCESS_TIME_HEADER = "X-Process-Time-Ms"
 MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024
+SHADOW_SHUTDOWN_TIMEOUT_SECONDS = 5.0
 OPERATIONAL_PATHS = frozenset({"/health", "/metrics", "/live", "/ready"})
 _REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 _BODY_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
@@ -817,7 +818,10 @@ def create_app(
         application.state.circuit_breaker_tripped_counter = circuit_breaker_tripped_counter
         application.state.circuit_breaker_gauge = circuit_breaker_gauge
         application.state.trace_exporter = resolved_trace_exporter
+        shadow_tasks: set[asyncio.Task[None]] = set()
+        application.state.shadow_tasks = shadow_tasks
         yield
+        await _drain_shadow_tasks(shadow_tasks, SHADOW_SHUTDOWN_TIMEOUT_SECONDS)
         resolved_audit_sink.close()
 
     application = FastAPI(
@@ -1240,7 +1244,6 @@ def create_app(
         explain: bool,
         explain_llm: bool,
         threshold: float | None,
-        background_tasks: BackgroundTasks,
     ) -> tuple[float, list[PredictionResult], bool, str | None]:
         """Run the shared scoring pipeline: cap, inference, audit emit, and shadow scheduling.
 
@@ -1303,20 +1306,28 @@ def create_app(
 
         sh_model: FraudModel | None = getattr(request.app.state, "shadow_model", None)
         if sh_model is not None:
-            background_tasks.add_task(
-                _evaluate_shadow_traffic,
-                shadow_model=sh_model,
-                frame=frame,
-                primary_results=results,
-                audit_sink=sink,
-                request_id=getattr(request.state, "request_id", None),
-                shadow_evaluations_counter=getattr(
-                    request.app.state, "shadow_evaluations_counter", None
-                ),
-                shadow_discrepancies_counter=getattr(
-                    request.app.state, "shadow_discrepancies_counter", None
-                ),
+            # Scheduled on the event loop instead of as a response background task: a
+            # background task still runs before the request is finished, which held the
+            # connection open for the whole challenger evaluation.
+            shadow_tasks: set[asyncio.Task[None]] = request.app.state.shadow_tasks
+            shadow_task = asyncio.ensure_future(
+                run_in_threadpool(
+                    _evaluate_shadow_traffic,
+                    shadow_model=sh_model,
+                    frame=frame,
+                    primary_results=results,
+                    audit_sink=sink,
+                    request_id=getattr(request.state, "request_id", None),
+                    shadow_evaluations_counter=getattr(
+                        request.app.state, "shadow_evaluations_counter", None
+                    ),
+                    shadow_discrepancies_counter=getattr(
+                        request.app.state, "shadow_discrepancies_counter", None
+                    ),
+                )
             )
+            shadow_tasks.add(shadow_task)
+            shadow_task.add_done_callback(shadow_tasks.discard)
 
         return applied_threshold, results, fallback_applied, fallback_reason
 
@@ -1329,7 +1340,6 @@ def create_app(
     async def predict(
         payload: PredictionRequest,
         request: Request,
-        background_tasks: BackgroundTasks,
     ) -> PredictionResponse | JSONResponse:
         loaded = _model_from_request(request)
         try:
@@ -1346,7 +1356,6 @@ def create_app(
                 explain=payload.explain,
                 explain_llm=payload.explain_llm,
                 threshold=payload.threshold,
-                background_tasks=background_tasks,
             )
         except _ScoringOverloadedError:
             return _scoring_overloaded_response()
@@ -1368,7 +1377,6 @@ def create_app(
     async def score(
         payload: ScoreRequest,
         request: Request,
-        background_tasks: BackgroundTasks,
     ) -> ScoreResponse | JSONResponse:
         loaded = _model_from_request(request)
         try:
@@ -1385,7 +1393,6 @@ def create_app(
                 explain=payload.explain,
                 explain_llm=payload.explain_llm,
                 threshold=payload.threshold,
-                background_tasks=background_tasks,
             )
         except _ScoringOverloadedError:
             return _scoring_overloaded_response()
@@ -1510,6 +1517,22 @@ def _scoring_overloaded_response() -> JSONResponse:
         content={"detail": "Too many concurrent scoring requests."},
         headers={"Retry-After": "1"},
     )
+
+
+async def _drain_shadow_tasks(
+    tasks: Collection[asyncio.Task[None]],
+    timeout_seconds: float,
+) -> None:
+    """Wait for in-flight shadow evaluations so a shutdown does not silently drop them."""
+    pending = [task for task in tasks if not task.done()]
+    if not pending:
+        return
+    _, unfinished = await asyncio.wait(pending, timeout=timeout_seconds)
+    for task in unfinished:
+        logger.warning("Cancelling a shadow evaluation that outlived the shutdown grace period.")
+        task.cancel()
+    if unfinished:
+        await asyncio.gather(*unfinished, return_exceptions=True)
 
 
 def _model_from_request(request: Request) -> FraudModel:

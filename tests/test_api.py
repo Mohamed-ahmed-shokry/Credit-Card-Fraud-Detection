@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import threading
@@ -36,6 +37,7 @@ from fraud_detection.api import (
     SHADOW_MODEL_PATH_ENVIRONMENT_VARIABLE,
     CircuitBreaker,
     _api_key_is_valid,
+    _drain_shadow_tasks,
     app_from_environment,
     create_app,
 )
@@ -1925,6 +1927,50 @@ def test_circuit_breaker_latency_sla_breach(
     with TestClient(app) as client:
         client.post("/v1/score", json={"transaction": rec})
         assert cb.state == "open"
+
+
+def test_shadow_evaluation_does_not_extend_the_request(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, primary_model, dataset = api_context
+    rec = dataset.features.iloc[0].to_dict()
+
+    slow_shadow = MagicMock(wraps=primary_model)
+    slow_shadow.metadata = primary_model.metadata
+    slow_shadow.threshold = primary_model.threshold
+    slow_shadow.feature_names = primary_model.feature_names
+
+    def slow_shadow_predict(frame: Any) -> Any:
+        time.sleep(1.0)
+        return np.full(len(frame), 0.99)
+
+    slow_shadow.predict_probabilities.side_effect = slow_shadow_predict
+    app = create_app(model=primary_model, shadow_model=slow_shadow)
+
+    with TestClient(app) as test_client:
+        started_at = time.perf_counter()
+        response = test_client.post("/v1/score", json={"transaction": rec})
+        elapsed = time.perf_counter() - started_at
+
+    assert response.status_code == 200
+    assert response.json()["prediction"]["is_fraud"] in {True, False}
+    assert elapsed < 0.5, f"shadow evaluation held the request for {elapsed:.3f}s"
+
+
+def test_shadow_drain_cancels_work_that_outlives_the_grace_period() -> None:
+    async def scenario() -> None:
+        started = asyncio.Event()
+
+        async def never_finishes() -> None:
+            started.set()
+            await asyncio.sleep(30)
+
+        task = asyncio.ensure_future(never_finishes())
+        await started.wait()
+        await _drain_shadow_tasks({task}, timeout_seconds=0.05)
+        assert task.cancelled()
+
+    asyncio.run(scenario())
 
 
 def test_traffic_shadowing_and_metrics(
