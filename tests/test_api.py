@@ -533,7 +533,7 @@ def test_api_rejects_malformed_content_length_header(
     assert response.json()["detail"] == "Invalid Content-Length."
 
 
-def test_api_logs_and_reraises_unhandled_errors(
+def test_api_logs_and_answers_unhandled_errors_with_correlation_headers(
     api_context: tuple[TestClient, FraudModel, ValidatedDataset],
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -553,15 +553,22 @@ def test_api_logs_and_reraises_unhandled_errors(
     broken_app = create_app(model=cast(FraudModel, _BrokenModel()))
     with (
         caplog.at_level(logging.ERROR, logger="fraud_detection.api"),
-        TestClient(broken_app, raise_server_exceptions=False) as broken_client,
+        TestClient(broken_app) as broken_client,
     ):
         response = broken_client.post(
             "/v1/predict",
             json={"transactions": dataset.features.iloc[:1].to_dict(orient="records")},
+            headers={REQUEST_ID_HEADER: "failed-request"},
         )
 
     assert response.status_code == 500
+    assert response.json() == {"detail": "Internal server error."}
+    assert response.headers[REQUEST_ID_HEADER] == "failed-request"
+    assert float(response.headers[PROCESS_TIME_HEADER]) >= 0
+    assert response.headers["traceparent"].startswith("00-")
     assert "request_failed" in caplog.text
+    assert "failed-request" in caplog.text
+    assert "boom" not in response.text
 
 
 def test_metrics_endpoint_reports_request_and_prediction_counters(
@@ -1481,11 +1488,12 @@ def test_primary_model_returns_none_probabilities(
     mock_model.predict_probabilities.return_value = None
 
     app = create_app(model=mock_model)
-    with (
-        TestClient(app) as test_client,
-        pytest.raises(RuntimeError, match="Primary model returned no probabilities"),
-    ):
-        test_client.post("/v1/predict", json={"transactions": [rec]})
+    with TestClient(app) as test_client:
+        response = test_client.post("/v1/predict", json={"transactions": [rec]})
+
+    # The default fallback mode is 'raise', so the model failure surfaces as a 500.
+    assert response.status_code == 500
+    assert response.json() == {"detail": "Internal server error."}
 
 
 def test_unknown_feature_is_rejected_without_touching_the_circuit_breaker(
@@ -1831,11 +1839,11 @@ def test_circuit_breaker_raise_when_open(
     cb.trip()
 
     app = create_app(model=model, circuit_breaker=cb, fallback_mode="raise")
-    with (
-        TestClient(app) as client,
-        pytest.raises(RuntimeError, match="Circuit breaker is OPEN"),
-    ):
-        client.post("/v1/predict", json={"transactions": [rec]})
+    with TestClient(app) as client:
+        response = client.post("/v1/predict", json={"transactions": [rec]})
+
+    assert response.status_code == 500
+    assert response.json() == {"detail": "Internal server error."}
 
 
 def test_circuit_breaker_latency_sla_breach(

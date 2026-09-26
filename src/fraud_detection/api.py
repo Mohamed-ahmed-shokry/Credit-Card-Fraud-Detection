@@ -898,29 +898,40 @@ def create_app(
             except Exception:
                 logger.exception("Failed to export request trace.")
 
+        def stamp_response(response: Response, duration_ms: float) -> Response:
+            response.headers[REQUEST_ID_HEADER] = request_id
+            response.headers[PROCESS_TIME_HEADER] = f"{duration_ms:.3f}"
+            response.headers["traceparent"] = server_trace_context.traceparent
+            return response
+
         try:
             response: Response | None = await _request_body_error(request)
             if response is None:
                 response = await call_next(request)
         except Exception as exc:
-            duration_seconds = perf_counter() - started_at
+            duration_ms = (perf_counter() - started_at) * 1_000
             request_counter.labels(
                 method=request.method,
                 path=request.url.path,
                 status_code="500",
             ).inc()
             request_duration.labels(method=request.method, path=request.url.path).observe(
-                duration_seconds
+                duration_ms / 1_000
             )
             logger.exception(
                 "request_failed method=%s path=%s duration_ms=%.3f request_id=%s",
                 request.method,
                 request.url.path,
-                duration_seconds * 1_000,
+                duration_ms,
                 request_id,
             )
             export_trace(500, error_type=type(exc).__name__)
-            raise
+            # Answer here rather than re-raising: the sanitized body must still carry the
+            # correlation headers, which an outer error handler would not be able to add.
+            return stamp_response(
+                JSONResponse(status_code=500, content={"detail": "Internal server error."}),
+                duration_ms,
+            )
 
         duration_ms = (perf_counter() - started_at) * 1_000
         request_counter.labels(
@@ -931,9 +942,7 @@ def create_app(
         request_duration.labels(method=request.method, path=request.url.path).observe(
             duration_ms / 1_000
         )
-        response.headers[REQUEST_ID_HEADER] = request_id
-        response.headers[PROCESS_TIME_HEADER] = f"{duration_ms:.3f}"
-        response.headers["traceparent"] = server_trace_context.traceparent
+        stamp_response(response, duration_ms)
         export_trace(response.status_code)
         logger.info(
             "request_completed method=%s path=%s status_code=%d duration_ms=%.3f request_id=%s",
