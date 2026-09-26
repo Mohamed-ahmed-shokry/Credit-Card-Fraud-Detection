@@ -535,7 +535,8 @@ def create_app(
             'raise' (default), 'rule' (heuristic on Amount), or 'constant'.
         fallback_score: Fixed score for 'constant' fallback mode (default: 0.5).
         fallback_amount_threshold: Amount cutoff for 'rule' fallback mode (default: 1000.0).
-        degraded_mode: When True, bypasses primary model and uses fallback policy.
+        degraded_mode: When True, bypasses primary model and uses fallback policy. Requires a
+            fallback policy other than 'raise'.
         enable_chaos_header: When True, honor the `X-Simulate-Degraded` request header so a
             degraded-state fallback can be exercised on demand. Defaults to False, and when
             unset reads `FRAUD_ENABLE_CHAOS_HEADER`; the header is ignored unless enabled
@@ -594,6 +595,14 @@ def create_app(
         if degraded_mode is not None
         else os.getenv(DEGRADED_MODE_ENVIRONMENT_VARIABLE, "false").lower() in {"1", "true", "yes"}
     )
+    if resolved_degraded_mode and resolved_fallback_mode == "raise":
+        # Degraded mode only means something with a fallback policy to activate; with
+        # 'raise' the primary model would keep serving while /health reported degraded.
+        raise ValueError(
+            f"{DEGRADED_MODE_ENVIRONMENT_VARIABLE}/degraded_mode requires a fallback policy; "
+            f"set fallback_mode to 'rule' or 'constant' instead of "
+            f"'{resolved_fallback_mode}'."
+        )
 
     resolved_enable_chaos_header = (
         enable_chaos_header

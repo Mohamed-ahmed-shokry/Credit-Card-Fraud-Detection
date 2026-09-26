@@ -24,6 +24,7 @@ from fraud_detection.api import (
     CIRCUIT_BREAKER_FAILURE_THRESHOLD_ENVIRONMENT_VARIABLE,
     CIRCUIT_BREAKER_LATENCY_BUDGET_ENVIRONMENT_VARIABLE,
     CIRCUIT_BREAKER_RECOVERY_TIMEOUT_ENVIRONMENT_VARIABLE,
+    DEGRADED_MODE_ENVIRONMENT_VARIABLE,
     ENABLE_CHAOS_HEADER_ENVIRONMENT_VARIABLE,
     MAX_CONCURRENT_SCORING_ENVIRONMENT_VARIABLE,
     MAX_REQUEST_BODY_BYTES,
@@ -1515,6 +1516,22 @@ def test_fallback_configuration_validation(
 
     with pytest.raises(ValueError, match=r"fallback_score must be between 0\.0 and 1\.0"):
         create_app(model=model, fallback_score=1.5)
+
+    with pytest.raises(ValueError, match="requires a fallback policy"):
+        create_app(model=model, degraded_mode=True)
+
+    with pytest.raises(ValueError, match="requires a fallback policy"):
+        create_app(model=model, degraded_mode=True, fallback_mode="raise")
+
+
+def test_degraded_mode_environment_requires_a_fallback_policy(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, model, _ = api_context
+    monkeypatch.setenv(DEGRADED_MODE_ENVIRONMENT_VARIABLE, "true")
+    with pytest.raises(ValueError, match=DEGRADED_MODE_ENVIRONMENT_VARIABLE):
+        create_app(model=model)
 
 
 def test_primary_model_returns_none_probabilities(
