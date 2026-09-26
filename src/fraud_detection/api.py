@@ -233,6 +233,35 @@ def _resolve_max_concurrent_scoring(max_concurrent_scoring: int) -> int:
     return resolved
 
 
+def _resolve_positive_int(name: str, raw: str) -> int:
+    """Parse a strictly positive integer environment value with a named error."""
+    try:
+        resolved = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer, got {raw!r}.") from exc
+    if resolved < 1:
+        raise ValueError(f"{name} must be >= 1, got {resolved}.")
+    return resolved
+
+
+def _resolve_positive_float(name: str, raw: str) -> float:
+    """Parse a strictly positive float environment value with a named error."""
+    try:
+        resolved = float(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a number, got {raw!r}.") from exc
+    if resolved <= 0:
+        raise ValueError(f"{name} must be > 0, got {resolved}.")
+    return resolved
+
+
+def _resolve_optional_positive_float(name: str, raw: str | None) -> float | None:
+    """Parse an optional strictly positive float environment value with a named error."""
+    if raw is None or not raw.strip():
+        return None
+    return _resolve_positive_float(name, raw.strip())
+
+
 class CircuitBreaker:
     """Automated operational circuit breaker protecting scoring endpoints."""
 
@@ -576,10 +605,12 @@ def create_app(
         or os.getenv(CIRCUIT_BREAKER_ENABLED_ENVIRONMENT_VARIABLE, "false").lower()
         in {"1", "true", "yes"}
     )
-    resolved_latency_budget_ms = latency_budget_ms
-    env_latency_budget = os.getenv(CIRCUIT_BREAKER_LATENCY_BUDGET_ENVIRONMENT_VARIABLE)
-    if resolved_latency_budget_ms is None and env_latency_budget:
-        resolved_latency_budget_ms = float(env_latency_budget)
+    resolved_latency_budget_ms = _resolve_optional_positive_float(
+        CIRCUIT_BREAKER_LATENCY_BUDGET_ENVIRONMENT_VARIABLE,
+        os.getenv(CIRCUIT_BREAKER_LATENCY_BUDGET_ENVIRONMENT_VARIABLE),
+    )
+    if latency_budget_ms is not None:
+        resolved_latency_budget_ms = latency_budget_ms
 
     resolved_cb: CircuitBreaker | None = None
     if circuit_breaker is not None:
@@ -587,17 +618,19 @@ def create_app(
         if resolved_latency_budget_ms is not None:
             resolved_cb.latency_budget_ms = resolved_latency_budget_ms
     elif cb_enabled:
-        fail_thresh = int(
+        fail_thresh = _resolve_positive_int(
+            CIRCUIT_BREAKER_FAILURE_THRESHOLD_ENVIRONMENT_VARIABLE,
             os.getenv(
                 CIRCUIT_BREAKER_FAILURE_THRESHOLD_ENVIRONMENT_VARIABLE,
                 str(circuit_breaker_failure_threshold),
-            )
+            ).strip(),
         )
-        recov_timeout = float(
+        recov_timeout = _resolve_positive_float(
+            CIRCUIT_BREAKER_RECOVERY_TIMEOUT_ENVIRONMENT_VARIABLE,
             os.getenv(
                 CIRCUIT_BREAKER_RECOVERY_TIMEOUT_ENVIRONMENT_VARIABLE,
                 str(circuit_breaker_recovery_timeout),
-            )
+            ).strip(),
         )
         resolved_cb = CircuitBreaker(
             failure_threshold=fail_thresh,

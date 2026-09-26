@@ -1601,6 +1601,36 @@ def test_short_probability_array_activates_the_fallback(
     assert len(response.json()["predictions"]) == 3
 
 
+def test_malformed_circuit_breaker_environment_is_rejected(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, model, _ = api_context
+    monkeypatch.setenv(CIRCUIT_BREAKER_ENABLED_ENVIRONMENT_VARIABLE, "true")
+
+    monkeypatch.setenv(CIRCUIT_BREAKER_FAILURE_THRESHOLD_ENVIRONMENT_VARIABLE, "many")
+    with pytest.raises(
+        ValueError, match=f"{CIRCUIT_BREAKER_FAILURE_THRESHOLD_ENVIRONMENT_VARIABLE}"
+    ):
+        create_app(model=model)
+
+    monkeypatch.setenv(CIRCUIT_BREAKER_FAILURE_THRESHOLD_ENVIRONMENT_VARIABLE, "0")
+    with pytest.raises(ValueError, match=">= 1"):
+        create_app(model=model)
+
+    monkeypatch.delenv(CIRCUIT_BREAKER_FAILURE_THRESHOLD_ENVIRONMENT_VARIABLE)
+    monkeypatch.setenv(CIRCUIT_BREAKER_RECOVERY_TIMEOUT_ENVIRONMENT_VARIABLE, "soon")
+    with pytest.raises(
+        ValueError, match=f"{CIRCUIT_BREAKER_RECOVERY_TIMEOUT_ENVIRONMENT_VARIABLE}"
+    ):
+        create_app(model=model)
+
+    monkeypatch.delenv(CIRCUIT_BREAKER_RECOVERY_TIMEOUT_ENVIRONMENT_VARIABLE)
+    monkeypatch.setenv(CIRCUIT_BREAKER_LATENCY_BUDGET_ENVIRONMENT_VARIABLE, "-3")
+    with pytest.raises(ValueError, match=f"{CIRCUIT_BREAKER_LATENCY_BUDGET_ENVIRONMENT_VARIABLE}"):
+        create_app(model=model)
+
+
 def test_injected_circuit_breaker_adopts_the_latency_budget(
     api_context: tuple[TestClient, FraudModel, ValidatedDataset],
     monkeypatch: pytest.MonkeyPatch,
