@@ -95,6 +95,29 @@ class _RateLimitDecision:
     retry_after_seconds: int
 
 
+@dataclass(frozen=True)
+class _OperationalStatus:
+    """Fallback, degraded, circuit-breaker, and shadow detail for operational endpoints."""
+
+    fallback_mode: str
+    degraded_mode: bool
+    circuit_breaker: dict[str, Any] | None
+    shadow_model_version: str | None
+
+    def response_fields(self) -> dict[str, Any]:
+        """Return the response fields shared by `/health` and `/ready`."""
+        return {
+            "degraded_mode": True if self.degraded_mode else None,
+            "fallback_mode": self.fallback_mode if self.fallback_mode != "raise" else None,
+            "circuit_breaker": self.circuit_breaker,
+            "shadow_model_version": self.shadow_model_version,
+        }
+
+
+class _ScoringOverloadedError(Exception):
+    """Raised internally when the scoring concurrency cap sheds a request."""
+
+
 class _RateLimiter:
     """Simple in-memory rate limiter using fixed window."""
 
@@ -882,26 +905,14 @@ def create_app(
     )
     async def health(request: Request) -> HealthResponse:
         loaded = _model_from_request(request)
-        is_degraded = bool(getattr(request.app.state, "degraded_mode", False))
-        cb: CircuitBreaker | None = getattr(request.app.state, "circuit_breaker", None)
-        cb_dict = cb.to_dict() if cb is not None else None
-        if cb is not None and cb.state == "open":
-            is_degraded = True
-        fb_mode = str(getattr(request.app.state, "fallback_mode", "raise"))
-        sh_model: FraudModel | None = getattr(request.app.state, "shadow_model", None)
-        sh_ver = (
-            str(sh_model.metadata["dataset_fingerprint"])[:12] if sh_model is not None else None
-        )
+        status = _operational_status(request)
         return HealthResponse(
-            status="degraded" if is_degraded else "ready",
+            status="degraded" if status.degraded_mode else "ready",
             service_version=__version__,
             model_created_at=str(loaded.metadata["created_at"]),
             feature_count=len(loaded.feature_names),
             threshold=loaded.threshold,
-            degraded_mode=True if is_degraded else None,
-            fallback_mode=fb_mode if fb_mode != "raise" else None,
-            circuit_breaker=cb_dict,
-            shadow_model_version=sh_ver,
+            **status.response_fields(),
         )
 
     @application.get(
@@ -932,17 +943,12 @@ def create_app(
                 service_version=__version__,
                 detail="Model not loaded.",
             )
-        fb_mode = str(getattr(request.app.state, "fallback_mode", "raise"))
-        cb: CircuitBreaker | None = getattr(request.app.state, "circuit_breaker", None)
-        cb_dict = cb.to_dict() if cb is not None else None
-        is_degraded = bool(getattr(request.app.state, "degraded_mode", False))
-        if cb is not None and cb.state == "open":
-            is_degraded = True
-        sh_model: FraudModel | None = getattr(request.app.state, "shadow_model", None)
-        sh_ver = (
-            str(sh_model.metadata["dataset_fingerprint"])[:12] if sh_model is not None else None
+        status = _operational_status(request)
+        cannot_serve = (
+            status.circuit_breaker is not None
+            and status.circuit_breaker["state"] == "open"
+            and status.fallback_mode == "raise"
         )
-        cannot_serve = cb is not None and cb.state == "open" and fb_mode == "raise"
         if cannot_serve:
             response.status_code = 503
         return ReadinessResponse(
@@ -952,10 +958,7 @@ def create_app(
             model_created_at=str(loaded.metadata["created_at"]),
             feature_count=len(loaded.feature_names),
             threshold=loaded.threshold,
-            degraded_mode=True if is_degraded else None,
-            fallback_mode=fb_mode if fb_mode != "raise" else None,
-            circuit_breaker=cb_dict,
-            shadow_model_version=sh_ver,
+            **status.response_fields(),
         )
 
     def score_frame(
@@ -1084,19 +1087,22 @@ def create_app(
         prediction_counter.labels(is_fraud="false").inc(int((~decisions).sum()))
         return applied_threshold, results, False, None
 
-    @application.post(
-        "/v1/predict",
-        response_model=PredictionResponse,
-        responses={503: {"description": "Scoring concurrency cap reached."}},
-        tags=["predictions"],
-    )
-    async def predict(
-        payload: PredictionRequest,
+    async def _score_with_guardrails(
         request: Request,
+        loaded: FraudModel,
+        frame: pd.DataFrame,
+        *,
+        features: list[dict[str, float]],
+        explain: bool,
+        explain_llm: bool,
+        threshold: float | None,
         background_tasks: BackgroundTasks,
-    ) -> PredictionResponse | JSONResponse:
-        loaded = _model_from_request(request)
-        frame = pd.DataFrame(payload.transactions)
+    ) -> tuple[float, list[PredictionResult], bool, str | None]:
+        """Run the shared scoring pipeline: cap, inference, audit emit, and shadow scheduling.
+
+        Raises:
+            _ScoringOverloadedError: The scoring concurrency cap is already saturated.
+        """
         force_degraded = bool(getattr(request.app.state, "degraded_mode", False)) or (
             request.headers.get("X-Simulate-Degraded", "").lower() == "true"
         )
@@ -1107,20 +1113,16 @@ def create_app(
 
         if scoring_semaphore is not None:
             if scoring_semaphore.locked():
-                return JSONResponse(
-                    status_code=503,
-                    content={"detail": "Too many concurrent scoring requests."},
-                    headers={"Retry-After": "1"},
-                )
+                raise _ScoringOverloadedError
             await scoring_semaphore.acquire()
         try:
             applied_threshold, results, fallback_applied, fallback_reason = await run_in_threadpool(
                 score_frame,
                 loaded,
                 frame,
-                explain=payload.explain,
-                explain_llm=payload.explain_llm,
-                threshold=payload.threshold,
+                explain=explain,
+                explain_llm=explain_llm,
+                threshold=threshold,
                 fallback_mode=fb_mode,
                 fallback_score=fb_score,
                 fallback_amount_threshold=fb_amount,
@@ -1136,7 +1138,7 @@ def create_app(
                 model_version=str(loaded.metadata.get("dataset_fingerprint", ""))[:12],
                 dataset_fingerprint=str(loaded.metadata.get("dataset_fingerprint", "")),
                 threshold=applied_threshold,
-                features=payload.transactions,
+                features=features,
                 fallback_applied=fallback_applied,
                 fallback_reason=fallback_reason,
                 predictions=[
@@ -1171,6 +1173,38 @@ def create_app(
                 ),
             )
 
+        return applied_threshold, results, fallback_applied, fallback_reason
+
+    @application.post(
+        "/v1/predict",
+        response_model=PredictionResponse,
+        responses={503: {"description": "Scoring concurrency cap reached."}},
+        tags=["predictions"],
+    )
+    async def predict(
+        payload: PredictionRequest,
+        request: Request,
+        background_tasks: BackgroundTasks,
+    ) -> PredictionResponse | JSONResponse:
+        loaded = _model_from_request(request)
+        try:
+            (
+                applied_threshold,
+                results,
+                fallback_applied,
+                fallback_reason,
+            ) = await _score_with_guardrails(
+                request,
+                loaded,
+                pd.DataFrame(payload.transactions),
+                features=payload.transactions,
+                explain=payload.explain,
+                explain_llm=payload.explain_llm,
+                threshold=payload.threshold,
+                background_tasks=background_tasks,
+            )
+        except _ScoringOverloadedError:
+            return _scoring_overloaded_response()
         return PredictionResponse(
             model_version=str(loaded.metadata["dataset_fingerprint"])[:12],
             threshold=applied_threshold,
@@ -1192,80 +1226,24 @@ def create_app(
         background_tasks: BackgroundTasks,
     ) -> ScoreResponse | JSONResponse:
         loaded = _model_from_request(request)
-        frame = pd.DataFrame([payload.transaction])
-        force_degraded = bool(getattr(request.app.state, "degraded_mode", False)) or (
-            request.headers.get("X-Simulate-Degraded", "").lower() == "true"
-        )
-        fb_mode = str(getattr(request.app.state, "fallback_mode", "raise"))
-        fb_score = float(getattr(request.app.state, "fallback_score", 0.5))
-        fb_amount = float(getattr(request.app.state, "fallback_amount_threshold", 1000.0))
-        cb: CircuitBreaker | None = getattr(request.app.state, "circuit_breaker", None)
-
-        if scoring_semaphore is not None:
-            if scoring_semaphore.locked():
-                return JSONResponse(
-                    status_code=503,
-                    content={"detail": "Too many concurrent scoring requests."},
-                    headers={"Retry-After": "1"},
-                )
-            await scoring_semaphore.acquire()
         try:
-            applied_threshold, results, fallback_applied, fallback_reason = await run_in_threadpool(
-                score_frame,
+            (
+                applied_threshold,
+                results,
+                fallback_applied,
+                fallback_reason,
+            ) = await _score_with_guardrails(
+                request,
                 loaded,
-                frame,
+                pd.DataFrame([payload.transaction]),
+                features=[payload.transaction],
                 explain=payload.explain,
                 explain_llm=payload.explain_llm,
                 threshold=payload.threshold,
-                fallback_mode=fb_mode,
-                fallback_score=fb_score,
-                fallback_amount_threshold=fb_amount,
-                force_degraded=force_degraded,
-                circuit_breaker=cb,
+                background_tasks=background_tasks,
             )
-        finally:
-            if scoring_semaphore is not None:
-                scoring_semaphore.release()
-        sink: AuditSink = getattr(request.app.state, "audit_sink", resolved_audit_sink)
-        try:
-            audit_event = build_scoring_audit_event(
-                model_version=str(loaded.metadata.get("dataset_fingerprint", ""))[:12],
-                dataset_fingerprint=str(loaded.metadata.get("dataset_fingerprint", "")),
-                threshold=applied_threshold,
-                features=[payload.transaction],
-                fallback_applied=fallback_applied,
-                fallback_reason=fallback_reason,
-                predictions=[
-                    {
-                        "fraud_probability": results[0].fraud_probability,
-                        "is_fraud": results[0].is_fraud,
-                        "contributions": results[0].contributions,
-                        "explanation": results[0].explanation,
-                    }
-                ],
-                request_id=getattr(request.state, "request_id", None),
-            )
-            await run_in_threadpool(sink.emit, audit_event)
-        except Exception:
-            logger.exception("Failed to emit scoring audit event.")
-
-        sh_model: FraudModel | None = getattr(request.app.state, "shadow_model", None)
-        if sh_model is not None:
-            background_tasks.add_task(
-                _evaluate_shadow_traffic,
-                shadow_model=sh_model,
-                frame=frame,
-                primary_results=results,
-                audit_sink=sink,
-                request_id=getattr(request.state, "request_id", None),
-                shadow_evaluations_counter=getattr(
-                    request.app.state, "shadow_evaluations_counter", None
-                ),
-                shadow_discrepancies_counter=getattr(
-                    request.app.state, "shadow_discrepancies_counter", None
-                ),
-            )
-
+        except _ScoringOverloadedError:
+            return _scoring_overloaded_response()
         return ScoreResponse(
             model_version=str(loaded.metadata["dataset_fingerprint"])[:12],
             threshold=applied_threshold,
@@ -1381,8 +1359,38 @@ def _request_too_large_response() -> JSONResponse:
     )
 
 
+def _scoring_overloaded_response() -> JSONResponse:
+    return JSONResponse(
+        status_code=503,
+        content={"detail": "Too many concurrent scoring requests."},
+        headers={"Retry-After": "1"},
+    )
+
+
 def _model_from_request(request: Request) -> FraudModel:
     return cast(FraudModel, request.app.state.model)
+
+
+def _shadow_model_version(shadow_model: FraudModel | None) -> str | None:
+    if shadow_model is None:
+        return None
+    return str(shadow_model.metadata["dataset_fingerprint"])[:12]
+
+
+def _operational_status(request: Request) -> _OperationalStatus:
+    """Collect the circuit-breaker, fallback, degraded, and shadow detail of a service."""
+    circuit_breaker: CircuitBreaker | None = getattr(request.app.state, "circuit_breaker", None)
+    degraded_mode = bool(getattr(request.app.state, "degraded_mode", False))
+    if circuit_breaker is not None and circuit_breaker.state == "open":
+        degraded_mode = True
+    return _OperationalStatus(
+        fallback_mode=str(getattr(request.app.state, "fallback_mode", "raise")),
+        degraded_mode=degraded_mode,
+        circuit_breaker=circuit_breaker.to_dict() if circuit_breaker is not None else None,
+        shadow_model_version=_shadow_model_version(
+            cast(FraudModel | None, getattr(request.app.state, "shadow_model", None))
+        ),
+    )
 
 
 def app_from_environment() -> FastAPI:
