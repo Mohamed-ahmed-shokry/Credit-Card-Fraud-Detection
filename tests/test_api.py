@@ -1306,6 +1306,39 @@ def test_ready_returns_503_when_model_missing(
     assert body["detail"] == "Model not loaded."
 
 
+def test_health_returns_503_when_model_missing(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, model, _ = api_context
+
+    with TestClient(create_app(model=model)) as test_client:
+        del test_client.app.state.model
+        response = test_client.get("/health")
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Model not loaded."}
+
+
+def test_operational_endpoints_survive_metadata_without_a_fingerprint(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, model, _ = api_context
+    shadow_without_fingerprint = MagicMock(wraps=model)
+    shadow_without_fingerprint.metadata = {"created_at": "2026-09-20"}
+    shadow_without_fingerprint.threshold = model.threshold
+    shadow_without_fingerprint.feature_names = model.feature_names
+    app = create_app(model=model, shadow_model=shadow_without_fingerprint)
+
+    with TestClient(app) as test_client:
+        health = test_client.get("/health")
+        ready = test_client.get("/ready")
+
+    assert health.status_code == 200
+    assert health.json()["shadow_model_version"] == ""
+    assert ready.status_code == 200
+    assert ready.json()["shadow_model_version"] == ""
+
+
 def test_predict_emits_audit_event_to_configured_sink(
     tmp_path: Path,
     api_context: tuple[TestClient, FraudModel, ValidatedDataset],

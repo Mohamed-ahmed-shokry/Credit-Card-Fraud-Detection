@@ -1046,10 +1046,16 @@ def create_app(
         "/health",
         response_model=HealthResponse,
         response_model_exclude_none=True,
+        responses={503: {"description": "No model is loaded."}},
         tags=["operations"],
     )
-    async def health(request: Request) -> HealthResponse:
-        loaded = _model_from_request(request)
+    async def health(request: Request, response: Response) -> HealthResponse | JSONResponse:
+        loaded = getattr(request.app.state, "model", None)
+        if loaded is None:
+            # Same answer as /ready: an unloaded model is a service problem to report,
+            # not an internal error for the probe to trip over.
+            response.status_code = 503
+            return JSONResponse(status_code=503, content={"detail": "Model not loaded."})
         status = _operational_status(request)
         return HealthResponse(
             status="degraded" if status.degraded_mode else "ready",
@@ -1399,7 +1405,7 @@ def create_app(
         except _ScoringOverloadedError:
             return _scoring_overloaded_response()
         return PredictionResponse(
-            model_version=str(loaded.metadata["dataset_fingerprint"])[:12],
+            model_version=_model_version(loaded),
             threshold=applied_threshold,
             model_threshold=loaded.threshold,
             predictions=results,
@@ -1436,7 +1442,7 @@ def create_app(
         except _ScoringOverloadedError:
             return _scoring_overloaded_response()
         return ScoreResponse(
-            model_version=str(loaded.metadata["dataset_fingerprint"])[:12],
+            model_version=_model_version(loaded),
             threshold=applied_threshold,
             model_threshold=loaded.threshold,
             prediction=results[0],
@@ -1505,7 +1511,7 @@ def _evaluate_shadow_traffic(
             )
 
         shadow_event = build_shadow_scoring_audit_event(
-            shadow_model_version=str(shadow_model.metadata.get("dataset_fingerprint", ""))[:12],
+            shadow_model_version=_model_version(shadow_model),
             shadow_dataset_fingerprint=str(shadow_model.metadata.get("dataset_fingerprint", "")),
             evaluated_count=len(primary_results),
             discrepancy_count=discrepancies,
@@ -1590,10 +1596,14 @@ def _model_from_request(request: Request) -> FraudModel:
     return cast(FraudModel, request.app.state.model)
 
 
+def _model_version(model: FraudModel) -> str:
+    return str(model.metadata.get("dataset_fingerprint", ""))[:12]
+
+
 def _shadow_model_version(shadow_model: FraudModel | None) -> str | None:
     if shadow_model is None:
         return None
-    return str(shadow_model.metadata["dataset_fingerprint"])[:12]
+    return _model_version(shadow_model)
 
 
 def _operational_status(request: Request) -> _OperationalStatus:
