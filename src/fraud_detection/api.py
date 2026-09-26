@@ -81,6 +81,7 @@ ENABLE_CHAOS_HEADER_ENVIRONMENT_VARIABLE = "FRAUD_ENABLE_CHAOS_HEADER"
 REQUEST_ID_HEADER = "X-Request-ID"
 PROCESS_TIME_HEADER = "X-Process-Time-Ms"
 MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024
+RATE_LIMIT_TRACKED_KEY_LIMIT = 10_000
 SHADOW_SHUTDOWN_TIMEOUT_SECONDS = 5.0
 OPERATIONAL_PATHS = frozenset({"/health", "/metrics", "/live", "/ready"})
 _REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
@@ -129,11 +130,38 @@ class _RateLimiter:
         self.max_requests = max_requests
         self.window_seconds = window_seconds
         self._requests: dict[str, list[float]] = {}
+        self._last_eviction = 0.0
+
+    @property
+    def tracked_clients(self) -> int:
+        """Number of clients currently tracked in the window."""
+        return len(self._requests)
+
+    def _evict_idle_keys(self, window_start: float) -> None:
+        """Drop clients with no request inside the current window.
+
+        Without this the in-memory window grows with every client address the process
+        ever sees, which is unbounded for a long-lived server.
+        """
+        stale = [
+            key
+            for key, timestamps in self._requests.items()
+            if not timestamps or timestamps[-1] <= window_start
+        ]
+        for key in stale:
+            del self._requests[key]
 
     def check(self, key: str) -> _RateLimitDecision:
         """Record one request and report whether it fits the window."""
         now = time.time()
         window_start = now - self.window_seconds
+        # Swept at most once per window so the scan cannot dominate request latency.
+        if (
+            len(self._requests) >= RATE_LIMIT_TRACKED_KEY_LIMIT
+            and now - self._last_eviction >= self.window_seconds
+        ):
+            self._evict_idle_keys(window_start)
+            self._last_eviction = now
         timestamps = [ts for ts in self._requests.get(key, []) if ts > window_start]
         if len(timestamps) >= self.max_requests:
             self._requests[key] = timestamps

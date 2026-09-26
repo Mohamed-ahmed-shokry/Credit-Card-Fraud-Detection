@@ -38,6 +38,7 @@ from fraud_detection.api import (
     CircuitBreaker,
     _api_key_is_valid,
     _drain_shadow_tasks,
+    _RateLimiter,
     app_from_environment,
     create_app,
 )
@@ -1083,6 +1084,22 @@ def test_rate_limit_middleware_rejects_over_limit(
         assert response3.headers["X-RateLimit-Limit"] == "2"
         assert response3.headers["X-RateLimit-Remaining"] == "0"
         assert int(response3.headers["Retry-After"]) >= 0
+
+
+def test_rate_limiter_evicts_idle_clients(monkeypatch: pytest.MonkeyPatch) -> None:
+    clock = {"now": 1_000.0}
+    monkeypatch.setattr("fraud_detection.api.time.time", lambda: clock["now"])
+    monkeypatch.setattr("fraud_detection.api.RATE_LIMIT_TRACKED_KEY_LIMIT", 5)
+    limiter = _RateLimiter(5, 60.0)
+
+    for index in range(8):
+        limiter.check(f"10.0.0.{index}")
+    # Every client is still inside the window, so nothing may be dropped.
+    assert limiter.tracked_clients == 8
+
+    clock["now"] += 3_600
+    assert limiter.check("10.0.9.9").remaining == 4
+    assert limiter.tracked_clients == 1
 
 
 def test_rate_limit_meters_unauthenticated_requests(
