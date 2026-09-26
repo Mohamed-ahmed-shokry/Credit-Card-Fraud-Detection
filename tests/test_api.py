@@ -12,6 +12,7 @@ from typing import Any, cast
 from unittest.mock import MagicMock
 
 import numpy as np
+import pandas as pd
 import pytest
 from fastapi.testclient import TestClient
 
@@ -543,6 +544,9 @@ def test_api_logs_and_reraises_unhandled_errors(
         threshold = model.threshold
         metadata = model.metadata
 
+        def validate_features(self, features: pd.DataFrame) -> pd.DataFrame:
+            return model.validate_features(features)
+
         def predict_probabilities(self, _features: object) -> None:
             raise RuntimeError("boom")
 
@@ -605,6 +609,9 @@ def test_metrics_endpoint_records_unhandled_errors_as_500(
         feature_names = model.feature_names
         threshold = model.threshold
         metadata = model.metadata
+
+        def validate_features(self, features: pd.DataFrame) -> pd.DataFrame:
+            return model.validate_features(features)
 
         def predict_probabilities(self, _features: object) -> None:
             raise RuntimeError("boom")
@@ -1336,6 +1343,9 @@ def test_fallback_mode_constant_on_model_error(
         feature_names = model.feature_names
         metadata = model.metadata
 
+        def validate_features(self, features: pd.DataFrame) -> pd.DataFrame:
+            return model.validate_features(features)
+
         def predict_probabilities(self, _frame: Any) -> list[float]:
             raise RuntimeError("Underlying estimator corrupted")
 
@@ -1476,6 +1486,69 @@ def test_primary_model_returns_none_probabilities(
         pytest.raises(RuntimeError, match="Primary model returned no probabilities"),
     ):
         test_client.post("/v1/predict", json={"transactions": [rec]})
+
+
+def test_unknown_feature_is_rejected_without_touching_the_circuit_breaker(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, model, dataset = api_context
+    circuit_breaker = CircuitBreaker(failure_threshold=1)
+    app = create_app(
+        model=model,
+        fallback_mode="constant",
+        fallback_score=0.99,
+        circuit_breaker=circuit_breaker,
+    )
+
+    with TestClient(app) as test_client:
+        for _ in range(3):
+            response = test_client.post("/v1/score", json={"transaction": {"NotAFeature": 1.0}})
+            assert response.status_code == 422
+            assert "NotAFeature" in response.json()["detail"]
+
+        health = test_client.get("/health")
+        assert health.json()["status"] == "ready"
+        assert health.json()["circuit_breaker"]["state"] == "closed"
+
+        scored = test_client.post(
+            "/v1/score", json={"transaction": dataset.features.iloc[0].to_dict()}
+        )
+        assert scored.status_code == 200
+        assert scored.json()["fallback_applied"] is False
+
+
+def test_missing_feature_is_rejected_without_touching_the_circuit_breaker(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, model, dataset = api_context
+    partial = dict(dataset.features.iloc[0].drop("V1").to_dict())
+    circuit_breaker = CircuitBreaker(failure_threshold=1)
+    app = create_app(
+        model=model,
+        fallback_mode="constant",
+        fallback_score=0.99,
+        circuit_breaker=circuit_breaker,
+    )
+
+    with TestClient(app) as test_client:
+        response = test_client.post("/v1/predict", json={"transactions": [partial]})
+
+    assert response.status_code == 422
+    assert "V1" in response.json()["detail"]
+    assert circuit_breaker.consecutive_failures == 0
+    assert circuit_breaker.state == "closed"
+
+
+def test_schema_violation_is_rejected_even_when_degraded_mode_is_active(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, model, _ = api_context
+    app = create_app(model=model, fallback_mode="constant", degraded_mode=True)
+
+    with TestClient(app) as test_client:
+        response = test_client.post("/v1/score", json={"transaction": {"NotAFeature": 1.0}})
+
+    assert response.status_code == 422
 
 
 def test_circuit_breaker_unit() -> None:

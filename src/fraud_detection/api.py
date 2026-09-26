@@ -975,6 +975,11 @@ def create_app(
         circuit_breaker: CircuitBreaker | None = None,
     ) -> tuple[float, list[PredictionResult], bool, str | None]:
         """Score transactions with runtime guardrails and resilient degraded-state fallback."""
+        # Reject a request whose feature schema does not match the artifact before any
+        # guardrail state changes: a malformed request is a client error, never a model
+        # failure, so it must not record a circuit-breaker failure or be answered with a
+        # fabricated fallback score.
+        loaded.validate_features(frame)
         applied_threshold = loaded.threshold if threshold is None else threshold
         fallback_applied = False
         fallback_reason: str | None = None
