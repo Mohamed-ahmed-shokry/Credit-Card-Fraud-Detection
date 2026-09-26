@@ -738,6 +738,12 @@ def create_app(
         ["shadow_decision", "primary_decision"],
         registry=metrics_registry,
     )
+    scoring_rejected_counter = Counter(
+        "fraud_scoring_rejected_total",
+        "Total requests rejected before scoring by an optional guardrail.",
+        ["reason"],
+        registry=metrics_registry,
+    )
 
     if resolved_cb is not None:
         # Keep a caller-supplied callback: the metrics counter is chained onto it
@@ -890,6 +896,7 @@ def create_app(
         client_ip = request.client.host if request.client else "unknown"
         decision = rate_limiter.check(client_ip)
         if not decision.allowed:
+            scoring_rejected_counter.labels(reason="rate_limited").inc()
             return JSONResponse(
                 status_code=429,
                 content={"detail": "Rate limit exceeded"},
@@ -1292,6 +1299,7 @@ def create_app(
 
         if scoring_semaphore is not None:
             if scoring_semaphore.locked():
+                scoring_rejected_counter.labels(reason="concurrency_cap").inc()
                 raise _ScoringOverloadedError
             await scoring_semaphore.acquire()
         try:

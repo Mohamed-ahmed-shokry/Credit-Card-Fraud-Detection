@@ -1020,6 +1020,9 @@ def test_concurrency_cap_sheds_load_with_503(
     assert rejected.headers["Retry-After"] == "1"
     assert live.status_code == 200
 
+    metrics = test_client.get("/metrics")
+    assert 'fraud_scoring_rejected_total{reason="concurrency_cap"} 1.0' in metrics.text
+
 
 def test_concurrency_cap_reads_environment(
     api_context: tuple[TestClient, FraudModel, ValidatedDataset],
@@ -1099,6 +1102,9 @@ def test_rate_limit_middleware_rejects_over_limit(
         assert response3.headers["X-RateLimit-Limit"] == "2"
         assert response3.headers["X-RateLimit-Remaining"] == "0"
         assert int(response3.headers["Retry-After"]) >= 0
+
+        metrics = test_client.get("/metrics")
+        assert 'fraud_scoring_rejected_total{reason="rate_limited"} 1.0' in metrics.text
 
 
 def test_rate_limiter_evicts_idle_clients(monkeypatch: pytest.MonkeyPatch) -> None:
