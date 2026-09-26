@@ -13,6 +13,7 @@ from collections.abc import AsyncIterator, Callable, Collection
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from threading import RLock
 from time import perf_counter
 from typing import Annotated, Any, cast
 from uuid import uuid4
@@ -258,6 +259,10 @@ class CircuitBreaker:
         self.latency_budget_ms = latency_budget_ms
         self.half_open_success_threshold = half_open_success_threshold
         self.on_trip = on_trip
+        # Scoring runs concurrently in the threadpool, so every state transition is
+        # guarded: without it a lost update can erase a failure and keep the breaker
+        # closed while the model is failing.
+        self._lock = RLock()
 
         self.state = "closed"
         self.consecutive_failures = 0
@@ -267,6 +272,10 @@ class CircuitBreaker:
 
     def allow_request(self) -> bool:
         """Determine whether an incoming request may proceed to primary model scoring."""
+        with self._lock:
+            return self._allow_request_locked()
+
+    def _allow_request_locked(self) -> bool:
         if self.state == "closed":
             return True
         if self.state == "open":
@@ -285,64 +294,71 @@ class CircuitBreaker:
 
     def record_success(self) -> None:
         """Record a successful primary evaluation within latency budget."""
-        if self.state == "half_open":
-            self.consecutive_successes += 1
-            if self.consecutive_successes >= self.half_open_success_threshold:
-                self.state = "closed"
+        with self._lock:
+            if self.state == "half_open":
+                self.consecutive_successes += 1
+                if self.consecutive_successes >= self.half_open_success_threshold:
+                    self.state = "closed"
+                    self.consecutive_failures = 0
+                    self.consecutive_successes = 0
+                    self.last_state_change = time.time()
+                    logger.info("CircuitBreaker recovered: transitioned from half_open to closed.")
+            elif self.state == "closed":
                 self.consecutive_failures = 0
-                self.consecutive_successes = 0
-                self.last_state_change = time.time()
-                logger.info("CircuitBreaker recovered: transitioned from half_open to closed.")
-        elif self.state == "closed":
-            self.consecutive_failures = 0
 
     def record_failure(self, reason: str = "exception") -> None:
         """Record a failure (exception or latency budget breach)."""
-        now = time.time()
-        self.last_failure_time = now
-        self.consecutive_failures += 1
-        if self.state == "half_open":
-            self.state = "open"
-            self.last_state_change = now
-            if self.on_trip is not None:
-                self.on_trip()
-            logger.warning("CircuitBreaker probe failed (%s); transitioned back to open.", reason)
-        elif self.state == "closed":
-            if self.consecutive_failures >= self.failure_threshold:
+        with self._lock:
+            now = time.time()
+            self.last_failure_time = now
+            self.consecutive_failures += 1
+            if self.state == "half_open":
                 self.state = "open"
                 self.last_state_change = now
                 if self.on_trip is not None:
                     self.on_trip()
                 logger.warning(
-                    "CircuitBreaker tripped to open after %d consecutive failures (%s).",
-                    self.consecutive_failures,
-                    reason,
+                    "CircuitBreaker probe failed (%s); transitioned back to open.", reason
                 )
+            elif self.state == "closed":
+                if self.consecutive_failures >= self.failure_threshold:
+                    self.state = "open"
+                    self.last_state_change = now
+                    if self.on_trip is not None:
+                        self.on_trip()
+                    logger.warning(
+                        "CircuitBreaker tripped to open after %d consecutive failures (%s).",
+                        self.consecutive_failures,
+                        reason,
+                    )
 
     def trip(self) -> None:
         """Force the circuit breaker to OPEN state."""
-        self.state = "open"
-        self.last_failure_time = time.time()
-        self.last_state_change = time.time()
-        if self.on_trip is not None:
-            self.on_trip()
+        with self._lock:
+            self.state = "open"
+            self.last_failure_time = time.time()
+            self.last_state_change = time.time()
+            if self.on_trip is not None:
+                self.on_trip()
 
     def reset(self) -> None:
         """Reset the circuit breaker to CLOSED state."""
-        self.state = "closed"
-        self.consecutive_failures = 0
-        self.consecutive_successes = 0
-        self.last_state_change = time.time()
+        with self._lock:
+            self.state = "closed"
+            self.consecutive_failures = 0
+            self.consecutive_successes = 0
+            self.last_state_change = time.time()
 
     def to_dict(self) -> dict[str, Any]:
         """Return circuit breaker status dictionary."""
-        return {
-            "state": self.state,
-            "consecutive_failures": self.consecutive_failures,
-            "failure_threshold": self.failure_threshold,
-            "recovery_timeout": self.recovery_timeout,
-            "latency_budget_ms": self.latency_budget_ms,
-        }
+        with self._lock:
+            return {
+                "state": self.state,
+                "consecutive_failures": self.consecutive_failures,
+                "failure_threshold": self.failure_threshold,
+                "recovery_timeout": self.recovery_timeout,
+                "latency_budget_ms": self.latency_budget_ms,
+            }
 
 
 class PredictionRequest(BaseModel):

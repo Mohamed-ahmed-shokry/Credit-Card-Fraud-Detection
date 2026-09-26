@@ -1601,6 +1601,31 @@ def test_short_probability_array_activates_the_fallback(
     assert len(response.json()["predictions"]) == 3
 
 
+def test_circuit_breaker_serializes_concurrent_state_transitions() -> None:
+    trip_entered = threading.Event()
+    release_trip = threading.Event()
+
+    def on_trip() -> None:
+        trip_entered.set()
+        assert release_trip.wait(timeout=10), "circuit breaker trip was never released"
+
+    circuit_breaker = CircuitBreaker(failure_threshold=1, on_trip=on_trip)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(circuit_breaker.record_failure)
+        assert trip_entered.wait(timeout=10), "circuit breaker never tripped"
+        second = pool.submit(circuit_breaker.record_failure)
+        time.sleep(0.1)
+        failures_while_tripping = circuit_breaker.consecutive_failures
+        release_trip.set()
+        first.result(timeout=10)
+        second.result(timeout=10)
+
+    # The second failure must not be applied while the first transition is in flight.
+    assert failures_while_tripping == 1
+    assert circuit_breaker.consecutive_failures == 2
+
+
 def test_circuit_breaker_unit() -> None:
     tripped_count = 0
 
