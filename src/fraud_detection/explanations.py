@@ -77,7 +77,7 @@ class TemplateExplanationProvider:
         )
         prob = float(request.probability)
         risk_level = "HIGH" if prob >= 0.7 else "MEDIUM" if prob >= 0.3 else "LOW"
-        decision = "FRAUD" if prob >= request.threshold else "LEGITIMATE"
+        decision = request.decision or ("FRAUD" if prob >= request.threshold else "LEGITIMATE")
 
         text = (
             f"Transaction classified as {decision} "
@@ -112,6 +112,12 @@ class CostController:
         self._tokens_consumed: int = 0
         self._lock = Lock()
 
+    @property
+    def tokens_consumed(self) -> int:
+        """Return total tokens consumed under this controller."""
+        with self._lock:
+            return self._tokens_consumed
+
     def check_and_record(self, tokens_used: int = 0) -> tuple[bool, str | None]:
         """Check whether budget allows the request and record usage."""
         with self._lock:
@@ -122,14 +128,27 @@ class CostController:
                     self._timestamps.popleft()
                 if len(self._timestamps) >= self.max_requests_per_minute:
                     return False, "Rate limit exceeded (requests per minute)"
-                self._timestamps.append(now)
 
+            if self.max_tokens_budget is not None and (
+                (tokens_used > 0 and self._tokens_consumed + tokens_used > self.max_tokens_budget)
+                or (tokens_used == 0 and self._tokens_consumed >= self.max_tokens_budget)
+            ):
+                return False, "Token budget exhausted"
+
+            if self.max_requests_per_minute is not None:
+                self._timestamps.append(now)
             if self.max_tokens_budget is not None:
-                if self._tokens_consumed + tokens_used > self.max_tokens_budget:
-                    return False, "Token budget exhausted"
                 self._tokens_consumed += tokens_used
 
             return True, None
+
+    def record_tokens(self, tokens_used: int) -> bool:
+        """Record token consumption after request execution."""
+        with self._lock:
+            if self.max_tokens_budget is not None:
+                self._tokens_consumed += max(0, tokens_used)
+                return self._tokens_consumed <= self.max_tokens_budget
+            return True
 
 
 class ExternalExplanationProvider:
@@ -144,6 +163,7 @@ class ExternalExplanationProvider:
         redact_inputs: bool = True,
         cost_controller: CostController | None = None,
         fallback_provider: ExplanationProvider | None = None,
+        tokens_per_request: int | None = None,
     ) -> None:
         self._name = name
         self.endpoint_fn = endpoint_fn
@@ -151,6 +171,12 @@ class ExternalExplanationProvider:
         self.redact_inputs = redact_inputs
         self.cost_controller = cost_controller
         self.fallback_provider = fallback_provider or TemplateExplanationProvider()
+        if tokens_per_request is not None:
+            self.tokens_per_request = tokens_per_request
+        elif cost_controller is not None and cost_controller.max_tokens_budget is not None:
+            self.tokens_per_request = 1
+        else:
+            self.tokens_per_request = 0
 
     @property
     def name(self) -> str:
@@ -163,7 +189,9 @@ class ExternalExplanationProvider:
 
         # 1. Cost & budget check
         if self.cost_controller is not None:
-            allowed, reason = self.cost_controller.check_and_record()
+            allowed, reason = self.cost_controller.check_and_record(
+                tokens_used=self.tokens_per_request
+            )
             if not allowed:
                 logger.warning("Cost controller blocked external explanation: %s", reason)
                 fb_res = self.fallback_provider.explain(request)
@@ -187,8 +215,9 @@ class ExternalExplanationProvider:
         if self.redact_inputs:
             payload = redact_data(payload)
 
-        # 3. Call with timeout
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        # 3. Call with timeout without blocking executor shutdown
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        try:
             future = executor.submit(self.endpoint_fn, payload)
             try:
                 explanation_text = future.result(timeout=self.timeout_seconds)
@@ -197,6 +226,9 @@ class ExternalExplanationProvider:
                     explanation=explanation_text,
                     provider=self.name,
                     latency_ms=duration_ms,
+                    tokens_used=self.tokens_per_request
+                    if self.cost_controller is not None
+                    else None,
                     fallback_triggered=False,
                 )
             except concurrent.futures.TimeoutError:
@@ -225,6 +257,8 @@ class ExternalExplanationProvider:
                     fallback_triggered=True,
                     fallback_reason=str(exc),
                 )
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
 
     def explain_batch(self, requests: Sequence[ExplanationRequest]) -> list[ExplanationResult]:
         """Generate explanations for all requests sequentially or via pool."""

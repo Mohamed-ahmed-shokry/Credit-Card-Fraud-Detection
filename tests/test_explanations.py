@@ -267,3 +267,66 @@ def test_api_predict_with_custom_explanation_provider() -> None:
         assert len(preds) == 2
         for p in preds:
             assert p["explanation"].startswith("API Custom:")
+
+
+def test_template_explanation_provider_honors_request_decision() -> None:
+    provider = TemplateExplanationProvider()
+    req = ExplanationRequest(
+        probability=0.2,
+        threshold=0.5,
+        decision="MANUAL_REVIEW",
+        contributions={"V1": 0.1},
+    )
+    res = provider.explain(req)
+    assert "Transaction classified as MANUAL_REVIEW" in res.explanation
+
+
+def test_external_provider_timeout_does_not_block_on_shutdown() -> None:
+    def very_slow_endpoint(_payload: dict[str, Any]) -> str:
+        time.sleep(1.0)
+        return "too late"
+
+    provider = ExternalExplanationProvider(
+        endpoint_fn=very_slow_endpoint,
+        timeout_seconds=0.05,
+    )
+    req = ExplanationRequest(
+        probability=0.9,
+        threshold=0.5,
+        decision="FRAUD",
+        contributions={"V1": 0.5},
+    )
+    t0 = time.perf_counter()
+    res = provider.explain(req)
+    elapsed = time.perf_counter() - t0
+
+    assert res.fallback_triggered is True
+    assert "Timeout after 0.05s" in str(res.fallback_reason)
+    assert elapsed < 0.4  # Must not wait for 1.0s sleep in worker
+
+
+def test_external_provider_enforces_token_budget() -> None:
+    controller = CostController(max_tokens_budget=2)
+    provider = ExternalExplanationProvider(
+        endpoint_fn=lambda _p: "ok",
+        cost_controller=controller,
+        tokens_per_request=1,
+    )
+    req = ExplanationRequest(
+        probability=0.5,
+        threshold=0.5,
+        decision="LEGITIMATE",
+        contributions={"V1": 0.1},
+    )
+
+    res1 = provider.explain(req)
+    assert res1.fallback_triggered is False
+    assert res1.tokens_used == 1
+
+    res2 = provider.explain(req)
+    assert res2.fallback_triggered is False
+    assert res2.tokens_used == 1
+
+    res3 = provider.explain(req)
+    assert res3.fallback_triggered is True
+    assert res3.fallback_reason == "Token budget exhausted"
