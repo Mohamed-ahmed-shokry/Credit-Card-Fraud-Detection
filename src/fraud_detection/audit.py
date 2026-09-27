@@ -365,6 +365,29 @@ def replay_audit_log(
     max_discrepancies_to_record: int = 100,
 ) -> AuditReplayReport:
     """Replay scoring events from a JSONL audit log against a model to detect divergence."""
+    if (
+        isinstance(tolerance, bool)
+        or not isinstance(tolerance, (int, float))
+        or not math.isfinite(tolerance)
+        or tolerance < 0.0
+    ):
+        raise ValueError("tolerance must be a finite, non-negative float.")
+
+    if (
+        isinstance(max_discrepancies_to_record, bool)
+        or not isinstance(max_discrepancies_to_record, int)
+        or max_discrepancies_to_record < 0
+    ):
+        raise ValueError("max_discrepancies_to_record must be a non-negative integer.")
+
+    if threshold is not None and (
+        isinstance(threshold, bool)
+        or not isinstance(threshold, (int, float))
+        or not math.isfinite(threshold)
+        or not (0.0 <= threshold <= 1.0)
+    ):
+        raise ValueError("threshold must be a finite float between 0.0 and 1.0.")
+
     if isinstance(model, (str, Path)):
         from fraud_detection.model import load_model
 
@@ -423,6 +446,9 @@ def replay_audit_log(
             inline_features = payload.get("features")
             frame: pd.DataFrame
             if isinstance(inline_features, list) and inline_features:
+                if len(inline_features) != len(logged_predictions):
+                    skipped_events += 1
+                    continue
                 frame = pd.DataFrame(inline_features)
             elif external_df is not None:
                 n_rows = len(logged_predictions)
@@ -447,21 +473,44 @@ def replay_audit_log(
                 skipped_events += 1
                 continue
 
-            applied_thresh = (
-                threshold
-                if threshold is not None
-                else float(payload.get("threshold", getattr(model, "threshold", 0.5)))
-            )
+            if len(probs) != len(logged_predictions):
+                skipped_events += 1
+                continue
+
+            if threshold is not None:
+                applied_thresh = float(threshold)
+            else:
+                raw_thresh = payload.get("threshold")
+                if raw_thresh is None:
+                    raw_thresh = getattr(model, "threshold", 0.5)
+                if raw_thresh is None:
+                    raw_thresh = 0.5
+                try:
+                    applied_thresh = float(raw_thresh)
+                    if not math.isfinite(applied_thresh) or not (0.0 <= applied_thresh <= 1.0):
+                        applied_thresh = 0.5
+                except (TypeError, ValueError):
+                    applied_thresh = 0.5
+
             decisions = np.asarray(probs) >= applied_thresh
             event_id = str(event_dict.get("event_id", f"event_{line_num}"))
 
             for idx, (pred_dict, prob, dec) in enumerate(
-                zip(logged_predictions, probs, decisions, strict=False)
+                zip(logged_predictions, probs, decisions, strict=True)
             ):
                 if not isinstance(pred_dict, dict):
                     continue
+                raw_prob = pred_dict.get("fraud_probability")
+                if raw_prob is None:
+                    continue
+                try:
+                    logged_prob = float(raw_prob)
+                    if not math.isfinite(logged_prob):
+                        continue
+                except (TypeError, ValueError):
+                    continue
+
                 total_transactions += 1
-                logged_prob = float(pred_dict.get("fraud_probability", 0.0))
                 logged_dec = bool(pred_dict.get("is_fraud", False))
                 prob_float = float(prob)
                 dec_bool = bool(dec)
@@ -499,7 +548,7 @@ def replay_audit_log(
 
     mean_abs_diff = (sum_abs_diff / total_transactions) if total_transactions > 0 else 0.0
 
-    if replayed_events == 0:
+    if replayed_events == 0 or total_transactions == 0:
         status = "EMPTY"
     elif score_discrepancies > 0 or decision_flips > 0:
         status = "DIVERGENT"

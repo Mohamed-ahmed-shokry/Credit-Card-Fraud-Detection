@@ -7,6 +7,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from fraud_detection import __version__
 from fraud_detection.audit import (
     AuditEvent,
@@ -448,3 +450,91 @@ def test_replay_audit_log_skip_edge_cases(tmp_path: Path) -> None:
     )
     report_fail = replay_audit_log(fail_log, FailingModel())
     assert report_fail.skipped_events == 1
+
+
+def test_replay_audit_log_validation_and_robustness(tmp_path: Path) -> None:
+    log_file = tmp_path / "robust.jsonl"
+    log_file.write_text("", encoding="utf-8")
+    model = DummyFraudModel(threshold=0.5, probs=[0.2])
+
+    # Validation errors on inputs
+    with pytest.raises(ValueError, match="tolerance must be a finite, non-negative float"):
+        replay_audit_log(log_file, model, tolerance=float("nan"))
+    with pytest.raises(ValueError, match="tolerance must be a finite, non-negative float"):
+        replay_audit_log(log_file, model, tolerance=-0.01)
+    with pytest.raises(ValueError, match="tolerance must be a finite, non-negative float"):
+        replay_audit_log(log_file, model, tolerance=True)  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="max_discrepancies_to_record must be"):
+        replay_audit_log(log_file, model, max_discrepancies_to_record=-1)
+    with pytest.raises(ValueError, match="max_discrepancies_to_record must be"):
+        replay_audit_log(log_file, model, max_discrepancies_to_record=True)  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match=r"threshold must be a finite float between 0\.0 and 1\.0"):
+        replay_audit_log(log_file, model, threshold=1.5)
+    with pytest.raises(ValueError, match=r"threshold must be a finite float between 0\.0 and 1\.0"):
+        replay_audit_log(log_file, model, threshold=-0.1)
+
+    # Payload with null threshold and non-numeric probabilities
+    events = [
+        # Null threshold in payload, valid predictions
+        json.dumps(
+            {
+                "event_type": "scoring",
+                "payload": {
+                    "threshold": None,
+                    "features": [{"V1": 1.0}],
+                    "predictions": [{"fraud_probability": 0.2, "is_fraud": False}],
+                },
+            }
+        ),
+        # Non-numeric probability should be skipped gracefully
+        json.dumps(
+            {
+                "event_type": "scoring",
+                "payload": {
+                    "threshold": 0.5,
+                    "features": [{"V1": 1.0}],
+                    "predictions": [{"fraud_probability": "not-numeric", "is_fraud": False}],
+                },
+            }
+        ),
+        # Length mismatch between features (2) and predictions (1) should skip event
+        json.dumps(
+            {
+                "event_type": "scoring",
+                "payload": {
+                    "threshold": 0.5,
+                    "features": [{"V1": 1.0}, {"V1": 2.0}],
+                    "predictions": [{"fraud_probability": 0.2, "is_fraud": False}],
+                },
+            }
+        ),
+    ]
+    log_file.write_text("\n".join(events) + "\n", encoding="utf-8")
+    report = replay_audit_log(log_file, model)
+    assert report.total_events == 3
+    assert report.scoring_events == 3
+    assert report.replayed_events == 2
+    assert report.skipped_events == 1  # length mismatch skipped
+    assert report.total_transactions == 1  # only first event had 1 valid transaction
+    assert report.status == "MATCH"
+
+    # When zero transactions are evaluated, status must be EMPTY
+    empty_log = tmp_path / "empty_tx.jsonl"
+    empty_log.write_text(
+        json.dumps(
+            {
+                "event_type": "scoring",
+                "payload": {
+                    "features": [{"V1": 1.0}],
+                    "predictions": [{"fraud_probability": "corrupt", "is_fraud": False}],
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    report_empty = replay_audit_log(empty_log, model)
+    assert report_empty.total_transactions == 0
+    assert report_empty.status == "EMPTY"
