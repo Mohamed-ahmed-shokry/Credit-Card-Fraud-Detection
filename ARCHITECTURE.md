@@ -179,10 +179,12 @@ For operational resiliency and safe challenger evaluation:
   `failure_threshold` or execution times exceeding `latency_budget_ms` trip the
   breaker from `CLOSED` to `OPEN`, failing over immediately to fallback policies
   until `recovery_timeout` elapses, after which a `HALF_OPEN` probe test determines
-  recovery. Breaker state is tracked via `/health` telemetry and Prometheus
+  recovery. State transitions are synchronized with a lock across concurrent threadpool
+  workers. Breaker state is tracked via `/health` telemetry and Prometheus
   (`fraud_circuit_breaker_state`).
 - Asynchronous traffic shadowing evaluates transactions against `shadow_model_path`
-  in the background without blocking or delaying primary client responses, recording
+  on detached background tasks outside the ASGI request lifecycle without blocking,
+  delaying primary client responses, or holding connections open, recording
   prediction discrepancies and latency metrics (`fraud_shadow_evaluations_total`)
   to structured audit logs.
 
@@ -213,7 +215,12 @@ the request and response, while the tuned artifact threshold remains visible as
   detecting distribution shifts early without waiting for full batch cycles.
 - Streaming profile accumulation updates feature distributions incrementally
   using Welford's algorithm, keeping memory constant regardless of stream length.
-- Traffic shadowing never blocks, delays, or fails primary scoring responses.
+- Traffic shadowing runs on detached tasks outside the ASGI request lifecycle,
+  never blocking, delaying, or failing primary scoring responses.
+- Caller-input schema mismatches return `422` immediately and do not affect
+  circuit-breaker health or trip fallback policies.
+- Prometheus request metrics are labeled with matched route templates, collapsing
+  undeclared paths into `'unmatched'` to prevent label cardinality explosion.
 - Circuit breakers fail fast to safe deterministic fallback policies when upstream
   or model degradations occur.
 - Trace propagation preserves a valid incoming W3C trace ID while creating a new
