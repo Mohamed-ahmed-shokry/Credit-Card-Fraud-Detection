@@ -8,6 +8,14 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- Serving rejection metrics: added `fraud_scoring_rejected_total` Prometheus counter
+  labeled by reason (`rate_limited`, `concurrency_capped`).
+- Chaos simulation opt-in: `FRAUD_ENABLE_CHAOS_HEADER` / `enable_chaos_header`
+  explicitly enables `X-Simulate-Degraded` request header processing (default off).
+- Container smoke testing: CI now validates `/v1/predict`, `/v1/score`, and `422`
+  schema rejection against the live Docker container image.
+- Configurable circuit breaker recovery: added `FRAUD_CIRCUIT_BREAKER_RECOVERY_TIMEOUT`
+  environment variable resolution alongside failures and reset timeout.
 - Optional scoring overload protection: `max_concurrent_scoring` /
   `FRAUD_MAX_CONCURRENT_SCORING` / `serve --max-concurrent-scoring` shed excess
   `/v1/predict` and `/v1/score` traffic with `503` and `Retry-After` while
@@ -239,6 +247,14 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- Prometheus request metrics now use matched route templates (e.g. `/v1/predict`,
+  `/v1/score`, `/health`) and group undeclared routes under `'unmatched'`, avoiding
+  unbounded metric label cardinality.
+- The optional rate-limiting middleware now runs outside API-key verification to meter
+  unauthenticated requests, and evicts stale client tracking keys to bound memory usage.
+- Background traffic shadowing now executes on detached, reference-held tasks outside
+  the ASGI request lifecycle, preventing shadow execution from delaying primary responses
+  or holding client connections open.
 - The development HTTP test client constraint now requires `httpx2>=2.12`,
   avoiding the vulnerable 2.9.x/httpcore2 dependency line reported by
   `pip-audit`.
@@ -271,6 +287,21 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- Schema-invalid scoring requests (unknown, missing, or malformed features) return
+  `422` immediately and no longer record circuit-breaker failures or trip fallback scoring.
+- Estimators that violate scoring contracts (e.g. missing or mismatched probability arrays)
+  now route through configured fallback policies and record breaker failures instead of
+  raising unhandled `500` errors.
+- Unhandled `500` server errors now return structured JSON responses with `X-Request-ID`,
+  `X-Process-Time-Ms`, and `traceparent` headers.
+- `GET /health` returns `503 Service Unavailable` with `{"detail": "Model not loaded."}`
+  when no model is loaded, matching `GET /ready`.
+- Circuit breaker state transitions are protected with a reentrant lock against race
+  conditions under concurrent worker execution.
+- Injected circuit breakers properly apply `latency_budget_ms` and chain caller-supplied
+  `on_trip` callbacks alongside Prometheus metrics updates.
+- Starting serving in `degraded_mode` with `fallback_mode="raise"` now fails fast with a
+  clear configuration error instead of silently running without a fallback policy.
 - `/v1/predict` and `/v1/score` now run model inference and audit-sink writes
   on the Starlette threadpool instead of the event loop, so slow scoring
   batches no longer freeze probes, middleware, and concurrent requests.
