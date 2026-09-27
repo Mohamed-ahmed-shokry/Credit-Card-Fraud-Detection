@@ -532,4 +532,3 @@ def test_streaming_profile_from_dict_validation() -> None:
     bad["features"]["x"]["m2"] = -1.0
     with pytest.raises(DriftError, match=r"m2 for feature 'x' must be a finite"):
         StreamingProfile.from_dict(bad)
-
