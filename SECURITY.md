@@ -72,6 +72,7 @@ evidence; they do not make an untrusted `model.joblib` safe to deserialize.
 
 ### Key rotation and startup admission
 
+Initial trust bundles are created from public keys using `generate-trust-bundle`.
 Trust bundles contain the public key ID, raw public key, and lifecycle status for
 each verification key. Rotate in two stages: add the replacement key while the
 old key remains active, deploy the updated bundle, move signing to the replacement,

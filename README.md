@@ -431,6 +431,16 @@ digest or `PASSED` status checks. The private key is never embedded in the attes
 or printed by the CLI. Keep it in a restricted CI secret store, rotate it through an
 operator-controlled process, and pin the public key in deployment configuration.
 
+### Create a trust bundle
+
+Combine one or more public keys into an immutable trust bundle for deployment verification:
+
+```bash
+fraud-detect generate-trust-bundle \
+  --output config/trust-bundle.json \
+  --public-key config/release-signing-public.pem
+```
+
 ### Rotate verification keys
 
 Keep the old key active while introducing the replacement, then revoke the old key
@@ -930,9 +940,9 @@ For automated MLOps workflows, `retrain` automates challenger training, off-samp
 ```bash
 fraud-detect retrain artifacts/champion data/fresh_batch.csv \
   --output artifacts/challenger \
-  --metric roc_auc \
+  --metric auprc \
   --min-gain 0.005 \
-  --output-report reports/retrain_decision.json \
+  --report-output reports/retrain_decision.json \
   --promote \
   --fail-on-rejection
 ```
@@ -1060,10 +1070,10 @@ Inject controlled synthetic shifts (mean offsets, variance scaling, anomaly spik
 ```bash
 fraud-detect simulate-drift data/demo.csv \
   --output data/chaos_drifted.csv \
-  --feature Amount \
+  --features Amount \
   --mean-offset 50.0 \
   --variance-scale 2.0 \
-  --anomaly-rate 0.05
+  --anomaly-fraction 0.05
 ```
 
 ## Reference label-delay analysis
