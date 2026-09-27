@@ -349,3 +349,21 @@ def test_compliance_command_manifest_error_cases(tmp_path: Path) -> None:
     )
     assert res_no.exit_code == 2
     assert "must be a JSON object" in res_no.stderr
+
+
+def test_compliance_report_escapes_drift_status_and_classes() -> None:
+    bundle = _bundle()
+    bundle["drift"]["overall_status"] = "<script>alert('pwned')</script>"
+    bundle["drift"]["features"] = [
+        {
+            "feature": "V1",
+            "psi": 0.35,
+            "status": '"><script>alert("feature")</script>',
+        }
+    ]
+    html = render_compliance_report(bundle)
+    assert "<script>" not in html
+    assert "&lt;script&gt;alert(&#x27;pwned&#x27;)&lt;/script&gt;" in html
+    assert "&lt;script&gt;alert(&quot;feature&quot;)&lt;/script&gt;" in html
+    # CSS class should be sanitized to alphanumeric and hyphens/underscores
+    assert 'class="scriptalertfeaturescript"' in html

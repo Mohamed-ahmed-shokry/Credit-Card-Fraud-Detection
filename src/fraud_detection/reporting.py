@@ -9,6 +9,7 @@ the Python standard library so the runtime and packaging stay dependency-free.
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from html import escape
@@ -403,7 +404,7 @@ def _drift_section(bundle: Mapping[str, Any]) -> str:
         [
             [
                 _fmt(drift.get("rows")),
-                status,
+                escape(status),
                 _fmt(drift.get("mean_psi")),
                 _fmt(drift.get("max_psi")),
             ]
@@ -423,14 +424,15 @@ def _drift_section(bundle: Mapping[str, Any]) -> str:
                 [
                     _fmt(item.get("feature")),
                     _fmt(item.get("psi")),
-                    feature_status,
+                    escape(feature_status),
                 ]
             )
-            feature_classes.append(feature_status)
+            safe_cls = re.sub(r"[^a-zA-Z0-9_\-]", "", feature_status)
+            feature_classes.append(safe_cls)
     features_table = _table(
         ["Feature", "PSI", "Status"],
         [
-            [cell, row[1], f'<span class="{cls}">{escape(cls)}</span>']
+            [cell, row[1], f'<span class="{cls}">{row[2]}</span>']
             for cell, row, cls in zip(
                 [row[0] for row in feature_rows], feature_rows, feature_classes, strict=True
             )
