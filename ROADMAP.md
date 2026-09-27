@@ -947,41 +947,89 @@ robustness, and CLI documentation errors) are recorded as Phase 24.
   and linting passed; strict mypy passed across 14 source files; package build and
   Twine checks passed; CI container smoke checks added.
 
-## Phase 24 — Evidence Rendering, Replay, and Documentation Correctness (Proposed)
+## Phase 24 — Evidence Rendering, Replay, and Documentation Correctness (In progress)
 
-Recorded from the same audit that scoped Phase 23, so the verified findings are
-not lost. Every item below was reproduced against the current code.
+### Objective
 
-- **Compliance report escaping** — `reporting.py` interpolates drift
-  `overall_status` and the per-feature status class into HTML unescaped, so a
-  bundle carrying crafted status text injects script or event-handler markup,
-  contradicting README's "escapes evidence values before rendering".
-- **Audit replay validation** — `replay_audit_log` does not validate `tolerance`
-  or `max_discrepancies_to_record` (`tolerance=nan` silently disables score
-  comparison), crashes on a non-numeric `fraud_probability` or a null threshold,
-  silently truncates mismatched feature/prediction lists, and reports
-  `status="MATCH"` when zero transactions were compared.
-- **Explanation-provider timeouts** — `timeout_seconds` does not bound latency
-  because the threadpool context manager waits on shutdown, contradicting
-  README's "strict timeouts"; the `CostController` token budget is never
-  enforced, and `ExplanationRequest.decision` is ignored by the template
-  provider.
-- **Artifact validation robustness** — `validate_artifact` can raise instead of
-  reporting on a corrupted `model.joblib` with a matching manifest digest, and
-  raises `AttributeError` when `manifest["files"]` is a list.
-- **Streaming profiler validation** — `StreamingProfile.from_dict` performs no
-  shape checks (missing `edges`, mismatched `counts` length, non-finite `mean`),
-  and `update` commits earlier features when a later feature fails validation.
-- **Local explanation consistency** — `explain_local` is batch-dependent for
-  estimators without native importances, and for the default sigmoid-calibrated
-  model the contributions do not sum to the served score's log-odds.
-- **Documentation errors** — the README `retrain`, and `simulate-drift` examples
-  use options that do not exist; `generate-trust-bundle` is undocumented, so the
-  key-rotation runbook cannot be followed; `retrain --promote` reports
-  `PROMOTED` while silently not promoting when the champion is a file.
-- **Test debt** — `cli.py` sits at 92% coverage with untested failure paths in
-  `retrain`, `export-edge --max-error`, and the signing/attestation commands,
-  against CONTRIBUTING's rule that tests must cover failure behavior.
+Eliminate silent failures, security escaping vulnerabilities, latency leaks, and
+documentation discrepancies across compliance evidence rendering, historical audit
+log replay, explanation providers, artifact validation, streaming profiling, and CLI
+MLOps workflows. Ensure all failure paths are reported honestly, contracts are strictly
+enforced, and operational documentation matches the code.
+
+### Scope
+
+- **Compliance report escaping** — HTML-escape `overall_status` in drift summary tables
+  and strictly sanitize/escape per-feature status classes on drift badge tags in
+  `reporting.py`, preventing HTML/script injection from crafted model metadata or
+  evidence bundles.
+- **Audit replay validation** — validate `tolerance` (finite, >= 0) and
+  `max_discrepancies_to_record` (>= 0) in `replay_audit_log`; handle non-numeric or
+  missing probabilities and null thresholds defensively without crashing; verify
+  feature and prediction list lengths match strictly to prevent silent truncation;
+  and report `status="EMPTY"` when zero transactions are evaluated.
+- **Explanation-provider timeouts and contracts** — prevent the threadpool executor in
+  `ExternalExplanationProvider.explain()` from blocking on shutdown upon timeout by
+  terminating without waiting (`wait=False, cancel_futures=True`); enforce token
+  consumption tracking in `CostController`; and honor caller-specified
+  `ExplanationRequest.decision` in `TemplateExplanationProvider`.
+- **Artifact validation robustness** — gracefully catch unpickling errors (including
+  `_pickle.UnpicklingError` and corrupted pickle payloads) during `validate_artifact()`
+  and report them as validation errors instead of raising unhandled exceptions; validate
+  that `manifest["files"]` is a mapping before performing key lookups.
+- **Streaming profiler validation and atomicity** — pre-validate all features and compute
+  distributions before committing state in `StreamingProfile.update()`, guaranteeing
+  that invalid batches leave the profile state completely unmodified; validate schema
+  structure, edge sorting, count lengths, and finite statistics in `from_dict()`.
+- **Local explanation consistency** — use baseline training feature distributions
+  (from feature profiles or scaler statistics) rather than transient batch means for
+  tree estimators in `_explain_local_importance()`, making per-transaction contributions
+  batch-invariant; adjust sigmoid-calibrated logistic contributions to reflect the
+  calibrator's slope.
+- **Retrain champion promotion safety and README corrections** — validate that the champion
+  is an artifact directory before retraining with `--promote` (refusing promotion with
+  an actionable error when champion is a standalone file); correct README examples for
+  `retrain` (`--report-output`, valid `--metric` options: `auprc`, `f1`, `expected_cost`)
+  and `simulate-drift` (`--features`, `--anomaly-fraction`); and document
+  `generate-trust-bundle` for initial key bundle creation.
+- **Test debt reduction in CLI** — add comprehensive CLI tests covering untested failure
+  paths in `retrain`, `export-edge --max-error`, `generate-trust-bundle`,
+  `rotate-trust-bundle`, and `verify-attestation`.
+
+### Acceptance criteria
+
+- `render_compliance_report()` escapes `overall_status` and sanitizes/escapes status CSS
+  classes, neutralizing injected script and HTML markup in evidence bundles.
+- `replay_audit_log()` raises `ValueError` for NaN or negative `tolerance` or negative
+  discrepancy caps; gracefully handles missing/null thresholds and non-numeric
+  probabilities; raises or skips mismatched feature/prediction counts without silent
+  truncation; and returns `status="EMPTY"` when no transactions are evaluated.
+- `ExternalExplanationProvider.explain()` returns within `timeout_seconds` plus worker
+  spawn overhead without waiting for long-running functions on shutdown; `CostController`
+  enforces token budgets; and `TemplateExplanationProvider` preserves custom decisions.
+- `validate_artifact()` returns `valid=False` with descriptive errors for corrupt model
+  files and list-shaped manifest files without crashing.
+- `StreamingProfile.update()` is atomic: an invalid feature in a batch raises `DriftError`
+  and leaves all feature counts and moments unchanged; `from_dict()` validates schema
+  integrity and finite values.
+- `FraudModel.explain_local()` produces identical contributions for a transaction
+  regardless of batch size or neighboring transactions; calibrated logistic contributions
+  incorporate calibration slope.
+- `fraud-detect retrain --promote` fails fast with an actionable error if champion is not
+  an artifact directory; README examples for `retrain` and `simulate-drift` execute
+  successfully; and `generate-trust-bundle` is documented in README and SECURITY.
+- `src/fraud_detection/cli.py` branch coverage reaches >= 97%, and full test suite,
+  Ruff checks/formatting, and strict mypy pass with zero findings.
+
+### Explicit exclusions
+
+This phase does not replace Platt scaling with other calibration algorithms, add
+remote distributed audit replay engines or external database storage, change
+the package version, or publish a release.
+
+### Delivery record
+
+Filled in as phase increments complete.
 
 ## Contributing to the roadmap
 
