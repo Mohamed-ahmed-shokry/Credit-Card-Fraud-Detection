@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from copy import deepcopy
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -403,3 +405,131 @@ def test_streaming_profile_empty_to_reference_profile() -> None:
     assert len(ref["feature_a"]["proportions"]) == 3
     assert pytest.approx(sum(ref["feature_a"]["proportions"])) == 1.0
     assert ref["feature_a"]["standard_deviation"] == 0.0
+
+
+def test_streaming_profile_update_atomicity() -> None:
+    sp = StreamingProfile({"a": [10.0, 20.0], "b": [1.0, 2.0]})
+    sp.update(pd.DataFrame({"a": [5.0], "b": [1.5]}))
+    assert sp.total_counts["a"] == 1
+    assert sp.total_counts["b"] == 1
+    state_before = sp.to_dict()
+
+    # Attempt update with invalid second feature (NaN)
+    with pytest.raises(DriftError, match="non-finite values"):
+        sp.update(pd.DataFrame({"a": [15.0], "b": [np.nan]}))
+
+    assert sp.to_dict() == state_before
+
+    # Attempt update with invalid second feature (non-numeric)
+    with pytest.raises(DriftError, match="must be numeric"):
+        sp.update(pd.DataFrame({"a": [15.0], "b": ["not_a_number"]}))
+
+    assert sp.to_dict() == state_before
+
+
+def test_streaming_profile_from_dict_validation() -> None:
+    valid_state = {
+        "features": {
+            "x": {
+                "edges": [10.0, 20.0],
+                "counts": [1, 2, 3],
+                "total_count": 6,
+                "mean": 15.0,
+                "m2": 4.5,
+            }
+        }
+    }
+    sp = StreamingProfile.from_dict(valid_state)
+    assert sp.total_counts["x"] == 6
+
+    # 1. Not a mapping
+    with pytest.raises(DriftError, match="Invalid profiler state dictionary"):
+        StreamingProfile.from_dict("not-a-dict")  # type: ignore[arg-type]
+
+    # 2. Features not a mapping
+    with pytest.raises(DriftError, match="must be a non-empty mapping"):
+        StreamingProfile.from_dict({"features": ["not-a-dict"]})
+
+    # 3. Feature name empty
+    with pytest.raises(DriftError, match="non-empty strings"):
+        StreamingProfile.from_dict({"features": {"": valid_state["features"]["x"]}})
+
+    # 4. Feature spec not a mapping
+    with pytest.raises(DriftError, match="must be a mapping"):
+        StreamingProfile.from_dict({"features": {"x": "not-a-map"}})
+
+    # 5. Missing required key
+    bad = deepcopy(valid_state)
+    del bad["features"]["x"]["counts"]
+    with pytest.raises(DriftError, match=r"missing required key: 'counts'"):
+        StreamingProfile.from_dict(bad)
+
+    # 6. Edges not a list or invalid numbers
+    bad = deepcopy(valid_state)
+    bad["features"]["x"]["edges"] = "not-a-list"
+    with pytest.raises(DriftError, match="must be a list"):
+        StreamingProfile.from_dict(bad)
+
+    bad = deepcopy(valid_state)
+    bad["features"]["x"]["edges"] = ["str", "edges"]
+    with pytest.raises(DriftError, match="must contain numbers"):
+        StreamingProfile.from_dict(bad)
+
+    bad = deepcopy(valid_state)
+    bad["features"]["x"]["edges"] = [20.0, 10.0]
+    with pytest.raises(DriftError, match="strictly increasing"):
+        StreamingProfile.from_dict(bad)
+
+    # 7. Counts not a list, length mismatch, negative, or bool
+    bad = deepcopy(valid_state)
+    bad["features"]["x"]["counts"] = "not-a-list"
+    with pytest.raises(DriftError, match=r"Counts for feature 'x' must be a list"):
+        StreamingProfile.from_dict(bad)
+
+    bad = deepcopy(valid_state)
+    bad["features"]["x"]["counts"] = [1, 2]
+    with pytest.raises(DriftError, match=r"Counts length for feature 'x' \(2\) must equal"):
+        StreamingProfile.from_dict(bad)
+
+    bad = deepcopy(valid_state)
+    bad["features"]["x"]["counts"] = [1, -2, 7]
+    with pytest.raises(DriftError, match="must be non-negative integers"):
+        StreamingProfile.from_dict(bad)
+
+    bad = deepcopy(valid_state)
+    bad["features"]["x"]["counts"] = [1, True, 4]
+    with pytest.raises(DriftError, match="must be non-negative integers"):
+        StreamingProfile.from_dict(bad)
+
+    # 8. total_count bool, negative, or mismatch with sum(counts)
+    bad = deepcopy(valid_state)
+    bad["features"]["x"]["total_count"] = True
+    with pytest.raises(DriftError, match=r"total_count for feature 'x' must be an integer"):
+        StreamingProfile.from_dict(bad)
+
+    bad = deepcopy(valid_state)
+    bad["features"]["x"]["total_count"] = -1
+    with pytest.raises(DriftError, match=r"total_count for feature 'x' must be non-negative"):
+        StreamingProfile.from_dict(bad)
+
+    bad = deepcopy(valid_state)
+    bad["features"]["x"]["total_count"] = 999
+    with pytest.raises(DriftError, match=r"total_count \(999\) for feature 'x' does not match"):
+        StreamingProfile.from_dict(bad)
+
+    # 9. mean and m2 validation
+    bad = deepcopy(valid_state)
+    bad["features"]["x"]["mean"] = "not-a-number"
+    with pytest.raises(DriftError, match=r"mean and m2 for feature 'x' must be numbers"):
+        StreamingProfile.from_dict(bad)
+
+    bad = deepcopy(valid_state)
+    bad["features"]["x"]["mean"] = float("nan")
+    with pytest.raises(DriftError, match=r"mean for feature 'x' must be finite"):
+        StreamingProfile.from_dict(bad)
+
+    bad = deepcopy(valid_state)
+    bad["features"]["x"]["m2"] = -1.0
+    with pytest.raises(DriftError, match=r"m2 for feature 'x' must be a finite"):
+        StreamingProfile.from_dict(bad)
+

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from typing import Any, cast
 
@@ -226,11 +227,16 @@ class StreamingProfile:
             missing = sorted(expected - provided)
             raise DriftError(f"Streaming batch is missing expected features: {missing}")
 
-        for feature, edges_list in self.feature_edges.items():
+        # Pre-validate all features before mutating state (atomicity guarantee)
+        validated_values: dict[str, np.ndarray] = {}
+        for feature in self.feature_edges:
             values = _numeric_feature_values(frame, column_lookup[feature], context="Streaming")
             if not np.isfinite(values).all():
                 raise DriftError(f"Streaming feature {feature!r} contains non-finite values.")
+            validated_values[feature] = values
 
+        for feature, edges_list in self.feature_edges.items():
+            values = validated_values[feature]
             full_edges = np.concatenate(([-np.inf], edges_list, [np.inf]))
             batch_counts, _ = np.histogram(values, bins=full_edges)
             self.counts[feature] += batch_counts
@@ -284,23 +290,85 @@ class StreamingProfile:
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> StreamingProfile:
+    def from_dict(cls, data: dict[str, Any] | Mapping[str, Any]) -> StreamingProfile:
         """Restore profiler state from a serialized checkpoint."""
-        if not isinstance(data, dict) or "features" not in data:
+        if not isinstance(data, Mapping) or "features" not in data:
             raise DriftError("Invalid profiler state dictionary: missing 'features'.")
         raw_features = data["features"]
-        if not isinstance(raw_features, dict) or not raw_features:
+        if not isinstance(raw_features, Mapping) or not raw_features:
             raise DriftError("Profiler state 'features' must be a non-empty mapping.")
 
-        feature_edges = {
-            feature: [float(e) for e in spec["edges"]] for feature, spec in raw_features.items()
-        }
-        instance = cls(feature_edges)
+        feature_edges: dict[str, list[float]] = {}
+        validated_specs: dict[str, tuple[list[int], int, float, float]] = {}
+
         for feature, spec in raw_features.items():
-            instance.counts[feature] = np.asarray(spec["counts"], dtype=np.int64)
-            instance.total_counts[feature] = int(spec["total_count"])
-            instance.means[feature] = float(spec["mean"])
-            instance.m2s[feature] = float(spec["m2"])
+            if not isinstance(feature, str) or not feature:
+                raise DriftError("Feature names must be non-empty strings.")
+            if not isinstance(spec, Mapping):
+                raise DriftError(f"Profiler state for feature {feature!r} must be a mapping.")
+
+            for req_key in ("edges", "counts", "total_count", "mean", "m2"):
+                if req_key not in spec:
+                    raise DriftError(
+                        f"Profiler state for feature {feature!r} missing required key: {req_key!r}."
+                    )
+
+            edges = spec["edges"]
+            if not isinstance(edges, list):
+                raise DriftError(f"Edges for feature {feature!r} must be a list.")
+            try:
+                edges_list = [float(e) for e in edges]
+            except (TypeError, ValueError) as exc:
+                raise DriftError(f"Edges for feature {feature!r} must contain numbers.") from exc
+            interior = np.asarray(edges_list, dtype=float)
+            if not np.isfinite(interior).all() or np.any(np.diff(interior) <= 0):
+                raise DriftError(
+                    f"Bin edges for feature {feature!r} must be finite and strictly increasing."
+                )
+
+            counts = spec["counts"]
+            if not isinstance(counts, list):
+                raise DriftError(f"Counts for feature {feature!r} must be a list.")
+            if len(counts) != len(edges_list) + 1:
+                raise DriftError(
+                    f"Counts length for feature {feature!r} ({len(counts)}) "
+                    f"must equal len(edges) + 1 ({len(edges_list) + 1})."
+                )
+            if any(isinstance(c, bool) or not isinstance(c, int) or c < 0 for c in counts):
+                raise DriftError(f"Counts for feature {feature!r} must be non-negative integers.")
+
+            total_count = spec["total_count"]
+            if isinstance(total_count, bool) or not isinstance(total_count, int):
+                raise DriftError(f"total_count for feature {feature!r} must be an integer.")
+            if total_count < 0:
+                raise DriftError(f"total_count for feature {feature!r} must be non-negative.")
+            if total_count != sum(counts):
+                raise DriftError(
+                    f"total_count ({total_count}) for feature {feature!r} "
+                    f"does not match sum of counts ({sum(counts)})."
+                )
+
+            try:
+                mean = float(spec["mean"])
+                m2 = float(spec["m2"])
+            except (TypeError, ValueError) as exc:
+                raise DriftError(f"mean and m2 for feature {feature!r} must be numbers.") from exc
+            if not np.isfinite(mean):
+                raise DriftError(f"mean for feature {feature!r} must be finite.")
+            if not np.isfinite(m2) or m2 < 0.0:
+                raise DriftError(
+                    f"m2 for feature {feature!r} must be a finite non-negative number."
+                )
+
+            feature_edges[feature] = edges_list
+            validated_specs[feature] = (counts, total_count, mean, m2)
+
+        instance = cls(feature_edges)
+        for feature, (counts_list, total_count, mean, m2) in validated_specs.items():
+            instance.counts[feature] = np.asarray(counts_list, dtype=np.int64)
+            instance.total_counts[feature] = total_count
+            instance.means[feature] = mean
+            instance.m2s[feature] = m2
         return instance
 
 
