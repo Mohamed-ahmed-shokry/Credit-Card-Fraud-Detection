@@ -20,7 +20,7 @@ Status legend: `Proposed` (not started), `In progress`, `Done`.
 ## Current state
 
 The project is a production-grade reference implementation with the implementation work in
-Phases 2 through 22 complete. Phase 1's workflows are in place, but the first
+Phases 2 through 23 complete. Phase 1's workflows are in place, but the first
 real PyPI release still requires maintainer-side trusted-publisher setup. The
 shipped system covers leakage-safe training, multiple calibrated estimators,
 threshold and calibration analysis, label-delay temporal gaps, drift surveillance,
@@ -30,8 +30,10 @@ export, an isolated explanation provider boundary with deterministic fallback,
 persisted lineage, HTML compliance reports, historical audit log replay, degraded
 serving fallback guardrails, an automated champion-challenger retraining pipeline,
 edge runtime export, distributed telemetry, continuous operational
-surveillance, and an operational serving contract with liveness/readiness probes,
-deployable reference middleware, and an optional scoring concurrency cap.
+surveillance, an operational serving contract with liveness/readiness probes,
+deployable reference middleware, an optional scoring concurrency cap, synchronized
+circuit-breaker safety, detached traffic shadowing, honest schema error responses,
+and bounded operational metrics.
 
 ## Phase 1 — Distribution
 
@@ -785,7 +787,7 @@ operator's responsibility as SECURITY.md already states.
   format and check passed; strict mypy passed on 14 source files; package build
   and Twine checks passed.
 
-## Phase 23 — Serving Correctness and Defense-in-Depth Hardening (In progress)
+## Phase 23 — Serving Correctness and Defense-in-Depth Hardening (Done)
 
 ### Objective
 
@@ -913,7 +915,37 @@ robustness, and CLI documentation errors) are recorded as Phase 24.
 
 ### Delivery record
 
-Filled in when the phase completes.
+- Extracted the shared scoring guardrail sequence (`_score_request`) across
+  `/v1/predict` and `/v1/score` and aligned health/readiness status resolution.
+- Validated request feature schemas before consulting the circuit breaker;
+  schema-invalid inputs return `422` immediately without recording breaker failures
+  or triggering fallback policies.
+- Guarded model contract violations (missing, empty, or mismatched probabilities)
+  inside the inference block so they record breaker failures and route through
+  the configured fallback policy instead of raising `500` after fallback checks.
+- Synchronized circuit breaker state transitions with a reentrant lock, chained
+  caller-provided `on_trip` callbacks with Prometheus metrics counters, applied
+  `latency_budget_ms` to injected breakers, and added named validation errors for
+  circuit breaker environment settings.
+- Added structured JSON `500` server error responses carrying `X-Request-ID`,
+  `X-Process-Time-Ms`, and `traceparent` correlation headers.
+- Added explicit `FRAUD_ENABLE_CHAOS_HEADER` opt-in (default disabled) for
+  `X-Simulate-Degraded` and fail-fast startup rejection for `degraded_mode=True`
+  with `fallback_mode="raise"`.
+- Moved asynchronous shadow evaluation to detached, reference-held background
+  tasks outside the ASGI request lifecycle.
+- Positioned rate limiting ahead of API-key verification to meter unauthenticated
+  traffic and added window-based client tracking eviction to bound memory growth.
+- Switched Prometheus request metrics to matched route templates (`unmatched` for
+  undeclared paths) and added `fraud_scoring_rejected_total` counters labeled by reason.
+- Updated `GET /health` to return `503 Service Unavailable` when the model is absent,
+  matching `GET /ready`.
+- Extended CI container smoke testing to validate `/v1/predict`, `/v1/score`, and
+  `422` schema rejection on the running container image.
+- Updated README, SECURITY, ARCHITECTURE, and CHANGELOG documentation.
+- Final validation: 518 tests passed with 97.49% branch coverage; Ruff formatting
+  and linting passed; strict mypy passed across 14 source files; package build and
+  Twine checks passed; CI container smoke checks added.
 
 ## Phase 24 — Evidence Rendering, Replay, and Documentation Correctness (Proposed)
 
