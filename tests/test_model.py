@@ -780,6 +780,55 @@ def test_explain_local_random_forest() -> None:
         model.explain_local(features.iloc[:1])
 
 
+def test_explain_local_random_forest_batch_invariance() -> None:
+    dataset = validate_frame(generate_synthetic_data(rows=500, fraud_rate=0.1, random_state=1))
+    model = train_model(
+        dataset,
+        config=TrainingConfig(
+            estimator=EstimatorType.RANDOM_FOREST,
+            calibration_method=CalibrationMethod.NONE,
+        ),
+    )
+    features = dataset.features.iloc[:3]
+
+    explanations_batch = model.explain_local(features)
+    assert len(explanations_batch) == 3
+
+    # Explanation for row 0 alone must be identical to row 0 in batch
+    explanations_single = model.explain_local(features.iloc[:1])
+    assert len(explanations_single) == 1
+    for feat in model.feature_names:
+        assert explanations_single[0][feat] == pytest.approx(explanations_batch[0][feat])
+    # Must have non-zero contributions (not degenerate 0s from single-row batch mean)
+    assert any(abs(v) > 1e-6 for v in explanations_single[0].values())
+
+
+def test_explain_local_logistic_calibration_slope() -> None:
+    dataset = validate_frame(generate_synthetic_data(rows=500, fraud_rate=0.1, random_state=1))
+    model = train_model(
+        dataset,
+        config=TrainingConfig(
+            estimator=EstimatorType.LOGISTIC_REGRESSION,
+            calibration_method=CalibrationMethod.SIGMOID,
+        ),
+    )
+    slope = model.metadata.get("calibration_slope")
+    assert slope is not None and isinstance(slope, float) and slope > 0
+
+    features = dataset.features.iloc[:2]
+    explanations_calibrated = model.explain_local(features)
+
+    # If we artificially double the slope in metadata, contributions should double
+    model_double = deepcopy(model)
+    model_double.metadata["calibration_slope"] = slope * 2.0
+    explanations_doubled = model_double.explain_local(features)
+
+    for feat in model.feature_names:
+        assert explanations_doubled[0][feat] == pytest.approx(
+            explanations_calibrated[0][feat] * 2.0
+        )
+
+
 def test_load_model_supports_bare_joblib_file(
     tmp_path: Path, trained_model: tuple[FraudModel, ValidatedDataset]
 ) -> None:

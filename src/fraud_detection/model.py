@@ -332,13 +332,22 @@ class FraudModel:
         centered = feature_array - np.asarray(scaler_mean, dtype=float)
         scaled = centered / np.asarray(scaler_scale, dtype=float)
 
+        slope = self.metadata.get("calibration_slope")
+        if slope is None:
+            slope = _extract_calibration_slope(self.estimator)
+        effective_slope = (
+            float(slope)
+            if slope is not None and np.isfinite(float(slope)) and float(slope) > 0
+            else 1.0
+        )
+
         results = []
         for row_idx in range(len(ordered)):
             row_scaled = scaled[row_idx]
             row_contributions = {}
             for feat_idx, feature in enumerate(self.feature_names):
                 coef = coef_dict.get(feature, 0.0)
-                row_contributions[feature] = float(coef * row_scaled[feat_idx])
+                row_contributions[feature] = float(coef * row_scaled[feat_idx] * effective_slope)
             results.append(row_contributions)
         return results
 
@@ -351,8 +360,22 @@ class FraudModel:
         importance_dict = {eff["feature"]: eff["coefficient"] for eff in effects}
         total_importance = sum(importance_dict.values()) or 1.0
 
+        ref_profile = self.metadata.get("reference_profile") or {}
+        scaler_mean = self.metadata.get("scaler_mean")
+
         feature_array = ordered.to_numpy(dtype=float)
-        feature_means = np.mean(feature_array, axis=0)
+
+        # Use persistent reference training distributions for batch-invariance
+        baseline_means = np.zeros(len(self.feature_names), dtype=float)
+        for idx, feat in enumerate(self.feature_names):
+            if (
+                isinstance(ref_profile, dict)
+                and feat in ref_profile
+                and "mean" in ref_profile[feat]
+            ):
+                baseline_means[idx] = float(ref_profile[feat]["mean"])
+            elif scaler_mean is not None and idx < len(scaler_mean):
+                baseline_means[idx] = float(scaler_mean[idx])
 
         results = []
         for row_idx in range(len(ordered)):
@@ -360,11 +383,37 @@ class FraudModel:
             row_contributions = {}
             for feat_idx, feature in enumerate(self.feature_names):
                 importance = importance_dict.get(feature, 0.0)
-                deviation = row_values[feat_idx] - feature_means[feat_idx]
+                deviation = row_values[feat_idx] - baseline_means[feat_idx]
                 normalized_importance = importance / total_importance
                 row_contributions[feature] = float(normalized_importance * deviation)
             results.append(row_contributions)
         return results
+
+
+def _extract_calibration_slope(estimator: Any) -> float | None:
+    """Extract mean calibration slope from Sigmoid-calibrated classifier."""
+    if not hasattr(estimator, "calibrated_classifiers_"):
+        return None
+    slopes: list[float] = []
+    for cc in getattr(estimator, "calibrated_classifiers_", []):
+        cals = getattr(cc, "calibrators", getattr(cc, "calibrators_", None))
+        if cals is None and hasattr(cc, "calibrator_"):
+            cals = [cc.calibrator_]
+        if cals:
+            for cal in cals:
+                a = getattr(cal, "a_", None)
+                if a is not None:
+                    try:
+                        val = float(a)
+                        if np.isfinite(val):
+                            slopes.append(-val)
+                    except (TypeError, ValueError):
+                        pass
+    if slopes:
+        mean_slope = float(np.mean(slopes))
+        if mean_slope > 0:
+            return mean_slope
+    return None
 
 
 def train_model(
@@ -521,6 +570,7 @@ def train_model(
         "reference_profile": build_reference_profile(features_train),
         "drift_thresholds": default_thresholds(),
         "feature_effects": feature_effects,
+        "calibration_slope": _extract_calibration_slope(estimator),
         "scaler_mean": scaler_mean,
         "scaler_scale": scaler_scale,
         "validation_metrics": validation_metrics_payload,
