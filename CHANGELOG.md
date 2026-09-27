@@ -8,6 +8,12 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- Token budget enforcement in explanation providers: added strict token usage tracking
+  in `CostController` to reject requests exceeding configured consumption caps.
+- CLI branch coverage expansion: added failure-path test coverage for `retrain`, `export-edge`,
+  `generate-trust-bundle`, `rotate-trust-bundle`, `verify-attestation`, and `compliance`.
+- Initial key bundle documentation: documented `generate-trust-bundle` workflow and
+  verification steps in `README.md` and `SECURITY.md`.
 - Serving rejection metrics: added `fraud_scoring_rejected_total` Prometheus counter
   labeled by reason (`rate_limited`, `concurrency_capped`).
 - Chaos simulation opt-in: `FRAUD_ENABLE_CHAOS_HEADER` / `enable_chaos_header`
@@ -247,6 +253,18 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- Local explanation baseline invariance: `FraudModel.explain_local()` now compares feature
+  values against training baseline distributions (from feature profiles or scaler statistics)
+  rather than transient batch means, guaranteeing identical feature contributions for
+  transactions scored individually or in batches.
+- Calibrated logistic explanation scaling: local feature contributions for sigmoid-calibrated
+  logistic models now scale with the Platt calibrator slope to align with output probabilities.
+- Streaming profile atomicity: `StreamingProfile.update()` validates all batch features before
+  mutating internal state, ensuring malformed batches leave running moments unmodified.
+- Streaming profile deserialization: `StreamingProfile.from_dict()` validates schema structure,
+  edge monotonicity, bin count lengths, and finite statistics.
+- Retrain champion directory validation: `fraud-detect retrain --promote` now strictly requires
+  the champion target to be a directory artifact, rejecting standalone model files.
 - Prometheus request metrics now use matched route templates (e.g. `/v1/predict`,
   `/v1/score`, `/health`) and group undeclared routes under `'unmatched'`, avoiding
   unbounded metric label cardinality.
@@ -287,6 +305,20 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- Compliance report XSS prevention: HTML-escaped `overall_status` in drift summary tables
+  and sanitized badge CSS classes in `render_compliance_report()`.
+- Audit log replay validation: `replay_audit_log()` now validates `tolerance` and
+  `max_discrepancies_to_record`, gracefully handles missing thresholds and non-numeric
+  probabilities, rejects mismatched feature and prediction lengths without silent truncation,
+  and reports `status="EMPTY"` when no transactions are evaluated.
+- Non-blocking explanation timeouts: `ExternalExplanationProvider.explain()` shuts down the
+  threadpool executor with `wait=False, cancel_futures=True` on timeout.
+- Template explanation decisions: `TemplateExplanationProvider` preserves custom decisions
+  from `ExplanationRequest`.
+- Artifact validation robustness: `validate_artifact()` catches unpickling errors and verifies
+  `manifest["files"]` is a mapping, returning descriptive validation errors without crashing.
+- CLI documentation options: corrected `README.md` examples for `retrain` (`--report-output`,
+  valid `--metric` options) and `simulate-drift` (`--features`, `--anomaly-fraction`).
 - Schema-invalid scoring requests (unknown, missing, or malformed features) return
   `422` immediately and no longer record circuit-breaker failures or trip fallback scoring.
 - Estimators that violate scoring contracts (e.g. missing or mismatched probability arrays)

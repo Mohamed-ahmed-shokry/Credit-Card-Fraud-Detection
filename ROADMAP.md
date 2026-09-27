@@ -20,7 +20,7 @@ Status legend: `Proposed` (not started), `In progress`, `Done`.
 ## Current state
 
 The project is a production-grade reference implementation with the implementation work in
-Phases 2 through 23 complete. Phase 1's workflows are in place, but the first
+Phases 2 through 24 complete. Phase 1's workflows are in place, but the first
 real PyPI release still requires maintainer-side trusted-publisher setup. The
 shipped system covers leakage-safe training, multiple calibrated estimators,
 threshold and calibration analysis, label-delay temporal gaps, drift surveillance,
@@ -947,7 +947,7 @@ robustness, and CLI documentation errors) are recorded as Phase 24.
   and linting passed; strict mypy passed across 14 source files; package build and
   Twine checks passed; CI container smoke checks added.
 
-## Phase 24 — Evidence Rendering, Replay, and Documentation Correctness (In progress)
+## Phase 24 — Evidence Rendering, Replay, and Documentation Correctness (Done)
 
 ### Objective
 
@@ -1029,7 +1029,16 @@ the package version, or publish a release.
 
 ### Delivery record
 
-Filled in as phase increments complete.
+- **HTML-escaped compliance reports**: HTML-escaped `overall_status` in drift summary tables and sanitized status CSS class names on badges in `render_compliance_report()`, neutralizing script and HTML markup injection from crafted model metadata (`b7e7f81`).
+- **Defensive audit replay validation**: validated `tolerance` and `max_discrepancies_to_record` inputs, handled null thresholds and non-numeric probabilities, prevented silent length truncation across feature and prediction arrays, and returned `status="EMPTY"` when 0 transactions are evaluated in `replay_audit_log()` (`ab8b479`).
+- **Bounded explanation provider contracts**: prevented threadpool executor blocking on shutdown upon timeout (`wait=False, cancel_futures=True`) in `ExternalExplanationProvider.explain()`, enforced token budget consumption caps in `CostController`, and honored caller custom decisions in `TemplateExplanationProvider` (`59533de`).
+- **Hardened artifact validation**: caught all model loading exceptions (including `_pickle.UnpicklingError` and corrupted pickle payloads) during `validate_artifact()`, validated that `manifest["files"]` is a mapping, and reported structured validation failures without crashing (`89e6030`).
+- **Atomic streaming profile updates**: pre-validated all batch features before updating profile state in `StreamingProfile.update()`, guaranteeing state immutability on invalid batches; strictly validated schema structure, bin edge monotonicity, bin count lengths, and finite statistics in `from_dict()` (`12efc77`).
+- **Batch-invariant local explanations**: benchmarked tree-estimator feature contributions against baseline training feature distributions (from profiles/scaler statistics) rather than transient batch means in `FraudModel.explain_local()`, guaranteeing batch-invariant contributions; scaled sigmoid-calibrated logistic contributions by Platt calibrator slope (`f5c8a99`).
+- **Retrain champion directory safety**: enforced that `fraud-detect retrain --promote` strictly requires the champion target to be a directory artifact, failing fast with an actionable error for standalone files (`271de74`).
+- **CLI documentation corrections**: corrected `README.md` and `SECURITY.md` for `retrain` (`--report-output`, valid `--metric` options: `auprc`, `f1`, `expected_cost`), `simulate-drift` (`--features`, `--anomaly-fraction`), and documented `generate-trust-bundle` for initial key bundle creation (`92db49d`).
+- **CLI test coverage reduction**: added comprehensive CLI test suites covering error and branch paths across `retrain`, `export-edge`, `generate-trust-bundle`, `rotate-trust-bundle`, `verify-attestation`, `compliance`, and `replay-audit`, elevating `src/fraud_detection/cli.py` branch coverage to 98.63% (`ec89cff`).
+- **Quality gate verification**: 545 tests passed (100% pass rate); global branch coverage reached 98.33% (well exceeding the 97.0% floor); Ruff lint and formatting passed with zero findings; strict mypy passed across all 14 source files; wheel and sdist built cleanly and passed Twine check (`6eaf8b3`).
 
 ## Contributing to the roadmap
 
