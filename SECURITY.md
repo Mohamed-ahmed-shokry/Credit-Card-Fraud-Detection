@@ -126,7 +126,12 @@ depth, not a replacement for gateway authentication: responses carry
 `Retry-After` and `X-RateLimit-*` headers, but key storage, rotation, and
 perimeter enforcement remain the operator's job. Provided keys are checked
 with `secrets.compare_digest` against every configured value so verification
-time does not depend on which key matched.
+time does not depend on which key matched. The rate limiter operates ahead of
+API-key verification so unauthenticated traffic (including credential brute-force
+attempts) is metered, and idle client keys are evicted to bound memory usage.
+Chaos simulation headers (such as `X-Simulate-Degraded`) require explicit server
+opt-in (`FRAUD_ENABLE_CHAOS_HEADER=true`) so unauthenticated external clients
+cannot force fallback scoring.
 
 An optional scoring concurrency cap (`max_concurrent_scoring` /
 `FRAUD_MAX_CONCURRENT_SCORING`) sheds excess scoring load with `503` and
