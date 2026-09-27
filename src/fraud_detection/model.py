@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import warnings
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -957,24 +958,32 @@ def validate_artifact(
                 )
                 integrity_ok = False
 
-            files_map = manifest.get("files", {})
-            for fname in (MODEL_FILENAME, METADATA_FILENAME):
-                fpath = artifact_path / fname
-                expected_hash = files_map.get(fname)
-                if not fpath.is_file():
-                    errors.append(f"Missing required artifact file: {fname}")
-                    integrity_ok = False
-                elif not expected_hash:
-                    errors.append(f"Manifest missing entry for file: {fname}")
-                    integrity_ok = False
-                else:
-                    actual_hash = _file_sha256(fpath)
-                    if actual_hash != expected_hash:
-                        errors.append(
-                            f"Integrity digest mismatch for {fname}: "
-                            f"expected {expected_hash}, got {actual_hash}"
-                        )
+            files_map = manifest.get("files")
+            if not isinstance(files_map, Mapping):
+                errors.append(
+                    "Manifest 'files' entry must be a JSON object mapping "
+                    "filename to SHA-256 digest."
+                )
+                integrity_ok = False
+                files_map = {}
+            else:
+                for fname in (MODEL_FILENAME, METADATA_FILENAME):
+                    fpath = artifact_path / fname
+                    expected_hash = files_map.get(fname)
+                    if not fpath.is_file():
+                        errors.append(f"Missing required artifact file: {fname}")
                         integrity_ok = False
+                    elif not expected_hash:
+                        errors.append(f"Manifest missing entry for file: {fname}")
+                        integrity_ok = False
+                    else:
+                        actual_hash = _file_sha256(fpath)
+                        if actual_hash != expected_hash:
+                            errors.append(
+                                f"Integrity digest mismatch for {fname}: "
+                                f"expected {expected_hash}, got {actual_hash}"
+                            )
+                            integrity_ok = False
 
             can_load_model = integrity_ok and model_file.is_file()
             checks.append(
@@ -1113,16 +1122,7 @@ def validate_artifact(
                     embedded_meta = json.loads(_serialize_metadata(candidate.metadata))
                     if embedded_meta != raw_metadata:
                         errors.append("Persisted metadata.json does not match embedded metadata.")
-        except (
-            OSError,
-            ModelArtifactError,
-            ValueError,
-            TypeError,
-            KeyError,
-            AttributeError,
-            ImportError,
-            EOFError,
-        ) as exc:
+        except Exception as exc:  # noqa: BLE001
             errors.append(f"Model loading or structural validation failed: {exc}")
 
     if loaded_model is not None:

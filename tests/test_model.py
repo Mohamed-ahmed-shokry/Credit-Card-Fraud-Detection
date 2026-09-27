@@ -1138,6 +1138,43 @@ def test_validate_artifact_missing_report_fields(
     assert any("missing required report fields" in err for err in report.errors)
 
 
+def test_validate_artifact_manifest_files_not_a_mapping(
+    tmp_path: Path, trained_model: tuple[FraudModel, ValidatedDataset]
+) -> None:
+    model, _ = trained_model
+    artifact_dir = tmp_path / "art_files_not_a_map"
+    save_model(model, artifact_dir)
+    manifest_path = artifact_dir / MANIFEST_FILENAME
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["files"] = ["not", "a", "mapping"]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    report = validate_artifact(artifact_dir)
+    assert report.valid is False
+    assert any("Manifest 'files' entry must be a JSON object" in err for err in report.errors)
+
+
+def test_validate_artifact_corrupt_pickle_caught(
+    tmp_path: Path, trained_model: tuple[FraudModel, ValidatedDataset]
+) -> None:
+    model, _ = trained_model
+    artifact_dir = tmp_path / "art_corrupt_pickle"
+    save_model(model, artifact_dir)
+    model_file = artifact_dir / MODEL_FILENAME
+    # Overwrite model file with invalid pickle bytes that trigger UnpicklingError
+    corrupt_bytes = b"\x80\x05\x95\x00\x00\x00\x00\x00\x00\x00\x00cbad_pickle\nfail\n"
+    model_file.write_bytes(corrupt_bytes)
+    # Update manifest hash so hash check passes, exercising the loader exception handling
+    manifest_path = artifact_dir / MANIFEST_FILENAME
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["files"][MODEL_FILENAME] = sha256(corrupt_bytes).hexdigest()
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    report = validate_artifact(artifact_dir)
+    assert report.valid is False
+    assert any("Model loading or structural validation failed" in err for err in report.errors)
+
+
 def test_attestation_generation_and_verification(
     tmp_path: Path, trained_model: tuple[FraudModel, ValidatedDataset]
 ) -> None:
