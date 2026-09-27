@@ -510,6 +510,9 @@ def retrain_command(
     if normalized_metric not in valid_metrics:
         _abort(f"Invalid evaluation metric '{metric}'; must be one of {sorted(valid_metrics)}.")
 
+    if promote and not champion.is_dir():
+        _abort(f"--promote requires champion to be an artifact directory; got file {champion}.")
+
     output_has_content = output.is_file() or (
         output.is_dir() and next(output.iterdir(), None) is not None
     )
@@ -719,7 +722,7 @@ def retrain_command(
             )
 
         promoted_to_champion = False
-        if is_promoted and promote and champion.is_dir():
+        if is_promoted and promote:
             save_model(challenger_model, champion)
             promoted_to_champion = True
 

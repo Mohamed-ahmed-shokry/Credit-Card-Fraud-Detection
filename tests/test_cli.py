@@ -2397,6 +2397,28 @@ def test_retrain_cli(tmp_path: Path, trained_artifact: Path) -> None:
     assert promote_report["promoted_to_champion"] is True
 
 
+def test_retrain_cli_promote_rejects_file_champion(
+    tmp_path: Path, trained_artifact: Path
+) -> None:
+    data_path = tmp_path / "fresh_data.csv"
+    generate_synthetic_data(rows=200, random_state=42).to_csv(data_path, index=False)
+    file_champion = trained_artifact / "model.joblib"
+
+    res = runner.invoke(
+        app,
+        [
+            "retrain",
+            str(file_champion),
+            str(data_path),
+            "--output",
+            str(tmp_path / "challenger_out"),
+            "--promote",
+        ],
+    )
+    assert res.exit_code == 2
+    assert "--promote requires champion to be an artifact directory" in res.output
+
+
 def test_drift_cli_success(tmp_path: Path, trained_artifact: Path) -> None:
     data_path = tmp_path / "drift_data.csv"
     generate_synthetic_data(rows=250, random_state=42).to_csv(data_path, index=False)
