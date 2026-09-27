@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import urllib.error
 from copy import deepcopy
@@ -9,6 +10,7 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+import joblib
 import pandas as pd
 import pytest
 from typer.testing import CliRunner
@@ -2374,8 +2376,6 @@ def test_retrain_cli(tmp_path: Path, trained_artifact: Path) -> None:
     assert bad_metric_res.exit_code == 2
 
     # 5. Retrain with --promote flag
-    import shutil
-
     champ_copy = tmp_path / "champ_copy"
     shutil.copytree(trained_artifact, champ_copy)
     promote_res = runner.invoke(
@@ -2397,9 +2397,7 @@ def test_retrain_cli(tmp_path: Path, trained_artifact: Path) -> None:
     assert promote_report["promoted_to_champion"] is True
 
 
-def test_retrain_cli_promote_rejects_file_champion(
-    tmp_path: Path, trained_artifact: Path
-) -> None:
+def test_retrain_cli_promote_rejects_file_champion(tmp_path: Path, trained_artifact: Path) -> None:
     data_path = tmp_path / "fresh_data.csv"
     generate_synthetic_data(rows=200, random_state=42).to_csv(data_path, index=False)
     file_champion = trained_artifact / "model.joblib"
@@ -2967,3 +2965,608 @@ def test_simulate_drift_e2e_with_multi_window_surveillance(
     )
     assert mw_res.exit_code == 1
     assert "Multi-window drift surveillance tripped" in mw_res.output
+
+
+def _sample_compliance_bundle() -> dict[str, Any]:
+    return {
+        "model_version": "abc123456789",
+        "model": {
+            "estimator": "LogisticRegression",
+            "threshold": 0.42,
+            "created_at": "2026-09-14T10:00:00+00:00",
+            "cost_policy": {
+                "name": "strict-recall",
+                "false_positive_cost": 1.0,
+                "false_negative_cost": 25.0,
+            },
+            "test_metrics": {
+                "roc_auc": 0.91,
+                "average_precision": 0.62,
+                "brier_score": 0.04,
+                "precision": 0.5,
+                "recall": 0.8,
+                "f1": 0.62,
+                "balanced_accuracy": 0.88,
+                "expected_cost_per_transaction": 0.12,
+            },
+        },
+        "calibration": {
+            "rows": 100,
+            "bins": 2,
+            "brier_score": 0.04,
+            "expected_calibration_error": 0.03,
+            "max_calibration_error": 0.08,
+            "reliability": 0.01,
+            "resolution": 0.12,
+            "uncertainty": 0.09,
+            "detail": [
+                {
+                    "bin_index": 0,
+                    "lower": 0.0,
+                    "upper": 0.5,
+                    "count": 80,
+                    "mean_predicted": 0.1,
+                    "fraction_positive": 0.08,
+                }
+            ],
+        },
+        "thresholds": {
+            "model_threshold_metrics": {
+                "threshold": 0.42,
+                "precision": 0.5,
+                "recall": 0.8,
+                "f1": 0.62,
+                "expected_cost_per_transaction": 0.12,
+                "flagged": 20,
+                "flagged_rate": 0.2,
+            },
+            "detail": [
+                {
+                    "threshold": 0.5,
+                    "precision": 0.6,
+                    "recall": 0.7,
+                    "f1": 0.65,
+                    "expected_cost_per_transaction": 0.11,
+                    "flagged": 15,
+                    "flagged_rate": 0.15,
+                }
+            ],
+        },
+        "drift": {
+            "rows": 100,
+            "overall_status": "drifted",
+            "mean_psi": 0.13,
+            "max_psi": 0.31,
+            "thresholds": {"warning_at": 0.1, "drift_at": 0.25},
+            "features": [
+                {"feature": "Amount", "psi": 0.31, "status": "drifted"},
+                {"feature": "Time", "psi": 0.12, "status": "warning"},
+            ],
+        },
+        "benchmark": {
+            "results": [
+                {
+                    "batch_size": 1,
+                    "median_ms": 1.2,
+                    "ms_per_transaction": 1.2,
+                    "transactions_per_second": 833.3,
+                }
+            ]
+        },
+    }
+
+
+def test_compliance_cli_success_and_errors(tmp_path: Path, trained_artifact: Path) -> None:
+    bundle_data = _sample_compliance_bundle()
+    bundle_path = tmp_path / "promotion_bundle.json"
+    bundle_path.write_text(json.dumps(bundle_data), encoding="utf-8")
+    output_html = tmp_path / "compliance.html"
+
+    # 1. Success without optional flags
+    res = runner.invoke(app, ["compliance", str(bundle_path), "--output", str(output_html)])
+    assert res.exit_code == 0, res.output
+    assert output_html.is_file()
+    assert "<!DOCTYPE html>" in output_html.read_text(encoding="utf-8")
+
+    # 2. Success with stability and artifact manifest
+    stab_path = tmp_path / "stability.json"
+    stab_data = {
+        "results": [
+            {
+                "start_date": "2026-01-01",
+                "end_date": "2026-01-07",
+                "train_rows": 100,
+                "test_rows": 50,
+                "test_fraud_rate": 0.05,
+                "roc_auc": 0.92,
+                "average_precision": 0.85,
+                "brier_score": 0.04,
+                "expected_cost_per_transaction": 0.12,
+            }
+        ]
+    }
+    stab_path.write_text(json.dumps(stab_data), encoding="utf-8")
+    res_full = runner.invoke(
+        app,
+        [
+            "compliance",
+            str(bundle_path),
+            "--stability",
+            str(stab_path),
+            "--artifact",
+            str(trained_artifact),
+        ],
+    )
+    assert res_full.exit_code == 0, res_full.output
+    assert "<!DOCTYPE html>" in res_full.output
+
+    # 3. Invalid JSON in bundle
+    bad_json = tmp_path / "bad.json"
+    bad_json.write_text("{bad", encoding="utf-8")
+    res_bad = runner.invoke(app, ["compliance", str(bad_json)])
+    assert res_bad.exit_code == 2
+    assert "Invalid promotion bundle JSON" in res_bad.output
+
+    # 4. Non-dict JSON in bundle
+    list_json = tmp_path / "list.json"
+    list_json.write_text("[]", encoding="utf-8")
+    res_list = runner.invoke(app, ["compliance", str(list_json)])
+    assert res_list.exit_code == 2
+    assert "The promotion bundle must be a JSON object" in res_list.output
+
+
+def test_export_edge_cli_max_error_exceeded(tmp_path: Path) -> None:
+    uncalibrated_model = train_model(
+        validate_frame(generate_synthetic_data(rows=300, fraud_rate=0.08, random_state=42)),
+        config=TrainingConfig(calibration_method=CalibrationMethod.NONE),
+    )
+    uncal_art = tmp_path / "art_uncal"
+    save_model(uncalibrated_model, uncal_art)
+
+    data_path = tmp_path / "val.csv"
+    generate_synthetic_data(rows=300, fraud_rate=0.08, random_state=42).to_csv(
+        data_path, index=False
+    )
+    out_edge = tmp_path / "edge.json"
+
+    res = runner.invoke(
+        app,
+        [
+            "export-edge",
+            str(uncal_art),
+            "--output",
+            str(out_edge),
+            "--validation-data",
+            str(data_path),
+            "--max-error",
+            "0.0",
+        ],
+    )
+    assert res.exit_code == 2
+    assert "exceeds the probability error tolerance" in res.output
+
+
+def test_trust_bundle_cli_failure_paths(tmp_path: Path) -> None:
+    # 1. generate-trust-bundle without --public-key
+    res1 = runner.invoke(app, ["generate-trust-bundle"])
+    assert res1.exit_code == 2
+    assert "At least one --public-key is required" in res1.output
+
+    # 2. generate-trust-bundle with invalid/corrupt public key
+    corrupt_key = tmp_path / "corrupt_pub.pem"
+    corrupt_key.write_text("not a pem", encoding="utf-8")
+    res2 = runner.invoke(app, ["generate-trust-bundle", "--public-key", str(corrupt_key)])
+    assert res2.exit_code == 2
+
+    # 3. rotate-trust-bundle without --add-public-key or --revoke-key-id
+    bundle_path = tmp_path / "bundle.json"
+    valid_key = tmp_path / "key.pem"
+    runner.invoke(
+        app,
+        [
+            "generate-signing-key",
+            "--private-key",
+            str(tmp_path / "priv.pem"),
+            "--public-key",
+            str(valid_key),
+        ],
+    )
+    res_gen = runner.invoke(
+        app,
+        ["generate-trust-bundle", "--output", str(bundle_path), "--public-key", str(valid_key)],
+    )
+    assert res_gen.exit_code == 0
+
+    res3 = runner.invoke(app, ["rotate-trust-bundle", str(bundle_path)])
+    assert res3.exit_code == 2
+    assert "Provide --add-public-key or --revoke-key-id" in res3.output
+
+    # 4. rotate-trust-bundle revoking an unknown key ID
+    res4 = runner.invoke(
+        app,
+        [
+            "rotate-trust-bundle",
+            str(bundle_path),
+            "--revoke-key-id",
+            "unknown-key-1234567890abcdef",
+        ],
+    )
+    assert res4.exit_code == 2
+
+
+def test_verify_attestation_cli_failure_paths(tmp_path: Path) -> None:
+    att_path = tmp_path / "att.json"
+    att_path.write_text("{}", encoding="utf-8")
+    pub_key = tmp_path / "pub.pem"
+    pub_key.write_text("dummy", encoding="utf-8")
+    bundle_path = tmp_path / "bundle.json"
+    bundle_path.write_text("{}", encoding="utf-8")
+
+    # 1. Neither or both public_key and trust_bundle
+    res_neither = runner.invoke(app, ["verify-attestation", str(att_path)])
+    assert res_neither.exit_code == 2
+    assert "Provide exactly one" in res_neither.output
+
+    res_both = runner.invoke(
+        app,
+        ["verify-attestation", str(att_path), str(pub_key), "--trust-bundle", str(bundle_path)],
+    )
+    assert res_both.exit_code == 2
+    assert "Provide exactly one" in res_both.output
+
+    # 2. Corrupt JSON in attestation
+    bad_att = tmp_path / "bad_att.json"
+    bad_att.write_text("{corrupt", encoding="utf-8")
+    res_corrupt = runner.invoke(app, ["verify-attestation", str(bad_att), str(pub_key)])
+    assert res_corrupt.exit_code == 1
+    assert "valid" in res_corrupt.output
+
+    # 3. Non-dict root in attestation
+    list_att = tmp_path / "list_att.json"
+    list_att.write_text("[]", encoding="utf-8")
+    keypair_priv = tmp_path / "k_priv.pem"
+    keypair_pub = tmp_path / "k_pub.pem"
+    runner.invoke(
+        app,
+        [
+            "generate-signing-key",
+            "--private-key",
+            str(keypair_priv),
+            "--public-key",
+            str(keypair_pub),
+        ],
+    )
+    res_list = runner.invoke(app, ["verify-attestation", str(list_att), str(keypair_pub)])
+    assert res_list.exit_code == 1
+    assert "Attestation root must be a JSON object" in res_list.output
+
+    # 4. Attestation missing signature when require_signature is True
+    no_sig_att = tmp_path / "no_sig_att.json"
+    no_sig_att.write_text(json.dumps({"status": "PASSED"}), encoding="utf-8")
+    res_no_sig = runner.invoke(app, ["verify-attestation", str(no_sig_att), str(keypair_pub)])
+    assert res_no_sig.exit_code == 1
+    assert "Attestation has no signature" in res_no_sig.output
+
+
+def test_validate_artifact_cli_signing_flags(tmp_path: Path, trained_artifact: Path) -> None:
+    priv_key = tmp_path / "sign_priv.pem"
+    pub_key = tmp_path / "sign_pub.pem"
+    runner.invoke(
+        app,
+        ["generate-signing-key", "--private-key", str(priv_key), "--public-key", str(pub_key)],
+    )
+
+    # 1. --signing-key without --attestation-output
+    res1 = runner.invoke(
+        app,
+        ["validate-artifact", str(trained_artifact), "--strict", "--signing-key", str(priv_key)],
+    )
+    assert res1.exit_code == 2
+    assert "--signing-key requires --attestation-output" in res1.output
+
+    # 2. --signing-key without --strict
+    res2 = runner.invoke(
+        app,
+        [
+            "validate-artifact",
+            str(trained_artifact),
+            "--signing-key",
+            str(priv_key),
+            "--attestation-output",
+            str(tmp_path / "att.json"),
+        ],
+    )
+    assert res2.exit_code == 2
+    assert "--signing-key requires --strict validation" in res2.output
+
+    # 3. Corrupt private key
+    corrupt_priv = tmp_path / "corrupt_priv.pem"
+    corrupt_priv.write_text("bad key", encoding="utf-8")
+    res3 = runner.invoke(
+        app,
+        [
+            "validate-artifact",
+            str(trained_artifact),
+            "--strict",
+            "--signing-key",
+            str(corrupt_priv),
+            "--attestation-output",
+            str(tmp_path / "att.json"),
+        ],
+    )
+    assert res3.exit_code == 2
+
+
+def test_retrain_cli_more_branches(tmp_path: Path, trained_artifact: Path) -> None:
+    data_path = tmp_path / "fresh_data.csv"
+    generate_synthetic_data(rows=200, fraud_rate=0.1, random_state=42).to_csv(
+        data_path, index=False
+    )
+
+    # 1. Retrain with --metric f1
+    res_f1 = runner.invoke(
+        app,
+        [
+            "retrain",
+            str(trained_artifact),
+            str(data_path),
+            "--output",
+            str(tmp_path / "chall_f1"),
+            "--metric",
+            "f1",
+            "--min-gain",
+            "-1.0",
+        ],
+    )
+    assert res_f1.exit_code == 0, res_f1.output
+    report_f1 = json.loads(res_f1.stdout)
+    assert report_f1["primary_metric"] == "f1"
+
+    # 2. Invalid training data causes DataValidationError / abort
+    bad_data = tmp_path / "bad_data.csv"
+    bad_data.write_text("invalid,csv\n1\n", encoding="utf-8")
+    res_bad = runner.invoke(
+        app,
+        [
+            "retrain",
+            str(trained_artifact),
+            str(bad_data),
+            "--output",
+            str(tmp_path / "chall_bad"),
+        ],
+    )
+    assert res_bad.exit_code == 2
+
+
+def test_stream_profile_cli_jsonl_fewer_than_batch_size(tmp_path: Path) -> None:
+    frame = generate_synthetic_data(rows=200, random_state=42)
+    jsonl_path = tmp_path / "small.jsonl"
+    with jsonl_path.open("w", encoding="utf-8") as f:
+        for record in frame.to_dict(orient="records"):
+            f.write(json.dumps({"payload": {"features": [record]}}) + "\n")
+
+    out_prof = tmp_path / "stream_out.json"
+    res = runner.invoke(
+        app,
+        [
+            "stream-profile",
+            str(jsonl_path),
+            "--output",
+            str(out_prof),
+            "--batch-size",
+            "500",
+        ],
+    )
+    assert res.exit_code == 0, res.output
+    assert out_prof.is_file()
+
+
+def test_multi_window_drift_missing_reference_profile(
+    tmp_path: Path, trained_artifact: Path
+) -> None:
+    m = load_model(trained_artifact)
+    m.metadata.pop("reference_profile", None)
+    standalone_joblib = tmp_path / "model.joblib"
+    joblib.dump(m, standalone_joblib)
+
+    data_path = tmp_path / "data.csv"
+    generate_synthetic_data(rows=200, random_state=42).to_csv(data_path, index=False)
+
+    res = runner.invoke(app, ["multi-window-drift", str(standalone_joblib), str(data_path)])
+    assert res.exit_code == 2
+    assert "does not contain a reference profile" in res.output
+
+
+def test_cli_main_module_execution(monkeypatch: pytest.MonkeyPatch) -> None:
+    import runpy
+    import sys
+
+    monkeypatch.setattr(sys, "argv", ["fraud-detect", "--help"])
+    with pytest.raises(SystemExit) as exc_info:
+        runpy.run_module("fraud_detection.cli", run_name="__main__")
+    assert exc_info.value.code == 0
+
+
+def test_retrain_cli_output_already_exists(tmp_path: Path, trained_artifact: Path) -> None:
+    data_path = tmp_path / "data.csv"
+    generate_synthetic_data(rows=200, random_state=42).to_csv(data_path, index=False)
+    existing_out = tmp_path / "existing_challenger"
+    existing_out.mkdir()
+    (existing_out / "file.txt").write_text("exists", encoding="utf-8")
+
+    res = runner.invoke(
+        app,
+        [
+            "retrain",
+            str(trained_artifact),
+            str(data_path),
+            "--output",
+            str(existing_out),
+        ],
+    )
+    assert res.exit_code == 2
+    assert "Output already exists" in res.output
+
+
+def test_retrain_cli_fallback_champion_metadata(tmp_path: Path, trained_artifact: Path) -> None:
+    data_path = tmp_path / "data.csv"
+    data = generate_synthetic_data(rows=300, fraud_rate=0.08, random_state=42)
+    data.to_csv(data_path, index=False)
+
+    # 1. Champion with invalid config values triggers fallbacks
+    m = load_model(trained_artifact)
+    m.metadata["training_config"] = {
+        "estimator": "invalid_est",
+        "threshold_strategy": "invalid_thresh",
+        "calibration_method": "invalid_calib",
+        "split_strategy": "invalid_split",
+    }
+    champ_invalid = tmp_path / "champ_invalid.joblib"
+    joblib.dump(m, champ_invalid)
+
+    res1 = runner.invoke(
+        app,
+        [
+            "retrain",
+            str(champ_invalid),
+            str(data_path),
+            "--output",
+            str(tmp_path / "out1"),
+        ],
+    )
+    assert res1.exit_code == 0, res1.output
+
+    # 2. Champion with no training_config triggers estimator name inference (e.g. 'forest')
+    m2 = load_model(trained_artifact)
+    m2.metadata.pop("training_config", None)
+    m2.metadata["estimator"] = "RandomForestClassifier"
+    champ_legacy = tmp_path / "champ_legacy.joblib"
+    joblib.dump(m2, champ_legacy)
+
+    res2 = runner.invoke(
+        app,
+        [
+            "retrain",
+            str(champ_legacy),
+            str(data_path),
+            "--output",
+            str(tmp_path / "out2"),
+        ],
+    )
+    assert res2.exit_code == 0, res2.output
+
+
+def test_retrain_cli_recall_guardrail_failure(tmp_path: Path, trained_artifact: Path) -> None:
+    data_path = tmp_path / "data.csv"
+    data = generate_synthetic_data(rows=300, fraud_rate=0.08, random_state=42)
+    data.to_csv(data_path, index=False)
+
+    from fraud_detection.evaluation import ClassificationMetrics
+
+    mock_champ_eval = ClassificationMetrics(
+        threshold=0.5,
+        roc_auc=0.9,
+        average_precision=0.8,
+        brier_score=0.05,
+        precision=0.7,
+        recall=0.8,
+        f1=0.75,
+        balanced_accuracy=0.85,
+        true_positives=8,
+        false_positives=3,
+        true_negatives=87,
+        false_negatives=2,
+    )
+    mock_chall_eval = ClassificationMetrics(
+        threshold=0.5,
+        roc_auc=0.9,
+        average_precision=0.9,
+        brier_score=0.04,
+        precision=0.9,
+        recall=0.01,
+        f1=0.02,
+        balanced_accuracy=0.5,
+        true_positives=1,
+        false_positives=0,
+        true_negatives=90,
+        false_negatives=9,
+    )
+
+    with patch(
+        "fraud_detection.cli.evaluate_predictions",
+        side_effect=[mock_chall_eval, mock_champ_eval],
+    ):
+        res = runner.invoke(
+            app,
+            [
+                "retrain",
+                str(trained_artifact),
+                str(data_path),
+                "--output",
+                str(tmp_path / "out_guardrail"),
+            ],
+        )
+    assert res.exit_code == 0
+    report = json.loads(res.stdout)
+    assert report["decision"] == "REJECTED"
+    assert "collapsed below 0.05 guardrail" in report["decision_reason"]
+
+
+def test_replay_audit_log_cli_write_error(tmp_path: Path, trained_artifact: Path) -> None:
+    audit_file = tmp_path / "audit.jsonl"
+    audit_file.write_text('{"event": "score"}\n', encoding="utf-8")
+    rep_out = tmp_path / "report.json"
+
+    with patch.object(Path, "write_text", side_effect=OSError("Disk write error")):
+        res = runner.invoke(
+            app,
+            [
+                "replay-audit",
+                str(audit_file),
+                str(trained_artifact),
+                "--output",
+                str(rep_out),
+            ],
+        )
+    assert res.exit_code == 2
+    assert "Failed to write replay report" in res.output
+
+
+def test_generate_signing_key_cli_signing_error(tmp_path: Path) -> None:
+    from fraud_detection.signing import SigningError
+
+    with patch("fraud_detection.cli.write_keypair", side_effect=SigningError("Keygen failed")):
+        res = runner.invoke(
+            app,
+            [
+                "generate-signing-key",
+                "--private-key",
+                str(tmp_path / "priv.pem"),
+                "--public-key",
+                str(tmp_path / "pub.pem"),
+            ],
+        )
+    assert res.exit_code == 2
+    assert "Keygen failed" in res.output
+
+
+def test_export_edge_cli_without_validation_data(tmp_path: Path) -> None:
+    uncalibrated_model = train_model(
+        validate_frame(generate_synthetic_data(rows=300, fraud_rate=0.08, random_state=42)),
+        config=TrainingConfig(calibration_method=CalibrationMethod.NONE),
+    )
+    uncal_art = tmp_path / "art_uncal2"
+    save_model(uncalibrated_model, uncal_art)
+    out_edge = tmp_path / "edge_noval.json"
+
+    res = runner.invoke(
+        app,
+        [
+            "export-edge",
+            str(uncal_art),
+            "--output",
+            str(out_edge),
+        ],
+    )
+    assert res.exit_code == 0, res.output
+    assert out_edge.is_file()
