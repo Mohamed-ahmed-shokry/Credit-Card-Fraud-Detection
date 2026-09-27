@@ -156,6 +156,30 @@ jobs:
           curl --fail --silent http://localhost:8000/health
           curl --fail --silent http://localhost:8000/metrics
 
+      - name: Score real traffic against the container image
+        run: |
+          python - <<'PY' > /tmp/transaction.json
+          import json
+
+          from fraud_detection.model import load_model
+
+          model = load_model("artifacts/model")
+          print(json.dumps({name: 1.0 for name in model.feature_names}))
+          PY
+          transaction=$(cat /tmp/transaction.json)
+          curl --fail --silent --header "Content-Type: application/json" \
+            --data "{\"transactions\": [$transaction]}" \
+            http://localhost:8000/v1/predict
+          curl --fail --silent --header "Content-Type: application/json" \
+            --data "{\"transaction\": $transaction}" \
+            http://localhost:8000/v1/score
+          # A schema mismatch is a client error, never a fabricated fallback score.
+          status=$(curl --silent --output /dev/null --write-out "%{http_code}" \
+            --header "Content-Type: application/json" \
+            --data '{"transaction": {"NotAFeature": 1.0}}' \
+            http://localhost:8000/v1/score)
+          test "$status" = "422"
+
       - name: Show container logs
         if: always()
         run: docker logs fraud-api
