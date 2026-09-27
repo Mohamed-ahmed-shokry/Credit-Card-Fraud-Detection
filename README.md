@@ -516,9 +516,9 @@ fraud-detect serve artifacts/model --host 0.0.0.0 --port 8000
 ```
 
 Interactive OpenAPI documentation is available at `http://localhost:8000/docs`,
-operational health at `GET /health`, liveness at `GET /live`, readiness at
-`GET /ready`, and Prometheus metrics at `GET /metrics`. Probes and metrics stay
-reachable without an API key when the optional middleware is enabled.
+operational health at `GET /health` (returns `503` if model is unready or absent, matching `/ready`),
+liveness at `GET /live`, readiness at `GET /ready`, and Prometheus metrics at `GET /metrics`.
+Probes and metrics stay reachable without an API key when the optional middleware is enabled.
 
 Score one or more transactions (all trained features are required):
 
@@ -623,7 +623,7 @@ Feature values must be finite JSON numbers; numeric strings and booleans are not
 coerced. Validation errors describe the failing location and rule without echoing
 the submitted transaction value.
 
-Every HTTP response includes:
+Every HTTP response (including unhandled `500` server errors and rejection responses) includes:
 
 - `X-Request-ID`, which propagates a safe caller-supplied identifier or generates one;
 - `X-Process-Time-Ms`, the server-side request duration.
@@ -658,9 +658,11 @@ storage, and it rejects endpoints with embedded credentials; those controls belo
 to the deployment gateway or collector.
 
 `GET /metrics` reports Prometheus-format counters and a histogram: total requests
-and request duration labeled by method, path, and status code, plus total scored
-transactions labeled by decision. Restrict it to a trusted scrape network like any
-other operational endpoint; it carries counts and labels only, never transaction
+and request duration labeled by method, matched route template (collapsing undeclared
+paths into `'unmatched'`), and status code; total scored transactions labeled by decision;
+and `fraud_scoring_rejected_total` counting requests rejected by rate limiting or
+scoring concurrency caps labeled by reason. Restrict it to a trusted scrape network like
+any other operational endpoint; it carries counts and labels only, never transaction
 values.
 
 ### Optional API key authentication
@@ -704,7 +706,9 @@ Enable per-client-IP rate limiting with the `rate_limit_requests` and
 options, or the `FRAUD_RATE_LIMIT_REQUESTS` and
 `FRAUD_RATE_LIMIT_WINDOW_SECONDS` environment variables. This is a reference
 implementation using an in-memory fixed-window algorithm—not a substitute for a
-proper rate limiter at the gateway level. Operational endpoints are never rate
+proper rate limiter at the gateway level. Rate limiting meters both authenticated
+and unauthenticated traffic (including brute-force attempts) and bounds tracked
+client keys to avoid unbounded memory growth. Operational endpoints are never rate
 limited.
 
 ```python
@@ -748,10 +752,10 @@ When the cap is reached, `/v1/predict` and `/v1/score` return
 
 Configure resilient fallback policies when runtime exceptions occur or during degraded upstream conditions:
 
-- `fallback_mode`: `"constant"` (returns fixed calibrated score, default 0.5), `"rule"` (heuristic based on transaction amount threshold), or `"raise"` (fails with 500 error).
-- Environment variables: `FRAUD_FALLBACK_MODE`, `FRAUD_FALLBACK_SCORE`, `FRAUD_FALLBACK_AMOUNT_THRESHOLD`, `FRAUD_DEGRADED_MODE`.
-- Chaos testing header: Pass `X-Simulate-Degraded: true` on `/v1/predict` or `/v1/score` requests to simulate degraded-state fallback scoring.
-- Observability: Fallback activations are tracked via Prometheus metric `fraud_fallback_predictions_total` with `mode` and `reason` labels.
+- `fallback_mode`: `"constant"` (returns fixed calibrated score, default 0.5), `"rule"` (heuristic based on transaction amount threshold), or `"raise"` (fails with 500 error). Note that `degraded_mode=True` requires a non-raise fallback policy (`"constant"` or `"rule"`).
+- Environment variables: `FRAUD_FALLBACK_MODE`, `FRAUD_FALLBACK_SCORE`, `FRAUD_FALLBACK_AMOUNT_THRESHOLD`, `FRAUD_DEGRADED_MODE`, `FRAUD_CIRCUIT_BREAKER_FAILURES`, `FRAUD_CIRCUIT_BREAKER_RESET_TIMEOUT`, `FRAUD_CIRCUIT_BREAKER_RECOVERY_TIMEOUT`.
+- Chaos testing header: Pass `X-Simulate-Degraded: true` on `/v1/predict` or `/v1/score` requests to simulate degraded-state fallback scoring. This header is honored only when `FRAUD_ENABLE_CHAOS_HEADER=true` (or `enable_chaos_header=True`) is explicitly configured (disabled by default).
+- Observability: Fallback activations are tracked via Prometheus metric `fraud_fallback_predictions_total` with `mode` and `reason` labels, and circuit breaker transitions update `fraud_circuit_breaker_state`.
 
 ### Structured audit event export
 
