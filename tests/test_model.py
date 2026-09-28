@@ -16,6 +16,8 @@ import sklearn
 
 from fraud_detection import __version__
 from fraud_detection.data import ValidatedDataset, generate_synthetic_data, validate_frame
+from fraud_detection.drift import ScoreProfile
+from fraud_detection.evaluation import DecisionAction, TieredThresholds
 from fraud_detection.model import (
     ARTIFACT_VERSION,
     MANIFEST_FILENAME,
@@ -1292,3 +1294,87 @@ def test_attestation_generation_and_verification(
     is_valid_br, msg_br = verify_attestation(bad_root_file)
     assert is_valid_br is False
     assert "must be a JSON object" in msg_br
+
+
+def test_training_config_tiered_thresholds_validation() -> None:
+    # 1. Valid configuration
+    cfg = TrainingConfig(review_threshold=0.2, deny_threshold=0.7)
+    assert cfg.review_threshold == 0.2
+    assert cfg.deny_threshold == 0.7
+
+    # 2. Only one supplied
+    with pytest.raises(ValueError, match="must be provided together"):
+        TrainingConfig(review_threshold=0.2, deny_threshold=None)
+    with pytest.raises(ValueError, match="must be provided together"):
+        TrainingConfig(review_threshold=None, deny_threshold=0.7)
+
+    # 3. Inverted thresholds
+    with pytest.raises(ValueError, match="cannot exceed"):
+        TrainingConfig(review_threshold=0.8, deny_threshold=0.3)
+
+
+def test_fraud_model_predict_decisions_and_properties(
+    trained_model: tuple[FraudModel, ValidatedDataset],
+) -> None:
+    model, dataset = trained_model
+    features = dataset.features.head(10)
+
+    # 1. Score profile property
+    assert isinstance(model.score_profile, ScoreProfile)
+    assert model.score_profile.rows > 0
+
+    # 2. Fallback when score_profile is missing/corrupted
+    m_no_sp = deepcopy(model)
+    m_no_sp.metadata.pop("score_profile", None)
+    assert m_no_sp.score_profile is None
+    m_no_sp.metadata["score_profile"] = "corrupted"
+    assert m_no_sp.score_profile is None
+
+    # 3. Tiered thresholds property
+    assert model.tiered_thresholds is None
+    m_tiered = deepcopy(model)
+    m_tiered.metadata["tiered_thresholds"] = {"review_threshold": 0.2, "deny_threshold": 0.7}
+    assert isinstance(m_tiered.tiered_thresholds, TieredThresholds)
+    assert m_tiered.tiered_thresholds.review_threshold == 0.2
+    assert m_tiered.tiered_thresholds.deny_threshold == 0.7
+
+    # 4. predict_decisions without explicit thresholds uses binary fallback (deny if >= threshold)
+    decisions = model.predict_decisions(features)
+    assert len(decisions) == 10
+    assert all(d in {DecisionAction.ALLOW.value, DecisionAction.DENY.value} for d in decisions)
+
+    # 5. predict_decisions with explicit tiered thresholds
+    decisions_tiered = model.predict_decisions(features, review_threshold=0.01, deny_threshold=0.99)
+    assert len(decisions_tiered) == 10
+    assert any(d == DecisionAction.CHALLENGE.value for d in decisions_tiered)
+
+    # 6. predict_decisions using model metadata tiered_thresholds
+    decisions_meta = m_tiered.predict_decisions(features)
+    assert len(decisions_meta) == 10
+
+    # 7. predict_decisions with invalid threshold raises ModelArtifactError
+    with pytest.raises(ModelArtifactError):
+        model.predict_decisions(features, review_threshold=0.9, deny_threshold=0.1)
+
+
+def test_train_model_persists_score_profile_and_tiered_thresholds(tmp_path: Path) -> None:
+    data = validate_frame(generate_synthetic_data(rows=300, fraud_rate=0.08, random_state=42))
+    cfg = TrainingConfig(review_threshold=0.15, deny_threshold=0.65)
+    model = train_model(data, config=cfg)
+
+    assert "score_profile" in model.metadata
+    assert model.metadata["tiered_thresholds"] == {
+        "review_threshold": 0.15,
+        "deny_threshold": 0.65,
+    }
+    assert model.score_profile is not None
+    assert model.tiered_thresholds == TieredThresholds(0.15, 0.65)
+
+    # Save and reload
+    art_dir = tmp_path / "model_art"
+    save_model(model, art_dir)
+    loaded = load_model(art_dir)
+
+    assert loaded.score_profile is not None
+    assert loaded.score_profile.rows == model.score_profile.rows
+    assert loaded.tiered_thresholds == TieredThresholds(0.15, 0.65)

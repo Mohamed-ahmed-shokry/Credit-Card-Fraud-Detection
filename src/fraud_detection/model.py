@@ -31,8 +31,16 @@ from sklearn.preprocessing import StandardScaler
 
 from fraud_detection import __version__
 from fraud_detection.data import ValidatedDataset
-from fraud_detection.drift import build_reference_profile, default_thresholds
+from fraud_detection.drift import (
+    DriftError,
+    ScoreProfile,
+    build_reference_profile,
+    build_score_profile,
+    default_thresholds,
+)
 from fraud_detection.evaluation import (
+    TieredThresholds,
+    assign_tiered_decisions,
     evaluate_predictions,
     expected_classification_cost,
     select_cost_threshold,
@@ -125,6 +133,8 @@ class TrainingConfig:
     learning_rate: float = 0.1
     l2_regularization: float = 0.0
     max_bins: int = 255
+    review_threshold: float | None = None
+    deny_threshold: float | None = None
 
     def __post_init__(self) -> None:
         if not 0.05 <= self.test_size <= 0.4:
@@ -177,6 +187,13 @@ class TrainingConfig:
             raise ValueError("l2_regularization must be non-negative")
         if self.max_bins < 2:
             raise ValueError("max_bins must be at least 2")
+        if (self.review_threshold is None) != (self.deny_threshold is None):
+            raise ValueError("review_threshold and deny_threshold must be provided together.")
+        if self.review_threshold is not None and self.deny_threshold is not None:
+            TieredThresholds(
+                review_threshold=self.review_threshold,
+                deny_threshold=self.deny_threshold,
+            )
 
 
 @dataclass
@@ -215,6 +232,67 @@ class FraudModel:
     def predict(self, features: pd.DataFrame) -> np.ndarray:
         """Return binary decisions using the artifact's tuned threshold."""
         return (self.predict_probabilities(features) >= self.threshold).astype("int8")
+
+    def predict_decisions(
+        self,
+        features: pd.DataFrame,
+        *,
+        review_threshold: float | None = None,
+        deny_threshold: float | None = None,
+    ) -> np.ndarray:
+        """Return tiered risk decisions ('ALLOW', 'CHALLENGE', 'DENY') for input features."""
+        probabilities = self.predict_probabilities(features)
+        r_thresh = review_threshold
+        d_thresh = deny_threshold
+        if r_thresh is None or d_thresh is None:
+            tiered_meta = self.metadata.get("tiered_thresholds")
+            if isinstance(tiered_meta, Mapping):
+                r_thresh = (
+                    r_thresh
+                    if r_thresh is not None
+                    else float(tiered_meta.get("review_threshold", self.threshold))
+                )
+                d_thresh = (
+                    d_thresh
+                    if d_thresh is not None
+                    else float(tiered_meta.get("deny_threshold", self.threshold))
+                )
+            else:
+                r_thresh = r_thresh if r_thresh is not None else self.threshold
+                d_thresh = d_thresh if d_thresh is not None else self.threshold
+        try:
+            return assign_tiered_decisions(
+                probabilities,
+                review_threshold=r_thresh,
+                deny_threshold=d_thresh,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ModelArtifactError(str(exc)) from exc
+
+    @property
+    def score_profile(self) -> ScoreProfile | None:
+        """Return baseline validation score distribution profile if available."""
+        raw = self.metadata.get("score_profile")
+        if isinstance(raw, Mapping):
+            try:
+                return ScoreProfile.from_dict(raw)
+            except (DriftError, TypeError, ValueError, KeyError):
+                return None
+        return None
+
+    @property
+    def tiered_thresholds(self) -> TieredThresholds | None:
+        """Return persisted tiered decision boundaries if configured."""
+        raw = self.metadata.get("tiered_thresholds")
+        if isinstance(raw, Mapping):
+            try:
+                return TieredThresholds(
+                    review_threshold=float(raw["review_threshold"]),
+                    deny_threshold=float(raw["deny_threshold"]),
+                )
+            except (TypeError, ValueError, KeyError):
+                return None
+        return None
 
     def validate_features(self, features: pd.DataFrame) -> pd.DataFrame:
         """Validate and reorder transaction features to the training schema."""
@@ -568,6 +646,10 @@ def train_model(
             "false_negative_cost": settings.false_negative_cost,
         },
         "reference_profile": build_reference_profile(features_train),
+        "score_profile": build_score_profile(
+            validation_probabilities,
+            threshold=threshold,
+        ).to_dict(),
         "drift_thresholds": default_thresholds(),
         "feature_effects": feature_effects,
         "calibration_slope": _extract_calibration_slope(estimator),
@@ -576,6 +658,11 @@ def train_model(
         "validation_metrics": validation_metrics_payload,
         "test_metrics": test_metrics_payload,
     }
+    if settings.review_threshold is not None and settings.deny_threshold is not None:
+        metadata["tiered_thresholds"] = {
+            "review_threshold": float(settings.review_threshold),
+            "deny_threshold": float(settings.deny_threshold),
+        }
     metadata["lineage"] = _build_lineage(
         dataset_fingerprint=dataset_fingerprint,
         settings=settings,

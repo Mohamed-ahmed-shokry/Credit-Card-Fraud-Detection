@@ -12,10 +12,14 @@ from fraud_detection.drift import (
     DriftError,
     MultiWindowDriftReport,
     MultiWindowFeatureDrift,
+    ScoreDriftReport,
+    ScoreProfile,
     StreamingProfile,
     assess_drift,
     assess_multi_window_drift,
     build_reference_profile,
+    build_score_profile,
+    calculate_score_drift,
     default_thresholds,
     resolve_thresholds,
     surveillance_tripped,
@@ -532,3 +536,138 @@ def test_streaming_profile_from_dict_validation() -> None:
     bad["features"]["x"]["m2"] = -1.0
     with pytest.raises(DriftError, match=r"m2 for feature 'x' must be a finite"):
         StreamingProfile.from_dict(bad)
+
+
+def test_build_score_profile_and_serialization() -> None:
+    rng = np.random.default_rng(42)
+    probs = rng.uniform(0.0, 1.0, size=200)
+
+    profile = build_score_profile(probs, threshold=0.5, bins=10)
+    assert isinstance(profile, ScoreProfile)
+    assert profile.rows == 200
+    assert 0.0 <= profile.mean_score <= 1.0
+    assert profile.std_score >= 0.0
+    assert len(profile.bin_edges) == 11
+    assert len(profile.bin_counts) == 10
+    assert sum(profile.bin_counts) == 200
+    assert pytest.approx(sum(profile.bin_percentages)) == 1.0
+    assert "p50" in profile.quantiles
+    assert profile.threshold == 0.5
+    assert 0.0 <= profile.flagged_rate <= 1.0
+
+    d = profile.to_dict()
+    assert d["rows"] == 200
+    restored = ScoreProfile.from_dict(d)
+    assert restored.rows == profile.rows
+    assert restored.mean_score == pytest.approx(profile.mean_score)
+    assert restored.bin_counts == profile.bin_counts
+
+
+def test_build_score_profile_validation() -> None:
+    with pytest.raises(DriftError, match="non-empty one-dimensional"):
+        build_score_profile(np.array([]))
+    with pytest.raises(DriftError, match=r"between 0\.0 and 1\.0"):
+        build_score_profile(np.array([0.1, 1.5]))
+    with pytest.raises(DriftError, match=r"between 0\.0 and 1\.0"):
+        build_score_profile(np.array([0.1, -0.1]))
+    with pytest.raises(DriftError, match=r"between 0\.0 and 1\.0"):
+        build_score_profile(np.array([0.1, np.nan]))
+    with pytest.raises(DriftError, match="bins must be between 2 and 50"):
+        build_score_profile(np.array([0.1, 0.5]), bins=1)
+    with pytest.raises(DriftError, match="bins must be between 2 and 50"):
+        build_score_profile(np.array([0.1, 0.5]), bins=51)
+    with pytest.raises(DriftError, match="threshold must be a finite number"):
+        build_score_profile(np.array([0.1, 0.5]), threshold=True)  # type: ignore[arg-type]
+    with pytest.raises(DriftError, match="threshold must be a finite number"):
+        build_score_profile(np.array([0.1, 0.5]), threshold=1.5)
+
+
+def test_score_profile_from_dict_validation() -> None:
+    valid = {
+        "rows": 100,
+        "mean_score": 0.45,
+        "std_score": 0.25,
+        "bin_edges": [0.0, 0.5, 1.0],
+        "bin_counts": [60, 40],
+        "bin_percentages": [0.6, 0.4],
+        "quantiles": {"p50": 0.4},
+        "threshold": 0.5,
+        "flagged_rate": 0.4,
+    }
+    ScoreProfile.from_dict(valid)
+
+    # Not a mapping
+    with pytest.raises(DriftError, match="must be a mapping"):
+        ScoreProfile.from_dict("not-a-dict")  # type: ignore[arg-type]
+
+    # Missing field
+    bad = deepcopy(valid)
+    bad.pop("mean_score")
+    with pytest.raises(DriftError, match="invalid or missing fields"):
+        ScoreProfile.from_dict(bad)
+
+    # Non-positive rows
+    bad = deepcopy(valid)
+    bad["rows"] = 0
+    with pytest.raises(DriftError, match="rows must be positive"):
+        ScoreProfile.from_dict(bad)
+
+    # Invalid mean_score
+    bad = deepcopy(valid)
+    bad["mean_score"] = 1.2
+    with pytest.raises(DriftError, match="mean_score must be between 0 and 1"):
+        ScoreProfile.from_dict(bad)
+
+    # Negative std_score
+    bad = deepcopy(valid)
+    bad["std_score"] = -0.1
+    with pytest.raises(DriftError, match="std_score must be non-negative"):
+        ScoreProfile.from_dict(bad)
+
+    # Length mismatch
+    bad = deepcopy(valid)
+    bad["bin_counts"] = [60]
+    with pytest.raises(DriftError, match="bin_counts length must equal"):
+        ScoreProfile.from_dict(bad)
+
+    # Negative bin count
+    bad = deepcopy(valid)
+    bad["bin_counts"] = [-1, 101]
+    with pytest.raises(DriftError, match="bin_counts must be non-negative"):
+        ScoreProfile.from_dict(bad)
+
+    # Non-strictly increasing edges
+    bad = deepcopy(valid)
+    bad["bin_edges"] = [0.0, 0.0, 1.0]
+    with pytest.raises(DriftError, match="bin_edges must be strictly increasing"):
+        ScoreProfile.from_dict(bad)
+
+
+def test_calculate_score_drift_stable_and_drifted() -> None:
+    rng = np.random.default_rng(42)
+    # Baseline: beta distribution centered near 0.2
+    base_probs = rng.beta(2, 8, size=500)
+    profile = build_score_profile(base_probs, threshold=0.5, bins=10)
+
+    # 1. Stable: same distribution
+    curr_stable = rng.beta(2, 8, size=500)
+    rep_stable = calculate_score_drift(profile, curr_stable)
+    assert isinstance(rep_stable, ScoreDriftReport)
+    assert rep_stable.status == "STABLE"
+    assert rep_stable.psi < STABLE_THRESHOLD
+    assert abs(rep_stable.score_shift) < 0.05
+    assert rep_stable.to_dict()["status"] == "STABLE"
+
+    # 2. Drifted: distribution shifted sharply towards 0.8
+    curr_drifted = rng.beta(8, 2, size=500)
+    rep_drifted = calculate_score_drift(profile, curr_drifted)
+    assert rep_drifted.status == "DRIFTED"
+    assert rep_drifted.psi > DRIFT_THRESHOLD
+    assert rep_drifted.score_shift > 0.3
+    assert rep_drifted.flagged_rate_shift > 0.3
+
+    # 3. Validation errors
+    with pytest.raises(DriftError, match="non-empty one-dimensional"):
+        calculate_score_drift(profile, np.array([]))
+    with pytest.raises(DriftError, match=r"between 0\.0 and 1\.0"):
+        calculate_score_drift(profile, np.array([0.5, 1.2]))

@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
+from itertools import pairwise
 from typing import Any, cast
 
 import numpy as np
@@ -94,6 +95,124 @@ class MultiWindowDriftReport:
         }
 
 
+@dataclass(frozen=True)
+class ScoreProfile:
+    """Statistical summary of predicted fraud probabilities."""
+
+    rows: int
+    mean_score: float
+    std_score: float
+    bin_edges: tuple[float, ...]
+    bin_counts: tuple[int, ...]
+    bin_percentages: tuple[float, ...]
+    quantiles: dict[str, float]
+    threshold: float
+    flagged_rate: float
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-compatible profile mapping."""
+        return {
+            "rows": self.rows,
+            "mean_score": self.mean_score,
+            "std_score": self.std_score,
+            "bin_edges": list(self.bin_edges),
+            "bin_counts": list(self.bin_counts),
+            "bin_percentages": list(self.bin_percentages),
+            "quantiles": dict(self.quantiles),
+            "threshold": self.threshold,
+            "flagged_rate": self.flagged_rate,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> ScoreProfile:
+        """Construct a ScoreProfile from a mapping with validation."""
+        if not isinstance(data, Mapping):
+            raise DriftError("Score profile data must be a mapping.")
+        try:
+            rows = int(data["rows"])
+            mean_score = float(data["mean_score"])
+            std_score = float(data["std_score"])
+            threshold = float(data["threshold"])
+            flagged_rate = float(data["flagged_rate"])
+            bin_edges = tuple(float(x) for x in data["bin_edges"])
+            bin_counts = tuple(int(x) for x in data["bin_counts"])
+            bin_percentages = tuple(float(x) for x in data["bin_percentages"])
+            quantiles = {str(k): float(v) for k, v in data["quantiles"].items()}
+        except (KeyError, TypeError, ValueError) as exc:
+            raise DriftError("Score profile data contains invalid or missing fields.") from exc
+
+        if rows <= 0:
+            raise DriftError("Score profile rows must be positive.")
+        if not (0.0 <= mean_score <= 1.0) or not np.isfinite(mean_score):
+            raise DriftError("Score profile mean_score must be between 0 and 1.")
+        if std_score < 0.0 or not np.isfinite(std_score):
+            raise DriftError("Score profile std_score must be non-negative and finite.")
+        if not (0.0 <= threshold <= 1.0) or not np.isfinite(threshold):
+            raise DriftError("Score profile threshold must be between 0 and 1.")
+        if not (0.0 <= flagged_rate <= 1.0) or not np.isfinite(flagged_rate):
+            raise DriftError("Score profile flagged_rate must be between 0 and 1.")
+        if len(bin_edges) < 3:
+            raise DriftError("Score profile bin_edges must have at least 2 bins.")
+        if len(bin_counts) != len(bin_edges) - 1:
+            raise DriftError("Score profile bin_counts length must equal len(bin_edges) - 1.")
+        if len(bin_percentages) != len(bin_counts):
+            raise DriftError("Score profile bin_percentages length must match bin_counts.")
+        if any(c < 0 for c in bin_counts):
+            raise DriftError("Score profile bin_counts must be non-negative.")
+        if any(not np.isfinite(e) for e in bin_edges):
+            raise DriftError("Score profile bin_edges must be finite.")
+        if any(b <= a for a, b in pairwise(bin_edges)):
+            raise DriftError("Score profile bin_edges must be strictly increasing.")
+
+        return cls(
+            rows=rows,
+            mean_score=mean_score,
+            std_score=std_score,
+            bin_edges=bin_edges,
+            bin_counts=bin_counts,
+            bin_percentages=bin_percentages,
+            quantiles=quantiles,
+            threshold=threshold,
+            flagged_rate=flagged_rate,
+        )
+
+
+@dataclass(frozen=True)
+class ScoreDriftReport:
+    """Diagnostic report comparing current predicted probabilities against a baseline profile."""
+
+    rows: int
+    psi: float
+    status: str
+    baseline_mean_score: float
+    current_mean_score: float
+    score_shift: float
+    baseline_flagged_rate: float
+    current_flagged_rate: float
+    flagged_rate_shift: float
+    warning_at: float = STABLE_THRESHOLD
+    drift_at: float = DRIFT_THRESHOLD
+    baseline_bin_percentages: tuple[float, ...] = ()
+    current_bin_percentages: tuple[float, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-compatible report mapping."""
+        return {
+            "rows": self.rows,
+            "psi": self.psi,
+            "status": self.status,
+            "baseline_mean_score": self.baseline_mean_score,
+            "current_mean_score": self.current_mean_score,
+            "score_shift": self.score_shift,
+            "baseline_flagged_rate": self.baseline_flagged_rate,
+            "current_flagged_rate": self.current_flagged_rate,
+            "flagged_rate_shift": self.flagged_rate_shift,
+            "thresholds": {"warning_at": self.warning_at, "drift_at": self.drift_at},
+            "baseline_bin_percentages": list(self.baseline_bin_percentages),
+            "current_bin_percentages": list(self.current_bin_percentages),
+        }
+
+
 def default_thresholds() -> dict[str, float]:
     """Return the reference PSI cutoffs persisted with each model card."""
     return {"warning_at": STABLE_THRESHOLD, "drift_at": DRIFT_THRESHOLD}
@@ -120,6 +239,129 @@ def resolve_thresholds(source: object) -> tuple[float, float]:
     if not np.isfinite(warning_at) or not np.isfinite(drift_at) or not 0.0 <= warning_at < drift_at:
         raise DriftError("Drift thresholds must satisfy 0 <= warning_at < drift_at.")
     return (warning_at, drift_at)
+
+
+def build_score_profile(
+    probabilities: np.ndarray | Sequence[float],
+    *,
+    threshold: float = 0.5,
+    bins: int = 10,
+) -> ScoreProfile:
+    """Build a statistical profile of predicted fraud probabilities."""
+    probs = np.asarray(probabilities, dtype=float)
+    if probs.ndim != 1 or probs.size == 0:
+        raise DriftError("probabilities must be a non-empty one-dimensional array.")
+    if not np.isfinite(probs).all() or np.any((probs < 0.0) | (probs > 1.0)):
+        raise DriftError("probabilities must contain finite values between 0.0 and 1.0.")
+    if bins < 2 or bins > 50:
+        raise DriftError("bins must be between 2 and 50.")
+    if (
+        isinstance(threshold, bool)
+        or not np.isfinite(float(threshold))
+        or not (0.0 <= float(threshold) <= 1.0)
+    ):
+        raise DriftError("threshold must be a finite number between 0.0 and 1.0.")
+
+    thresh = float(threshold)
+    edges = np.linspace(0.0, 1.0, bins + 1)
+    counts, _ = np.histogram(probs, bins=edges)
+    rows = int(probs.size)
+    percentages = counts / rows if rows > 0 else np.zeros_like(counts, dtype=float)
+
+    mean_score = float(np.mean(probs))
+    std_score = float(np.std(probs))
+    q_vals = np.quantile(probs, [0.25, 0.5, 0.75, 0.90, 0.99])
+    quantiles = {
+        "p25": float(q_vals[0]),
+        "p50": float(q_vals[1]),
+        "p75": float(q_vals[2]),
+        "p90": float(q_vals[3]),
+        "p99": float(q_vals[4]),
+    }
+    flagged_rate = float(np.mean(probs >= thresh))
+
+    return ScoreProfile(
+        rows=rows,
+        mean_score=mean_score,
+        std_score=std_score,
+        bin_edges=tuple(float(e) for e in edges),
+        bin_counts=tuple(int(c) for c in counts),
+        bin_percentages=tuple(float(p) for p in percentages),
+        quantiles=quantiles,
+        threshold=thresh,
+        flagged_rate=flagged_rate,
+    )
+
+
+def calculate_score_drift(
+    baseline_profile: ScoreProfile | Mapping[str, Any],
+    current_probabilities: np.ndarray | Sequence[float],
+    *,
+    warning_at: float | None = None,
+    drift_at: float | None = None,
+) -> ScoreDriftReport:
+    """Calculate Population Stability Index (PSI) and shifts for predicted probabilities."""
+    profile = (
+        baseline_profile
+        if isinstance(baseline_profile, ScoreProfile)
+        else ScoreProfile.from_dict(baseline_profile)
+    )
+    probs = np.asarray(current_probabilities, dtype=float)
+    if probs.ndim != 1 or probs.size == 0:
+        raise DriftError("current_probabilities must be a non-empty one-dimensional array.")
+    if not np.isfinite(probs).all() or np.any((probs < 0.0) | (probs > 1.0)):
+        raise DriftError("current_probabilities must contain finite values between 0.0 and 1.0.")
+
+    warn_cut, drift_cut = resolve_thresholds(
+        {"warning_at": warning_at, "drift_at": drift_at}
+        if warning_at is not None or drift_at is not None
+        else None
+    )
+
+    edges = np.asarray(profile.bin_edges, dtype=float)
+    curr_counts, _ = np.histogram(probs, bins=edges)
+    curr_rows = int(probs.size)
+    curr_percentages = (
+        curr_counts / curr_rows if curr_rows > 0 else np.zeros_like(curr_counts, dtype=float)
+    )
+
+    base_props = np.asarray(profile.bin_percentages, dtype=float)
+    smoothed_base = np.maximum(base_props, _EPSILON)
+    smoothed_base = smoothed_base / smoothed_base.sum()
+
+    smoothed_curr = np.maximum(curr_percentages, _EPSILON)
+    smoothed_curr = smoothed_curr / smoothed_curr.sum()
+
+    psi_contributions = (smoothed_curr - smoothed_base) * np.log(smoothed_curr / smoothed_base)
+    psi = float(np.sum(psi_contributions))
+
+    if psi >= drift_cut:
+        status = "DRIFTED"
+    elif psi >= warn_cut:
+        status = "WARNING"
+    else:
+        status = "STABLE"
+
+    curr_mean = float(np.mean(probs))
+    score_shift = curr_mean - profile.mean_score
+    curr_flagged = float(np.mean(probs >= profile.threshold))
+    flagged_shift = curr_flagged - profile.flagged_rate
+
+    return ScoreDriftReport(
+        rows=curr_rows,
+        psi=psi,
+        status=status,
+        baseline_mean_score=profile.mean_score,
+        current_mean_score=curr_mean,
+        score_shift=score_shift,
+        baseline_flagged_rate=profile.flagged_rate,
+        current_flagged_rate=curr_flagged,
+        flagged_rate_shift=flagged_shift,
+        warning_at=warn_cut,
+        drift_at=drift_cut,
+        baseline_bin_percentages=tuple(float(p) for p in profile.bin_percentages),
+        current_bin_percentages=tuple(float(p) for p in curr_percentages),
+    )
 
 
 def build_reference_profile(
