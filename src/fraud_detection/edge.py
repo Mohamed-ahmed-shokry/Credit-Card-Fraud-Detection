@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import csv
 import json
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
+from enum import StrEnum
 from numbers import Real
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -15,6 +17,14 @@ if TYPE_CHECKING:
 
 EDGE_SCHEMA_VERSION = 1
 SUPPORTED_QUANTIZATION_BITS = 8
+
+
+class EdgeDecisionAction(StrEnum):
+    """Tiered decision routing action in edge runtime."""
+
+    ALLOW = "ALLOW"
+    CHALLENGE = "CHALLENGE"
+    DENY = "DENY"
 
 
 class EdgeArtifactError(ValueError):
@@ -89,6 +99,174 @@ class EdgeModel:
     def predict_record(self, record: Mapping[str, Any]) -> bool:
         """Apply the persisted threshold to one record."""
         return self.score_record(record) >= self.threshold
+
+    def explain_record(
+        self,
+        record: Mapping[str, Any],
+        top_k: int = 3,
+    ) -> dict[str, Any]:
+        """Compute quantized linear feature contributions and top risk factors.
+
+        For each feature: c_i = ((x_i - mean_i) / scale_i) * weight_i * weight_scale.
+        Returns a dictionary containing:
+            - probability: float
+            - intercept: float
+            - contributions: dict[str, float]
+            - top_contributions: list[dict[str, Any]] (ranked by absolute contribution)
+            - summary: human-readable explanation string
+        """
+        if (
+            not isinstance(top_k, int)
+            or isinstance(top_k, bool)
+            or not (1 <= top_k <= len(self.feature_names))
+        ):
+            raise EdgeArtifactError(
+                f"top_k must be an integer between 1 and {len(self.feature_names)}."
+            )
+        values = self._ordered_values(record)
+        contributions: dict[str, float] = {}
+        linear_score = self.intercept
+        for feature, value, mean, scale, weight in zip(
+            self.feature_names,
+            values,
+            self.scaler_mean,
+            self.scaler_scale,
+            self.quantized_weights,
+            strict=True,
+        ):
+            contribution = ((value - mean) / scale) * weight * self.weight_scale
+            contributions[feature] = contribution
+            linear_score += contribution
+
+        prob = _sigmoid(linear_score)
+
+        sorted_features = sorted(
+            contributions.items(),
+            key=lambda item: (-abs(item[1]), item[0]),
+        )
+        top_items = sorted_features[:top_k]
+        top_contributions = [
+            {
+                "feature": feat,
+                "contribution": round(contrib, 6),
+                "direction": "increases_risk" if contrib >= 0 else "decreases_risk",
+            }
+            for feat, contrib in top_items
+        ]
+        factors = ", ".join(
+            f"{item['feature']} ({float(item['contribution']):+.4f}, "
+            f"{str(item['direction']).replace('_', ' ')})"
+            for item in top_contributions
+        )
+        summary = f"Edge score: {prob:.2%}. Top contributing factors: {factors}."
+        return {
+            "probability": prob,
+            "intercept": self.intercept,
+            "contributions": contributions,
+            "top_contributions": top_contributions,
+            "summary": summary,
+        }
+
+    def explain_records(
+        self,
+        records: Sequence[Mapping[str, Any]],
+        top_k: int = 3,
+    ) -> list[dict[str, Any]]:
+        """Compute explanations for an ordered sequence of records."""
+        if not records:
+            raise EdgeArtifactError("At least one edge transaction is required.")
+        return [self.explain_record(record, top_k=top_k) for record in records]
+
+    def predict_decision_record(
+        self,
+        record: Mapping[str, Any],
+        *,
+        review_threshold: float | None = None,
+        deny_threshold: float | None = None,
+    ) -> dict[str, Any]:
+        """Classify a single record into ALLOW, CHALLENGE, or DENY."""
+        if (review_threshold is None) ^ (deny_threshold is None):
+            raise EdgeArtifactError(
+                "review_threshold and deny_threshold must both be provided or both omitted."
+            )
+        eff_review = self.threshold if review_threshold is None else review_threshold
+        eff_deny = self.threshold if deny_threshold is None else deny_threshold
+
+        if (
+            isinstance(eff_review, bool)
+            or not math.isfinite(eff_review)
+            or not (0.0 <= eff_review <= 1.0)
+        ):
+            raise EdgeArtifactError("review_threshold must be a finite float between 0.0 and 1.0.")
+        if (
+            isinstance(eff_deny, bool)
+            or not math.isfinite(eff_deny)
+            or not (0.0 <= eff_deny <= 1.0)
+        ):
+            raise EdgeArtifactError("deny_threshold must be a finite float between 0.0 and 1.0.")
+        if eff_review > eff_deny:
+            raise EdgeArtifactError(
+                f"review_threshold ({eff_review}) cannot exceed deny_threshold ({eff_deny})."
+            )
+
+        prob = self.score_record(record)
+        if prob < eff_review:
+            decision = EdgeDecisionAction.ALLOW.value
+            is_fraud = False
+        elif prob >= eff_deny:
+            decision = EdgeDecisionAction.DENY.value
+            is_fraud = True
+        else:
+            decision = EdgeDecisionAction.CHALLENGE.value
+            is_fraud = False
+
+        return {
+            "probability": prob,
+            "decision": decision,
+            "is_fraud": is_fraud,
+            "review_threshold": float(eff_review),
+            "deny_threshold": float(eff_deny),
+        }
+
+    def predict_decision_records(
+        self,
+        records: Sequence[Mapping[str, Any]],
+        *,
+        review_threshold: float | None = None,
+        deny_threshold: float | None = None,
+    ) -> list[dict[str, Any]]:
+        """Predict tiered decisions for an ordered sequence of records."""
+        if not records:
+            raise EdgeArtifactError("At least one edge transaction is required.")
+        return [
+            self.predict_decision_record(
+                record,
+                review_threshold=review_threshold,
+                deny_threshold=deny_threshold,
+            )
+            for record in records
+        ]
+
+    def score_batch_file(
+        self,
+        input_path: Path | str,
+        output_path: Path | str,
+        *,
+        explain: bool = False,
+        top_k: int = 3,
+        review_threshold: float | None = None,
+        deny_threshold: float | None = None,
+    ) -> dict[str, Any]:
+        """Stream a batch file (CSV or JSONL) and write scored decisions."""
+        return score_batch_file(
+            self,
+            input_path,
+            output_path,
+            explain=explain,
+            top_k=top_k,
+            review_threshold=review_threshold,
+            deny_threshold=deny_threshold,
+        )
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-compatible edge artifact mapping."""
@@ -234,3 +412,214 @@ def _sigmoid(value: float) -> float:
         return 1.0 / (1.0 + math.exp(-value))
     exponential = math.exp(value)
     return exponential / (1.0 + exponential)
+
+
+def _stream_records(in_path: Path) -> Iterator[tuple[int, dict[str, Any]]]:
+    suffix = in_path.suffix.lower()
+    if suffix in (".jsonl", ".ndjson"):
+        with in_path.open("r", encoding="utf-8") as f:
+            for line_idx, line in enumerate(f, start=1):
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    obj = json.loads(stripped)
+                except json.JSONDecodeError as exc:
+                    raise EdgeArtifactError(f"Line {line_idx} is not valid JSON: {exc}") from exc
+                if not isinstance(obj, dict):
+                    raise EdgeArtifactError(f"Line {line_idx} must be a JSON object.")
+                yield line_idx, obj
+    elif suffix in (".csv", ".tsv"):
+        delimiter = "\t" if suffix == ".tsv" else ","
+        with in_path.open("r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f, delimiter=delimiter)
+            for row_idx, row in enumerate(reader, start=1):
+                converted: dict[str, Any] = {}
+                for k, v in row.items():
+                    if k is not None and v is not None:
+                        try:
+                            converted[k] = float(v)
+                        except (ValueError, TypeError):
+                            converted[k] = v
+                yield row_idx, converted
+    elif suffix == ".json":
+        try:
+            data = json.loads(in_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise EdgeArtifactError(f"Invalid JSON in {in_path}: {exc}") from exc
+        if not isinstance(data, list):
+            raise EdgeArtifactError("JSON content must be a list of records.")
+        for row_idx, item in enumerate(data, start=1):
+            if not isinstance(item, dict):
+                raise EdgeArtifactError(f"Item {row_idx} must be a JSON object.")
+            yield row_idx, item
+    else:
+        raise EdgeArtifactError(
+            f"Unsupported input file format '{suffix}'. Expected .csv, .tsv, .json, or .jsonl."
+        )
+
+
+def score_batch_file(
+    target_a: EdgeModel | Path | str,
+    target_b: Path | str,
+    target_c: Path | str | None = None,
+    *,
+    model: EdgeModel | Path | str | None = None,
+    explain: bool = False,
+    top_k: int = 3,
+    review_threshold: float | None = None,
+    deny_threshold: float | None = None,
+) -> dict[str, Any]:
+    """Stream a batch of transactions and write scored predictions.
+
+    Supports JSONL (.jsonl, .ndjson), JSON (.json array or JSONL), and CSV (.csv, .tsv).
+    """
+    if isinstance(target_a, EdgeModel):
+        edge_model = target_a
+        in_path = Path(target_b)
+        if target_c is None:
+            raise EdgeArtifactError("output_path is required.")
+        out_path = Path(target_c)
+    elif target_c is not None:
+        edge_model = target_a if isinstance(target_a, EdgeModel) else load_edge_model(target_a)
+        in_path = Path(target_b)
+        out_path = Path(target_c)
+    else:
+        if model is None:
+            raise EdgeArtifactError("model must be provided as an argument to score_batch_file.")
+        edge_model = model if isinstance(model, EdgeModel) else load_edge_model(model)
+        in_path = Path(target_a)
+        out_path = Path(target_b)
+
+    if not in_path.is_file():
+        raise EdgeArtifactError(f"Input file not found: {in_path}")
+
+    out_suffix = out_path.suffix.lower()
+    if out_suffix not in (".csv", ".tsv", ".jsonl", ".ndjson", ".json"):
+        raise EdgeArtifactError(
+            f"Unsupported output file format '{out_suffix}'. Expected .csv, .tsv, .json, or .jsonl."
+        )
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    count = 0
+    total_prob = 0.0
+    decision_counts = {
+        EdgeDecisionAction.ALLOW.value: 0,
+        EdgeDecisionAction.CHALLENGE.value: 0,
+        EdgeDecisionAction.DENY.value: 0,
+    }
+
+    if out_suffix in (".csv", ".tsv"):
+        delimiter = "\t" if out_suffix == ".tsv" else ","
+        fieldnames = ["row_id", "probability", "decision", "is_fraud"]
+        if explain:
+            fieldnames.extend(["summary", "explanation", "top_factors"])
+
+        with out_path.open("w", encoding="utf-8", newline="") as out_f:
+            writer = csv.DictWriter(out_f, fieldnames=fieldnames, delimiter=delimiter)
+            writer.writeheader()
+
+            for row_idx, record in _stream_records(in_path):
+                count += 1
+                decision_res = edge_model.predict_decision_record(
+                    record,
+                    review_threshold=review_threshold,
+                    deny_threshold=deny_threshold,
+                )
+                prob = decision_res["probability"]
+                decision = decision_res["decision"]
+                total_prob += prob
+                decision_counts[decision] += 1
+
+                row_id = record.get("id", record.get("row_id", row_idx))
+                out_row: dict[str, Any] = {
+                    "row_id": row_id,
+                    "probability": round(prob, 6),
+                    "decision": decision,
+                    "is_fraud": int(decision_res["is_fraud"]),
+                }
+                if explain:
+                    expl = edge_model.explain_record(record, top_k=top_k)
+                    out_row["summary"] = expl["summary"]
+                    out_row["explanation"] = expl["summary"]
+                    out_row["top_factors"] = "; ".join(
+                        f"{c['feature']}:{c['contribution']:+.4f}"
+                        for c in expl["top_contributions"]
+                    )
+                writer.writerow(out_row)
+
+    elif out_suffix in (".jsonl", ".ndjson"):
+        with out_path.open("w", encoding="utf-8") as out_f:
+            for row_idx, record in _stream_records(in_path):
+                count += 1
+                decision_res = edge_model.predict_decision_record(
+                    record,
+                    review_threshold=review_threshold,
+                    deny_threshold=deny_threshold,
+                )
+                prob = decision_res["probability"]
+                decision = decision_res["decision"]
+                total_prob += prob
+                decision_counts[decision] += 1
+
+                row_id = record.get("id", record.get("row_id", row_idx))
+                out_obj: dict[str, Any] = {
+                    "row_id": row_id,
+                    "probability": round(prob, 6),
+                    "decision": decision,
+                    "is_fraud": decision_res["is_fraud"],
+                    "review_threshold": decision_res["review_threshold"],
+                    "deny_threshold": decision_res["deny_threshold"],
+                }
+                if explain:
+                    expl = edge_model.explain_record(record, top_k=top_k)
+                    out_obj["summary"] = expl["summary"]
+                    out_obj["explanation"] = expl["summary"]
+                    out_obj["top_contributions"] = expl["top_contributions"]
+                out_f.write(json.dumps(out_obj) + "\n")
+
+    else:  # .json array
+        json_rows: list[dict[str, Any]] = []
+        for row_idx, record in _stream_records(in_path):
+            count += 1
+            decision_res = edge_model.predict_decision_record(
+                record,
+                review_threshold=review_threshold,
+                deny_threshold=deny_threshold,
+            )
+            prob = decision_res["probability"]
+            decision = decision_res["decision"]
+            total_prob += prob
+            decision_counts[decision] += 1
+
+            row_id = record.get("id", record.get("row_id", row_idx))
+            out_obj = {
+                "row_id": row_id,
+                "probability": round(prob, 6),
+                "decision": decision,
+                "is_fraud": decision_res["is_fraud"],
+                "review_threshold": decision_res["review_threshold"],
+                "deny_threshold": decision_res["deny_threshold"],
+            }
+            if explain:
+                expl = edge_model.explain_record(record, top_k=top_k)
+                out_obj["summary"] = expl["summary"]
+                out_obj["explanation"] = expl["summary"]
+                out_obj["top_contributions"] = expl["top_contributions"]
+            json_rows.append(out_obj)
+
+        with out_path.open("w", encoding="utf-8") as out_f:
+            json.dump(json_rows, out_f, indent=2)
+
+    if count == 0:
+        raise EdgeArtifactError("Input file contains no records to score.")
+
+    return {
+        "rows_processed": count,
+        "input_path": str(in_path),
+        "output_path": str(out_path),
+        "mean_probability": round(total_prob / count, 6),
+        "decision_counts": decision_counts,
+        "explained": explain,
+    }
