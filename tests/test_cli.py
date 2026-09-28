@@ -3570,3 +3570,394 @@ def test_export_edge_cli_without_validation_data(tmp_path: Path) -> None:
     )
     assert res.exit_code == 0, res.output
     assert out_edge.is_file()
+
+
+def test_predict_command_with_tiered_thresholds_and_audit(
+    tmp_path: Path, trained_artifact: Path
+) -> None:
+    data_path = tmp_path / "data.csv"
+    data = generate_synthetic_data(rows=200, random_state=12)
+    data.to_csv(data_path, index=False)
+    out_csv = tmp_path / "preds.csv"
+    audit_log = tmp_path / "audit.jsonl"
+
+    res = runner.invoke(
+        app,
+        [
+            "predict",
+            str(trained_artifact),
+            str(data_path),
+            "--output",
+            str(out_csv),
+            "--review-threshold",
+            "0.15",
+            "--deny-threshold",
+            "0.85",
+            "--audit-log",
+            str(audit_log),
+        ],
+    )
+    assert res.exit_code == 0, res.output
+    summary = json.loads(res.output)
+    assert summary["review_threshold"] == 0.15
+    assert summary["deny_threshold"] == 0.85
+    assert "decision_counts" in summary
+    assert "ALLOW" in summary["decision_counts"]
+    assert "CHALLENGE" in summary["decision_counts"]
+    assert "DENY" in summary["decision_counts"]
+
+    df = pd.read_csv(out_csv)
+    assert "decision" in df.columns
+    assert set(df["decision"].unique()).issubset({"ALLOW", "CHALLENGE", "DENY"})
+
+    audit_lines = audit_log.read_text(encoding="utf-8").strip().splitlines()
+    assert len(audit_lines) == 1
+    event = json.loads(audit_lines[0])
+    assert event["event_type"] == "scoring"
+    assert event["payload"]["review_threshold"] == 0.15
+    assert event["payload"]["deny_threshold"] == 0.85
+    assert "decision" in event["payload"]["predictions"][0]
+
+
+def test_predict_command_tiered_threshold_validation(
+    tmp_path: Path, trained_artifact: Path
+) -> None:
+    data_path = tmp_path / "data.csv"
+    data = generate_synthetic_data(rows=200, random_state=1)
+    data.to_csv(data_path, index=False)
+
+    # Missing one threshold
+    res1 = runner.invoke(
+        app,
+        [
+            "predict",
+            str(trained_artifact),
+            str(data_path),
+            "--review-threshold",
+            "0.2",
+        ],
+    )
+    assert res1.exit_code == 2
+    assert "Both --review-threshold and --deny-threshold must be supplied together" in res1.output
+
+    # review > deny
+    res2 = runner.invoke(
+        app,
+        [
+            "predict",
+            str(trained_artifact),
+            str(data_path),
+            "--review-threshold",
+            "0.8",
+            "--deny-threshold",
+            "0.2",
+        ],
+    )
+    assert res2.exit_code == 2
+    assert "--review-threshold cannot exceed --deny-threshold" in res2.output
+
+    # out of bounds
+    res3 = runner.invoke(
+        app,
+        [
+            "predict",
+            str(trained_artifact),
+            str(data_path),
+            "--review-threshold",
+            "-0.1",
+            "--deny-threshold",
+            "0.5",
+        ],
+    )
+    assert res3.exit_code == 2
+    assert "Tiered thresholds must fall between 0.0 and 1.0" in res3.output
+
+
+def test_score_drift_command_csv_and_reporting(tmp_path: Path, trained_model: FraudModel) -> None:
+    art_path = tmp_path / "model_art"
+    save_model(trained_model, art_path)
+
+    # Generate predictions CSV
+    df = pd.DataFrame({"fraud_probability": [0.01, 0.05, 0.02, 0.95, 0.12]})
+    csv_path = tmp_path / "preds.csv"
+    df.to_csv(csv_path, index=False)
+
+    rep_out = tmp_path / "score_drift.json"
+    res = runner.invoke(
+        app,
+        [
+            "score-drift",
+            str(art_path),
+            str(csv_path),
+            "--output",
+            str(rep_out),
+        ],
+    )
+    assert res.exit_code == 0, res.output
+    assert rep_out.is_file()
+    data = json.loads(rep_out.read_text(encoding="utf-8"))
+    assert "psi" in data
+    assert "status" in data
+    assert "score_shift" in data
+
+
+def test_score_drift_command_formats(tmp_path: Path, trained_model: FraudModel) -> None:
+    art_path = tmp_path / "model_art"
+    save_model(trained_model, art_path)
+
+    # TSV format
+    tsv_path = tmp_path / "preds.tsv"
+    tsv_df = pd.DataFrame({"score": [0.02, 0.04, 0.03, 0.01]})
+    tsv_df.to_csv(tsv_path, sep="\t", index=False)
+
+    res_tsv = runner.invoke(
+        app,
+        [
+            "score-drift",
+            str(art_path),
+            str(tsv_path),
+            "--score-column",
+            "score",
+        ],
+    )
+    assert res_tsv.exit_code == 0, res_tsv.output
+
+    # JSONL format with dicts
+    jsonl_path = tmp_path / "preds.jsonl"
+    jsonl_path.write_text(
+        json.dumps({"fraud_probability": 0.05})
+        + "\n"
+        + json.dumps({"fraud_probability": 0.02})
+        + "\n",
+        encoding="utf-8",
+    )
+    res_jsonl = runner.invoke(
+        app,
+        [
+            "score-drift",
+            str(art_path),
+            str(jsonl_path),
+        ],
+    )
+    assert res_jsonl.exit_code == 0, res_jsonl.output
+
+    # JSONL format with raw numbers
+    jsonl_nums_path = tmp_path / "preds_nums.jsonl"
+    jsonl_nums_path.write_text("0.1\n0.2\n0.05\n", encoding="utf-8")
+    res_nums = runner.invoke(
+        app,
+        [
+            "score-drift",
+            str(art_path),
+            str(jsonl_nums_path),
+        ],
+    )
+    assert res_nums.exit_code == 0, res_nums.output
+
+    # Plain text format
+    txt_path = tmp_path / "preds.txt"
+    txt_path.write_text("0.05\n0.12\n0.01\n", encoding="utf-8")
+    res_txt = runner.invoke(
+        app,
+        [
+            "score-drift",
+            str(art_path),
+            str(txt_path),
+        ],
+    )
+    assert res_txt.exit_code == 0, res_txt.output
+
+
+def test_score_drift_command_fail_on_and_alert_webhook(
+    tmp_path: Path, trained_model: FraudModel
+) -> None:
+    art_path = tmp_path / "model_art"
+    save_model(trained_model, art_path)
+
+    # Heavily shifted predictions -> should cause drift
+    shifted_df = pd.DataFrame({"fraud_probability": [0.99] * 50})
+    csv_path = tmp_path / "shifted.csv"
+    shifted_df.to_csv(csv_path, index=False)
+
+    # Invalid fail-on
+    res_inv = runner.invoke(
+        app,
+        [
+            "score-drift",
+            str(art_path),
+            str(csv_path),
+            "--fail-on",
+            "critical",
+        ],
+    )
+    assert res_inv.exit_code == 2
+    assert "Invalid --fail-on 'critical'" in res_inv.output
+
+    # Tripped fail-on with webhook
+    with patch("fraud_detection.cli._post_webhook") as mock_post:
+        res_trip = runner.invoke(
+            app,
+            [
+                "score-drift",
+                str(art_path),
+                str(csv_path),
+                "--fail-on",
+                "warning",
+                "--alert-webhook-url",
+                "https://alerts.internal/drift",
+            ],
+        )
+        assert res_trip.exit_code == 1
+        assert "Score drift surveillance tripped" in res_trip.output
+        mock_post.assert_called_once()
+        call_args = mock_post.call_args[0]
+        assert call_args[0] == "https://alerts.internal/drift"
+        assert call_args[1]["alert"] == "SCORE_DRIFT"
+
+
+def test_score_drift_command_errors(tmp_path: Path, trained_model: FraudModel) -> None:
+    # Model without score profile
+    meta = dict(trained_model.metadata)
+    meta.pop("score_profile", None)
+    model_no_prof = FraudModel(
+        estimator=trained_model.estimator,
+        threshold=trained_model.threshold,
+        feature_names=trained_model.feature_names,
+        metadata=meta,
+        artifact_version=trained_model.artifact_version,
+    )
+    art_path = tmp_path / "no_prof"
+    save_model(model_no_prof, art_path)
+
+    csv_path = tmp_path / "data.csv"
+    pd.DataFrame({"fraud_probability": [0.1, 0.2]}).to_csv(csv_path, index=False)
+
+    res_no_prof = runner.invoke(
+        app,
+        [
+            "score-drift",
+            str(art_path),
+            str(csv_path),
+        ],
+    )
+    assert res_no_prof.exit_code == 2
+    assert "does not contain a baseline score_profile" in res_no_prof.output
+
+    # Missing column in CSV
+    art_with_prof = tmp_path / "with_prof"
+    save_model(trained_model, art_with_prof)
+    bad_csv = tmp_path / "bad.csv"
+    pd.DataFrame({"unrelated_col": [1, 2]}).to_csv(bad_csv, index=False)
+
+    res_bad_col = runner.invoke(
+        app,
+        [
+            "score-drift",
+            str(art_with_prof),
+            str(bad_csv),
+        ],
+    )
+    assert res_bad_col.exit_code == 2
+    assert "Could not identify probability column" in res_bad_col.output
+
+    # Empty scores
+    empty_csv = tmp_path / "empty.csv"
+    pd.DataFrame({"fraud_probability": []}).to_csv(empty_csv, index=False)
+    res_empty = runner.invoke(
+        app,
+        [
+            "score-drift",
+            str(art_with_prof),
+            str(empty_csv),
+        ],
+    )
+    assert res_empty.exit_code == 2
+    assert "No valid scores found" in res_empty.output
+
+
+def test_score_edge_command(tmp_path: Path) -> None:
+    dataset = validate_frame(generate_synthetic_data(rows=300, random_state=42))
+    model = train_model(
+        dataset,
+        config=TrainingConfig(calibration_method=CalibrationMethod.NONE),
+    )
+    art_dir = tmp_path / "uncal_model"
+    save_model(model, art_dir)
+
+    edge_file = tmp_path / "edge_artifact.json"
+    res_export = runner.invoke(
+        app,
+        [
+            "export-edge",
+            str(art_dir),
+            "--output",
+            str(edge_file),
+        ],
+    )
+    assert res_export.exit_code == 0, res_export.output
+
+    # Create input CSV
+    in_csv = tmp_path / "input.csv"
+    test_data = generate_synthetic_data(rows=200, random_state=99).head(20)
+    test_data = test_data.drop(columns=["Class"], errors="ignore")
+    test_data.to_csv(in_csv, index=False)
+
+    out_jsonl = tmp_path / "edge_out.jsonl"
+    res_score = runner.invoke(
+        app,
+        [
+            "score-edge",
+            str(edge_file),
+            str(in_csv),
+            "--output",
+            str(out_jsonl),
+            "--explain",
+            "--top-k",
+            "3",
+            "--review-threshold",
+            "0.2",
+            "--deny-threshold",
+            "0.8",
+        ],
+    )
+    assert res_score.exit_code == 0, res_score.output
+    summary = json.loads(res_score.output)
+    assert summary["rows_processed"] == 20
+    assert "decision_counts" in summary
+
+    lines = out_jsonl.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 20
+    first_record = json.loads(lines[0])
+    assert "probability" in first_record
+    assert "decision" in first_record
+    assert first_record["decision"] in ("ALLOW", "CHALLENGE", "DENY")
+    assert "explanation" in first_record
+    assert "top_contributions" in first_record
+
+    # Output already exists without overwrite
+    res_dup = runner.invoke(
+        app,
+        [
+            "score-edge",
+            str(edge_file),
+            str(in_csv),
+            "--output",
+            str(out_jsonl),
+        ],
+    )
+    assert res_dup.exit_code == 2
+    assert "Output already exists" in res_dup.output
+
+    # With overwrite
+    res_over = runner.invoke(
+        app,
+        [
+            "score-edge",
+            str(edge_file),
+            str(in_csv),
+            "--output",
+            str(out_jsonl),
+            "--overwrite",
+        ],
+    )
+    assert res_over.exit_code == 0, res_over.output

@@ -36,13 +36,15 @@ from fraud_detection.drift import (
     DriftError,
     DriftReport,
     MultiWindowDriftReport,
+    ScoreDriftReport,
     StreamingProfile,
     assess_drift,
     assess_multi_window_drift,
     build_reference_profile,
+    calculate_score_drift,
     surveillance_tripped,
 )
-from fraud_detection.edge import EdgeArtifactError, build_edge_model
+from fraud_detection.edge import EdgeArtifactError, build_edge_model, score_batch_file
 from fraud_detection.evaluation import (
     ThresholdRow,
     calibration_report,
@@ -1366,6 +1368,20 @@ def predict_command(
             "Both thresholds are reported in the summary."
         ),
     ] = None,
+    review_threshold: Annotated[
+        float | None,
+        typer.Option(
+            "--review-threshold",
+            help="Upper score threshold for automatic ALLOW routing in tiered policy.",
+        ),
+    ] = None,
+    deny_threshold: Annotated[
+        float | None,
+        typer.Option(
+            "--deny-threshold",
+            help="Lower score threshold for automatic DENY routing in tiered policy.",
+        ),
+    ] = None,
     explain_llm: Annotated[
         bool,
         typer.Option(help="Include per-transaction LLM-generated natural language explanations."),
@@ -1385,6 +1401,18 @@ def predict_command(
         _abort(f"Output already exists: {output}. Pass --overwrite to replace it.")
     if threshold is not None and (isinstance(threshold, bool) or not 0.0 <= threshold <= 1.0):
         _abort(f"Invalid threshold {threshold!r}: must fall between 0 and 1.")
+    if (review_threshold is None) ^ (deny_threshold is None):
+        _abort("Both --review-threshold and --deny-threshold must be supplied together.")
+    if review_threshold is not None and deny_threshold is not None:
+        if (
+            isinstance(review_threshold, bool)
+            or not 0.0 <= review_threshold <= 1.0
+            or isinstance(deny_threshold, bool)
+            or not 0.0 <= deny_threshold <= 1.0
+        ):
+            _abort("Tiered thresholds must fall between 0.0 and 1.0.")
+        if review_threshold > deny_threshold:
+            _abort("--review-threshold cannot exceed --deny-threshold.")
 
     try:
         model = load_model(model_path)
@@ -1393,9 +1421,15 @@ def predict_command(
         probabilities = model.predict_probabilities(features)
         applied_threshold = model.threshold if threshold is None else threshold
         predictions = (probabilities >= applied_threshold).astype("int8")
+        decisions = model.predict_decisions(
+            features,
+            review_threshold=review_threshold,
+            deny_threshold=deny_threshold,
+        )
         scored = frame.copy()
         scored["fraud_probability"] = probabilities
         scored["is_fraud"] = predictions
+        scored["decision"] = decisions
         if explain:
             explanations = model.explain_local(features)
             for idx, expl in enumerate(explanations):
@@ -1419,17 +1453,21 @@ def predict_command(
                     model_version=str(model.metadata.get("dataset_fingerprint", ""))[:12],
                     dataset_fingerprint=str(model.metadata.get("dataset_fingerprint", "")),
                     threshold=applied_threshold,
+                    review_threshold=review_threshold,
+                    deny_threshold=deny_threshold,
                     features=features.to_dict(orient="records"),
                     predictions=[
                         {
                             "index": int(idx),
                             "fraud_probability": float(prob),
                             "is_fraud": bool(pred),
+                            "decision": str(dec),
                         }
-                        for idx, prob, pred in zip(
+                        for idx, prob, pred, dec in zip(
                             scored.index,
                             probabilities,
                             predictions,
+                            decisions,
                             strict=True,
                         )
                     ],
@@ -1446,6 +1484,12 @@ def predict_command(
         ModelArtifactError,
     ) as exc:
         _abort(str(exc))
+
+    decision_counts = {
+        "ALLOW": int((decisions == "ALLOW").sum()),
+        "CHALLENGE": int((decisions == "CHALLENGE").sum()),
+        "DENY": int((decisions == "DENY").sum()),
+    }
     typer.echo(
         json.dumps(
             {
@@ -1455,6 +1499,9 @@ def predict_command(
                 "threshold": applied_threshold,
                 "model_threshold": model.threshold,
                 "threshold_overridden": threshold is not None,
+                "review_threshold": review_threshold,
+                "deny_threshold": deny_threshold,
+                "decision_counts": decision_counts,
             }
         )
     )
@@ -2104,6 +2151,227 @@ def _post_webhook(url: str, payload: dict[str, Any]) -> None:
         urllib.request.urlopen(req, timeout=10)  # noqa: S310
     except urllib.error.URLError as exc:
         typer.echo(f"Warning: Failed to send webhook: {exc}", err=True)
+
+
+def _send_score_drift_alert(
+    *,
+    report: ScoreDriftReport,
+    webhook_url: str,
+    model_version: str,
+) -> None:
+    """Post score drift alert payload to webhook URL."""
+    payload = {
+        "alert": "SCORE_DRIFT",
+        "model_version": model_version,
+        "status": report.status,
+        "psi": round(report.psi, 6),
+        "score_shift": round(report.score_shift, 6),
+        "flagged_rate_shift": round(report.flagged_rate_shift, 6),
+    }
+    _post_webhook(webhook_url, payload)
+
+
+@app.command("score-drift")
+def score_drift_command(
+    model_path: Annotated[
+        Path,
+        typer.Argument(exists=True, readable=True, help="Model file or artifact directory."),
+    ],
+    scores_or_predictions: Annotated[
+        Path,
+        typer.Argument(
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="Current predictions CSV or scores file.",
+        ),
+    ],
+    output: Annotated[
+        Path | None,
+        typer.Option("--output", "-o", help="Optional JSON report destination."),
+    ] = None,
+    overwrite: Annotated[
+        bool,
+        typer.Option(help="Replace an existing report file."),
+    ] = False,
+    fail_on: Annotated[
+        str | None,
+        typer.Option(
+            help="Exit code 1 when status reaches 'warning' or 'drifted' (for CI/CD or cron).",
+        ),
+    ] = None,
+    alert_webhook_url: Annotated[
+        str | None,
+        typer.Option(
+            "--alert-webhook-url",
+            help="HTTP webhook URL to receive drift alert when surveillance triggers.",
+        ),
+    ] = None,
+    score_column: Annotated[
+        str | None,
+        typer.Option(
+            "--score-column",
+            help="Column name for probability if input is CSV (auto-detected if omitted).",
+        ),
+    ] = None,
+) -> None:
+    """Assess drift between baseline validation scores and operational predictions."""
+    _guard_output(output, overwrite)
+    try:
+        model = load_model(model_path)
+        profile = model.score_profile
+        if profile is None:
+            raise DriftError("Model artifact does not contain a baseline score_profile.")
+
+        suffix = scores_or_predictions.suffix.lower()
+        if suffix in (".csv", ".tsv"):
+            delimiter = "\t" if suffix == ".tsv" else ","
+            df = pd.read_csv(scores_or_predictions, delimiter=delimiter)
+            target_col = score_column
+            if target_col is None:
+                for candidate in (
+                    "fraud_probability",
+                    "probability",
+                    "score",
+                    "fraud_score",
+                    "pred_prob",
+                ):
+                    if candidate in df.columns:
+                        target_col = candidate
+                        break
+            if target_col is None or target_col not in df.columns:
+                raise DriftError(
+                    f"Could not identify probability column in {scores_or_predictions}. "
+                    "Specify --score-column."
+                )
+            series = pd.to_numeric(df[target_col], errors="coerce").dropna()
+            current_scores = series.to_numpy(dtype=float)
+        elif suffix in (".jsonl", ".ndjson"):
+            scores_list: list[float] = []
+            with scores_or_predictions.open("r", encoding="utf-8") as f:
+                for line in f:
+                    s = line.strip()
+                    if not s:
+                        continue
+                    obj = json.loads(s)
+                    if isinstance(obj, dict):
+                        col = score_column or (
+                            "fraud_probability" if "fraud_probability" in obj else "score"
+                        )
+                        if col in obj:
+                            scores_list.append(float(obj[col]))
+                    elif isinstance(obj, (int, float)):
+                        scores_list.append(float(obj))
+            current_scores = np.asarray(scores_list, dtype=float)
+        else:
+            lines = scores_or_predictions.read_text(encoding="utf-8").splitlines()
+            current_scores = np.asarray(
+                [float(line.strip()) for line in lines if line.strip()], dtype=float
+            )
+
+        if len(current_scores) == 0:
+            raise DriftError(f"No valid scores found in {scores_or_predictions}.")
+
+        report = calculate_score_drift(profile, current_scores)
+        report_json = json.dumps(report.to_dict(), indent=2)
+        _emit_report(report_json, output)
+
+        tripped = False
+        if fail_on is not None:
+            norm_fail = fail_on.strip().lower()
+            if norm_fail not in ("warning", "drifted"):
+                _abort(f"Invalid --fail-on {fail_on!r}: must be 'warning' or 'drifted'.")
+            rep_status = report.status.lower()
+            tripped = (norm_fail == "warning" and rep_status in ("warning", "drifted")) or (
+                norm_fail == "drifted" and rep_status == "drifted"
+            )
+
+        if tripped:
+            if alert_webhook_url:
+                _send_score_drift_alert(
+                    report=report,
+                    webhook_url=alert_webhook_url,
+                    model_version=str(model.metadata.get("dataset_fingerprint", ""))[:12],
+                )
+            typer.echo(
+                f"Score drift surveillance tripped: status={report.status} "
+                f"meets --fail-on {fail_on}.",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+    except (
+        OSError,
+        UnicodeDecodeError,
+        pd.errors.ParserError,
+        pd.errors.EmptyDataError,
+        ModelArtifactError,
+        DriftError,
+    ) as exc:
+        _abort(str(exc))
+
+
+@app.command("score-edge")
+def score_edge_command(
+    edge_model: Annotated[
+        Path,
+        typer.Argument(exists=True, readable=True, help="Edge artifact JSON path."),
+    ],
+    input_file: Annotated[
+        Path,
+        typer.Argument(
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="Input transaction batch file (CSV, TSV, JSON, or JSONL).",
+        ),
+    ],
+    output: Annotated[
+        Path,
+        typer.Option("--output", "-o", help="Scored output file destination."),
+    ] = Path("edge_predictions.jsonl"),
+    explain: Annotated[
+        bool,
+        typer.Option(help="Include feature explanations and top risk contributors."),
+    ] = False,
+    top_k: Annotated[
+        int,
+        typer.Option(help="Number of top contributing features when --explain is active."),
+    ] = 3,
+    review_threshold: Annotated[
+        float | None,
+        typer.Option(
+            "--review-threshold",
+            help="Upper score threshold for automatic ALLOW routing in tiered policy.",
+        ),
+    ] = None,
+    deny_threshold: Annotated[
+        float | None,
+        typer.Option(
+            "--deny-threshold",
+            help="Lower score threshold for automatic DENY routing in tiered policy.",
+        ),
+    ] = None,
+    overwrite: Annotated[
+        bool,
+        typer.Option(help="Replace an existing output file."),
+    ] = False,
+) -> None:
+    """Stream-score transactions using a dependency-light quantized edge artifact."""
+    if output.exists() and not overwrite:
+        _abort(f"Output already exists: {output}. Pass --overwrite to replace it.")
+    try:
+        summary = score_batch_file(
+            edge_model,
+            input_file,
+            output,
+            explain=explain,
+            top_k=top_k,
+            review_threshold=review_threshold,
+            deny_threshold=deny_threshold,
+        )
+        typer.echo(json.dumps(summary, indent=2))
+    except (EdgeArtifactError, OSError) as exc:
+        _abort(str(exc))
 
 
 @app.command("multi-window-drift")
