@@ -1040,6 +1040,40 @@ the package version, or publish a release.
 - **CLI test coverage reduction**: added comprehensive CLI test suites covering error and branch paths across `retrain`, `export-edge`, `generate-trust-bundle`, `rotate-trust-bundle`, `verify-attestation`, `compliance`, and `replay-audit`, elevating `src/fraud_detection/cli.py` branch coverage to 98.63% (`ec89cff`).
 - **Quality gate verification**: 545 tests passed (100% pass rate); global branch coverage reached 98.33% (well exceeding the 97.0% floor); Ruff lint and formatting passed with zero findings; strict mypy passed across all 14 source files; wheel and sdist built cleanly and passed Twine check (`6eaf8b3`).
 
+## Phase 25 — Decision Policy Tiers, Output Score Surveillance, and Edge Explanation Parity (In progress)
+
+### Objective
+
+Bridge the gap between binary model scores and real-world fraud decisioning by introducing three-tier risk routing (`ALLOW`, `CHALLENGE`, `DENY`), output prediction score drift surveillance, and edge runtime feature explanation parity.
+
+### Scope
+
+- **Multi-tier decision policies & evaluation** — define `DecisionAction` (`ALLOW`, `CHALLENGE`, `DENY`), `TieredThresholds` ($0 \le review\_threshold \le deny\_threshold \le 1.0$), and `evaluate_tiered_policy()` in `evaluation.py` measuring allow/review/deny rates, review/deny precisions, overall fraud catch rate, and weighted operational costs; add `predict_decisions()` to `FraudModel` in `model.py`.
+- **Serving & audit integration** — expose `decision`, `review_threshold`, and `deny_threshold` on `/v1/predict` and `/v1/score` endpoints, request schemas, and prediction responses in `api.py`; record decisions and tiered thresholds in structured audit events in `audit.py`; pass decisions to `TemplateExplanationProvider` in `explanations.py`.
+- **Output score surveillance** — compute baseline validation score distribution profiles (`ScoreProfile`) during training; implement `calculate_score_drift()` in `drift.py` calculating Score Population Stability Index (PSI), mean score shift, and flagged-rate delta; add `fraud-detect score-drift` command in `cli.py` with exit code triggers and alerting webhooks (Slack, PagerDuty).
+- **Edge runtime explanation parity & standalone scoring** — implement `EdgeModel.explain_record()` in `edge.py` computing quantized linear feature contributions in pure Python without scikit-learn or pandas; add `EdgeModel.predict_decision_record()` for tiered decisions; add `EdgeModel.score_batch_file()` and `fraud-detect score-edge` CLI command for dependency-free batch scoring and explanations.
+
+### Acceptance criteria
+
+- `TieredThresholds` enforces $0 \le review\_threshold \le deny\_threshold \le 1.0$ and rejects non-finite or inverted thresholds.
+- `evaluate_tiered_policy()` computes exact allow/review/deny counts, rates, precisions, catch rates, and expected operational costs.
+- `FraudModel.predict_decisions()` routes transactions correctly into `ALLOW`, `CHALLENGE`, and `DENY` actions; legacy models and calls without tiered thresholds preserve binary behavior where `is_fraud` maps to `DENY` / `ALLOW`.
+- `/v1/predict` and `/v1/score` return the `decision` field and tiered thresholds; audit events log the decision and tiered threshold fields.
+- `train_model()` saves a baseline `score_profile` in model metadata; legacy artifacts without `score_profile` remain loadable and fall back gracefully.
+- `calculate_score_drift()` computes valid Score PSI, probability shifts, and flagged-rate shifts; raises `DriftError` on empty or invalid probability arrays.
+- `fraud-detect score-drift` command parses predictions/audit logs, computes score drift against the model artifact, and respects `--fail-on` and webhook alerting.
+- `EdgeModel.explain_record()` computes accurate linear contributions in pure Python matching full model logistic explanations within int8 quantization tolerance.
+- `EdgeModel.score_batch_file()` and `fraud-detect score-edge` CLI command score CSV and JSONL files without requiring scikit-learn or pandas.
+- All existing tests pass, branch coverage remains >= 97.0%, Ruff and strict mypy pass with zero findings, and packages build cleanly.
+
+### Explicit exclusions
+
+This phase does not implement dynamic rule graph execution (AST evaluation of arbitrary Python expressions), automated online Bayesian threshold updating, external database sinks for drift profiles, or web-based UI dashboards.
+
+### Delivery record
+
+Filled in as phase increments complete.
+
 ## Contributing to the roadmap
 
 Open an issue or a pull request that references the relevant phase item.
