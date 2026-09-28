@@ -2170,3 +2170,129 @@ def test_traffic_shadowing_exception_handling(
         assert len(res.json()["predictions"]) == 2
 
     sink.close()
+
+
+def test_tiered_decisions_predict_and_score(
+    client: TestClient,
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, _, dataset = api_context
+    record = dataset.features.iloc[0].to_dict()
+
+    # 1. /v1/predict with tiered thresholds
+    predict_res = client.post(
+        "/v1/predict",
+        json={
+            "transactions": [record],
+            "review_threshold": 0.05,
+            "deny_threshold": 0.95,
+        },
+    )
+    assert predict_res.status_code == 200
+    data = predict_res.json()
+    assert data["review_threshold"] == 0.05
+    assert data["deny_threshold"] == 0.95
+    assert data["predictions"][0]["decision"] in ("ALLOW", "CHALLENGE", "DENY")
+
+    # 2. /v1/score with tiered thresholds
+    score_res = client.post(
+        "/v1/score",
+        json={
+            "transaction": record,
+            "review_threshold": 0.05,
+            "deny_threshold": 0.95,
+        },
+    )
+    assert score_res.status_code == 200
+    s_data = score_res.json()
+    assert s_data["review_threshold"] == 0.05
+    assert s_data["deny_threshold"] == 0.95
+    assert s_data["prediction"]["decision"] in ("ALLOW", "CHALLENGE", "DENY")
+
+
+def test_tiered_decisions_validation_errors(
+    client: TestClient,
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, _, dataset = api_context
+    record = dataset.features.iloc[0].to_dict()
+
+    # Only review_threshold provided
+    res1 = client.post(
+        "/v1/predict",
+        json={"transactions": [record], "review_threshold": 0.2},
+    )
+    assert res1.status_code == 422
+
+    # Inverted thresholds
+    res2 = client.post(
+        "/v1/predict",
+        json={"transactions": [record], "review_threshold": 0.8, "deny_threshold": 0.2},
+    )
+    assert res2.status_code == 422
+
+    # Score only deny_threshold
+    res3 = client.post(
+        "/v1/score",
+        json={"transaction": record, "deny_threshold": 0.8},
+    )
+    assert res3.status_code == 422
+
+
+def test_tiered_decisions_metrics_and_audit(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+    tmp_path: Path,
+) -> None:
+    _, model, dataset = api_context
+    sink_file = tmp_path / "audit_tiers.jsonl"
+    sink = JsonlAuditSink(sink_file)
+    app = create_app(model=model, audit_sink=sink)
+
+    records = [dataset.features.iloc[i].to_dict() for i in range(5)]
+    with TestClient(app) as test_client:
+        res = test_client.post(
+            "/v1/predict",
+            json={
+                "transactions": records,
+                "review_threshold": 0.1,
+                "deny_threshold": 0.9,
+                "explain_llm": True,
+            },
+        )
+        assert res.status_code == 200
+
+        # Check Prometheus metrics
+        metrics_res = test_client.get("/metrics")
+        assert metrics_res.status_code == 200
+        text = metrics_res.text
+        assert "fraud_decisions_total" in text
+        assert "fraud_output_score" in text
+
+    sink.close()
+
+    # Check Audit event payload
+    event_data = json.loads(sink_file.read_text(encoding="utf-8").strip())
+    assert event_data["payload"]["review_threshold"] == 0.1
+    assert event_data["payload"]["deny_threshold"] == 0.9
+    assert "decision" in event_data["payload"]["predictions"][0]
+    assert "decision_counts" in event_data["payload"]
+
+
+def test_tiered_decisions_model_metadata_defaults(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, model, dataset = api_context
+    tiered_model = deepcopy(model)
+    tiered_model.metadata["tiered_thresholds"] = {
+        "review_threshold": 0.12,
+        "deny_threshold": 0.88,
+    }
+    app = create_app(model=tiered_model)
+    rec = dataset.features.iloc[0].to_dict()
+
+    with TestClient(app) as client:
+        res = client.post("/v1/predict", json={"transactions": [rec]})
+        assert res.status_code == 200
+        data = res.json()
+        assert data["review_threshold"] == 0.12
+        assert data["deny_threshold"] == 0.88

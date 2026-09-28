@@ -215,6 +215,9 @@ def build_scoring_audit_event(
     fallback_reason: str | None = None,
     request_id: str | None = None,
     client_metadata: dict[str, Any] | None = None,
+    review_threshold: float | None = None,
+    deny_threshold: float | None = None,
+    decision_counts: Mapping[str, int] | None = None,
 ) -> AuditEvent:
     """Construct a structured scoring audit event."""
     fraud_count = sum(1 for p in predictions if p.get("is_fraud"))
@@ -224,6 +227,21 @@ def build_scoring_audit_event(
         "fraud_count": fraud_count,
         "predictions": list(predictions),
     }
+    if review_threshold is not None:
+        payload["review_threshold"] = review_threshold
+    if deny_threshold is not None:
+        payload["deny_threshold"] = deny_threshold
+    if decision_counts is not None:
+        payload["decision_counts"] = dict(decision_counts)
+    else:
+        counts: dict[str, int] = {}
+        for p in predictions:
+            dec = p.get("decision")
+            if dec:
+                counts[str(dec)] = counts.get(str(dec), 0) + 1
+        if counts:
+            payload["decision_counts"] = counts
+
     if features is not None:
         payload["features"] = list(features)
     if fallback_applied:

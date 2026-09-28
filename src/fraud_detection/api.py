@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from threading import RLock
 from time import perf_counter
-from typing import Annotated, Any, cast
+from typing import Annotated, Any, Self, cast
 from uuid import uuid4
 
 import numpy as np
@@ -31,7 +31,7 @@ from prometheus_client import (
     Histogram,
     generate_latest,
 )
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from starlette.concurrency import run_in_threadpool
 from starlette.middleware.base import RequestResponseEndpoint
 from starlette.responses import Response
@@ -44,6 +44,7 @@ from fraud_detection.audit import (
     build_scoring_audit_event,
     build_shadow_scoring_audit_event,
 )
+from fraud_detection.evaluation import DecisionAction, TieredThresholds
 from fraud_detection.explanations import ExplanationProvider
 from fraud_detection.model import FraudModel, ModelArtifactError, load_model
 from fraud_detection.telemetry import (
@@ -433,6 +434,22 @@ class PredictionRequest(BaseModel):
     explain: bool = False
     explain_llm: bool = False
     threshold: float | None = Field(default=None, ge=0.0, le=1.0)
+    review_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
+    deny_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
+
+    @model_validator(mode="after")
+    def validate_tiered_thresholds(self) -> Self:
+        if (self.review_threshold is None) ^ (self.deny_threshold is None):
+            raise ValueError(
+                "review_threshold and deny_threshold must both be provided or both omitted."
+            )
+        if (
+            self.review_threshold is not None
+            and self.deny_threshold is not None
+            and self.review_threshold > self.deny_threshold
+        ):
+            raise ValueError("review_threshold cannot exceed deny_threshold.")
+        return self
 
 
 class PredictionResult(BaseModel):
@@ -440,6 +457,7 @@ class PredictionResult(BaseModel):
 
     fraud_probability: float
     is_fraud: bool
+    decision: str = "ALLOW"
     contributions: dict[str, float] | None = None
     explanation: str | None = None
 
@@ -450,6 +468,8 @@ class PredictionResponse(BaseModel):
     model_version: str
     threshold: float
     model_threshold: float
+    review_threshold: float | None = None
+    deny_threshold: float | None = None
     predictions: list[PredictionResult]
     fallback_applied: bool = False
     fallback_reason: str | None = None
@@ -464,6 +484,22 @@ class ScoreRequest(BaseModel):
     explain: bool = False
     explain_llm: bool = False
     threshold: float | None = Field(default=None, ge=0.0, le=1.0)
+    review_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
+    deny_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
+
+    @model_validator(mode="after")
+    def validate_tiered_thresholds(self) -> Self:
+        if (self.review_threshold is None) ^ (self.deny_threshold is None):
+            raise ValueError(
+                "review_threshold and deny_threshold must both be provided or both omitted."
+            )
+        if (
+            self.review_threshold is not None
+            and self.deny_threshold is not None
+            and self.review_threshold > self.deny_threshold
+        ):
+            raise ValueError("review_threshold cannot exceed deny_threshold.")
+        return self
 
 
 class ScoreResponse(BaseModel):
@@ -472,6 +508,8 @@ class ScoreResponse(BaseModel):
     model_version: str
     threshold: float
     model_threshold: float
+    review_threshold: float | None = None
+    deny_threshold: float | None = None
     prediction: PredictionResult
     fallback_applied: bool = False
     fallback_reason: str | None = None
@@ -708,6 +746,18 @@ def create_app(
         "fraud_predictions_total",
         "Total scored transactions by decision.",
         ["is_fraud"],
+        registry=metrics_registry,
+    )
+    decision_counter = Counter(
+        "fraud_decisions_total",
+        "Total scored transactions by decision policy tier.",
+        ["action"],
+        registry=metrics_registry,
+    )
+    score_histogram = Histogram(
+        "fraud_output_score",
+        "Distribution of model prediction fraud scores.",
+        buckets=(0.0, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 1.0),
         registry=metrics_registry,
     )
     fallback_counter = Counter(
@@ -1118,11 +1168,31 @@ def create_app(
         probabilities: np.ndarray,
         *,
         applied_threshold: float,
+        eff_review: float,
+        eff_deny: float,
         explain: bool,
         explain_llm: bool,
     ) -> list[PredictionResult]:
-        """Threshold primary probabilities and build the per-transaction results."""
-        decisions = probabilities >= applied_threshold
+        """Classify primary probabilities using tiered thresholds and build
+        per-transaction results.
+        """
+        decision_actions: list[str] = []
+        is_fraud_flags: list[bool] = []
+        for prob in probabilities:
+            p_val = float(prob)
+            score_histogram.observe(p_val)
+            if p_val < eff_review:
+                act = DecisionAction.ALLOW.value
+                flag = False
+            elif p_val >= eff_deny:
+                act = DecisionAction.DENY.value
+                flag = True
+            else:
+                act = DecisionAction.CHALLENGE.value
+                flag = False
+            decision_actions.append(act)
+            is_fraud_flags.append(flag)
+
         local_explanations = loaded.explain_local(frame) if explain or explain_llm else None
         natural_language = (
             loaded.explain_local_natural_language(
@@ -1130,17 +1200,21 @@ def create_app(
                 probabilities,
                 threshold=applied_threshold,
                 contributions=local_explanations,
+                decisions=decision_actions,
                 provider=explanation_provider,
             )
             if explain_llm
             else None
         )
         results: list[PredictionResult] = []
-        for index, (probability, decision) in enumerate(zip(probabilities, decisions, strict=True)):
+        for index, (prob, is_fraud, action) in enumerate(
+            zip(probabilities, is_fraud_flags, decision_actions, strict=True)
+        ):
             results.append(
                 PredictionResult(
-                    fraud_probability=float(probability),
-                    is_fraud=bool(decision),
+                    fraud_probability=float(prob),
+                    is_fraud=is_fraud,
+                    decision=action,
                     contributions=(
                         local_explanations[index]
                         if explain and local_explanations is not None
@@ -1149,8 +1223,17 @@ def create_app(
                     explanation=(natural_language[index] if natural_language else None),
                 )
             )
-        prediction_counter.labels(is_fraud="true").inc(int(decisions.sum()))
-        prediction_counter.labels(is_fraud="false").inc(int((~decisions).sum()))
+        fraud_sum = sum(1 for f in is_fraud_flags if f)
+        prediction_counter.labels(is_fraud="true").inc(fraud_sum)
+        prediction_counter.labels(is_fraud="false").inc(len(is_fraud_flags) - fraud_sum)
+        for action in (
+            DecisionAction.ALLOW.value,
+            DecisionAction.CHALLENGE.value,
+            DecisionAction.DENY.value,
+        ):
+            act_count = sum(1 for a in decision_actions if a == action)
+            if act_count > 0:
+                decision_counter.labels(action=action).inc(act_count)
         return results
 
     def _require_probabilities(probabilities: Any, expected_rows: int) -> np.ndarray:
@@ -1177,19 +1260,34 @@ def create_app(
         explain: bool,
         explain_llm: bool,
         threshold: float | None,
+        review_threshold: float | None = None,
+        deny_threshold: float | None = None,
         fallback_mode: str = "raise",
         fallback_score: float = 0.5,
         fallback_amount_threshold: float = 1000.0,
         force_degraded: bool = False,
         circuit_breaker: CircuitBreaker | None = None,
-    ) -> tuple[float, list[PredictionResult], bool, str | None]:
+    ) -> tuple[float, list[PredictionResult], bool, str | None, float, float]:
         """Score transactions with runtime guardrails and resilient degraded-state fallback."""
         # Reject a request whose feature schema does not match the artifact before any
         # guardrail state changes: a malformed request is a client error, never a model
         # failure, so it must not record a circuit-breaker failure or be answered with a
         # fabricated fallback score.
         loaded.validate_features(frame)
-        applied_threshold = loaded.threshold if threshold is None else threshold
+        raw_th = getattr(loaded, "threshold", 0.5) if threshold is None else threshold
+        applied_threshold = float(raw_th) if isinstance(raw_th, (int, float)) else 0.5
+
+        tiered = getattr(loaded, "tiered_thresholds", None)
+        if review_threshold is not None and deny_threshold is not None:
+            eff_review = float(review_threshold)
+            eff_deny = float(deny_threshold)
+        elif isinstance(tiered, TieredThresholds):
+            eff_review = float(tiered.review_threshold)
+            eff_deny = float(tiered.deny_threshold)
+        else:
+            eff_review = applied_threshold
+            eff_deny = applied_threshold
+
         fallback_applied = False
         fallback_reason: str | None = None
         results: list[PredictionResult] = []
@@ -1222,6 +1320,8 @@ def create_app(
                     frame,
                     probabilities,
                     applied_threshold=applied_threshold,
+                    eff_review=eff_review,
+                    eff_deny=eff_deny,
                     explain=explain,
                     explain_llm=explain_llm,
                 )
@@ -1239,14 +1339,24 @@ def create_app(
                 fallback_reason = f"model_exception: {type(exc).__name__}"
 
         if not fallback_applied:
-            return applied_threshold, results, False, None
+            return applied_threshold, results, False, None, eff_review, eff_deny
 
         if fallback_mode == "constant":
-            dec_const = fallback_score >= applied_threshold
+            prob_const = float(fallback_score)
+            if prob_const < eff_review:
+                act_const = DecisionAction.ALLOW.value
+                flag_const = False
+            elif prob_const >= eff_deny:
+                act_const = DecisionAction.DENY.value
+                flag_const = True
+            else:
+                act_const = DecisionAction.CHALLENGE.value
+                flag_const = False
             results = [
                 PredictionResult(
-                    fraud_probability=float(fallback_score),
-                    is_fraud=bool(dec_const),
+                    fraud_probability=prob_const,
+                    is_fraud=flag_const,
+                    decision=act_const,
                     contributions=None,
                     explanation="Fallback policy (constant) applied.",
                 )
@@ -1258,7 +1368,15 @@ def create_app(
                 amt_val = float(amount)
                 is_high = amt_val >= fallback_amount_threshold
                 prob = 1.0 if is_high else 0.0
-                is_fraud = bool(prob >= applied_threshold)
+                if prob < eff_review:
+                    act_rule = DecisionAction.ALLOW.value
+                    flag_rule = False
+                elif prob >= eff_deny:
+                    act_rule = DecisionAction.DENY.value
+                    flag_rule = True
+                else:
+                    act_rule = DecisionAction.CHALLENGE.value
+                    flag_rule = False
                 rule_exp = (
                     f"Fallback rule applied: Amount ({amt_val:.2f}) "
                     f"{'>=' if is_high else '<'} {fallback_amount_threshold:.2f}."
@@ -1266,7 +1384,8 @@ def create_app(
                 results.append(
                     PredictionResult(
                         fraud_probability=prob,
-                        is_fraud=is_fraud,
+                        is_fraud=flag_rule,
+                        decision=act_rule,
                         contributions=None,
                         explanation=rule_exp,
                     )
@@ -1274,10 +1393,18 @@ def create_app(
         fraud_count = sum(1 for r in results if r.is_fraud)
         prediction_counter.labels(is_fraud="true").inc(fraud_count)
         prediction_counter.labels(is_fraud="false").inc(len(results) - fraud_count)
+        for action in (
+            DecisionAction.ALLOW.value,
+            DecisionAction.CHALLENGE.value,
+            DecisionAction.DENY.value,
+        ):
+            act_count = sum(1 for r in results if r.decision == action)
+            if act_count > 0:
+                decision_counter.labels(action=action).inc(act_count)
         fallback_counter.labels(mode=fallback_mode, reason=fallback_reason or "unknown").inc(
             len(results)
         )
-        return applied_threshold, results, True, fallback_reason
+        return applied_threshold, results, True, fallback_reason, eff_review, eff_deny
 
     async def _score_with_guardrails(
         request: Request,
@@ -1288,7 +1415,9 @@ def create_app(
         explain: bool,
         explain_llm: bool,
         threshold: float | None,
-    ) -> tuple[float, list[PredictionResult], bool, str | None]:
+        review_threshold: float | None = None,
+        deny_threshold: float | None = None,
+    ) -> tuple[float, list[PredictionResult], bool, str | None, float, float]:
         """Run the shared scoring pipeline: cap, inference, audit emit, and shadow scheduling.
 
         Raises:
@@ -1309,13 +1438,22 @@ def create_app(
                 raise _ScoringOverloadedError
             await scoring_semaphore.acquire()
         try:
-            applied_threshold, results, fallback_applied, fallback_reason = await run_in_threadpool(
+            (
+                applied_threshold,
+                results,
+                fallback_applied,
+                fallback_reason,
+                eff_review,
+                eff_deny,
+            ) = await run_in_threadpool(
                 score_frame,
                 loaded,
                 frame,
                 explain=explain,
                 explain_llm=explain_llm,
                 threshold=threshold,
+                review_threshold=review_threshold,
+                deny_threshold=deny_threshold,
                 fallback_mode=fb_mode,
                 fallback_score=fb_score,
                 fallback_amount_threshold=fb_amount,
@@ -1331,6 +1469,8 @@ def create_app(
                 model_version=str(loaded.metadata.get("dataset_fingerprint", ""))[:12],
                 dataset_fingerprint=str(loaded.metadata.get("dataset_fingerprint", "")),
                 threshold=applied_threshold,
+                review_threshold=eff_review,
+                deny_threshold=eff_deny,
                 features=features,
                 fallback_applied=fallback_applied,
                 fallback_reason=fallback_reason,
@@ -1338,6 +1478,7 @@ def create_app(
                     {
                         "fraud_probability": r.fraud_probability,
                         "is_fraud": r.is_fraud,
+                        "decision": r.decision,
                         "contributions": r.contributions,
                         "explanation": r.explanation,
                     }
@@ -1374,7 +1515,7 @@ def create_app(
             shadow_tasks.add(shadow_task)
             shadow_task.add_done_callback(shadow_tasks.discard)
 
-        return applied_threshold, results, fallback_applied, fallback_reason
+        return applied_threshold, results, fallback_applied, fallback_reason, eff_review, eff_deny
 
     @application.post(
         "/v1/predict",
@@ -1393,6 +1534,8 @@ def create_app(
                 results,
                 fallback_applied,
                 fallback_reason,
+                eff_review,
+                eff_deny,
             ) = await _score_with_guardrails(
                 request,
                 loaded,
@@ -1401,6 +1544,8 @@ def create_app(
                 explain=payload.explain,
                 explain_llm=payload.explain_llm,
                 threshold=payload.threshold,
+                review_threshold=payload.review_threshold,
+                deny_threshold=payload.deny_threshold,
             )
         except _ScoringOverloadedError:
             return _scoring_overloaded_response()
@@ -1408,6 +1553,8 @@ def create_app(
             model_version=_model_version(loaded),
             threshold=applied_threshold,
             model_threshold=loaded.threshold,
+            review_threshold=eff_review,
+            deny_threshold=eff_deny,
             predictions=results,
             fallback_applied=fallback_applied,
             fallback_reason=fallback_reason,
@@ -1430,6 +1577,8 @@ def create_app(
                 results,
                 fallback_applied,
                 fallback_reason,
+                eff_review,
+                eff_deny,
             ) = await _score_with_guardrails(
                 request,
                 loaded,
@@ -1438,6 +1587,8 @@ def create_app(
                 explain=payload.explain,
                 explain_llm=payload.explain_llm,
                 threshold=payload.threshold,
+                review_threshold=payload.review_threshold,
+                deny_threshold=payload.deny_threshold,
             )
         except _ScoringOverloadedError:
             return _scoring_overloaded_response()
@@ -1445,6 +1596,8 @@ def create_app(
             model_version=_model_version(loaded),
             threshold=applied_threshold,
             model_threshold=loaded.threshold,
+            review_threshold=eff_review,
+            deny_threshold=eff_deny,
             prediction=results[0],
             fallback_applied=fallback_applied,
             fallback_reason=fallback_reason,

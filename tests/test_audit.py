@@ -538,3 +538,32 @@ def test_replay_audit_log_validation_and_robustness(tmp_path: Path) -> None:
     report_empty = replay_audit_log(empty_log, model)
     assert report_empty.total_transactions == 0
     assert report_empty.status == "EMPTY"
+
+
+def test_build_scoring_audit_event_tiered_thresholds_and_decisions() -> None:
+    # 1. Automatic decision_counts derivation
+    event = build_scoring_audit_event(
+        model_version="v1",
+        dataset_fingerprint="fp1",
+        threshold=0.5,
+        review_threshold=0.2,
+        deny_threshold=0.7,
+        predictions=[
+            {"fraud_probability": 0.1, "is_fraud": False, "decision": "ALLOW"},
+            {"fraud_probability": 0.4, "is_fraud": False, "decision": "CHALLENGE"},
+            {"fraud_probability": 0.8, "is_fraud": True, "decision": "DENY"},
+        ],
+    )
+    assert event.payload["review_threshold"] == 0.2
+    assert event.payload["deny_threshold"] == 0.7
+    assert event.payload["decision_counts"] == {"ALLOW": 1, "CHALLENGE": 1, "DENY": 1}
+
+    # 2. Explicit decision_counts override
+    event_explicit = build_scoring_audit_event(
+        model_version="v1",
+        dataset_fingerprint="fp1",
+        threshold=0.5,
+        predictions=[],
+        decision_counts={"ALLOW": 5, "DENY": 2},
+    )
+    assert event_explicit.payload["decision_counts"] == {"ALLOW": 5, "DENY": 2}

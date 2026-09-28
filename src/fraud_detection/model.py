@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import warnings
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -347,6 +347,7 @@ class FraudModel:
         *,
         threshold: float | None = None,
         contributions: list[dict[str, Any]] | None = None,
+        decisions: Sequence[str] | None = None,
         top_k: int = 3,
         provider: ExplanationProvider | None = None,
     ) -> list[str]:
@@ -370,6 +371,9 @@ class FraudModel:
         ):
             raise ModelArtifactError("Natural-language explanations require valid probabilities.")
 
+        if decisions is not None and len(decisions) != len(ordered):
+            raise ModelArtifactError("Decisions count does not match the transaction count.")
+
         local_contributions = contributions or self.explain_local(ordered)
         if len(local_contributions) != len(ordered):
             raise ModelArtifactError("Local explanations do not match the transaction count.")
@@ -379,7 +383,9 @@ class FraudModel:
             ExplanationRequest(
                 probability=float(prob),
                 threshold=applied_threshold,
-                decision="FRAUD" if float(prob) >= applied_threshold else "LEGITIMATE",
+                decision=str(decisions[i])
+                if decisions is not None
+                else ("FRAUD" if float(prob) >= applied_threshold else "LEGITIMATE"),
                 contributions={k: float(v) for k, v in row_contrib.items()},
                 features={str(k): v for k, v in ordered.iloc[i].to_dict().items()}
                 if len(ordered) > 0
