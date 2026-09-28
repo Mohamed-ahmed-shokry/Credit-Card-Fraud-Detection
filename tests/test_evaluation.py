@@ -4,8 +4,13 @@ import numpy as np
 import pytest
 
 from fraud_detection.evaluation import (
+    DecisionAction,
+    TieredMetrics,
+    TieredThresholds,
+    assign_tiered_decisions,
     calibration_report,
     evaluate_predictions,
+    evaluate_tiered_policy,
     expected_classification_cost,
     select_cost_threshold,
     select_f1_threshold,
@@ -254,3 +259,131 @@ def test_metric_functions_reject_invalid_vectors(
 ) -> None:
     with pytest.raises(ValueError, match=message):
         select_f1_threshold(y_true, probabilities)
+
+
+def test_tiered_thresholds_validation() -> None:
+    t = TieredThresholds(review_threshold=0.3, deny_threshold=0.8)
+    assert t.review_threshold == 0.3
+    assert t.deny_threshold == 0.8
+    assert t.to_dict() == {"review_threshold": 0.3, "deny_threshold": 0.8}
+
+    # Equality is valid (binary policy boundary)
+    t_eq = TieredThresholds(review_threshold=0.5, deny_threshold=0.5)
+    assert t_eq.review_threshold == 0.5
+    assert t_eq.deny_threshold == 0.5
+
+    # Inverted thresholds
+    with pytest.raises(ValueError, match=r"review_threshold .* cannot exceed deny_threshold"):
+        TieredThresholds(review_threshold=0.8, deny_threshold=0.3)
+
+    # Out of range
+    with pytest.raises(ValueError, match=r"between 0\.0 and 1\.0"):
+        TieredThresholds(review_threshold=-0.1, deny_threshold=0.5)
+    with pytest.raises(ValueError, match=r"between 0\.0 and 1\.0"):
+        TieredThresholds(review_threshold=0.2, deny_threshold=1.5)
+
+    # Non-numeric / boolean
+    with pytest.raises(TypeError, match="numeric"):
+        TieredThresholds(review_threshold=True, deny_threshold=0.5)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="numeric"):
+        TieredThresholds(review_threshold=0.2, deny_threshold=False)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="real numbers"):
+        TieredThresholds(review_threshold="bad", deny_threshold=0.5)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="finite"):
+        TieredThresholds(review_threshold=float("nan"), deny_threshold=0.5)
+
+
+def test_assign_tiered_decisions() -> None:
+    probs = np.array([0.1, 0.3, 0.5, 0.8, 0.95])
+    actions = assign_tiered_decisions(probs, review_threshold=0.3, deny_threshold=0.8)
+    expected = np.array(
+        [
+            DecisionAction.ALLOW.value,
+            DecisionAction.CHALLENGE.value,
+            DecisionAction.CHALLENGE.value,
+            DecisionAction.DENY.value,
+            DecisionAction.DENY.value,
+        ]
+    )
+    np.testing.assert_array_equal(actions, expected)
+
+    # Empty or invalid vectors
+    with pytest.raises(ValueError, match="non-empty one-dimensional"):
+        assign_tiered_decisions(np.array([]), review_threshold=0.3, deny_threshold=0.8)
+    with pytest.raises(ValueError, match="between 0 and 1"):
+        assign_tiered_decisions(np.array([0.1, 1.5]), review_threshold=0.3, deny_threshold=0.8)
+
+
+def test_evaluate_tiered_policy_metrics_and_costs() -> None:
+    y_true = np.array([0, 0, 0, 0, 1, 1])
+    probs = np.array([0.05, 0.2, 0.4, 0.85, 0.5, 0.9])
+    # Tiers with review=0.3, deny=0.8:
+    # ALLOW: idx 0 (y=0), idx 1 (y=0) -> allow_count=2, caught_fraud_allow=0, missed_fraud=0
+    # CHALLENGE: idx 2 (y=0), idx 4 (y=1) -> review_count=2, caught_fraud_review=1, false_review=1
+    # DENY: idx 3 (y=0), idx 5 (y=1) -> deny_count=2, caught_fraud_deny=1, false_deny=1
+
+    metrics = evaluate_tiered_policy(
+        y_true,
+        probs,
+        review_threshold=0.3,
+        deny_threshold=0.8,
+        manual_review_cost=10.0,
+        false_deny_cost=60.0,
+        missed_fraud_cost=300.0,
+    )
+
+    assert isinstance(metrics, TieredMetrics)
+    assert metrics.rows == 6
+    assert metrics.fraud_count == 2
+    assert metrics.review_threshold == 0.3
+    assert metrics.deny_threshold == 0.8
+    assert metrics.allow_count == 2
+    assert metrics.review_count == 2
+    assert metrics.deny_count == 2
+    assert metrics.allow_rate == pytest.approx(2 / 6)
+    assert metrics.review_rate == pytest.approx(2 / 6)
+    assert metrics.deny_rate == pytest.approx(2 / 6)
+    assert metrics.caught_fraud_review == 1
+    assert metrics.caught_fraud_deny == 1
+    assert metrics.missed_fraud == 0
+    assert metrics.review_precision == pytest.approx(0.5)
+    assert metrics.deny_precision == pytest.approx(0.5)
+    assert metrics.total_catch_rate == pytest.approx(1.0)
+
+    # Cost: review_count (2) * 10 + false_deny (1) * 60 + missed_fraud (0) * 300 = 20 + 60 = 80
+    # Expected cost per transaction: 80 / 6 = 13.333...
+    assert metrics.expected_cost_per_transaction == pytest.approx(80.0 / 6.0)
+
+    d = metrics.to_dict()
+    assert d["rows"] == 6
+    assert d["deny_count"] == 2
+
+
+def test_evaluate_tiered_policy_validation() -> None:
+    y_true = np.array([0, 1])
+    probs = np.array([0.2, 0.8])
+
+    with pytest.raises(ValueError, match="manual_review_cost must be a non-negative"):
+        evaluate_tiered_policy(
+            y_true,
+            probs,
+            review_threshold=0.3,
+            deny_threshold=0.7,
+            manual_review_cost=-1.0,
+        )
+    with pytest.raises(ValueError, match="false_deny_cost must be a non-negative"):
+        evaluate_tiered_policy(
+            y_true,
+            probs,
+            review_threshold=0.3,
+            deny_threshold=0.7,
+            false_deny_cost=float("inf"),
+        )
+    with pytest.raises(ValueError, match="missed_fraud_cost must be a non-negative"):
+        evaluate_tiered_policy(
+            y_true,
+            probs,
+            review_threshold=0.3,
+            deny_threshold=0.7,
+            missed_fraud_cost=True,  # type: ignore[arg-type]
+        )

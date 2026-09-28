@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from enum import StrEnum
+from typing import Any
 
 import numpy as np
 from sklearn.metrics import (
@@ -116,6 +118,71 @@ class ClassificationMetrics:
     true_positives: int
 
     def to_dict(self) -> dict[str, float | int]:
+        """Return a JSON-compatible metrics mapping."""
+        return asdict(self)
+
+
+class DecisionAction(StrEnum):
+    """Action outcome of a tiered decision policy."""
+
+    ALLOW = "ALLOW"
+    CHALLENGE = "CHALLENGE"
+    DENY = "DENY"
+
+
+@dataclass(frozen=True)
+class TieredThresholds:
+    """Decision boundaries for three-tier risk routing."""
+
+    review_threshold: float
+    deny_threshold: float
+
+    def __post_init__(self) -> None:
+        if isinstance(self.review_threshold, bool) or isinstance(self.deny_threshold, bool):
+            raise TypeError("Thresholds must be numeric, not boolean.")
+        try:
+            r = float(self.review_threshold)
+            d = float(self.deny_threshold)
+        except (TypeError, ValueError) as exc:
+            raise TypeError("Thresholds must be real numbers.") from exc
+        if not (np.isfinite(r) and np.isfinite(d)):
+            raise ValueError("Thresholds must be finite.")
+        if not (0.0 <= r <= 1.0) or not (0.0 <= d <= 1.0):
+            raise ValueError("Thresholds must be between 0.0 and 1.0.")
+        if r > d:
+            raise ValueError(f"review_threshold ({r}) cannot exceed deny_threshold ({d}).")
+
+    def to_dict(self) -> dict[str, float]:
+        """Return a JSON-compatible thresholds mapping."""
+        return {
+            "review_threshold": float(self.review_threshold),
+            "deny_threshold": float(self.deny_threshold),
+        }
+
+
+@dataclass(frozen=True)
+class TieredMetrics:
+    """Performance, workload, and operational costs for a three-tier decision policy."""
+
+    rows: int
+    fraud_count: int
+    review_threshold: float
+    deny_threshold: float
+    allow_count: int
+    review_count: int
+    deny_count: int
+    allow_rate: float
+    review_rate: float
+    deny_rate: float
+    caught_fraud_review: int
+    caught_fraud_deny: int
+    missed_fraud: int
+    review_precision: float
+    deny_precision: float
+    total_catch_rate: float
+    expected_cost_per_transaction: float
+
+    def to_dict(self) -> dict[str, Any]:
         """Return a JSON-compatible metrics mapping."""
         return asdict(self)
 
@@ -358,6 +425,114 @@ def summarize_thresholds(
             )
         )
     return ThresholdTradeoff(rows=int(y_true.size), detail=tuple(detail))
+
+
+def assign_tiered_decisions(
+    probabilities: np.ndarray,
+    *,
+    review_threshold: float,
+    deny_threshold: float,
+) -> np.ndarray:
+    """Return an array of DecisionAction strings ('ALLOW', 'CHALLENGE', 'DENY').
+
+    ALLOW: probability < review_threshold
+    CHALLENGE: review_threshold <= probability < deny_threshold
+    DENY: probability >= deny_threshold
+    """
+    tiered = TieredThresholds(review_threshold=review_threshold, deny_threshold=deny_threshold)
+    probs = np.asarray(probabilities, dtype=float)
+    if probs.ndim != 1 or probs.size == 0:
+        raise ValueError("probabilities must be a non-empty one-dimensional array")
+    if not np.isfinite(probs).all() or np.any((probs < 0.0) | (probs > 1.0)):
+        raise ValueError("probabilities must be finite numbers between 0 and 1")
+
+    actions = np.full(probs.shape, DecisionAction.ALLOW.value, dtype=object)
+    actions[probs >= tiered.review_threshold] = DecisionAction.CHALLENGE.value
+    actions[probs >= tiered.deny_threshold] = DecisionAction.DENY.value
+    return actions
+
+
+def evaluate_tiered_policy(
+    y_true: np.ndarray,
+    probabilities: np.ndarray,
+    *,
+    review_threshold: float,
+    deny_threshold: float,
+    manual_review_cost: float = 5.0,
+    false_deny_cost: float = 50.0,
+    missed_fraud_cost: float = 200.0,
+) -> TieredMetrics:
+    """Evaluate operational workload, precisions, and costs for a three-tier policy.
+
+    ALLOW: probability < review_threshold
+    CHALLENGE: review_threshold <= probability < deny_threshold
+    DENY: probability >= deny_threshold
+    """
+    _validate_vectors(y_true, probabilities)
+    tiered = TieredThresholds(review_threshold=review_threshold, deny_threshold=deny_threshold)
+    r_thresh = float(tiered.review_threshold)
+    d_thresh = float(tiered.deny_threshold)
+
+    for cost_name, cost_val in [
+        ("manual_review_cost", manual_review_cost),
+        ("false_deny_cost", false_deny_cost),
+        ("missed_fraud_cost", missed_fraud_cost),
+    ]:
+        if isinstance(cost_val, bool) or not np.isfinite(float(cost_val)) or float(cost_val) < 0.0:
+            raise ValueError(f"{cost_name} must be a non-negative finite number")
+
+    rows = int(y_true.size)
+    frauds = int(np.sum(y_true == 1))
+
+    is_deny = probabilities >= d_thresh
+    is_review = (probabilities >= r_thresh) & (~is_deny)
+    is_allow = probabilities < r_thresh
+
+    deny_count = int(np.sum(is_deny))
+    review_count = int(np.sum(is_review))
+    allow_count = int(np.sum(is_allow))
+
+    caught_fraud_deny = int(np.sum(is_deny & (y_true == 1)))
+    caught_fraud_review = int(np.sum(is_review & (y_true == 1)))
+    missed_fraud = int(np.sum(is_allow & (y_true == 1)))
+
+    false_deny = int(np.sum(is_deny & (y_true == 0)))
+
+    allow_rate = float(allow_count / rows) if rows > 0 else 0.0
+    review_rate = float(review_count / rows) if rows > 0 else 0.0
+    deny_rate = float(deny_count / rows) if rows > 0 else 0.0
+
+    deny_precision = float(caught_fraud_deny / deny_count) if deny_count > 0 else 0.0
+    review_precision = float(caught_fraud_review / review_count) if review_count > 0 else 0.0
+    total_caught = caught_fraud_deny + caught_fraud_review
+    total_catch_rate = float(total_caught / frauds) if frauds > 0 else 1.0
+
+    total_cost = (
+        review_count * float(manual_review_cost)
+        + false_deny * float(false_deny_cost)
+        + missed_fraud * float(missed_fraud_cost)
+    )
+    expected_cost_per_tx = float(total_cost / rows) if rows > 0 else 0.0
+
+    return TieredMetrics(
+        rows=rows,
+        fraud_count=frauds,
+        review_threshold=r_thresh,
+        deny_threshold=d_thresh,
+        allow_count=allow_count,
+        review_count=review_count,
+        deny_count=deny_count,
+        allow_rate=allow_rate,
+        review_rate=review_rate,
+        deny_rate=deny_rate,
+        caught_fraud_review=caught_fraud_review,
+        caught_fraud_deny=caught_fraud_deny,
+        missed_fraud=missed_fraud,
+        review_precision=review_precision,
+        deny_precision=deny_precision,
+        total_catch_rate=total_catch_rate,
+        expected_cost_per_transaction=expected_cost_per_tx,
+    )
 
 
 def _validate_vectors(y_true: np.ndarray, probabilities: np.ndarray) -> None:
