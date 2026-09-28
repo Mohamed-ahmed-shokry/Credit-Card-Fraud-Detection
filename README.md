@@ -29,6 +29,12 @@ binary target contains exactly `0` (legitimate) and `1` (fraud).
   features fail with actionable errors.
 - **Two serving modes:** batch CSV scoring through the CLI and bounded online batches
   through FastAPI.
+- **Multi-tier decision policies:** automated routing into `ALLOW`, `CHALLENGE` (manual
+  review), and `DENY` actions based on dual review and deny thresholds.
+- **Output score surveillance:** Population Stability Index (PSI) tracking over prediction
+  score distributions with automated alerting webhooks.
+- **Edge explanation parity:** quantized int8 linear explanations and streaming batch scoring
+  in pure Python with zero external machine-learning dependencies.
 - **Quality gates:** formatting, linting, strict type checking, branch coverage of at
   least 97%, package builds, and Python 3.12/3.14 CI.
 
@@ -119,6 +125,19 @@ edge_model = load_edge_model("artifacts/edge-model.json")
 transaction = {feature: 0.0 for feature in edge_model.feature_names}
 probability = edge_model.score_record(transaction)
 is_fraud = edge_model.predict_record(transaction)
+decision = edge_model.predict_decision_record(transaction, review_threshold=0.2, deny_threshold=0.8)
+explanation = edge_model.explain_record(transaction, top_k=3)
+```
+
+Batch-score transactions and export explanations without Python dependencies:
+
+```bash
+fraud-detect score-edge artifacts/edge-model.json transactions.csv \
+  --output edge_predictions.jsonl \
+  --explain \
+  --top-k 3 \
+  --review-threshold 0.2 \
+  --deny-threshold 0.8
 ```
 
 The example abbreviates the feature mapping; every exported feature is required and
@@ -191,6 +210,56 @@ The summary reports the applied `threshold`, the tuned `model_threshold`, and
 whether `threshold_overridden` is true. Via the API, include `"threshold": 0.5`
 in the request body; the response carries the applied `threshold` plus the
 unchanged `model_threshold`.
+
+## Multi-tier decision policies
+
+Real-world financial systems rarely rely on binary allow/deny decisions alone. Transactions in an ambiguous risk zone often require secondary authentication or manual analyst review.
+
+The system supports a 3-tier operational decision policy:
+- `ALLOW`: probability $< review\_threshold$ (transaction proceeds immediately)
+- `CHALLENGE`: $review\_threshold \le \text{probability} < deny\_threshold$ (routed to step-up authentication or manual review)
+- `DENY`: probability $\ge deny\_threshold$ (blocked outright)
+
+In the CLI:
+
+```bash
+fraud-detect predict artifacts/model data/demo.csv \
+  --output predictions.csv \
+  --review-threshold 0.15 \
+  --deny-threshold 0.85
+```
+
+The output CSV will include a `decision` column (`ALLOW`, `CHALLENGE`, or `DENY`), and the summary reports aggregate counts across all tiers.
+
+Via the API, pass `review_threshold` and `deny_threshold` in `/v1/predict` or `/v1/score`:
+
+```bash
+curl -X POST http://localhost:8000/v1/score \
+  -H "Content-Type: application/json" \
+  -d '{
+    "transaction": {"Time": 100.0, "V1": 0.5, ...},
+    "review_threshold": 0.15,
+    "deny_threshold": 0.85
+  }'
+```
+
+The response includes the assigned `decision` along with `review_threshold` and `deny_threshold`. Decisions are also recorded in structured JSONL audit logs.
+
+## Prediction score drift surveillance
+
+To detect silent model degradation or macroeconomic shifts before labeled chargebacks arrive, the system tracks drift directly on predicted probability distributions using Population Stability Index (PSI):
+
+```bash
+fraud-detect score-drift artifacts/model current_predictions.csv \
+  --fail-on warning \
+  --alert-webhook-url https://hooks.slack.com/services/...
+```
+
+The command:
+- Compares operational prediction scores against the baseline validation score profile persisted during model training.
+- Computes overall Score PSI, mean probability shift, and flagged-rate changes.
+- Automatically sends structured alert payloads to configured webhooks when drift is detected.
+- Exits with code `1` when `--fail-on` is tripped, enabling automated CI/CD and cron surveillance gates.
 
 ## Train on the anonymized dataset
 

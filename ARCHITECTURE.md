@@ -25,8 +25,10 @@ financial-services platform.
    asynchronous challenger traffic shadowing (`shadow_model_path`).
 6. `drift.py` compares current numeric distributions with the training profile,
    provides multi-window surveillance computing drift velocity and acceleration,
+   tracks output prediction score drift via `ScoreProfile` and `calculate_score_drift`,
    and implements an online incremental `StreamingProfile` via Welford's algorithm.
-   `evaluation.py` computes holdout, calibration, and threshold reports;
+   `evaluation.py` defines multi-tier decision routing (`DecisionAction`, `TieredThresholds`,
+   `evaluate_tiered_policy`), calibration analysis, and threshold reports;
    `reporting.py` renders promotion evidence as escaped, self-contained HTML.
 7. `audit.py` exports thread-safe, structured JSONL audit events for scoring,
    shadowing, and promotion decisions with automated Luhn-validated PAN and sensitive key
@@ -38,9 +40,11 @@ financial-services platform.
 9. `model.py` provides `generate_attestation` and `verify_attestation` to export
    and verify tamper-evident, canonical SHA-256 digested attestation manifests.
 10. `edge.py` defines a versioned, dependency-light int8 runtime for the supported
-    uncalibrated logistic artifact contract. `cli.py` builds and validates this
-    representation with `export-edge`; the runtime scorer itself does not import
-    scikit-learn.
+    uncalibrated logistic artifact contract, providing quantized linear feature explanations
+    (`explain_record`), multi-tier decision routing (`predict_decision_record`), and
+    pure-Python streaming batch file scoring (`score_batch_file`). `cli.py` builds and
+    validates this representation with `export-edge`; the runtime scorer itself does not
+    import scikit-learn or pandas.
 11. `telemetry.py` parses W3C `traceparent` contexts and provides an injectable
     trace exporter plus best-effort OTLP/HTTP JSON export. `api.py` creates one
     server span per HTTP request and isolates exporter failures from scoring.
@@ -227,6 +231,11 @@ the request and response, while the tuned artifact threshold remains visible as
   server span ID; malformed contexts start a fresh trace.
 - OTLP collection is optional and best effort. It must never become a scoring
   availability dependency.
+- Output score drift surveillance evaluates prediction probabilities against baseline
+  validation profiles using Population Stability Index (PSI) without requiring labels,
+  tripping alerting webhooks when distributions deviate.
+- Multi-tier decision routing adheres strictly to $0 \le review\_threshold \le deny\_threshold \le 1.0$,
+  ensuring transactions cannot simultaneously qualify for both ALLOW and DENY actions.
 
 ## Extension guidance
 

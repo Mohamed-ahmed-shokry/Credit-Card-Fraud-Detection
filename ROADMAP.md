@@ -20,7 +20,7 @@ Status legend: `Proposed` (not started), `In progress`, `Done`.
 ## Current state
 
 The project is a production-grade reference implementation with the implementation work in
-Phases 2 through 24 complete. Phase 1's workflows are in place, but the first
+Phases 2 through 25 complete. Phase 1's workflows are in place, but the first
 real PyPI release still requires maintainer-side trusted-publisher setup. The
 shipped system covers leakage-safe training, multiple calibrated estimators,
 threshold and calibration analysis, label-delay temporal gaps, drift surveillance,
@@ -1040,7 +1040,7 @@ the package version, or publish a release.
 - **CLI test coverage reduction**: added comprehensive CLI test suites covering error and branch paths across `retrain`, `export-edge`, `generate-trust-bundle`, `rotate-trust-bundle`, `verify-attestation`, `compliance`, and `replay-audit`, elevating `src/fraud_detection/cli.py` branch coverage to 98.63% (`ec89cff`).
 - **Quality gate verification**: 545 tests passed (100% pass rate); global branch coverage reached 98.33% (well exceeding the 97.0% floor); Ruff lint and formatting passed with zero findings; strict mypy passed across all 14 source files; wheel and sdist built cleanly and passed Twine check (`6eaf8b3`).
 
-## Phase 25 — Decision Policy Tiers, Output Score Surveillance, and Edge Explanation Parity (In progress)
+## Phase 25 — Decision Policy Tiers, Output Score Surveillance, and Edge Explanation Parity (Done)
 
 ### Objective
 
@@ -1072,7 +1072,12 @@ This phase does not implement dynamic rule graph execution (AST evaluation of ar
 
 ### Delivery record
 
-Filled in as phase increments complete.
+- **Multi-tier decision policies & evaluation metrics**: defined `DecisionAction` (`ALLOW`, `CHALLENGE`, `DENY`), `TieredThresholds`, and `evaluate_tiered_policy()` in `evaluation.py`, providing comprehensive tiered metrics (allow/challenge/deny rates, review/deny precisions, catch rates, operational cost) (`323b5d1`).
+- **Score distribution profiling & drift surveillance**: implemented `ScoreProfile`, `build_score_profile()`, `calculate_score_drift()`, and `ScoreDriftReport` in `drift.py`, persisted baseline score profiles in model metadata, and added `predict_decisions()` on `FraudModel` with backward compatibility (`f7396d9`).
+- **Edge explanation parity & streaming scoring**: implemented pure-Python quantized linear feature explanations (`EdgeModel.explain_record`), multi-tier decision routing (`EdgeModel.predict_decision_record`), and streaming batch file scoring (`score_batch_file`) with zero external ML dependencies (`9f05a25`).
+- **API scoring & audit log integration**: extended `/v1/predict` and `/v1/score` endpoints to accept optional tiered thresholds and return `decision` actions; persisted decisions and tiered thresholds in structured JSONL audit logs; added `fraud_decisions_total` and `fraud_output_score` Prometheus metrics (`25042bb`).
+- **CLI commands for score surveillance, edge scoring, and tiered predict**: added `--review-threshold` and `--deny-threshold` to `predict`, implemented `fraud-detect score-drift` with `--fail-on` and webhook alerting, and added `fraud-detect score-edge` with `--explain` (`141ce76`).
+- **Documentation & architecture alignment**: documented multi-tier decision policies, prediction score drift surveillance, and edge explanation workflows across `README.md`, `ARCHITECTURE.md`, `CHANGELOG.md`, and marked Phase 25 as completed in `ROADMAP.md`.
 
 ## Contributing to the roadmap
 

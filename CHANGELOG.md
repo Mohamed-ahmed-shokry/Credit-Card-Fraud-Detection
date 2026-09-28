@@ -8,6 +8,21 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- Multi-tier decision routing and policy evaluation: added `DecisionAction` (`ALLOW`,
+  `CHALLENGE`, `DENY`), `TieredThresholds`, `evaluate_tiered_policy()` in `evaluation.py`,
+  and `predict_decisions()` on `FraudModel` for automated 3-tier risk routing.
+- Prediction score drift surveillance: added `ScoreProfile` statistical distribution
+  profiling during model training, `calculate_score_drift()` in `drift.py` computing
+  Score Population Stability Index (PSI) and score shifts, and `fraud-detect score-drift`
+  CLI command with `--fail-on` exit gates and automated alerting webhooks.
+- Edge runtime explanation parity and streaming file scoring: added `EdgeModel.explain_record()`
+  calculating quantized int8 linear feature contributions in pure Python, `EdgeModel.predict_decision_record()`
+  for tiered decisions, and `score_batch_file()` / `fraud-detect score-edge` for dependency-free
+  batch file evaluation.
+- API and audit tiered decision integration: added `decision`, `review_threshold`, and
+  `deny_threshold` to `/v1/predict` and `/v1/score` request/response schemas, persisted tiered
+  decisions in structured JSONL scoring audit events, and exposed `fraud_decisions_total` and
+  `fraud_output_score` Prometheus metrics.
 - Token budget enforcement in explanation providers: added strict token usage tracking
   in `CostController` to reject requests exceeding configured consumption caps.
 - CLI branch coverage expansion: added failure-path test coverage for `retrain`, `export-edge`,
