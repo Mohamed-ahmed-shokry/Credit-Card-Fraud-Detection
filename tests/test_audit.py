@@ -18,11 +18,13 @@ from fraud_detection.audit import (
     NullAuditSink,
     _is_luhn_valid,
     _mask_pans_in_string,
+    backtest_audit_policy,
     build_promotion_audit_event,
     build_scoring_audit_event,
     redact_data,
     replay_audit_log,
 )
+from fraud_detection.evaluation import TieredThresholds
 
 
 def test_is_luhn_valid() -> None:
@@ -567,3 +569,155 @@ def test_build_scoring_audit_event_tiered_thresholds_and_decisions() -> None:
         decision_counts={"ALLOW": 5, "DENY": 2},
     )
     assert event_explicit.payload["decision_counts"] == {"ALLOW": 5, "DENY": 2}
+
+
+def test_backtest_audit_policy_explicit_and_inferred_baseline(tmp_path: Path) -> None:
+    log_file = tmp_path / "audit_backtest.jsonl"
+    events = [
+        # Scoring event 1 with tiered thresholds in payload
+        json.dumps(
+            {
+                "event_type": "scoring",
+                "payload": {
+                    "review_threshold": 0.25,
+                    "deny_threshold": 0.75,
+                    "predictions": [
+                        {"fraud_probability": 0.1, "is_fraud": False},
+                        {"fraud_probability": 0.5, "is_fraud": False},
+                    ],
+                },
+            }
+        ),
+        # Non-scoring event should be skipped
+        json.dumps({"event_type": "promotion", "payload": {}}),
+        # Corrupt JSON line should be skipped
+        "{invalid json",
+        # Scoring event 2
+        json.dumps(
+            {
+                "event_type": "scoring",
+                "payload": {
+                    "predictions": [
+                        {"fraud_probability": 0.85, "is_fraud": True},
+                    ],
+                },
+            }
+        ),
+    ]
+    log_file.write_text("\n".join(events) + "\n", encoding="utf-8")
+
+    candidate = TieredThresholds(0.3, 0.7)
+
+    # 1. Inferred baseline from audit log (should find 0.25, 0.75 from event 1)
+    report_inferred = backtest_audit_policy(log_file, candidate)
+    assert report_inferred.rows == 3
+    assert report_inferred.baseline_thresholds == TieredThresholds(0.25, 0.75)
+    assert report_inferred.candidate_thresholds == candidate
+    assert report_inferred.transition_matrix.total_records == 3
+
+    # 2. Explicit baseline override
+    explicit_baseline = TieredThresholds(0.2, 0.8)
+    report_explicit = backtest_audit_policy(
+        log_file,
+        candidate,
+        baseline_thresholds=explicit_baseline,
+    )
+    assert report_explicit.baseline_thresholds == explicit_baseline
+    assert report_explicit.candidate_thresholds == candidate
+
+    # 3. Ground truth evaluation
+    y_true = [0, 0, 1]
+    report_with_labels = backtest_audit_policy(
+        log_file,
+        candidate,
+        baseline_thresholds=explicit_baseline,
+        y_true=y_true,
+    )
+    assert report_with_labels.cost_delta is not None
+    assert report_with_labels.fraud_catch_delta is not None
+
+
+def test_backtest_audit_policy_inferred_binary_threshold(tmp_path: Path) -> None:
+    log_file = tmp_path / "binary_audit.jsonl"
+    event = json.dumps(
+        {
+            "event_type": "scoring",
+            "payload": {
+                "threshold": 0.6,
+                "predictions": [
+                    {"fraud_probability": 0.4},
+                    {"fraud_probability": 0.7},
+                ],
+            },
+        }
+    )
+    log_file.write_text(event + "\n", encoding="utf-8")
+
+    candidate = TieredThresholds(0.3, 0.8)
+    report = backtest_audit_policy(log_file, candidate)
+    assert report.baseline_thresholds == TieredThresholds(0.6, 0.6)
+    assert report.rows == 2
+
+
+def test_backtest_audit_policy_default_fallback_baseline(tmp_path: Path) -> None:
+    log_file = tmp_path / "fallback_audit.jsonl"
+    event = json.dumps(
+        {
+            "event_type": "scoring",
+            "payload": {
+                "predictions": [
+                    {"fraud_probability": 0.3},
+                    {"fraud_probability": 0.7},
+                ],
+            },
+        }
+    )
+    log_file.write_text(event + "\n", encoding="utf-8")
+
+    candidate = TieredThresholds(0.2, 0.8)
+    report = backtest_audit_policy(log_file, candidate)
+    assert report.baseline_thresholds == TieredThresholds(0.5, 0.5)
+
+
+def test_backtest_audit_policy_validation_errors(tmp_path: Path) -> None:
+    candidate = TieredThresholds(0.2, 0.8)
+
+    # File not found
+    with pytest.raises(FileNotFoundError, match="Audit log file not found"):
+        backtest_audit_policy(tmp_path / "nonexistent.jsonl", candidate)
+
+    # Candidate not TieredThresholds
+    with pytest.raises(TypeError, match="candidate_thresholds must be a TieredThresholds instance"):
+        backtest_audit_policy(tmp_path / "dummy.jsonl", (0.2, 0.8))  # type: ignore[arg-type]
+
+    # Baseline not TieredThresholds
+    log_file = tmp_path / "valid.jsonl"
+    log_file.write_text(
+        json.dumps(
+            {
+                "event_type": "scoring",
+                "payload": {"predictions": [{"fraud_probability": 0.5}]},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(TypeError, match="baseline_thresholds must be a TieredThresholds instance"):
+        backtest_audit_policy(log_file, candidate, baseline_thresholds=0.5)  # type: ignore[arg-type]
+
+    # Empty log / no valid scoring transactions
+    empty_log = tmp_path / "empty.jsonl"
+    empty_log.write_text(
+        json.dumps({"event_type": "promotion", "payload": {}}) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="No valid scoring transactions found in audit log"):
+        backtest_audit_policy(empty_log, candidate)
+
+    # y_true length mismatch
+    with pytest.raises(
+        ValueError,
+        match=r"Length of y_true \(2\) does not match number of scored transactions \(1\)",
+    ):
+        backtest_audit_policy(log_file, candidate, y_true=[0, 1])

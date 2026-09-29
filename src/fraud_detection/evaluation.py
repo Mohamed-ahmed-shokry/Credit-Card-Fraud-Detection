@@ -215,6 +215,69 @@ class TieredThresholdTuningResult:
         }
 
 
+@dataclass(frozen=True)
+class PolicyTransitionMatrix:
+    """Breakdown of decision shifts between baseline and candidate policies."""
+
+    allow_to_allow: int
+    allow_to_challenge: int
+    allow_to_deny: int
+    challenge_to_allow: int
+    challenge_to_challenge: int
+    challenge_to_deny: int
+    deny_to_allow: int
+    deny_to_challenge: int
+    deny_to_deny: int
+    total_records: int
+    turnover_count: int
+    turnover_rate: float
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-compatible transition matrix mapping."""
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class PolicyBacktestReport:
+    """Comparative backtest analysis between baseline and candidate policies."""
+
+    rows: int
+    baseline_thresholds: TieredThresholds
+    candidate_thresholds: TieredThresholds
+    transition_matrix: PolicyTransitionMatrix
+    baseline_action_counts: dict[str, int]
+    candidate_action_counts: dict[str, int]
+    review_count_delta: int
+    review_rate_delta: float
+    deny_count_delta: int
+    deny_rate_delta: float
+    baseline_metrics: TieredMetrics | None = None
+    candidate_metrics: TieredMetrics | None = None
+    cost_delta: float | None = None
+    fraud_catch_delta: int | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-compatible backtest report mapping."""
+        return {
+            "rows": self.rows,
+            "baseline_thresholds": self.baseline_thresholds.to_dict(),
+            "candidate_thresholds": self.candidate_thresholds.to_dict(),
+            "transition_matrix": self.transition_matrix.to_dict(),
+            "baseline_action_counts": dict(self.baseline_action_counts),
+            "candidate_action_counts": dict(self.candidate_action_counts),
+            "review_count_delta": self.review_count_delta,
+            "review_rate_delta": self.review_rate_delta,
+            "deny_count_delta": self.deny_count_delta,
+            "deny_rate_delta": self.deny_rate_delta,
+            "baseline_metrics": self.baseline_metrics.to_dict() if self.baseline_metrics else None,
+            "candidate_metrics": (
+                self.candidate_metrics.to_dict() if self.candidate_metrics else None
+            ),
+            "cost_delta": self.cost_delta,
+            "fraud_catch_delta": self.fraud_catch_delta,
+        }
+
+
 def select_f1_threshold(y_true: np.ndarray, probabilities: np.ndarray) -> float:
     """Choose the probability threshold that maximizes F1.
 
@@ -710,6 +773,144 @@ def tune_tiered_thresholds(
         objective=norm_obj.value,
         candidate_evaluations=candidate_evals,
         constraints_satisfied=best_satisfied,
+    )
+
+
+def backtest_policy_transition(
+    probabilities: np.ndarray,
+    baseline_thresholds: TieredThresholds,
+    candidate_thresholds: TieredThresholds,
+    y_true: np.ndarray | None = None,
+    *,
+    manual_review_cost: float = 5.0,
+    false_deny_cost: float = 50.0,
+    missed_fraud_cost: float = 200.0,
+) -> PolicyBacktestReport:
+    """Simulate operational impact and decision migrations between two policies."""
+    probs = np.asarray(probabilities, dtype=float)
+    if probs.ndim != 1 or probs.size == 0:
+        raise ValueError("probabilities must be a non-empty one-dimensional array")
+    if not np.isfinite(probs).all() or np.any((probs < 0.0) | (probs > 1.0)):
+        raise ValueError("probabilities must be finite numbers between 0 and 1")
+
+    if not isinstance(baseline_thresholds, TieredThresholds):
+        raise TypeError("baseline_thresholds must be a TieredThresholds instance")
+    if not isinstance(candidate_thresholds, TieredThresholds):
+        raise TypeError("candidate_thresholds must be a TieredThresholds instance")
+
+    for cost_name, cost_val in [
+        ("manual_review_cost", manual_review_cost),
+        ("false_deny_cost", false_deny_cost),
+        ("missed_fraud_cost", missed_fraud_cost),
+    ]:
+        if isinstance(cost_val, bool) or not np.isfinite(float(cost_val)) or float(cost_val) < 0.0:
+            raise ValueError(f"{cost_name} must be a non-negative finite number")
+
+    if y_true is not None:
+        _validate_vectors(y_true, probs)
+
+    b_actions = assign_tiered_decisions(
+        probs,
+        review_threshold=baseline_thresholds.review_threshold,
+        deny_threshold=baseline_thresholds.deny_threshold,
+    )
+    c_actions = assign_tiered_decisions(
+        probs,
+        review_threshold=candidate_thresholds.review_threshold,
+        deny_threshold=candidate_thresholds.deny_threshold,
+    )
+
+    n_rows = len(probs)
+    b_allow = b_actions == DecisionAction.ALLOW.value
+    b_review = b_actions == DecisionAction.CHALLENGE.value
+    b_deny = b_actions == DecisionAction.DENY.value
+
+    c_allow = c_actions == DecisionAction.ALLOW.value
+    c_review = c_actions == DecisionAction.CHALLENGE.value
+    c_deny = c_actions == DecisionAction.DENY.value
+
+    turnover = int(np.sum(b_actions != c_actions))
+    turnover_rate = float(turnover / n_rows) if n_rows > 0 else 0.0
+
+    matrix = PolicyTransitionMatrix(
+        allow_to_allow=int(np.sum(b_allow & c_allow)),
+        allow_to_challenge=int(np.sum(b_allow & c_review)),
+        allow_to_deny=int(np.sum(b_allow & c_deny)),
+        challenge_to_allow=int(np.sum(b_review & c_allow)),
+        challenge_to_challenge=int(np.sum(b_review & c_review)),
+        challenge_to_deny=int(np.sum(b_review & c_deny)),
+        deny_to_allow=int(np.sum(b_deny & c_allow)),
+        deny_to_challenge=int(np.sum(b_deny & c_review)),
+        deny_to_deny=int(np.sum(b_deny & c_deny)),
+        total_records=n_rows,
+        turnover_count=turnover,
+        turnover_rate=turnover_rate,
+    )
+
+    b_counts = {
+        DecisionAction.ALLOW.value: int(np.sum(b_allow)),
+        DecisionAction.CHALLENGE.value: int(np.sum(b_review)),
+        DecisionAction.DENY.value: int(np.sum(b_deny)),
+    }
+    c_counts = {
+        DecisionAction.ALLOW.value: int(np.sum(c_allow)),
+        DecisionAction.CHALLENGE.value: int(np.sum(c_review)),
+        DecisionAction.DENY.value: int(np.sum(c_deny)),
+    }
+
+    review_delta = (
+        c_counts[DecisionAction.CHALLENGE.value] - b_counts[DecisionAction.CHALLENGE.value]
+    )
+    review_rate_delta = float(review_delta / n_rows) if n_rows > 0 else 0.0
+    deny_delta = c_counts[DecisionAction.DENY.value] - b_counts[DecisionAction.DENY.value]
+    deny_rate_delta = float(deny_delta / n_rows) if n_rows > 0 else 0.0
+
+    b_metrics = None
+    c_metrics = None
+    cost_delta = None
+    fraud_catch_delta = None
+
+    if y_true is not None:
+        b_metrics = evaluate_tiered_policy(
+            y_true,
+            probs,
+            review_threshold=baseline_thresholds.review_threshold,
+            deny_threshold=baseline_thresholds.deny_threshold,
+            manual_review_cost=manual_review_cost,
+            false_deny_cost=false_deny_cost,
+            missed_fraud_cost=missed_fraud_cost,
+        )
+        c_metrics = evaluate_tiered_policy(
+            y_true,
+            probs,
+            review_threshold=candidate_thresholds.review_threshold,
+            deny_threshold=candidate_thresholds.deny_threshold,
+            manual_review_cost=manual_review_cost,
+            false_deny_cost=false_deny_cost,
+            missed_fraud_cost=missed_fraud_cost,
+        )
+        cost_delta = float(
+            c_metrics.expected_cost_per_transaction - b_metrics.expected_cost_per_transaction
+        )
+        b_caught = b_metrics.caught_fraud_review + b_metrics.caught_fraud_deny
+        c_caught = c_metrics.caught_fraud_review + c_metrics.caught_fraud_deny
+        fraud_catch_delta = int(c_caught - b_caught)
+
+    return PolicyBacktestReport(
+        rows=n_rows,
+        baseline_thresholds=baseline_thresholds,
+        candidate_thresholds=candidate_thresholds,
+        transition_matrix=matrix,
+        baseline_action_counts=b_counts,
+        candidate_action_counts=c_counts,
+        review_count_delta=review_delta,
+        review_rate_delta=review_rate_delta,
+        deny_count_delta=deny_delta,
+        deny_rate_delta=deny_rate_delta,
+        baseline_metrics=b_metrics,
+        candidate_metrics=c_metrics,
+        cost_delta=cost_delta,
+        fraud_catch_delta=fraud_catch_delta,
     )
 
 

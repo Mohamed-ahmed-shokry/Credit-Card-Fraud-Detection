@@ -17,6 +17,11 @@ import numpy as np
 import pandas as pd
 
 from fraud_detection import __version__
+from fraud_detection.evaluation import (
+    PolicyBacktestReport,
+    TieredThresholds,
+    backtest_policy_transition,
+)
 
 # Sensitive key keywords that must always be masked in audit payloads
 DEFAULT_SENSITIVE_KEYS: tuple[str, ...] = (
@@ -587,4 +592,140 @@ def replay_audit_log(
         applied_threshold=threshold,
         status=status,
         discrepancies=tuple(discrepancies_list),
+    )
+
+
+def backtest_audit_policy(
+    audit_log_path: Path | str,
+    candidate_thresholds: TieredThresholds,
+    *,
+    baseline_thresholds: TieredThresholds | None = None,
+    y_true: np.ndarray | Sequence[int] | None = None,
+    manual_review_cost: float = 5.0,
+    false_deny_cost: float = 50.0,
+    missed_fraud_cost: float = 200.0,
+) -> PolicyBacktestReport:
+    """Stream a JSONL audit log and backtest candidate tiered decision thresholds.
+
+    Extracts recorded scoring probabilities from the audit log and performs
+    counterfactual backtesting against either an explicitly supplied baseline
+    policy or one inferred from the audit log metadata.
+
+    Parameters
+    ----------
+    audit_log_path:
+        Path to the JSONL audit event log file.
+    candidate_thresholds:
+        Target candidate TieredThresholds to evaluate.
+    baseline_thresholds:
+        Optional baseline TieredThresholds. If None, inferred from the first
+        valid thresholds in scoring event payloads, or defaults to (0.5, 0.5).
+    y_true:
+        Optional ground truth binary labels matching the extracted transactions.
+    manual_review_cost:
+        Operational cost per challenged transaction.
+    false_deny_cost:
+        Friction/support cost per legitimate transaction denied.
+    missed_fraud_cost:
+        Loss cost per undetected fraud allowed.
+
+    Returns
+    -------
+    PolicyBacktestReport
+        Comprehensive migration report with transition matrix and workload deltas.
+    """
+    if not isinstance(candidate_thresholds, TieredThresholds):
+        raise TypeError("candidate_thresholds must be a TieredThresholds instance")
+    if baseline_thresholds is not None and not isinstance(baseline_thresholds, TieredThresholds):
+        raise TypeError("baseline_thresholds must be a TieredThresholds instance")
+
+    audit_path = Path(audit_log_path)
+    if not audit_path.is_file():
+        raise FileNotFoundError(f"Audit log file not found: {audit_path}")
+
+    probs_list: list[float] = []
+    inferred_baseline: TieredThresholds | None = None
+
+    with audit_path.open("r", encoding="utf-8") as f:
+        for raw_line in f:
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                event_dict = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(event_dict, dict):
+                continue
+            if event_dict.get("event_type") != "scoring":
+                continue
+            payload = event_dict.get("payload")
+            if not isinstance(payload, dict):
+                continue
+
+            if inferred_baseline is None and baseline_thresholds is None:
+                r_th = payload.get("review_threshold")
+                d_th = payload.get("deny_threshold")
+                if r_th is not None and d_th is not None:
+                    try:
+                        r_f = float(r_th)
+                        d_f = float(d_th)
+                        if (
+                            not isinstance(r_th, bool)
+                            and not isinstance(d_th, bool)
+                            and math.isfinite(r_f)
+                            and math.isfinite(d_f)
+                            and 0.0 <= r_f <= d_f <= 1.0
+                        ):
+                            inferred_baseline = TieredThresholds(r_f, d_f)
+                    except (TypeError, ValueError):
+                        pass
+                if inferred_baseline is None and "threshold" in payload:
+                    th = payload.get("threshold")
+                    if th is not None and not isinstance(th, bool):
+                        try:
+                            th_f = float(th)
+                            if math.isfinite(th_f) and 0.0 <= th_f <= 1.0:
+                                inferred_baseline = TieredThresholds(th_f, th_f)
+                        except (TypeError, ValueError):
+                            pass
+
+            predictions = payload.get("predictions")
+            if not isinstance(predictions, list):
+                continue
+            for pred in predictions:
+                if not isinstance(pred, dict):
+                    continue
+                raw_prob = pred.get("fraud_probability")
+                if raw_prob is None or isinstance(raw_prob, bool):
+                    continue
+                try:
+                    prob = float(raw_prob)
+                    if math.isfinite(prob) and 0.0 <= prob <= 1.0:
+                        probs_list.append(prob)
+                except (TypeError, ValueError):
+                    continue
+
+    if not probs_list:
+        raise ValueError(f"No valid scoring transactions found in audit log: {audit_path}")
+
+    y_arr: np.ndarray | None = None
+    if y_true is not None:
+        y_arr = np.asarray(y_true, dtype=int)
+        if len(y_arr) != len(probs_list):
+            raise ValueError(
+                f"Length of y_true ({len(y_arr)}) does not match number of "
+                f"scored transactions ({len(probs_list)})"
+            )
+
+    effective_baseline = baseline_thresholds or inferred_baseline or TieredThresholds(0.5, 0.5)
+
+    return backtest_policy_transition(
+        probabilities=np.asarray(probs_list, dtype=float),
+        baseline_thresholds=effective_baseline,
+        candidate_thresholds=candidate_thresholds,
+        y_true=y_arr,
+        manual_review_cost=manual_review_cost,
+        false_deny_cost=false_deny_cost,
+        missed_fraud_cost=missed_fraud_cost,
     )

@@ -5,11 +5,14 @@ import pytest
 
 from fraud_detection.evaluation import (
     DecisionAction,
+    PolicyBacktestReport,
+    PolicyTransitionMatrix,
     TieredMetrics,
     TieredThresholds,
     TieredThresholdTuningResult,
     TieredTuningObjective,
     assign_tiered_decisions,
+    backtest_policy_transition,
     calibration_report,
     evaluate_predictions,
     evaluate_tiered_policy,
@@ -535,3 +538,146 @@ def test_tune_tiered_thresholds_to_dict() -> None:
     assert "candidate_evaluations" in d
     assert "constraints_satisfied" in d
     assert d["best_thresholds"]["review_threshold"] <= d["best_thresholds"]["deny_threshold"]
+
+
+def test_backtest_policy_transition_basic() -> None:
+    # Baseline: review=0.3, deny=0.7
+    # Candidate: review=0.2, deny=0.8
+    # Probs:
+    # 0.1: B=ALLOW, C=ALLOW (allow_to_allow)
+    # 0.25: B=ALLOW, C=CHALLENGE (allow_to_challenge)
+    # 0.5: B=CHALLENGE, C=CHALLENGE (challenge_to_challenge)
+    # 0.75: B=DENY, C=CHALLENGE (deny_to_challenge)
+    # 0.9: B=DENY, C=DENY (deny_to_deny)
+    probs = np.array([0.1, 0.25, 0.5, 0.75, 0.9])
+    baseline = TieredThresholds(0.3, 0.7)
+    candidate = TieredThresholds(0.2, 0.8)
+
+    report = backtest_policy_transition(probs, baseline, candidate)
+
+    assert isinstance(report, PolicyBacktestReport)
+    assert report.rows == 5
+    assert report.baseline_thresholds == baseline
+    assert report.candidate_thresholds == candidate
+
+    matrix = report.transition_matrix
+    assert isinstance(matrix, PolicyTransitionMatrix)
+    assert matrix.allow_to_allow == 1
+    assert matrix.allow_to_challenge == 1
+    assert matrix.allow_to_deny == 0
+    assert matrix.challenge_to_allow == 0
+    assert matrix.challenge_to_challenge == 1
+    assert matrix.challenge_to_deny == 0
+    assert matrix.deny_to_allow == 0
+    assert matrix.deny_to_challenge == 1
+    assert matrix.deny_to_deny == 1
+    assert matrix.total_records == 5
+    assert matrix.turnover_count == 2
+    assert matrix.turnover_rate == pytest.approx(0.4)
+
+    # Workload deltas
+    # Baseline counts: ALLOW=2, CHALLENGE=1, DENY=2
+    # Candidate counts: ALLOW=1, CHALLENGE=3, DENY=1
+    assert report.baseline_action_counts == {"ALLOW": 2, "CHALLENGE": 1, "DENY": 2}
+    assert report.candidate_action_counts == {"ALLOW": 1, "CHALLENGE": 3, "DENY": 1}
+    assert report.review_count_delta == 2
+    assert report.review_rate_delta == pytest.approx(0.4)
+    assert report.deny_count_delta == -1
+    assert report.deny_rate_delta == pytest.approx(-0.2)
+
+    # Without y_true, metrics and cost deltas are None
+    assert report.baseline_metrics is None
+    assert report.candidate_metrics is None
+    assert report.cost_delta is None
+    assert report.fraud_catch_delta is None
+
+    # Serialization
+    d = report.to_dict()
+    assert d["rows"] == 5
+    assert d["transition_matrix"]["turnover_count"] == 2
+    assert d["review_count_delta"] == 2
+    assert d["baseline_metrics"] is None
+
+
+def test_backtest_policy_transition_with_ground_truth() -> None:
+    y_true = np.array([0, 0, 0, 1, 1])
+    probs = np.array([0.05, 0.25, 0.45, 0.65, 0.85])
+    baseline = TieredThresholds(0.3, 0.7)
+    candidate = TieredThresholds(0.2, 0.6)
+
+    report = backtest_policy_transition(
+        probs,
+        baseline,
+        candidate,
+        y_true=y_true,
+        manual_review_cost=10.0,
+        false_deny_cost=60.0,
+        missed_fraud_cost=300.0,
+    )
+
+    assert report.baseline_metrics is not None
+    assert report.candidate_metrics is not None
+    assert report.cost_delta is not None
+    assert report.fraud_catch_delta is not None
+
+    b_cost = report.baseline_metrics.expected_cost_per_transaction
+    c_cost = report.candidate_metrics.expected_cost_per_transaction
+    assert report.cost_delta == pytest.approx(c_cost - b_cost)
+
+    b_caught = (
+        report.baseline_metrics.caught_fraud_review + report.baseline_metrics.caught_fraud_deny
+    )
+    c_caught = (
+        report.candidate_metrics.caught_fraud_review + report.candidate_metrics.caught_fraud_deny
+    )
+    assert report.fraud_catch_delta == c_caught - b_caught
+
+    d = report.to_dict()
+    assert d["cost_delta"] is not None
+    assert d["fraud_catch_delta"] is not None
+    assert d["baseline_metrics"] is not None
+    assert d["candidate_metrics"] is not None
+
+
+def test_backtest_policy_transition_validation_errors() -> None:
+    valid_probs = np.array([0.1, 0.5, 0.9])
+    t1 = TieredThresholds(0.2, 0.8)
+    t2 = TieredThresholds(0.3, 0.7)
+
+    # Empty probabilities
+    with pytest.raises(ValueError, match="probabilities must be a non-empty one-dimensional array"):
+        backtest_policy_transition(np.array([]), t1, t2)
+
+    # 2D probabilities
+    with pytest.raises(ValueError, match="probabilities must be a non-empty one-dimensional array"):
+        backtest_policy_transition(np.array([[0.1, 0.2]]), t1, t2)
+
+    # Out of range / non-finite probabilities
+    with pytest.raises(ValueError, match="probabilities must be finite numbers between 0 and 1"):
+        backtest_policy_transition(np.array([0.1, 1.5]), t1, t2)
+
+    with pytest.raises(ValueError, match="probabilities must be finite numbers between 0 and 1"):
+        backtest_policy_transition(np.array([0.1, float("nan")]), t1, t2)
+
+    # Threshold type errors
+    with pytest.raises(TypeError, match="baseline_thresholds must be a TieredThresholds instance"):
+        backtest_policy_transition(valid_probs, (0.2, 0.8), t2)  # type: ignore[arg-type]
+
+    with pytest.raises(TypeError, match="candidate_thresholds must be a TieredThresholds instance"):
+        backtest_policy_transition(valid_probs, t1, 0.5)  # type: ignore[arg-type]
+
+    # Cost validations
+    with pytest.raises(ValueError, match="manual_review_cost must be a non-negative finite number"):
+        backtest_policy_transition(valid_probs, t1, t2, manual_review_cost=-5.0)
+
+    with pytest.raises(ValueError, match="false_deny_cost must be a non-negative finite number"):
+        backtest_policy_transition(valid_probs, t1, t2, false_deny_cost=float("inf"))
+
+    with pytest.raises(ValueError, match="missed_fraud_cost must be a non-negative finite number"):
+        backtest_policy_transition(valid_probs, t1, t2, missed_fraud_cost=True)  # type: ignore[arg-type]
+
+    # y_true vector mismatch
+    with pytest.raises(
+        ValueError, match="y_true and probabilities must have the same non-zero length"
+    ):
+        backtest_policy_transition(valid_probs, t1, t2, y_true=np.array([0, 1]))
