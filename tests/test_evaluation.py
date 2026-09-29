@@ -7,6 +7,8 @@ from fraud_detection.evaluation import (
     DecisionAction,
     TieredMetrics,
     TieredThresholds,
+    TieredThresholdTuningResult,
+    TieredTuningObjective,
     assign_tiered_decisions,
     calibration_report,
     evaluate_predictions,
@@ -15,6 +17,7 @@ from fraud_detection.evaluation import (
     select_cost_threshold,
     select_f1_threshold,
     summarize_thresholds,
+    tune_tiered_thresholds,
 )
 
 
@@ -387,3 +390,148 @@ def test_evaluate_tiered_policy_validation() -> None:
             deny_threshold=0.7,
             missed_fraud_cost=True,  # type: ignore[arg-type]
         )
+
+
+def test_tune_tiered_thresholds_cost_minimization() -> None:
+    rng = np.random.default_rng(42)
+    y_true = np.concatenate([np.zeros(900, dtype=int), np.ones(100, dtype=int)])
+    # Non-frauds low scores, frauds higher scores
+    probs_legit = rng.beta(0.5, 20.0, size=900)
+    probs_fraud = rng.beta(5.0, 2.0, size=100)
+    probs = np.concatenate([probs_legit, probs_fraud])
+
+    result = tune_tiered_thresholds(
+        y_true,
+        probs,
+        objective=TieredTuningObjective.COST_MINIMIZATION,
+        manual_review_cost=5.0,
+        false_deny_cost=50.0,
+        missed_fraud_cost=200.0,
+        steps=30,
+    )
+
+    assert isinstance(result, TieredThresholdTuningResult)
+    assert result.objective == "cost_minimization"
+    assert result.constraints_satisfied is True
+    assert result.candidate_evaluations > 0
+    assert (
+        0.0
+        <= result.best_thresholds.review_threshold
+        <= result.best_thresholds.deny_threshold
+        <= 1.0
+    )
+    assert result.best_metrics.expected_cost_per_transaction >= 0.0
+    assert result.best_metrics.total_catch_rate > 0.5
+
+
+def test_tune_tiered_thresholds_capacity_constrained() -> None:
+    rng = np.random.default_rng(99)
+    y_true = np.concatenate([np.zeros(900, dtype=int), np.ones(100, dtype=int)])
+    probs_legit = rng.beta(0.5, 20.0, size=900)
+    probs_fraud = rng.beta(4.0, 2.0, size=100)
+    probs = np.concatenate([probs_legit, probs_fraud])
+
+    max_rev = 0.08
+    result = tune_tiered_thresholds(
+        y_true,
+        probs,
+        objective="capacity_constrained",
+        max_review_rate=max_rev,
+        steps=35,
+    )
+
+    assert result.objective == "capacity_constrained"
+    assert result.constraints_satisfied is True
+    assert result.best_metrics.review_rate <= max_rev + 1e-6
+    assert result.best_thresholds.review_threshold <= result.best_thresholds.deny_threshold
+
+
+def test_tune_tiered_thresholds_with_min_deny_precision() -> None:
+    y_true = np.array([0, 0, 0, 0, 0, 1, 1, 1, 1, 1])
+    probs = np.array([0.02, 0.05, 0.10, 0.20, 0.85, 0.30, 0.60, 0.80, 0.90, 0.95])
+
+    result = tune_tiered_thresholds(
+        y_true,
+        probs,
+        objective="cost_minimization",
+        min_deny_precision=0.75,
+        steps=20,
+    )
+
+    assert result.constraints_satisfied is True
+    if result.best_metrics.deny_count > 0:
+        assert result.best_metrics.deny_precision >= 0.75 - 1e-6
+
+
+def test_tune_tiered_thresholds_unsatisfied_constraints() -> None:
+    y_true = np.array([0, 1])
+    probs = np.array([0.9, 0.1])
+
+    # Impossible constraint: inverted scores where max achievable precision is 0.5
+    result = tune_tiered_thresholds(
+        y_true,
+        probs,
+        objective="capacity_constrained",
+        max_review_rate=0.5,
+        min_deny_precision=0.95,
+        steps=10,
+    )
+
+    assert isinstance(result, TieredThresholdTuningResult)
+    # Result gracefully falls back to best candidate without crashing
+    assert result.constraints_satisfied is False
+    assert result.best_thresholds.review_threshold <= result.best_thresholds.deny_threshold
+
+
+def test_tune_tiered_thresholds_validation_errors() -> None:
+    y_true = np.array([0, 0, 1, 1])
+    probs = np.array([0.1, 0.2, 0.8, 0.9])
+
+    with pytest.raises(ValueError, match="Invalid objective"):
+        tune_tiered_thresholds(y_true, probs, objective="unsupported_objective")
+
+    with pytest.raises(
+        ValueError, match="max_review_rate is required when objective is 'capacity_constrained'"
+    ):
+        tune_tiered_thresholds(
+            y_true, probs, objective="capacity_constrained", max_review_rate=None
+        )
+
+    with pytest.raises(ValueError, match=r"max_review_rate must be a float between 0\.0 and 1\.0"):
+        tune_tiered_thresholds(y_true, probs, max_review_rate=-0.1)
+
+    with pytest.raises(ValueError, match=r"max_review_rate must be a float between 0\.0 and 1\.0"):
+        tune_tiered_thresholds(y_true, probs, max_review_rate=True)  # type: ignore[arg-type]
+
+    with pytest.raises(
+        ValueError, match=r"min_deny_precision must be a float between 0\.0 and 1\.0"
+    ):
+        tune_tiered_thresholds(y_true, probs, min_deny_precision=1.5)
+
+    with pytest.raises(
+        ValueError, match=r"min_deny_precision must be a float between 0\.0 and 1\.0"
+    ):
+        tune_tiered_thresholds(y_true, probs, min_deny_precision=False)  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="steps must be an integer >= 5"):
+        tune_tiered_thresholds(y_true, probs, steps=3)
+
+    with pytest.raises(ValueError, match="steps must be an integer >= 5"):
+        tune_tiered_thresholds(y_true, probs, steps=True)  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="manual_review_cost must be a non-negative finite number"):
+        tune_tiered_thresholds(y_true, probs, manual_review_cost=-1.0)
+
+
+def test_tune_tiered_thresholds_to_dict() -> None:
+    y_true = np.array([0, 0, 0, 1, 1, 1])
+    probs = np.array([0.05, 0.1, 0.2, 0.7, 0.8, 0.9])
+
+    result = tune_tiered_thresholds(y_true, probs, steps=15)
+    d = result.to_dict()
+    assert "best_thresholds" in d
+    assert "best_metrics" in d
+    assert d["objective"] == "cost_minimization"
+    assert "candidate_evaluations" in d
+    assert "constraints_satisfied" in d
+    assert d["best_thresholds"]["review_threshold"] <= d["best_thresholds"]["deny_threshold"]

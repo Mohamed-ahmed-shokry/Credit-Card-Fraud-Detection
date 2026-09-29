@@ -187,6 +187,34 @@ class TieredMetrics:
         return asdict(self)
 
 
+class TieredTuningObjective(StrEnum):
+    """Optimization objective for tiered threshold tuning."""
+
+    COST_MINIMIZATION = "cost_minimization"
+    CAPACITY_CONSTRAINED = "capacity_constrained"
+
+
+@dataclass(frozen=True)
+class TieredThresholdTuningResult:
+    """Outcome of automated decision tier threshold optimization."""
+
+    best_thresholds: TieredThresholds
+    best_metrics: TieredMetrics
+    objective: str
+    candidate_evaluations: int
+    constraints_satisfied: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-compatible tuning result mapping."""
+        return {
+            "best_thresholds": self.best_thresholds.to_dict(),
+            "best_metrics": self.best_metrics.to_dict(),
+            "objective": self.objective,
+            "candidate_evaluations": self.candidate_evaluations,
+            "constraints_satisfied": self.constraints_satisfied,
+        }
+
+
 def select_f1_threshold(y_true: np.ndarray, probabilities: np.ndarray) -> float:
     """Choose the probability threshold that maximizes F1.
 
@@ -532,6 +560,156 @@ def evaluate_tiered_policy(
         deny_precision=deny_precision,
         total_catch_rate=total_catch_rate,
         expected_cost_per_transaction=expected_cost_per_tx,
+    )
+
+
+def tune_tiered_thresholds(
+    y_true: np.ndarray,
+    probabilities: np.ndarray,
+    *,
+    objective: str | TieredTuningObjective = TieredTuningObjective.COST_MINIMIZATION,
+    manual_review_cost: float = 5.0,
+    false_deny_cost: float = 50.0,
+    missed_fraud_cost: float = 200.0,
+    max_review_rate: float | None = None,
+    min_deny_precision: float | None = None,
+    steps: int = 50,
+) -> TieredThresholdTuningResult:
+    """Optimize three-tier decision boundaries on validation data.
+
+    Evaluates candidate threshold pairs (r, d) with r <= d under either
+    cost-minimization or review-capacity-constrained objectives.
+    """
+    _validate_vectors(y_true, probabilities)
+
+    for cost_name, cost_val in [
+        ("manual_review_cost", manual_review_cost),
+        ("false_deny_cost", false_deny_cost),
+        ("missed_fraud_cost", missed_fraud_cost),
+    ]:
+        if isinstance(cost_val, bool) or not np.isfinite(float(cost_val)) or float(cost_val) < 0.0:
+            raise ValueError(f"{cost_name} must be a non-negative finite number")
+
+    if max_review_rate is not None and (
+        isinstance(max_review_rate, bool)
+        or not np.isfinite(float(max_review_rate))
+        or not 0.0 <= float(max_review_rate) <= 1.0
+    ):
+        raise ValueError("max_review_rate must be a float between 0.0 and 1.0")
+
+    if min_deny_precision is not None and (
+        isinstance(min_deny_precision, bool)
+        or not np.isfinite(float(min_deny_precision))
+        or not 0.0 <= float(min_deny_precision) <= 1.0
+    ):
+        raise ValueError("min_deny_precision must be a float between 0.0 and 1.0")
+
+    if isinstance(steps, bool) or not isinstance(steps, int) or steps < 5:
+        raise ValueError("steps must be an integer >= 5")
+
+    try:
+        norm_obj = (
+            objective
+            if isinstance(objective, TieredTuningObjective)
+            else TieredTuningObjective(str(objective).lower())
+        )
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid objective {objective!r}: "
+            "must be 'cost_minimization' or 'capacity_constrained'"
+        ) from exc
+
+    if norm_obj is TieredTuningObjective.CAPACITY_CONSTRAINED and max_review_rate is None:
+        raise ValueError("max_review_rate is required when objective is 'capacity_constrained'")
+
+    # Generate candidate cut points
+    grid = np.linspace(0.005, 0.995, num=steps)
+    quantiles = np.quantile(probabilities, np.linspace(0.01, 0.99, num=steps))
+    raw_cuts = np.unique(np.clip(np.concatenate([grid, quantiles]), 0.001, 0.999))
+    cuts = np.sort(raw_cuts)
+
+    order = np.argsort(probabilities, kind="stable")
+    p_sorted = probabilities[order]
+    y_sorted = y_true[order]
+    n_total = len(y_sorted)
+    total_frauds = int(np.sum(y_sorted == 1))
+    cum_frauds = np.cumsum(y_sorted == 1)
+
+    r_cost = float(manual_review_cost)
+    fd_cost = float(false_deny_cost)
+    mf_cost = float(missed_fraud_cost)
+    max_rev = float(max_review_rate) if max_review_rate is not None else None
+    min_prec = float(min_deny_precision) if min_deny_precision is not None else None
+
+    best_key: tuple[int, float, float, float, float] | None = None
+    best_r = float(cuts[0])
+    best_d = float(cuts[-1])
+    best_satisfied = False
+    candidate_evals = 0
+
+    m_cuts = len(cuts)
+    for i in range(m_cuts):
+        r_val = float(cuts[i])
+        idx_r = int(np.searchsorted(p_sorted, r_val, side="left"))
+        missed = int(cum_frauds[idx_r - 1]) if idx_r > 0 else 0
+
+        for j in range(i, m_cuts):
+            d_val = float(cuts[j])
+            candidate_evals += 1
+            idx_d = int(np.searchsorted(p_sorted, d_val, side="left"))
+
+            caught_deny = int(total_frauds - (cum_frauds[idx_d - 1] if idx_d > 0 else 0))
+            caught_rev = total_frauds - caught_deny - missed
+
+            deny_count = n_total - idx_d
+            rev_count = idx_d - idx_r
+            false_deny = deny_count - caught_deny
+
+            rev_rate = rev_count / n_total
+            deny_prec = (caught_deny / deny_count) if deny_count > 0 else 0.0
+            catch_rate = (caught_deny + caught_rev) / total_frauds if total_frauds > 0 else 1.0
+
+            cost = (rev_count * r_cost + false_deny * fd_cost + missed * mf_cost) / n_total
+
+            penalty = 0.0
+            satisfied = True
+            if max_rev is not None and rev_rate > max_rev + 1e-9:
+                penalty += rev_rate - max_rev
+                satisfied = False
+            if min_prec is not None and (deny_count == 0 or deny_prec < min_prec - 1e-9):
+                penalty += (min_prec - deny_prec) if deny_count > 0 else min_prec
+                satisfied = False
+
+            if norm_obj is TieredTuningObjective.COST_MINIMIZATION:
+                key = (0 if satisfied else 1, penalty, cost, -catch_rate, r_val - d_val)
+            else:
+                key = (0 if satisfied else 1, penalty, -catch_rate, cost, r_val - d_val)
+
+            if best_key is None or key < best_key:
+                best_key = key
+                best_r = r_val
+                best_d = d_val
+                best_satisfied = satisfied
+
+    best_metrics = evaluate_tiered_policy(
+        y_true,
+        probabilities,
+        review_threshold=best_r,
+        deny_threshold=best_d,
+        manual_review_cost=manual_review_cost,
+        false_deny_cost=false_deny_cost,
+        missed_fraud_cost=missed_fraud_cost,
+    )
+
+    return TieredThresholdTuningResult(
+        best_thresholds=TieredThresholds(
+            review_threshold=best_metrics.review_threshold,
+            deny_threshold=best_metrics.deny_threshold,
+        ),
+        best_metrics=best_metrics,
+        objective=norm_obj.value,
+        candidate_evaluations=candidate_evals,
+        constraints_satisfied=best_satisfied,
     )
 
 
