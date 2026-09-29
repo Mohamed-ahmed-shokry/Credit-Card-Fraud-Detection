@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from enum import StrEnum
 from typing import Any
@@ -275,6 +276,98 @@ class PolicyBacktestReport:
             ),
             "cost_delta": self.cost_delta,
             "fraud_catch_delta": self.fraud_catch_delta,
+        }
+
+
+@dataclass(frozen=True)
+class SliceMetricRow:
+    """Performance and disparity metrics for a single data sub-population."""
+
+    slice_name: str
+    count: int
+    percentage: float
+    fraud_count: int
+    fraud_rate: float
+    flagged_count: int
+    flagged_rate: float
+    true_positives: int
+    false_positives: int
+    true_negatives: int
+    false_negatives: int
+    precision: float
+    recall: float
+    f1: float
+    false_positive_rate: float
+    recall_disparity: float
+    fpr_disparity: float
+    fraud_rate_disparity: float
+    is_underperforming: bool
+    underperformance_reasons: tuple[str, ...]
+    allow_count: int | None = None
+    review_count: int | None = None
+    deny_count: int | None = None
+    allow_rate: float | None = None
+    review_rate: float | None = None
+    deny_rate: float | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-compatible row mapping."""
+        return {
+            "slice_name": self.slice_name,
+            "count": self.count,
+            "percentage": self.percentage,
+            "fraud_count": self.fraud_count,
+            "fraud_rate": self.fraud_rate,
+            "flagged_count": self.flagged_count,
+            "flagged_rate": self.flagged_rate,
+            "true_positives": self.true_positives,
+            "false_positives": self.false_positives,
+            "true_negatives": self.true_negatives,
+            "false_negatives": self.false_negatives,
+            "precision": self.precision,
+            "recall": self.recall,
+            "f1": self.f1,
+            "false_positive_rate": self.false_positive_rate,
+            "recall_disparity": self.recall_disparity,
+            "fpr_disparity": self.fpr_disparity,
+            "fraud_rate_disparity": self.fraud_rate_disparity,
+            "is_underperforming": self.is_underperforming,
+            "underperformance_reasons": list(self.underperformance_reasons),
+            "allow_count": self.allow_count,
+            "review_count": self.review_count,
+            "deny_count": self.deny_count,
+            "allow_rate": self.allow_rate,
+            "review_rate": self.review_rate,
+            "deny_rate": self.deny_rate,
+        }
+
+
+@dataclass(frozen=True)
+class SliceDisparityReport:
+    """Disparity analysis comparing sub-population performance to global baseline."""
+
+    total_records: int
+    global_fraud_rate: float
+    global_precision: float
+    global_recall: float
+    global_false_positive_rate: float
+    min_recall_disparity: float
+    max_fpr_disparity: float
+    underperforming_slices: tuple[str, ...]
+    slices: tuple[SliceMetricRow, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-compatible report mapping."""
+        return {
+            "total_records": self.total_records,
+            "global_fraud_rate": self.global_fraud_rate,
+            "global_precision": self.global_precision,
+            "global_recall": self.global_recall,
+            "global_false_positive_rate": self.global_false_positive_rate,
+            "min_recall_disparity": self.min_recall_disparity,
+            "max_fpr_disparity": self.max_fpr_disparity,
+            "underperforming_slices": list(self.underperforming_slices),
+            "slices": [s.to_dict() for s in self.slices],
         }
 
 
@@ -911,6 +1004,230 @@ def backtest_policy_transition(
         candidate_metrics=c_metrics,
         cost_delta=cost_delta,
         fraud_catch_delta=fraud_catch_delta,
+    )
+
+
+def evaluate_slices(
+    y_true: np.ndarray,
+    probabilities: np.ndarray,
+    slices: np.ndarray | Sequence[Any],
+    *,
+    threshold: float = 0.5,
+    tiered_thresholds: TieredThresholds | None = None,
+    min_slice_size: int = 1,
+    min_recall_disparity: float = 0.8,
+    max_fpr_disparity: float = 1.5,
+) -> SliceDisparityReport:
+    """Evaluate decision metrics across categorical sub-population slices.
+
+    Computes per-slice fraud rates, catch rates (recall), false-positive rates,
+    precision, and disparity ratios relative to global model performance.
+    Flags slices violating minimum recall disparity or maximum FPR disparity.
+
+    Parameters
+    ----------
+    y_true:
+        1D array of binary ground-truth labels (0 or 1).
+    probabilities:
+        1D array of predicted fraud probabilities in [0, 1].
+    slices:
+        1D array or sequence of categorical slice identifiers.
+    threshold:
+        Binary classification threshold used when tiered_thresholds is None.
+    tiered_thresholds:
+        Optional three-tier decision boundaries.
+    min_slice_size:
+        Minimum number of records required to evaluate a slice. Slices with
+        fewer records are excluded. Must be >= 1.
+    min_recall_disparity:
+        Minimum acceptable ratio of slice recall to global recall (default: 0.8).
+    max_fpr_disparity:
+        Maximum acceptable ratio of slice FPR to global FPR (default: 1.5).
+
+    Returns
+    -------
+    SliceDisparityReport
+        Comprehensive sub-population performance and disparity report.
+    """
+    _validate_vectors(y_true, probabilities)
+
+    slice_arr = np.asarray(slices)
+    if slice_arr.ndim != 1:
+        raise ValueError("slices must be one-dimensional")
+    if slice_arr.shape[0] != y_true.shape[0]:
+        raise ValueError("slices and y_true must have the same length")
+
+    if (
+        isinstance(threshold, bool)
+        or not isinstance(threshold, (int, float))
+        or not np.isfinite(float(threshold))
+        or not (0.0 <= float(threshold) <= 1.0)
+    ):
+        raise ValueError("threshold must be a finite float between 0.0 and 1.0")
+
+    if tiered_thresholds is not None and not isinstance(tiered_thresholds, TieredThresholds):
+        raise TypeError("tiered_thresholds must be a TieredThresholds instance")
+
+    if (
+        isinstance(min_slice_size, bool)
+        or not isinstance(min_slice_size, int)
+        or min_slice_size < 1
+    ):
+        raise ValueError("min_slice_size must be an integer >= 1")
+
+    if (
+        isinstance(min_recall_disparity, bool)
+        or not isinstance(min_recall_disparity, (int, float))
+        or not np.isfinite(float(min_recall_disparity))
+        or float(min_recall_disparity) <= 0.0
+    ):
+        raise ValueError("min_recall_disparity must be a positive finite float")
+
+    if (
+        isinstance(max_fpr_disparity, bool)
+        or not isinstance(max_fpr_disparity, (int, float))
+        or not np.isfinite(float(max_fpr_disparity))
+        or float(max_fpr_disparity) <= 0.0
+    ):
+        raise ValueError("max_fpr_disparity must be a positive finite float")
+
+    min_rec_disp = float(min_recall_disparity)
+    max_fp_disp = float(max_fpr_disparity)
+
+    n_total = len(y_true)
+    y_arr = np.asarray(y_true, dtype=int)
+    probs = np.asarray(probabilities, dtype=float)
+
+    tiered_actions: np.ndarray | None = None
+    if tiered_thresholds is not None:
+        tiered_actions = assign_tiered_decisions(
+            probs,
+            review_threshold=tiered_thresholds.review_threshold,
+            deny_threshold=tiered_thresholds.deny_threshold,
+        )
+        flagged = tiered_actions != DecisionAction.ALLOW.value
+    else:
+        flagged = probs >= float(threshold)
+
+    g_fraud = int(np.sum(y_arr == 1))
+    g_negs = n_total - g_fraud
+    g_tp = int(np.sum(flagged & (y_arr == 1)))
+    g_fp = int(np.sum(flagged & (y_arr == 0)))
+
+    g_fraud_rate = float(g_fraud / n_total) if n_total > 0 else 0.0
+    g_precision = float(g_tp / (g_tp + g_fp)) if (g_tp + g_fp) > 0 else 0.0
+    g_recall = float(g_tp / g_fraud) if g_fraud > 0 else 1.0
+    g_fpr = float(g_fp / g_negs) if g_negs > 0 else 0.0
+
+    # Extract unique slices preserving deterministic order
+    unique_slices = sorted(np.unique(slice_arr), key=str)
+
+    rows: list[SliceMetricRow] = []
+    underperforming_slices: list[str] = []
+
+    for s_val in unique_slices:
+        mask = slice_arr == s_val
+        s_count = int(np.sum(mask))
+        if s_count < min_slice_size:
+            continue
+
+        s_name = str(s_val)
+        s_pct = float(s_count / n_total)
+        s_y = y_arr[mask]
+        s_flagged = flagged[mask]
+
+        s_fraud = int(np.sum(s_y == 1))
+        s_negs = s_count - s_fraud
+        s_flagged_count = int(np.sum(s_flagged))
+        s_flagged_rate = float(s_flagged_count / s_count)
+        s_fraud_rate = float(s_fraud / s_count)
+
+        s_tp = int(np.sum(s_flagged & (s_y == 1)))
+        s_fp = int(np.sum(s_flagged & (s_y == 0)))
+        s_fn = s_fraud - s_tp
+        s_tn = s_negs - s_fp
+
+        s_prec = float(s_tp / (s_tp + s_fp)) if (s_tp + s_fp) > 0 else 0.0
+        s_rec = float(s_tp / s_fraud) if s_fraud > 0 else 1.0
+        s_fpr = float(s_fp / s_negs) if s_negs > 0 else 0.0
+        s_f1 = float(2 * s_prec * s_rec / (s_prec + s_rec)) if (s_prec + s_rec) > 0 else 0.0
+
+        rec_disp = float(s_rec / g_recall) if g_recall > 0 else 1.0
+        fpr_disp = float(s_fpr / g_fpr) if g_fpr > 0 else 1.0
+        fr_disp = float(s_fraud_rate / g_fraud_rate) if g_fraud_rate > 0 else 1.0
+
+        reasons: list[str] = []
+        if s_fraud > 0 and rec_disp < min_rec_disp:
+            reasons.append(
+                f"Recall disparity {rec_disp:.3f} below minimum threshold {min_rec_disp:.3f}"
+            )
+        if s_negs > 0 and fpr_disp > max_fp_disp:
+            reasons.append(
+                f"False positive disparity {fpr_disp:.3f} "
+                f"exceeds maximum threshold {max_fp_disp:.3f}"
+            )
+
+        is_under = len(reasons) > 0
+        if is_under:
+            underperforming_slices.append(s_name)
+
+        s_allow_cnt = None
+        s_rev_cnt = None
+        s_deny_cnt = None
+        s_allow_rate = None
+        s_rev_rate = None
+        s_deny_rate = None
+
+        if tiered_actions is not None:
+            s_actions = tiered_actions[mask]
+            s_allow_cnt = int(np.sum(s_actions == DecisionAction.ALLOW.value))
+            s_rev_cnt = int(np.sum(s_actions == DecisionAction.CHALLENGE.value))
+            s_deny_cnt = int(np.sum(s_actions == DecisionAction.DENY.value))
+            s_allow_rate = float(s_allow_cnt / s_count)
+            s_rev_rate = float(s_rev_cnt / s_count)
+            s_deny_rate = float(s_deny_cnt / s_count)
+
+        rows.append(
+            SliceMetricRow(
+                slice_name=s_name,
+                count=s_count,
+                percentage=round(s_pct, 6),
+                fraud_count=s_fraud,
+                fraud_rate=round(s_fraud_rate, 6),
+                flagged_count=s_flagged_count,
+                flagged_rate=round(s_flagged_rate, 6),
+                true_positives=s_tp,
+                false_positives=s_fp,
+                true_negatives=s_tn,
+                false_negatives=s_fn,
+                precision=round(s_prec, 6),
+                recall=round(s_rec, 6),
+                f1=round(s_f1, 6),
+                false_positive_rate=round(s_fpr, 6),
+                recall_disparity=round(rec_disp, 6),
+                fpr_disparity=round(fpr_disp, 6),
+                fraud_rate_disparity=round(fr_disp, 6),
+                is_underperforming=is_under,
+                underperformance_reasons=tuple(reasons),
+                allow_count=s_allow_cnt,
+                review_count=s_rev_cnt,
+                deny_count=s_deny_cnt,
+                allow_rate=round(s_allow_rate, 6) if s_allow_rate is not None else None,
+                review_rate=round(s_rev_rate, 6) if s_rev_rate is not None else None,
+                deny_rate=round(s_deny_rate, 6) if s_deny_rate is not None else None,
+            )
+        )
+
+    return SliceDisparityReport(
+        total_records=n_total,
+        global_fraud_rate=round(g_fraud_rate, 6),
+        global_precision=round(g_precision, 6),
+        global_recall=round(g_recall, 6),
+        global_false_positive_rate=round(g_fpr, 6),
+        min_recall_disparity=min_rec_disp,
+        max_fpr_disparity=max_fp_disp,
+        underperforming_slices=tuple(underperforming_slices),
+        slices=tuple(rows),
     )
 
 

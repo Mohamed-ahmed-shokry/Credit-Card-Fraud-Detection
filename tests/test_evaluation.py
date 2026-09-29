@@ -7,6 +7,8 @@ from fraud_detection.evaluation import (
     DecisionAction,
     PolicyBacktestReport,
     PolicyTransitionMatrix,
+    SliceDisparityReport,
+    SliceMetricRow,
     TieredMetrics,
     TieredThresholds,
     TieredThresholdTuningResult,
@@ -15,6 +17,7 @@ from fraud_detection.evaluation import (
     backtest_policy_transition,
     calibration_report,
     evaluate_predictions,
+    evaluate_slices,
     evaluate_tiered_policy,
     expected_classification_cost,
     select_cost_threshold,
@@ -681,3 +684,174 @@ def test_backtest_policy_transition_validation_errors() -> None:
         ValueError, match="y_true and probabilities must have the same non-zero length"
     ):
         backtest_policy_transition(valid_probs, t1, t2, y_true=np.array([0, 1]))
+
+
+def test_evaluate_slices_basic() -> None:
+    y_true = np.array([0, 0, 1, 0, 1, 1])
+    probs = np.array([0.1, 0.2, 0.8, 0.3, 0.4, 0.9])
+    slices = ["in_person", "in_person", "in_person", "online", "online", "online"]
+
+    report = evaluate_slices(y_true, probs, slices, threshold=0.5)
+
+    assert isinstance(report, SliceDisparityReport)
+    assert report.total_records == 6
+    assert report.global_fraud_rate == pytest.approx(3 / 6)
+    # Global flagged (>=0.5): index 2 (1) and index 5 (1). Both are fraud!
+    # Global TP = 2, FP = 0, FN = 1, TN = 3
+    assert report.global_precision == pytest.approx(1.0)
+    assert report.global_recall == pytest.approx(2 / 3)
+    assert report.global_false_positive_rate == pytest.approx(0.0)
+    assert len(report.slices) == 2
+
+    s_in_person = next(s for s in report.slices if s.slice_name == "in_person")
+    assert isinstance(s_in_person, SliceMetricRow)
+    assert s_in_person.count == 3
+    assert s_in_person.percentage == pytest.approx(0.5)
+    assert s_in_person.fraud_count == 1
+    assert s_in_person.fraud_rate == pytest.approx(1 / 3)
+    assert s_in_person.true_positives == 1
+    assert s_in_person.false_positives == 0
+    assert s_in_person.recall == pytest.approx(1.0)
+    assert s_in_person.recall_disparity == pytest.approx(1.0 / (2 / 3))
+
+    s_online = next(s for s in report.slices if s.slice_name == "online")
+    assert s_online.count == 3
+    assert s_online.fraud_count == 2
+    # Online flagged: index 5 (prob 0.9, y=1). Index 4 (prob 0.4, y=1) missed.
+    assert s_online.true_positives == 1
+    assert s_online.false_negatives == 1
+    assert s_online.recall == pytest.approx(0.5)
+    assert s_online.recall_disparity == pytest.approx(0.5 / (2 / 3))
+
+    # Serialization
+    d = report.to_dict()
+    assert d["total_records"] == 6
+    assert len(d["slices"]) == 2
+    assert d["slices"][0]["slice_name"] == "in_person"
+
+
+def test_evaluate_slices_disparity_flagging() -> None:
+    # Construct a severe recall disparity:
+    # Global: 10 transactions. S1: 5 tx, 2 frauds, both caught (rec=1.0)
+    # S2: 5 tx, 2 frauds, both missed (rec=0.0).
+    # S3: 5 tx, 0 frauds, 3 false positives (high FPR).
+    y_true = np.array([0, 0, 0, 1, 1, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0])
+    probs = np.array(
+        [
+            0.1,
+            0.2,
+            0.2,
+            0.8,
+            0.9,  # S1: TP=2, FP=0, recall=1.0, fpr=0.0
+            0.1,
+            0.2,
+            0.2,
+            0.2,
+            0.3,  # S2: TP=0, FP=0, recall=0.0, fpr=0.0
+            0.9,
+            0.8,
+            0.7,
+            0.1,
+            0.2,  # S3: TP=0, FP=3, recall=1.0 (no fraud), fpr=3/5=0.6
+        ]
+    )
+    slices = ["region_a"] * 5 + ["region_b"] * 5 + ["region_c"] * 5
+
+    report = evaluate_slices(
+        y_true,
+        probs,
+        slices,
+        threshold=0.5,
+        min_recall_disparity=0.8,
+        max_fpr_disparity=1.5,
+    )
+
+    # region_b has recall 0.0 < 0.8 * global_recall -> underperforming
+    # region_c has FPR 0.6 > 1.5 * global_fpr (global_fpr = 3/11) -> underperforming
+    assert "region_b" in report.underperforming_slices
+    assert "region_c" in report.underperforming_slices
+    assert "region_a" not in report.underperforming_slices
+
+    b_row = next(s for s in report.slices if s.slice_name == "region_b")
+    assert b_row.is_underperforming is True
+    assert any("Recall disparity" in r for r in b_row.underperformance_reasons)
+
+    c_row = next(s for s in report.slices if s.slice_name == "region_c")
+    assert c_row.is_underperforming is True
+    assert any("False positive disparity" in r for r in c_row.underperformance_reasons)
+
+
+def test_evaluate_slices_tiered_thresholds() -> None:
+    y_true = np.array([0, 0, 1, 1])
+    probs = np.array([0.1, 0.4, 0.5, 0.9])
+    slices = np.array(["seg1", "seg1", "seg2", "seg2"])
+    tiered = TieredThresholds(0.3, 0.8)
+
+    report = evaluate_slices(y_true, probs, slices, tiered_thresholds=tiered)
+
+    # seg1: 0.1 (ALLOW), 0.4 (CHALLENGE)
+    s1 = next(s for s in report.slices if s.slice_name == "seg1")
+    assert s1.allow_count == 1
+    assert s1.review_count == 1
+    assert s1.deny_count == 0
+    assert s1.allow_rate == pytest.approx(0.5)
+    assert s1.review_rate == pytest.approx(0.5)
+    assert s1.deny_rate == pytest.approx(0.0)
+
+    # seg2: 0.5 (CHALLENGE), 0.9 (DENY)
+    s2 = next(s for s in report.slices if s.slice_name == "seg2")
+    assert s2.allow_count == 0
+    assert s2.review_count == 1
+    assert s2.deny_count == 1
+    assert s2.allow_rate == pytest.approx(0.0)
+    assert s2.review_rate == pytest.approx(0.5)
+    assert s2.deny_rate == pytest.approx(0.5)
+
+
+def test_evaluate_slices_min_slice_size() -> None:
+    y_true = np.array([0, 0, 1, 1])
+    probs = np.array([0.1, 0.2, 0.8, 0.9])
+    slices = ["big", "big", "big", "small"]
+
+    report = evaluate_slices(y_true, probs, slices, min_slice_size=2)
+    slice_names = [s.slice_name for s in report.slices]
+    assert "big" in slice_names
+    assert "small" not in slice_names
+
+
+def test_evaluate_slices_validation_errors() -> None:
+    y_true = np.array([0, 1])
+    probs = np.array([0.2, 0.8])
+    slices = ["s1", "s2"]
+
+    # Dimension and length errors
+    with pytest.raises(ValueError, match="slices must be one-dimensional"):
+        evaluate_slices(y_true, probs, np.array([["s1"], ["s2"]]))
+
+    with pytest.raises(ValueError, match="slices and y_true must have the same length"):
+        evaluate_slices(y_true, probs, ["s1"])
+
+    # Threshold errors
+    with pytest.raises(ValueError, match=r"threshold must be a finite float between 0\.0 and 1\.0"):
+        evaluate_slices(y_true, probs, slices, threshold=True)  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match=r"threshold must be a finite float between 0\.0 and 1\.0"):
+        evaluate_slices(y_true, probs, slices, threshold=-0.1)
+
+    # Tiered thresholds type error
+    with pytest.raises(TypeError, match="tiered_thresholds must be a TieredThresholds instance"):
+        evaluate_slices(y_true, probs, slices, tiered_thresholds=0.5)  # type: ignore[arg-type]
+
+    # min_slice_size errors
+    with pytest.raises(ValueError, match="min_slice_size must be an integer >= 1"):
+        evaluate_slices(y_true, probs, slices, min_slice_size=0)
+
+    with pytest.raises(ValueError, match="min_slice_size must be an integer >= 1"):
+        evaluate_slices(y_true, probs, slices, min_slice_size=True)  # type: ignore[arg-type]
+
+    # Disparity threshold errors
+    with pytest.raises(ValueError, match="min_recall_disparity must be a positive finite float"):
+        evaluate_slices(y_true, probs, slices, min_recall_disparity=-0.5)
+
+    with pytest.raises(ValueError, match="max_fpr_disparity must be a positive finite float"):
+        evaluate_slices(y_true, probs, slices, max_fpr_disparity=0.0)
