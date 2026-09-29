@@ -60,6 +60,13 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 tr.tuned td { background: #fff8e1; }
 tr.drifted td { background: #fdecea; }
 tr.warning td { background: #fff4e5; }
+.status-alert { color: #d32f2f; font-weight: 600; }
+.status-ok { color: #2e7d32; font-weight: 600; }
+.badge { display: inline-block; padding: 0.15rem 0.4rem; border-radius: 4px;
+         font-size: 0.8rem; font-weight: 600; }
+.badge-allow { background: #e8f5e9; color: #2e7d32; }
+.badge-challenge { background: #fff3e0; color: #e65100; }
+.badge-deny { background: #ffebee; color: #c62828; }
 code { background: #f2f2f2; padding: 0.05rem 0.3rem; border-radius: 3px; }
 footer { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #ddd;
          color: #777; font-size: 0.8rem; }
@@ -138,6 +145,9 @@ def render_compliance_report(
     *,
     stability: Mapping[str, Any] | None = None,
     manifest: Mapping[str, Any] | None = None,
+    slice_disparity: Mapping[str, Any] | None = None,
+    tiered_policy: Mapping[str, Any] | None = None,
+    score_profile: Mapping[str, Any] | None = None,
 ) -> str:
     """Render a promotion bundle into a self-contained HTML audit report.
 
@@ -149,11 +159,14 @@ def render_compliance_report(
             command) merged into the report as a reproducibility section.
         manifest: An optional artifact integrity manifest, recorded with its
             SHA-256 file digests for artifact provenance.
+        slice_disparity: An optional sub-population slice disparity report mapping.
+        tiered_policy: An optional tiered threshold tuning result or policy mapping.
+        score_profile: An optional validation score distribution profile mapping.
 
     Returns:
         The complete HTML document as a string.
     """
-    _require_mapping("model", bundle.get("model"))
+    model_mapping = _require_mapping("model", bundle.get("model"))
     _require_mapping("calibration", bundle.get("calibration"))
     _require_mapping("thresholds", bundle.get("thresholds"))
     _require_mapping("drift", bundle.get("drift"))
@@ -161,16 +174,39 @@ def render_compliance_report(
 
     model_version = _fmt(bundle.get("model_version") or _missing_version(bundle))
     document_title = f"Fraud detection compliance report — {model_version}"
-    content = "".join(
+
+    sections = [
+        _identity_section(bundle),
+        _metrics_section(bundle),
+        _calibration_section(bundle),
+        _thresholds_section(bundle),
+    ]
+
+    t_policy = (
+        tiered_policy
+        or bundle.get("tiered_policy")
+        or model_mapping.get("tiered_tuning")
+        or model_mapping.get("tiered_thresholds")
+    )
+    if isinstance(t_policy, Mapping):
+        sections.append(_tiered_policy_section(t_policy))
+
+    s_profile = score_profile or bundle.get("score_profile") or model_mapping.get("score_profile")
+    if isinstance(s_profile, Mapping):
+        sections.append(_score_profile_section(s_profile))
+
+    s_disparity = slice_disparity or bundle.get("slice_disparity")
+    if isinstance(s_disparity, Mapping):
+        sections.append(_slice_disparity_section(s_disparity))
+
+    sections.extend(
         [
-            _identity_section(bundle),
-            _metrics_section(bundle),
-            _calibration_section(bundle),
-            _thresholds_section(bundle),
             _drift_section(bundle),
             _benchmark_section(bundle),
         ]
     )
+
+    content = "".join(sections)
     if stability is not None:
         content += _stability_section(stability)
     if manifest is not None:
@@ -386,6 +422,197 @@ def _thresholds_section(bundle: Mapping[str, Any]) -> str:
         '<p class="footnote">The shaded first row is the model tune; the '
         "remaining rows are candidate thresholds scored on shared labeled "
         "data.</p></section>"
+    )
+
+
+def _tiered_policy_section(policy: Mapping[str, Any]) -> str:
+    raw_thresholds = policy.get("best_thresholds")
+    thresholds: Mapping[str, Any] = (
+        raw_thresholds if isinstance(raw_thresholds, Mapping) else policy
+    )
+    raw_metrics = policy.get("best_metrics")
+    metrics: Mapping[str, Any] = (
+        raw_metrics if isinstance(raw_metrics, Mapping) else policy
+    )
+
+    r_th = _fmt(thresholds.get("review_threshold"))
+    d_th = _fmt(thresholds.get("deny_threshold"))
+    objective = _fmt(policy.get("objective")) if "objective" in policy else None
+
+    dl_items = [
+        f"<dt>Review threshold</dt><dd>{r_th}</dd>",
+        f"<dt>Deny threshold</dt><dd>{d_th}</dd>",
+    ]
+    if objective:
+        dl_items.append(f"<dt>Optimization objective</dt><dd>{objective}</dd>")
+    if "expected_cost_per_transaction" in metrics:
+        cost_val = _fmt(metrics.get("expected_cost_per_transaction"))
+        dl_items.append(f"<dt>Expected cost / tx</dt><dd>{cost_val}</dd>")
+    if "total_catch_rate" in metrics:
+        dl_items.append(
+            f"<dt>Total fraud catch rate</dt><dd>{_fmt(metrics.get('total_catch_rate'))}</dd>"
+        )
+
+    tier_rows: list[list[str]] = []
+    if "allow_count" in metrics and "deny_count" in metrics:
+        tier_rows = [
+            [
+                '<span class="badge badge-allow">ALLOW</span>',
+                f"[0.0000, {r_th})",
+                _fmt(metrics.get("allow_count")),
+                _fmt(metrics.get("allow_rate")),
+                _fmt(metrics.get("missed_fraud", _MISSING_VALUE)),
+                _MISSING_VALUE,
+            ],
+            [
+                '<span class="badge badge-challenge">CHALLENGE</span>',
+                f"[{r_th}, {d_th})",
+                _fmt(metrics.get("review_count")),
+                _fmt(metrics.get("review_rate")),
+                _fmt(metrics.get("caught_fraud_review")),
+                _fmt(metrics.get("review_precision")),
+            ],
+            [
+                '<span class="badge badge-deny">DENY</span>',
+                f"[{d_th}, 1.0000]",
+                _fmt(metrics.get("deny_count")),
+                _fmt(metrics.get("deny_rate")),
+                _fmt(metrics.get("caught_fraud_deny")),
+                _fmt(metrics.get("deny_precision")),
+            ],
+        ]
+
+    table_html = ""
+    if tier_rows:
+        table_html = _table(
+            ["Tier action", "Score range", "Transactions", "Rate", "Caught fraud", "Precision"],
+            tier_rows,
+            numeric={"Transactions", "Rate", "Caught fraud", "Precision"},
+        )
+
+    return (
+        f'<section id="tiered-policy"><h2>Decision policy &amp; tiered thresholds</h2>'
+        f"<dl>{''.join(dl_items)}</dl>{table_html}"
+        '<p class="footnote">Transactions routed to CHALLENGE undergo step-up '
+        "authentication or manual review; DENY blocks immediately.</p></section>"
+    )
+
+
+def _score_profile_section(profile: Mapping[str, Any]) -> str:
+    rows_cnt = _fmt(profile.get("rows"))
+    mean_val = _fmt(profile.get("mean"))
+    std_val = _fmt(profile.get("std"))
+    min_val = _fmt(profile.get("min"))
+    max_val = _fmt(profile.get("max"))
+
+    dl_items = (
+        f"<dt>Evaluated rows</dt><dd>{rows_cnt}</dd>"
+        f"<dt>Mean risk score</dt><dd>{mean_val}</dd>"
+        f"<dt>Std deviation</dt><dd>{std_val}</dd>"
+        f"<dt>Min score</dt><dd>{min_val}</dd>"
+        f"<dt>Max score</dt><dd>{max_val}</dd>"
+    )
+
+    quantiles = profile.get("quantiles")
+    q_table = ""
+    if isinstance(quantiles, Mapping):
+        q_rows = [[escape(str(q)), _fmt(val)] for q, val in quantiles.items()]
+        q_table = "<h3>Score quantiles</h3>" + _table(
+            ["Quantile", "Score threshold"], q_rows, numeric={"Score threshold"}
+        )
+
+    return (
+        f'<section id="score-profile"><h2>Prediction score profile</h2>'
+        f"<dl>{dl_items}</dl>{q_table}</section>"
+    )
+
+
+def _slice_disparity_section(report: Mapping[str, Any]) -> str:
+    tot = _fmt(report.get("total_records"))
+    g_fr = _fmt(report.get("global_fraud_rate"))
+    g_rec = _fmt(report.get("global_recall"))
+    g_fpr = _fmt(report.get("global_false_positive_rate"))
+    min_rec_d = _fmt(report.get("min_recall_disparity"))
+    max_fp_d = _fmt(report.get("max_fpr_disparity"))
+
+    dl_items = (
+        f"<dt>Total evaluated</dt><dd>{tot}</dd>"
+        f"<dt>Global fraud rate</dt><dd>{g_fr}</dd>"
+        f"<dt>Global recall</dt><dd>{g_rec}</dd>"
+        f"<dt>Global false positive rate</dt><dd>{g_fpr}</dd>"
+        f"<dt>Min recall disparity</dt><dd>{min_rec_d}</dd>"
+        f"<dt>Max FPR disparity</dt><dd>{max_fp_d}</dd>"
+    )
+
+    slices_list = report.get("slices")
+    rows: list[list[str]] = []
+    headers = [
+        "Slice",
+        "Records",
+        "Share",
+        "Fraud rate",
+        "Recall",
+        "Recall disp.",
+        "FPR",
+        "FPR disp.",
+        "Status",
+    ]
+    numeric = {"Records", "Share", "Fraud rate", "Recall", "Recall disp.", "FPR", "FPR disp."}
+
+    row_classes: list[str] = []
+    if isinstance(slices_list, list):
+        for item in slices_list:
+            if not isinstance(item, Mapping):
+                continue
+            is_under = bool(item.get("is_underperforming", False))
+            status_html = (
+                '<span class="status-alert">UNDERPERFORMING</span>'
+                if is_under
+                else '<span class="status-ok">PASS</span>'
+            )
+            row_classes.append(' class="drifted"' if is_under else "")
+            rows.append(
+                [
+                    escape(str(item.get("slice_name", _MISSING_VALUE))),
+                    _fmt(item.get("count")),
+                    _fmt(item.get("percentage")),
+                    _fmt(item.get("fraud_rate")),
+                    _fmt(item.get("recall")),
+                    _fmt(item.get("recall_disparity")),
+                    _fmt(item.get("false_positive_rate")),
+                    _fmt(item.get("fpr_disparity")),
+                    status_html,
+                ]
+            )
+
+    body = ""
+    for r_class, row in zip(row_classes, rows, strict=True):
+        cells = "".join(
+            f'<td class="num">{cell}</td>' if header in numeric else f"<td>{cell}</td>"
+            for header, cell in zip(headers, row, strict=True)
+        )
+        body += f"<tr{r_class}>{cells}</tr>"
+
+    headers_th = "".join(
+        f'<th class="num">{h}</th>' if h in numeric else f"<th>{h}</th>" for h in headers
+    )
+    table_html = f"<table><thead><tr>{headers_th}</tr></thead><tbody>{body}</tbody></table>"
+
+    under_slices = report.get("underperforming_slices")
+    alert_note = ""
+    if isinstance(under_slices, (list, tuple)) and under_slices:
+        escaped_names = ", ".join(f"<code>{escape(str(s))}</code>" for s in under_slices)
+        alert_note = (
+            f'<p class="meta" style="color: #d32f2f;">'
+            f"<strong>Warning:</strong> Slices violating disparity bounds: {escaped_names}.</p>"
+        )
+
+    return (
+        f'<section id="slice-disparity"><h2>Sub-population slice disparity profiling</h2>'
+        f"<dl>{dl_items}</dl>{alert_note}{table_html}"
+        '<p class="footnote">Evaluates fairness and reliability across transaction '
+        "sub-populations. Slices with recall disparity below threshold or FPR "
+        "disparity above threshold are flagged.</p></section>"
     )
 
 

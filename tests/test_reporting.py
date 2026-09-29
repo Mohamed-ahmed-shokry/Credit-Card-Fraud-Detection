@@ -367,3 +367,114 @@ def test_compliance_report_escapes_drift_status_and_classes() -> None:
     assert "&lt;script&gt;alert(&quot;feature&quot;)&lt;/script&gt;" in html
     # CSS class should be sanitized to alphanumeric and hyphens/underscores
     assert 'class="scriptalertfeaturescript"' in html
+
+
+def test_compliance_report_tiered_policy_rendering() -> None:
+    bundle = _bundle()
+    tiered_data = {
+        "best_thresholds": {"review_threshold": 0.25, "deny_threshold": 0.75},
+        "best_metrics": {
+            "allow_count": 80,
+            "allow_rate": 0.8,
+            "review_count": 15,
+            "review_rate": 0.15,
+            "deny_count": 5,
+            "deny_rate": 0.05,
+            "caught_fraud_review": 3,
+            "caught_fraud_deny": 4,
+            "review_precision": 0.2,
+            "deny_precision": 0.8,
+            "expected_cost_per_transaction": 0.08,
+            "total_catch_rate": 0.875,
+        },
+        "objective": "cost_minimization",
+    }
+
+    # As keyword argument
+    html = render_compliance_report(bundle, tiered_policy=tiered_data)
+    assert '<section id="tiered-policy">' in html
+    assert "Decision policy &amp; tiered thresholds" in html
+    assert "0.2500" in html
+    assert "0.7500" in html
+    assert "cost_minimization" in html
+    assert "badge-allow" in html
+    assert "badge-challenge" in html
+    assert "badge-deny" in html
+
+    # Embedded in bundle
+    bundle_with_tier = _bundle()
+    bundle_with_tier["tiered_policy"] = tiered_data
+    html_embedded = render_compliance_report(bundle_with_tier)
+    assert '<section id="tiered-policy">' in html_embedded
+
+
+def test_compliance_report_score_profile_rendering() -> None:
+    bundle = _bundle()
+    score_data = {
+        "rows": 1000,
+        "mean": 0.052,
+        "std": 0.124,
+        "min": 0.001,
+        "max": 0.998,
+        "quantiles": {
+            "p50": 0.015,
+            "p90": 0.145,
+            "p99": 0.825,
+        },
+    }
+
+    html = render_compliance_report(bundle, score_profile=score_data)
+    assert '<section id="score-profile">' in html
+    assert "Prediction score profile" in html
+    assert "0.0520" in html
+    assert "p50" in html
+    assert "p99" in html
+    assert "0.8250" in html
+
+
+def test_compliance_report_slice_disparity_rendering_and_escaping() -> None:
+    bundle = _bundle()
+    slice_data = {
+        "total_records": 500,
+        "global_fraud_rate": 0.04,
+        "global_precision": 0.8,
+        "global_recall": 0.75,
+        "global_false_positive_rate": 0.02,
+        "min_recall_disparity": 0.8,
+        "max_fpr_disparity": 1.5,
+        "underperforming_slices": ["<script>alert('slice')</script>"],
+        "slices": [
+            {
+                "slice_name": "normal_tier",
+                "count": 400,
+                "percentage": 0.8,
+                "fraud_rate": 0.03,
+                "recall": 0.8,
+                "recall_disparity": 1.067,
+                "false_positive_rate": 0.015,
+                "fpr_disparity": 0.75,
+                "is_underperforming": False,
+            },
+            {
+                "slice_name": "<script>alert('slice')</script>",
+                "count": 100,
+                "percentage": 0.2,
+                "fraud_rate": 0.08,
+                "recall": 0.4,
+                "recall_disparity": 0.533,
+                "false_positive_rate": 0.05,
+                "fpr_disparity": 2.5,
+                "is_underperforming": True,
+            },
+        ],
+    }
+
+    html = render_compliance_report(bundle, slice_disparity=slice_data)
+    assert '<section id="slice-disparity">' in html
+    assert "Sub-population slice disparity profiling" in html
+    assert "PASS" in html
+    assert "UNDERPERFORMING" in html
+    # Verify strict HTML escaping
+    assert "<script>" not in html
+    assert "&lt;script&gt;alert(&#x27;slice&#x27;)&lt;/script&gt;" in html
+    assert 'class="drifted"' in html
