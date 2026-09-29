@@ -1378,3 +1378,86 @@ def test_train_model_persists_score_profile_and_tiered_thresholds(tmp_path: Path
     assert loaded.score_profile is not None
     assert loaded.score_profile.rows == model.score_profile.rows
     assert loaded.tiered_thresholds == TieredThresholds(0.15, 0.65)
+
+
+def test_train_model_with_tune_tiered_cost_minimization(tmp_path: Path) -> None:
+    data = validate_frame(generate_synthetic_data(rows=300, fraud_rate=0.08, random_state=42))
+    cfg = TrainingConfig(
+        tune_tiered=True,
+        tiered_objective="cost_minimization",
+        tiered_manual_review_cost=3.0,
+    )
+    model = train_model(data, config=cfg)
+
+    assert model.tiered_thresholds is not None
+    assert (
+        0.0
+        <= model.tiered_thresholds.review_threshold
+        <= model.tiered_thresholds.deny_threshold
+        <= 1.0
+    )
+    assert model.tiered_tuning is not None
+    assert model.tiered_tuning["objective"] == "cost_minimization"
+    assert "best_thresholds" in model.tiered_tuning
+
+    # Save and reload
+    art_dir = tmp_path / "art_tuned"
+    save_model(model, art_dir)
+    loaded = load_model(art_dir)
+    assert loaded.tiered_thresholds == model.tiered_thresholds
+    assert loaded.tiered_tuning is not None
+    assert loaded.tiered_tuning["objective"] == "cost_minimization"
+
+
+def test_train_model_with_tune_tiered_capacity_constrained() -> None:
+    data = validate_frame(generate_synthetic_data(rows=300, fraud_rate=0.08, random_state=123))
+    cfg = TrainingConfig(
+        tune_tiered=True,
+        tiered_objective="capacity_constrained",
+        tiered_max_review_rate=0.10,
+        tiered_min_deny_precision=0.70,
+    )
+    model = train_model(data, config=cfg)
+
+    assert model.tiered_thresholds is not None
+    assert model.tiered_tuning is not None
+    assert model.tiered_tuning["objective"] == "capacity_constrained"
+    assert model.tiered_thresholds.review_threshold <= model.tiered_thresholds.deny_threshold
+
+
+def test_training_config_tune_tiered_validation() -> None:
+    # Conflicting explicit thresholds
+    with pytest.raises(
+        ValueError,
+        match="Cannot specify explicit review_threshold/deny_threshold when tune_tiered=True",
+    ):
+        TrainingConfig(tune_tiered=True, review_threshold=0.2, deny_threshold=0.8)
+
+    # Invalid objective
+    with pytest.raises(
+        ValueError, match="tiered_objective must be 'cost_minimization' or 'capacity_constrained'"
+    ):
+        TrainingConfig(tune_tiered=True, tiered_objective="invalid_obj")
+
+    # Missing max_review_rate for capacity_constrained
+    with pytest.raises(
+        ValueError,
+        match="tiered_max_review_rate is required when tiered_objective='capacity_constrained'",
+    ):
+        TrainingConfig(
+            tune_tiered=True, tiered_objective="capacity_constrained", tiered_max_review_rate=None
+        )
+
+    # Invalid manual review cost
+    with pytest.raises(ValueError, match="tiered_manual_review_cost must be non-negative"):
+        TrainingConfig(tune_tiered=True, tiered_manual_review_cost=-1.0)
+
+    # Invalid max_review_rate
+    with pytest.raises(ValueError, match=r"tiered_max_review_rate must be between 0\.0 and 1\.0"):
+        TrainingConfig(tune_tiered=True, tiered_max_review_rate=1.5)
+
+    # Invalid min_deny_precision
+    with pytest.raises(
+        ValueError, match=r"tiered_min_deny_precision must be between 0\.0 and 1\.0"
+    ):
+        TrainingConfig(tune_tiered=True, tiered_min_deny_precision=-0.1)

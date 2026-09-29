@@ -45,6 +45,7 @@ from fraud_detection.evaluation import (
     expected_classification_cost,
     select_cost_threshold,
     select_f1_threshold,
+    tune_tiered_thresholds,
 )
 from fraud_detection.explanations import (
     ExplanationProvider,
@@ -135,6 +136,11 @@ class TrainingConfig:
     max_bins: int = 255
     review_threshold: float | None = None
     deny_threshold: float | None = None
+    tune_tiered: bool = False
+    tiered_objective: str = "cost_minimization"
+    tiered_manual_review_cost: float = 5.0
+    tiered_max_review_rate: float | None = None
+    tiered_min_deny_precision: float | None = None
 
     def __post_init__(self) -> None:
         if not 0.05 <= self.test_size <= 0.4:
@@ -194,6 +200,44 @@ class TrainingConfig:
                 review_threshold=self.review_threshold,
                 deny_threshold=self.deny_threshold,
             )
+        if self.tune_tiered and (
+            self.review_threshold is not None or self.deny_threshold is not None
+        ):
+            raise ValueError(
+                "Cannot specify explicit review_threshold/deny_threshold when tune_tiered=True."
+            )
+        if self.tune_tiered:
+            if self.tiered_objective not in ("cost_minimization", "capacity_constrained"):
+                raise ValueError(
+                    f"tiered_objective must be 'cost_minimization' or 'capacity_constrained', "
+                    f"got {self.tiered_objective!r}"
+                )
+            if (
+                isinstance(self.tiered_manual_review_cost, bool)
+                or not np.isfinite(self.tiered_manual_review_cost)
+                or self.tiered_manual_review_cost < 0.0
+            ):
+                raise ValueError("tiered_manual_review_cost must be non-negative and finite")
+            if self.tiered_max_review_rate is not None and (
+                isinstance(self.tiered_max_review_rate, bool)
+                or not np.isfinite(self.tiered_max_review_rate)
+                or not 0.0 <= self.tiered_max_review_rate <= 1.0
+            ):
+                raise ValueError("tiered_max_review_rate must be between 0.0 and 1.0")
+            if self.tiered_min_deny_precision is not None and (
+                isinstance(self.tiered_min_deny_precision, bool)
+                or not np.isfinite(self.tiered_min_deny_precision)
+                or not 0.0 <= self.tiered_min_deny_precision <= 1.0
+            ):
+                raise ValueError("tiered_min_deny_precision must be between 0.0 and 1.0")
+            if (
+                self.tiered_objective == "capacity_constrained"
+                and self.tiered_max_review_rate is None
+            ):
+                raise ValueError(
+                    "tiered_max_review_rate is required when "
+                    "tiered_objective='capacity_constrained'"
+                )
 
 
 @dataclass
@@ -292,6 +336,14 @@ class FraudModel:
                 )
             except (TypeError, ValueError, KeyError):
                 return None
+        return None
+
+    @property
+    def tiered_tuning(self) -> dict[str, Any] | None:
+        """Return tiered optimization metadata if tiered tuning was executed."""
+        raw = self.metadata.get("tiered_tuning")
+        if isinstance(raw, Mapping):
+            return dict(raw)
         return None
 
     def validate_features(self, features: pd.DataFrame) -> pd.DataFrame:
@@ -664,7 +716,20 @@ def train_model(
         "validation_metrics": validation_metrics_payload,
         "test_metrics": test_metrics_payload,
     }
-    if settings.review_threshold is not None and settings.deny_threshold is not None:
+    if settings.tune_tiered:
+        tuning_result = tune_tiered_thresholds(
+            validation_target_array,
+            validation_probabilities,
+            objective=settings.tiered_objective,
+            manual_review_cost=settings.tiered_manual_review_cost,
+            false_deny_cost=settings.false_positive_cost,
+            missed_fraud_cost=settings.false_negative_cost,
+            max_review_rate=settings.tiered_max_review_rate,
+            min_deny_precision=settings.tiered_min_deny_precision,
+        )
+        metadata["tiered_thresholds"] = tuning_result.best_thresholds.to_dict()
+        metadata["tiered_tuning"] = tuning_result.to_dict()
+    elif settings.review_threshold is not None and settings.deny_threshold is not None:
         metadata["tiered_thresholds"] = {
             "review_threshold": float(settings.review_threshold),
             "deny_threshold": float(settings.deny_threshold),
