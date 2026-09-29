@@ -1079,6 +1079,38 @@ This phase does not implement dynamic rule graph execution (AST evaluation of ar
 - **CLI commands for score surveillance, edge scoring, and tiered predict**: added `--review-threshold` and `--deny-threshold` to `predict`, implemented `fraud-detect score-drift` with `--fail-on` and webhook alerting, and added `fraud-detect score-edge` with `--explain` (`141ce76`).
 - **Documentation & architecture alignment**: documented multi-tier decision policies, prediction score drift surveillance, and edge explanation workflows across `README.md`, `ARCHITECTURE.md`, `CHANGELOG.md`, and marked Phase 25 as completed in `ROADMAP.md`.
 
+## Phase 26 — Decision Policy Optimization, Counterfactual Backtesting, and Slice Disparity Profiling (In progress)
+
+### Objective
+
+Equip operators with automated decision tier calibration, counterfactual policy backtesting on historical audits, and granular sub-population slice disparity diagnostics, transforming raw model risk scores into audited, cost-optimal business decisions.
+
+### Scope
+
+- **Automated decision tier calibration** — implement `tune_tiered_thresholds()` in `evaluation.py` supporting both cost-minimization objectives (balancing manual review cost, false deny friction, and missed fraud losses) and capacity-constrained objectives (maximizing fraud catch rate under an analyst review capacity budget); integrate tiered threshold optimization into `TrainingConfig` and `train_model()` in `model.py`.
+- **Counterfactual policy backtesting & transition simulation** — implement `PolicyTransitionMatrix`, `PolicyBacktestReport`, and `backtest_policy_transition()` in `evaluation.py` measuring turnover rates and decision migrations across tiers; implement `backtest_audit_policy()` in `audit.py` for streaming counterfactual evaluation of historical JSONL audit logs.
+- **Slice disparity & sub-population risk profiling** — implement `SliceMetricRow`, `SliceDisparityReport`, and `evaluate_slices()` in `evaluation.py` calculating slice fraud rates, catch rates, false-positive rates, and disparity ratios relative to the global population, flagging under-performing segments.
+- **CLI workflows & compliance evidence rendering** — add `fraud-detect backtest-policy` and `fraud-detect slice-metrics` commands in `cli.py`; add tiered tuning options to `fraud-detect train`; extend `render_compliance_report()` in `reporting.py` to display tiered decision policies, score distribution quantiles, and slice disparity tables.
+
+### Acceptance criteria
+
+- `tune_tiered_thresholds()` discovers optimal $(review\_threshold, deny\_threshold)$ satisfying $0 \le review\_threshold \le deny\_threshold \le 1.0$ under cost-minimization and review-capacity constraints.
+- `train_model()` with `tune_tiered=True` persists `tuned_tiered_thresholds` and tuning metadata into `model.metadata` and model artifacts.
+- `backtest_policy_transition()` computes exact $3 \times 3$ transition matrices, action turnover rates, review workload deltas, and net cost deltas.
+- `backtest_audit_policy()` streams JSONL audit logs, accurately backtesting candidate policies against historically recorded decisions.
+- `evaluate_slices()` computes per-slice metrics (precision, recall, allow/review/deny rates, disparity ratios) and correctly flags underperforming slices where recall disparity drops below 0.8 or false positive disparity exceeds 1.5.
+- CLI commands `backtest-policy` and `slice-metrics` execute cleanly, validate options, and output structured JSON and formatted tables.
+- `render_compliance_report()` includes tiered decision policies and slice disparity tables with proper HTML escaping.
+- Full test suite passes, branch coverage $\ge 97.0\%$, Ruff and strict mypy pass with zero errors, and packages build cleanly.
+
+### Explicit exclusions
+
+This phase does not implement dynamic rule graph execution (AST evaluation of arbitrary Python expressions), automated online Bayesian threshold updating, external database sinks for drift profiles, or web-based UI dashboards.
+
+### Delivery record
+
+Filled in as phase increments complete.
+
 ## Contributing to the roadmap
 
 Open an issue or a pull request that references the relevant phase item.
