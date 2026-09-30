@@ -3961,3 +3961,392 @@ def test_score_edge_command(tmp_path: Path) -> None:
         ],
     )
     assert res_over.exit_code == 0, res_over.output
+
+
+def test_train_cli_tune_tiered_cost_minimization(tmp_path: Path) -> None:
+    data_path = tmp_path / "data.csv"
+    generate_synthetic_data(rows=200, fraud_rate=0.1, random_state=42).to_csv(
+        data_path, index=False
+    )
+    out_dir = tmp_path / "model_tuned_cost"
+
+    res = runner.invoke(
+        app,
+        [
+            "train",
+            str(data_path),
+            "--output",
+            str(out_dir),
+            "--tune-tiered",
+            "--tiered-objective",
+            "cost_minimization",
+            "--tiered-manual-review-cost",
+            "3.0",
+        ],
+    )
+    assert res.exit_code == 0, res.output
+    payload = json.loads(res.output)
+    assert "tiered_thresholds" in payload
+    assert "tiered_tuning" in payload
+    assert payload["tiered_tuning"]["objective"] == "cost_minimization"
+    assert (
+        payload["tiered_thresholds"]["review_threshold"]
+        <= payload["tiered_thresholds"]["deny_threshold"]
+    )
+
+    loaded = load_model(out_dir)
+    assert loaded.tiered_thresholds is not None
+    assert loaded.tiered_tuning is not None
+
+
+def test_train_cli_tune_tiered_capacity_constrained(tmp_path: Path) -> None:
+    data_path = tmp_path / "data.csv"
+    generate_synthetic_data(rows=200, fraud_rate=0.1, random_state=42).to_csv(
+        data_path, index=False
+    )
+    out_dir = tmp_path / "model_tuned_cap"
+
+    res = runner.invoke(
+        app,
+        [
+            "train",
+            str(data_path),
+            "--output",
+            str(out_dir),
+            "--tune-tiered",
+            "--tiered-objective",
+            "capacity_constrained",
+            "--tiered-max-review-rate",
+            "0.15",
+            "--tiered-min-deny-precision",
+            "0.8",
+        ],
+    )
+    assert res.exit_code == 0, res.output
+    payload = json.loads(res.output)
+    assert "tiered_thresholds" in payload
+    assert payload["tiered_tuning"]["objective"] == "capacity_constrained"
+
+    # Missing max-review-rate for capacity_constrained should fail
+    res_err = runner.invoke(
+        app,
+        [
+            "train",
+            str(data_path),
+            "--output",
+            str(tmp_path / "fail"),
+            "--tune-tiered",
+            "--tiered-objective",
+            "capacity_constrained",
+        ],
+    )
+    assert res_err.exit_code == 2
+    assert "tiered_max_review_rate is required" in res_err.output
+
+
+def test_backtest_policy_cli_success_and_json(tmp_path: Path) -> None:
+    log_file = tmp_path / "audit.jsonl"
+    events = [
+        json.dumps(
+            {
+                "event_type": "scoring",
+                "payload": {
+                    "review_threshold": 0.25,
+                    "deny_threshold": 0.75,
+                    "predictions": [
+                        {"fraud_probability": 0.1, "is_fraud": False},
+                        {"fraud_probability": 0.5, "is_fraud": False},
+                        {"fraud_probability": 0.9, "is_fraud": True},
+                    ],
+                },
+            }
+        )
+    ]
+    log_file.write_text("\n".join(events) + "\n", encoding="utf-8")
+
+    # 1. Text output
+    res_text = runner.invoke(
+        app,
+        [
+            "backtest-policy",
+            str(log_file),
+            "--candidate-review",
+            "0.2",
+            "--candidate-deny",
+            "0.8",
+        ],
+    )
+    assert res_text.exit_code == 0, res_text.output
+    assert "Policy Backtest: 3 records evaluated" in res_text.output
+    assert "Transition Matrix (Baseline -> Candidate):" in res_text.output
+
+    # 2. JSON output and file saving
+    out_file = tmp_path / "backtest_report.json"
+    res_json = runner.invoke(
+        app,
+        [
+            "backtest-policy",
+            str(log_file),
+            "--candidate-review",
+            "0.2",
+            "--candidate-deny",
+            "0.8",
+            "--json",
+            "--output",
+            str(out_file),
+        ],
+    )
+    assert res_json.exit_code == 0, res_json.output
+    data = json.loads(res_json.output)
+    assert data["rows"] == 3
+    assert data["candidate_thresholds"]["review_threshold"] == 0.2
+    assert data["candidate_thresholds"]["deny_threshold"] == 0.8
+    assert out_file.exists()
+    assert json.loads(out_file.read_text(encoding="utf-8")) == data
+
+    # 3. Explicit baseline options
+    res_base = runner.invoke(
+        app,
+        [
+            "backtest-policy",
+            str(log_file),
+            "--candidate-review",
+            "0.3",
+            "--candidate-deny",
+            "0.7",
+            "--baseline-review",
+            "0.1",
+            "--baseline-deny",
+            "0.9",
+        ],
+    )
+    assert res_base.exit_code == 0, res_base.output
+    assert "Baseline: review=0.1000, deny=0.9000" in res_base.output
+
+
+def test_backtest_policy_cli_errors(tmp_path: Path) -> None:
+    log_file = tmp_path / "valid.jsonl"
+    log_file.write_text(
+        json.dumps(
+            {
+                "event_type": "scoring",
+                "payload": {"predictions": [{"fraud_probability": 0.5}]},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    # Inverted candidate thresholds
+    res_inv = runner.invoke(
+        app,
+        [
+            "backtest-policy",
+            str(log_file),
+            "--candidate-review",
+            "0.8",
+            "--candidate-deny",
+            "0.2",
+        ],
+    )
+    assert res_inv.exit_code == 2
+    assert "cannot exceed" in res_inv.output
+
+    # Partial baseline thresholds (only one provided)
+    res_part = runner.invoke(
+        app,
+        [
+            "backtest-policy",
+            str(log_file),
+            "--candidate-review",
+            "0.2",
+            "--candidate-deny",
+            "0.8",
+            "--baseline-review",
+            "0.3",
+        ],
+    )
+    assert res_part.exit_code == 2
+    assert "must be provided together" in res_part.output
+
+    # Non-existent audit log
+    res_missing = runner.invoke(
+        app,
+        [
+            "backtest-policy",
+            str(tmp_path / "nonexistent.jsonl"),
+            "--candidate-review",
+            "0.2",
+            "--candidate-deny",
+            "0.8",
+        ],
+    )
+    assert res_missing.exit_code == 2
+
+    # Output already exists without overwrite
+    out_file = tmp_path / "out.json"
+    out_file.write_text("{}", encoding="utf-8")
+    res_exist = runner.invoke(
+        app,
+        [
+            "backtest-policy",
+            str(log_file),
+            "--candidate-review",
+            "0.2",
+            "--candidate-deny",
+            "0.8",
+            "--output",
+            str(out_file),
+        ],
+    )
+    assert res_exist.exit_code == 2
+    assert "Output already exists" in res_exist.output
+
+
+def test_slice_metrics_cli_success_and_formatting(tmp_path: Path, trained_artifact: Path) -> None:
+    data = generate_synthetic_data(rows=200, fraud_rate=0.1, random_state=42)
+    data["channel"] = ["web" if i % 2 == 0 else "mobile" for i in range(len(data))]
+    csv_path = tmp_path / "slice_data.csv"
+    data.to_csv(csv_path, index=False)
+
+    # 1. Text table output
+    res_text = runner.invoke(
+        app,
+        [
+            "slice-metrics",
+            str(trained_artifact),
+            str(csv_path),
+            "--slice-column",
+            "channel",
+        ],
+    )
+    assert res_text.exit_code == 0, res_text.output
+    assert "Slice Disparity Analysis: 200 records across 2 slices" in res_text.output
+    assert "web" in res_text.output
+    assert "mobile" in res_text.output
+
+    # 2. JSON output and file saving
+    out_file = tmp_path / "slice_report.json"
+    res_json = runner.invoke(
+        app,
+        [
+            "slice-metrics",
+            str(trained_artifact),
+            str(csv_path),
+            "--slice-column",
+            "channel",
+            "--json",
+            "--output",
+            str(out_file),
+        ],
+    )
+    assert res_json.exit_code == 0, res_json.output
+    report_dict = json.loads(res_json.output)
+    assert report_dict["total_records"] == 200
+    assert len(report_dict["slices"]) == 2
+    assert out_file.exists()
+    assert json.loads(out_file.read_text(encoding="utf-8")) == report_dict
+
+    # 3. With tiered model / --use-tiered
+    res_tiered = runner.invoke(
+        app,
+        [
+            "slice-metrics",
+            str(trained_artifact),
+            str(csv_path),
+            "--slice-column",
+            "channel",
+            "--use-tiered",
+        ],
+    )
+    assert res_tiered.exit_code == 0, res_tiered.output
+
+
+def test_slice_metrics_cli_disparity_flagging_and_errors(
+    tmp_path: Path, trained_artifact: Path
+) -> None:
+    data = generate_synthetic_data(rows=200, fraud_rate=0.1, random_state=42)
+    data["channel"] = ["web" if i < 180 else "mobile" for i in range(len(data))]
+    csv_path = tmp_path / "slice_data.csv"
+    data.to_csv(csv_path, index=False)
+
+    # Force failure with strict disparity bounds
+    res_fail = runner.invoke(
+        app,
+        [
+            "slice-metrics",
+            str(trained_artifact),
+            str(csv_path),
+            "--slice-column",
+            "channel",
+            "--min-recall-disparity",
+            "1.5",  # Impossible ratio -> forces underperforming slice
+            "--fail-on-disparity",
+        ],
+    )
+    assert res_fail.exit_code == 1
+
+    # Missing slice column
+    res_no_col = runner.invoke(
+        app,
+        [
+            "slice-metrics",
+            str(trained_artifact),
+            str(csv_path),
+            "--slice-column",
+            "nonexistent_column",
+        ],
+    )
+    assert res_no_col.exit_code == 2
+    assert "Slice column 'nonexistent_column' not found" in res_no_col.output
+
+    # Missing target column
+    res_no_target = runner.invoke(
+        app,
+        [
+            "slice-metrics",
+            str(trained_artifact),
+            str(csv_path),
+            "--slice-column",
+            "channel",
+            "--target",
+            "nonexistent_target",
+        ],
+    )
+    assert res_no_target.exit_code == 2
+    assert "Target column 'nonexistent_target' not found" in res_no_target.output
+
+    # Missing features in CSV
+    bad_data = data[["channel", "Class"]].copy()
+    bad_csv = tmp_path / "missing_features.csv"
+    bad_data.to_csv(bad_csv, index=False)
+    res_missing_feat = runner.invoke(
+        app,
+        [
+            "slice-metrics",
+            str(trained_artifact),
+            str(bad_csv),
+            "--slice-column",
+            "channel",
+        ],
+    )
+    assert res_missing_feat.exit_code == 2
+    assert "Missing required model features" in res_missing_feat.output
+
+    # Output already exists without overwrite
+    out_file = tmp_path / "existing.json"
+    out_file.write_text("{}", encoding="utf-8")
+    res_exist = runner.invoke(
+        app,
+        [
+            "slice-metrics",
+            str(trained_artifact),
+            str(csv_path),
+            "--slice-column",
+            "channel",
+            "--output",
+            str(out_file),
+        ],
+    )
+    assert res_exist.exit_code == 2
+    assert "Output already exists" in res_exist.output

@@ -20,6 +20,7 @@ import uvicorn
 from fraud_detection import __version__
 from fraud_detection.audit import (
     JsonlAuditSink,
+    backtest_audit_policy,
     build_promotion_audit_event,
     build_scoring_audit_event,
     replay_audit_log,
@@ -47,8 +48,11 @@ from fraud_detection.drift import (
 from fraud_detection.edge import EdgeArtifactError, build_edge_model, score_batch_file
 from fraud_detection.evaluation import (
     ThresholdRow,
+    TieredThresholds,
+    TieredTuningObjective,
     calibration_report,
     evaluate_predictions,
+    evaluate_slices,
     expected_classification_cost,
     summarize_thresholds,
 )
@@ -187,9 +191,17 @@ def _training_config(
     split_strategy: SplitStrategy,
     time_column: str,
     temporal_gap: float = 0.0,
+    tune_tiered: bool = False,
+    tiered_objective: TieredTuningObjective = TieredTuningObjective.COST_MINIMIZATION,
+    tiered_manual_review_cost: float = 5.0,
+    tiered_max_review_rate: float | None = None,
+    tiered_min_deny_precision: float | None = None,
     overrides: dict[str, Any] | None = None,
 ) -> TrainingConfig:
     """Assemble the shared training configuration for train, compare, and stability."""
+    obj_val = (
+        tiered_objective.value if hasattr(tiered_objective, "value") else str(tiered_objective)
+    )
     kwargs: dict[str, Any] = {
         "test_size": test_size,
         "validation_size": validation_size,
@@ -212,6 +224,11 @@ def _training_config(
         "split_strategy": split_strategy,
         "time_column": time_column,
         "temporal_gap": temporal_gap,
+        "tune_tiered": tune_tiered,
+        "tiered_objective": obj_val,
+        "tiered_manual_review_cost": tiered_manual_review_cost,
+        "tiered_max_review_rate": tiered_max_review_rate,
+        "tiered_min_deny_precision": tiered_min_deny_precision,
     }
     if overrides:
         kwargs.update(overrides)
@@ -355,6 +372,48 @@ def train_command(
     split_strategy: SplitStrategyOption = SplitStrategy.STRATIFIED,
     time_column: TimeColumnOption = "Time",
     temporal_gap: TemporalGapOption = 0.0,
+    tune_tiered: Annotated[
+        bool,
+        typer.Option(
+            "--tune-tiered", help="Optimize three-tier decision boundaries on validation data."
+        ),
+    ] = False,
+    tiered_objective: Annotated[
+        TieredTuningObjective,
+        typer.Option(
+            "--tiered-objective",
+            help="Tuning objective: cost_minimization or capacity_constrained.",
+        ),
+    ] = TieredTuningObjective.COST_MINIMIZATION,
+    tiered_manual_review_cost: Annotated[
+        float,
+        typer.Option(
+            "--tiered-manual-review-cost",
+            "--manual-review-cost",
+            min=0.0,
+            help="Operational cost per challenged transaction.",
+        ),
+    ] = 5.0,
+    tiered_max_review_rate: Annotated[
+        float | None,
+        typer.Option(
+            "--tiered-max-review-rate",
+            "--max-review-rate",
+            min=0.0,
+            max=1.0,
+            help="Maximum allowed challenge rate (capacity constraint).",
+        ),
+    ] = None,
+    tiered_min_deny_precision: Annotated[
+        float | None,
+        typer.Option(
+            "--tiered-min-deny-precision",
+            "--min-deny-precision",
+            min=0.0,
+            max=1.0,
+            help="Minimum acceptable precision for automated denials.",
+        ),
+    ] = None,
     overwrite: Annotated[
         bool,
         typer.Option(help="Replace an existing model artifact."),
@@ -391,6 +450,11 @@ def train_command(
             split_strategy=split_strategy,
             time_column=time_column,
             temporal_gap=temporal_gap,
+            tune_tiered=tune_tiered,
+            tiered_objective=tiered_objective,
+            tiered_manual_review_cost=tiered_manual_review_cost,
+            tiered_max_review_rate=tiered_max_review_rate,
+            tiered_min_deny_precision=tiered_min_deny_precision,
         )
         git_info = _git_info()
         provenance = {
@@ -406,14 +470,20 @@ def train_command(
     except (OSError, DataValidationError, ModelArtifactError, ValueError) as exc:
         _abort(str(exc))
 
+    result_payload: dict[str, Any] = {
+        "model": str(model_path),
+        "estimator": model.metadata["estimator"],
+        "threshold": model.threshold,
+        "test_metrics": model.metadata["test_metrics"],
+    }
+    if model.tiered_thresholds is not None:
+        result_payload["tiered_thresholds"] = model.tiered_thresholds.to_dict()
+    if model.tiered_tuning is not None:
+        result_payload["tiered_tuning"] = model.tiered_tuning
+
     typer.echo(
         json.dumps(
-            {
-                "model": str(model_path),
-                "estimator": model.metadata["estimator"],
-                "threshold": model.threshold,
-                "test_metrics": model.metadata["test_metrics"],
-            },
+            result_payload,
             indent=2,
             sort_keys=True,
         )
@@ -3435,6 +3505,244 @@ def serve_command(
         host=host,
         port=port,
     )
+
+
+@app.command("backtest-policy")
+def backtest_policy_command(
+    audit_log: Annotated[
+        Path,
+        typer.Argument(
+            exists=True, dir_okay=False, readable=True, help="JSONL audit log to backtest."
+        ),
+    ],
+    candidate_review: Annotated[
+        float,
+        typer.Option(
+            "--candidate-review", "-r", min=0.0, max=1.0, help="Candidate review threshold."
+        ),
+    ],
+    candidate_deny: Annotated[
+        float,
+        typer.Option("--candidate-deny", "-d", min=0.0, max=1.0, help="Candidate deny threshold."),
+    ],
+    baseline_review: Annotated[
+        float | None,
+        typer.Option(
+            "--baseline-review", min=0.0, max=1.0, help="Optional baseline review threshold."
+        ),
+    ] = None,
+    baseline_deny: Annotated[
+        float | None,
+        typer.Option("--baseline-deny", min=0.0, max=1.0, help="Optional baseline deny threshold."),
+    ] = None,
+    manual_review_cost: Annotated[
+        float,
+        typer.Option(min=0.0, help="Operational cost per challenged transaction."),
+    ] = 5.0,
+    false_deny_cost: Annotated[
+        float,
+        typer.Option(min=0.0, help="Friction/support cost per legitimate transaction denied."),
+    ] = 50.0,
+    missed_fraud_cost: Annotated[
+        float,
+        typer.Option(min=0.0, help="Loss cost per undetected fraud allowed."),
+    ] = 200.0,
+    output: Annotated[
+        Path | None,
+        typer.Option("--output", "-o", help="Optional output JSON report destination."),
+    ] = None,
+    overwrite: Annotated[
+        bool,
+        typer.Option(help="Replace an existing report file."),
+    ] = False,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Output raw JSON instead of formatted text."),
+    ] = False,
+) -> None:
+    """Counterfactually backtest tiered decision thresholds against audit logs."""
+    _guard_output(output, overwrite)
+    try:
+        candidate = TieredThresholds(candidate_review, candidate_deny)
+        baseline: TieredThresholds | None = None
+        if baseline_review is not None or baseline_deny is not None:
+            if baseline_review is None or baseline_deny is None:
+                _abort("Both --baseline-review and --baseline-deny must be provided together.")
+            baseline = TieredThresholds(baseline_review, baseline_deny)
+
+        report = backtest_audit_policy(
+            audit_log_path=audit_log,
+            candidate_thresholds=candidate,
+            baseline_thresholds=baseline,
+            manual_review_cost=manual_review_cost,
+            false_deny_cost=false_deny_cost,
+            missed_fraud_cost=missed_fraud_cost,
+        )
+    except (OSError, ValueError, TypeError) as exc:
+        _abort(str(exc))
+
+    report_dict = report.to_dict()
+    report_json = json.dumps(report_dict, indent=2)
+
+    if output is not None:
+        _atomic_write_text(report_json + "\n", output)
+
+    if json_output or output is None:
+        if json_output:
+            typer.echo(report_json)
+        else:
+            matrix = report.transition_matrix
+            typer.echo(
+                f"Policy Backtest: {report.rows} records evaluated\n"
+                f"Baseline: review={report.baseline_thresholds.review_threshold:.4f}, "
+                f"deny={report.baseline_thresholds.deny_threshold:.4f}\n"
+                f"Candidate: review={report.candidate_thresholds.review_threshold:.4f}, "
+                f"deny={report.candidate_thresholds.deny_threshold:.4f}\n"
+                f"Turnover: {matrix.turnover_count} / {matrix.total_records} "
+                f"({matrix.turnover_rate:.1%})\n"
+                f"Review Workload Delta: {report.review_count_delta:+d} "
+                f"({report.review_rate_delta:+.1%})\n"
+                f"Deny Volume Delta: {report.deny_count_delta:+d} "
+                f"({report.deny_rate_delta:+.1%})\n"
+                f"Transition Matrix (Baseline -> Candidate):\n"
+                f"  ALLOW     -> ALLOW: {matrix.allow_to_allow:<5} "
+                f"CHALLENGE: {matrix.allow_to_challenge:<5} "
+                f"DENY: {matrix.allow_to_deny:<5}\n"
+                f"  CHALLENGE -> ALLOW: {matrix.challenge_to_allow:<5} "
+                f"CHALLENGE: {matrix.challenge_to_challenge:<5} "
+                f"DENY: {matrix.challenge_to_deny:<5}\n"
+                f"  DENY      -> ALLOW: {matrix.deny_to_allow:<5} "
+                f"CHALLENGE: {matrix.deny_to_challenge:<5} "
+                f"DENY: {matrix.deny_to_deny:<5}"
+            )
+
+
+@app.command("slice-metrics")
+def slice_metrics_command(
+    model_path: Annotated[
+        Path,
+        typer.Argument(exists=True, readable=True, help="Model artifact file or directory."),
+    ],
+    data: Annotated[
+        Path,
+        typer.Argument(exists=True, dir_okay=False, readable=True, help="Evaluation dataset CSV."),
+    ],
+    slice_column: Annotated[
+        str,
+        typer.Option("--slice-column", "-s", help="Categorical column name defining slices."),
+    ],
+    target: Annotated[
+        str,
+        typer.Option(help="Binary target column containing 0 and 1."),
+    ] = DEFAULT_TARGET,
+    threshold: Annotated[
+        float | None,
+        typer.Option(min=0.0, max=1.0, help="Custom binary classification threshold."),
+    ] = None,
+    use_tiered: Annotated[
+        bool,
+        typer.Option("--use-tiered", help="Use model's tuned tiered thresholds if available."),
+    ] = False,
+    min_slice_size: Annotated[
+        int,
+        typer.Option(min=1, help="Minimum record count to evaluate a slice."),
+    ] = 1,
+    min_recall_disparity: Annotated[
+        float,
+        typer.Option(min=0.0, help="Minimum acceptable slice recall disparity ratio."),
+    ] = 0.8,
+    max_fpr_disparity: Annotated[
+        float,
+        typer.Option(min=0.0, help="Maximum acceptable slice false-positive disparity ratio."),
+    ] = 1.5,
+    fail_on_disparity: Annotated[
+        bool,
+        typer.Option("--fail-on-disparity", help="Exit code 1 if any slice is underperforming."),
+    ] = False,
+    output: Annotated[
+        Path | None,
+        typer.Option("--output", "-o", help="Optional output JSON report destination."),
+    ] = None,
+    overwrite: Annotated[
+        bool,
+        typer.Option(help="Replace an existing report file."),
+    ] = False,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Output raw JSON instead of formatted text."),
+    ] = False,
+) -> None:
+    """Evaluate decision performance and disparity across data sub-populations."""
+    _guard_output(output, overwrite)
+    try:
+        model = load_model(model_path)
+        df = pd.read_csv(data)
+        if target not in df.columns:
+            _abort(f"Target column {target!r} not found in {data}.")
+        if slice_column not in df.columns:
+            _abort(f"Slice column {slice_column!r} not found in {data}.")
+
+        y_true = pd.to_numeric(df[target], errors="coerce").to_numpy(dtype=int)
+        slice_values = df[slice_column].astype(str).to_numpy()
+
+        feature_cols = list(model.feature_names)
+        missing_features = [col for col in feature_cols if col not in df.columns]
+        if missing_features:
+            _abort(f"Missing required model features in data: {missing_features}.")
+
+        features_df = df[feature_cols]
+        probs = model.predict_probabilities(features_df)
+
+        eff_threshold = threshold if threshold is not None else (model.threshold or 0.5)
+        eff_tiered = model.tiered_thresholds if use_tiered else None
+
+        report = evaluate_slices(
+            y_true=y_true,
+            probabilities=probs,
+            slices=slice_values,
+            threshold=eff_threshold,
+            tiered_thresholds=eff_tiered,
+            min_slice_size=min_slice_size,
+            min_recall_disparity=min_recall_disparity,
+            max_fpr_disparity=max_fpr_disparity,
+        )
+    except (OSError, ValueError, TypeError, ModelArtifactError) as exc:
+        _abort(str(exc))
+
+    report_dict = report.to_dict()
+    report_json = json.dumps(report_dict, indent=2)
+
+    if output is not None:
+        _atomic_write_text(report_json + "\n", output)
+
+    if json_output or output is None:
+        if json_output:
+            typer.echo(report_json)
+        else:
+            typer.echo(
+                f"Slice Disparity Analysis: {report.total_records} records across "
+                f"{len(report.slices)} slices\n"
+                f"Global: fraud_rate={report.global_fraud_rate:.2%}, "
+                f"recall={report.global_recall:.2%}, "
+                f"fpr={report.global_false_positive_rate:.2%}\n"
+                f"Disparity bounds: min_recall={report.min_recall_disparity:.2f}, "
+                f"max_fpr={report.max_fpr_disparity:.2f}\n"
+                f"{'Slice':<20} {'Count':<8} {'Fraud%':<8} {'Recall':<8} "
+                f"{'RecDisp':<9} {'FPR':<8} {'FprDisp':<9} {'Status'}"
+            )
+            for s in report.slices:
+                status_str = "UNDERPERFORMING" if s.is_underperforming else "PASS"
+                typer.echo(
+                    f"{s.slice_name:<20} {s.count:<8} {s.fraud_rate:<8.2%} {s.recall:<8.2%} "
+                    f"{s.recall_disparity:<9.2f} {s.false_positive_rate:<8.2%} "
+                    f"{s.fpr_disparity:<9.2f} {status_str}"
+                )
+            if report.underperforming_slices:
+                under_str = ", ".join(report.underperforming_slices)
+                typer.echo(f"\nWarning: Underperforming slices detected: {under_str}")
+
+    if fail_on_disparity and report.underperforming_slices:
+        raise typer.Exit(code=1)
 
 
 def _abort(message: str) -> NoReturn:
