@@ -1079,7 +1079,7 @@ This phase does not implement dynamic rule graph execution (AST evaluation of ar
 - **CLI commands for score surveillance, edge scoring, and tiered predict**: added `--review-threshold` and `--deny-threshold` to `predict`, implemented `fraud-detect score-drift` with `--fail-on` and webhook alerting, and added `fraud-detect score-edge` with `--explain` (`141ce76`).
 - **Documentation & architecture alignment**: documented multi-tier decision policies, prediction score drift surveillance, and edge explanation workflows across `README.md`, `ARCHITECTURE.md`, `CHANGELOG.md`, and marked Phase 25 as completed in `ROADMAP.md`.
 
-## Phase 26 — Decision Policy Optimization, Counterfactual Backtesting, and Slice Disparity Profiling (In progress)
+## Phase 26 — Decision Policy Optimization, Counterfactual Backtesting, and Slice Disparity Profiling (Done)
 
 ### Objective
 
@@ -1109,7 +1109,38 @@ This phase does not implement dynamic rule graph execution (AST evaluation of ar
 
 ### Delivery record
 
-Filled in as phase increments complete.
+- **Automated decision tier threshold tuning**: implemented `tune_tiered_thresholds()` in `evaluation.py`, supporting grid search optimization over $(review\_threshold, deny\_threshold)$ space under both cost-minimization and review-capacity-constrained objectives (`3de6dc8`).
+- **Model training tier tuning integration**: added `tune_tiered`, `tiered_objective`, `tiered_manual_review_cost`, `tiered_max_review_rate`, and `tiered_min_deny_precision` to `TrainingConfig` and `train_model()`, persisting optimized boundaries and full optimization metadata into model artifacts (`30bb48f`).
+- **Counterfactual policy transition backtesting**: implemented `PolicyTransitionMatrix`, `PolicyBacktestReport`, and `backtest_policy_transition()` in `evaluation.py`, and `backtest_audit_policy()` in `audit.py` for streaming counterfactual simulation of historical audit logs against candidate decision policies (`09b4252`).
+- **Sub-population slice disparity diagnostics**: implemented `SliceMetricRow`, `SliceDisparityReport`, and `evaluate_slices()` in `evaluation.py` measuring per-slice fraud rates, catch rates, FPRs, and disparity ratios relative to global metrics, flagging underperforming segments (`177059c`).
+- **Compliance reporting integration**: extended `render_compliance_report()` in `reporting.py` to render active tiered decision policies, score distribution quantiles, and sub-population slice disparity tables with strict HTML escaping (`acb8331`, `1dc0f17`).
+- **CLI commands & training flags**: added `fraud-detect backtest-policy` and `fraud-detect slice-metrics` commands, added `--tune-tiered` and tiered tuning options to `fraud-detect train`, and implemented comprehensive CLI integration tests (`d3647b4`).
+- **Documentation & quality gate verification**: documented all new commands and capabilities across `README.md`, `ARCHITECTURE.md`, `CHANGELOG.md`, and `ROADMAP.md`; verified 602 passing tests, 97.64% branch coverage, clean Ruff formatting and linting, and strict mypy verification.
+
+## Phase 27 — Declarative Decision Rules, Priority Overrides, and Sub-population Disparity Alerting (Planned)
+
+### Objective
+
+Complement statistical machine learning scores with deterministic declarative business rules, enabling operators to enforce immediate regulatory hard stops, VIP exemptions, and automated webhook alerts when segment disparities breach production tolerance.
+
+### Scope
+
+- **Declarative rule engine** — define typed, deterministic predicate rules (`RuleCondition`, `RuleAction`, `RuleSet`) supporting feature equality, numerical comparisons, set membership, and logical conjunctions without arbitrary code execution.
+- **Rule-model decision pipeline** — integrate rule evaluation into `FraudModel.predict_decisions()` and `/v1/predict` / `/v1/score` serving pipelines with configurable precedence (rules override model score vs. model score overrides rules).
+- **Rule execution audit logging** — record matched rule identifiers, triggered actions, and execution latencies in structured audit events and Prometheus counters (`fraud_rules_triggered_total`).
+- **Slice disparity alerting webhooks** — add automated Slack and PagerDuty alert dispatching to `fraud-detect slice-metrics` when underperforming sub-populations are identified.
+- **CLI & documentation** — add `fraud-detect test-rules` command to validate rule syntax and preview match rates against historical data.
+
+### Acceptance criteria
+
+- Declarative rules evaluate safely in bounded linear time without `eval()` or unsafe AST execution.
+- Rule overrides execute with deterministic priority and record matched rule IDs in scoring responses and audit logs.
+- `slice-metrics` dispatches structured alert notifications to configured webhook URLs upon disparity gate failures.
+- Full test suite passes, branch coverage remains $\ge 97.0\%$, Ruff and strict mypy pass with zero errors.
+
+### Explicit exclusions
+
+This phase does not implement distributed stateful CEP (complex event processing) engines, graphical rule builders, or live hot-reloading rule databases.
 
 ## Contributing to the roadmap
 
