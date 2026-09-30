@@ -28,12 +28,16 @@ financial-services platform.
    tracks output prediction score drift via `ScoreProfile` and `calculate_score_drift`,
    and implements an online incremental `StreamingProfile` via Welford's algorithm.
    `evaluation.py` defines multi-tier decision routing (`DecisionAction`, `TieredThresholds`,
-   `evaluate_tiered_policy`), calibration analysis, and threshold reports;
+   `evaluate_tiered_policy`), automated decision tier calibration (`tune_tiered_thresholds`),
+   counterfactual policy backtesting (`PolicyTransitionMatrix`, `backtest_policy_transition`),
+   sub-population slice disparity diagnostics (`SliceMetricRow`, `evaluate_slices`),
+   calibration analysis, and threshold reports;
    `reporting.py` renders promotion evidence as escaped, self-contained HTML.
 7. `audit.py` exports thread-safe, structured JSONL audit events for scoring,
    shadowing, and promotion decisions with automated Luhn-validated PAN and sensitive key
-   redaction guarantees, and provides `replay_audit_log` for historical replay
-   and divergence backtesting.
+   redaction guarantees, provides `replay_audit_log` for historical replay
+   and divergence backtesting, and `backtest_audit_policy` for streaming counterfactual
+   policy backtesting against audit logs.
 8. `explanations.py` defines the `ExplanationProvider` boundary, keeping
    deterministic offline template explanations as default while wrapping external
    LLM calls with timeouts, prompt redaction, cost controls, and fallback.

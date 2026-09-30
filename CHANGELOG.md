@@ -8,6 +8,21 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- Automated decision tier threshold optimization: added `tune_tiered_thresholds()` in `evaluation.py`
+  supporting both cost-minimization and review-capacity-constrained objectives, integrated tiered
+  boundary tuning into `TrainingConfig` and `train_model()`, and added `--tune-tiered`,
+  `--tiered-objective`, `--tiered-manual-review-cost`, `--tiered-max-review-rate`, and
+  `--tiered-min-deny-precision` flags to `fraud-detect train`.
+- Counterfactual policy backtesting: added `PolicyTransitionMatrix`, `PolicyBacktestReport`, and
+  `backtest_policy_transition()` in `evaluation.py`, streaming JSONL audit backtesting via
+  `backtest_audit_policy()` in `audit.py`, and `fraud-detect backtest-policy` CLI command
+  evaluating 3x3 migration matrices, turnover rates, and operational cost deltas.
+- Sub-population slice disparity profiling: added `SliceMetricRow`, `SliceDisparityReport`, and
+  `evaluate_slices()` in `evaluation.py`, and `fraud-detect slice-metrics` CLI command
+  evaluating recall and FPR disparities across categorical slices with `--fail-on-disparity` gating.
+- Compliance report tiered decision and disparity sections: extended `render_compliance_report()`
+  in `reporting.py` to render sanitized, HTML-escaped tables for active decision tier policies,
+  score distribution quantiles, and sub-population slice disparity diagnostics.
 - Multi-tier decision routing and policy evaluation: added `DecisionAction` (`ALLOW`,
   `CHALLENGE`, `DENY`), `TieredThresholds`, `evaluate_tiered_policy()` in `evaluation.py`,
   and `predict_decisions()` on `FraudModel` for automated 3-tier risk routing.

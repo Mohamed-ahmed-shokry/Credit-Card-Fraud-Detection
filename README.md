@@ -261,6 +261,55 @@ The command:
 - Automatically sends structured alert payloads to configured webhooks when drift is detected.
 - Exits with code `1` when `--fail-on` is tripped, enabling automated CI/CD and cron surveillance gates.
 
+## Decision policy tier optimization
+
+Automate the discovery of optimal review and denial boundaries during training instead of guessing manual cutoffs:
+
+```bash
+# Cost-minimization objective balancing manual reviews, false denials, and fraud losses
+fraud-detect train Dataset/creditcard.csv \
+  --output artifacts/model \
+  --tune-tiered \
+  --tiered-objective cost_minimization \
+  --tiered-manual-review-cost 5.0
+
+# Capacity-constrained objective maximizing catch rate within an analyst review budget
+fraud-detect train Dataset/creditcard.csv \
+  --output artifacts/model \
+  --tune-tiered \
+  --tiered-objective capacity_constrained \
+  --tiered-max-review-rate 0.05 \
+  --tiered-min-deny-precision 0.85
+```
+
+## Counterfactual policy backtesting
+
+Before migrating decision thresholds in production, simulate how historical transactions would migrate across tiers using audit logs:
+
+```bash
+fraud-detect backtest-policy audit.jsonl \
+  --candidate-review 0.15 \
+  --candidate-deny 0.80 \
+  --output reports/backtest.json
+```
+
+Evaluates $3 \times 3$ action transition matrices (`ALLOW`, `CHALLENGE`, `DENY`), action turnover rates, review workload deltas, and net cost changes.
+
+## Sub-population slice disparity diagnostics
+
+Audit model equity and vulnerability across operational segments (e.g. channel, card brand, merchant category):
+
+```bash
+fraud-detect slice-metrics artifacts/model Dataset/eval.csv \
+  --slice-column channel \
+  --use-tiered \
+  --min-recall-disparity 0.80 \
+  --max-fpr-disparity 1.50 \
+  --fail-on-disparity
+```
+
+Flags underperforming slices where fraud catch rate drops below 80% of global recall or false-positive rate exceeds 150% of global FPR, exiting with code `1` for automated CI/CD and deployment gating.
+
 ## Train on the anonymized dataset
 
 Place the downloaded CSV under the ignored `Dataset/` directory; raw financial data
@@ -1049,7 +1098,8 @@ fraud-detect compliance reports/promotion.json \
 The report is dependency-free, escapes evidence values before rendering, and
 states evidence rather than making an automated promotion decision. The HTML
 contains model identity, holdout metrics, calibration, threshold tradeoffs,
-drift, serving benchmarks, optional stability, and artifact SHA-256 digests.
+tiered decision routing policies, slice disparity diagnostics, drift, serving
+benchmarks, optional stability, and artifact SHA-256 digests.
 
 ## Container deployment
 
