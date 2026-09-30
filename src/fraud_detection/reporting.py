@@ -431,9 +431,7 @@ def _tiered_policy_section(policy: Mapping[str, Any]) -> str:
         raw_thresholds if isinstance(raw_thresholds, Mapping) else policy
     )
     raw_metrics = policy.get("best_metrics")
-    metrics: Mapping[str, Any] = (
-        raw_metrics if isinstance(raw_metrics, Mapping) else policy
-    )
+    metrics: Mapping[str, Any] = raw_metrics if isinstance(raw_metrics, Mapping) else policy
 
     r_th = _fmt(thresholds.get("review_threshold"))
     d_th = _fmt(thresholds.get("deny_threshold"))
