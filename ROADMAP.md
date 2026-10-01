@@ -1117,7 +1117,7 @@ This phase does not implement dynamic rule graph execution (AST evaluation of ar
 - **CLI commands & training flags**: added `fraud-detect backtest-policy` and `fraud-detect slice-metrics` commands, added `--tune-tiered` and tiered tuning options to `fraud-detect train`, and implemented comprehensive CLI integration tests (`d3647b4`).
 - **Documentation & quality gate verification**: documented all new commands and capabilities across `README.md`, `ARCHITECTURE.md`, `CHANGELOG.md`, and `ROADMAP.md`; verified 602 passing tests, 97.64% branch coverage, clean Ruff formatting and linting, and strict mypy verification.
 
-## Phase 27 — Declarative Decision Rules, Priority Overrides, and Sub-population Disparity Alerting (Planned)
+## Phase 27 — Declarative Decision Rules, Priority Overrides, and Sub-population Disparity Alerting (In progress)
 
 ### Objective
 
