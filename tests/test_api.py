@@ -45,6 +45,14 @@ from fraud_detection.api import (
 from fraud_detection.audit import JsonlAuditSink
 from fraud_detection.data import ValidatedDataset, generate_synthetic_data, validate_frame
 from fraud_detection.model import FraudModel, save_model, train_model, validate_artifact
+from fraud_detection.rules import (
+    DecisionRule,
+    RuleAction,
+    RuleCondition,
+    RuleOperator,
+    RulePrecedence,
+    RuleSet,
+)
 from fraud_detection.signing import load_private_key, load_public_key, write_keypair
 from fraud_detection.telemetry import TraceContext, TraceSpan
 from fraud_detection.trust import TrustBundle, write_trust_bundle
@@ -2296,3 +2304,162 @@ def test_tiered_decisions_model_metadata_defaults(
         data = res.json()
         assert data["review_threshold"] == 0.12
         assert data["deny_threshold"] == 0.88
+
+
+def test_declarative_rules_in_predict_and_metrics(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+    tmp_path: Path,
+) -> None:
+    _, model, dataset = api_context
+    sink_file = tmp_path / "audit.jsonl"
+    sink = JsonlAuditSink(sink_file)
+
+    rule_high = DecisionRule(
+        rule_id="R_HIGH",
+        name="High Amount Deny",
+        priority=10,
+        action=RuleAction.DENY,
+        conditions=(
+            RuleCondition(field="Amount", operator=RuleOperator.GREATER_THAN, value=500.0),
+        ),
+    )
+    rule_low = DecisionRule(
+        rule_id="R_LOW",
+        name="Low Amount Allow",
+        priority=20,
+        action=RuleAction.ALLOW,
+        conditions=(
+            RuleCondition(field="Amount", operator=RuleOperator.LESS_THAN_OR_EQUAL, value=50.0),
+        ),
+    )
+    rules = RuleSet(rules=(rule_high, rule_low))
+
+    app = create_app(
+        model=model,
+        rules=rules,
+        audit_sink=sink,
+    )
+
+    rec_high = dataset.features.iloc[0].to_dict()
+    rec_high["Amount"] = 999.0
+
+    rec_low = dataset.features.iloc[1].to_dict()
+    rec_low["Amount"] = 15.0
+
+    rec_mid = dataset.features.iloc[2].to_dict()
+    rec_mid["Amount"] = 200.0
+
+    with TestClient(app) as client:
+        # Check health and ready include rules metadata
+        h_res = client.get("/health")
+        assert h_res.status_code == 200
+        assert h_res.json()["rules_count"] == 2
+        assert h_res.json()["rule_precedence"] == "rules_override_model"
+
+        r_res = client.get("/ready")
+        assert r_res.status_code == 200
+        assert r_res.json()["rules_count"] == 2
+        assert r_res.json()["rule_precedence"] == "rules_override_model"
+
+        # Predict batch
+        pred_res = client.post("/v1/predict", json={"transactions": [rec_high, rec_low, rec_mid]})
+        assert pred_res.status_code == 200
+        preds = pred_res.json()["predictions"]
+        assert len(preds) == 3
+
+        # rec_high matched R_HIGH
+        assert preds[0]["decision"] == "DENY"
+        assert preds[0]["is_fraud"] is True
+        assert preds[0]["matched_rule"] == "R_HIGH"
+        assert preds[0]["rule_action"] == "DENY"
+
+        # rec_low matched R_LOW
+        assert preds[1]["decision"] == "ALLOW"
+        assert preds[1]["is_fraud"] is False
+        assert preds[1]["matched_rule"] == "R_LOW"
+        assert preds[1]["rule_action"] == "ALLOW"
+
+        # rec_mid matched neither rule
+        assert preds[2]["matched_rule"] is None
+        assert preds[2]["rule_action"] is None
+
+        # Check single-transaction /v1/score
+        score_res = client.post("/v1/score", json={"transaction": rec_high})
+        assert score_res.status_code == 200
+        single_pred = score_res.json()["prediction"]
+        assert single_pred["decision"] == "DENY"
+        assert single_pred["matched_rule"] == "R_HIGH"
+        assert single_pred["rule_action"] == "DENY"
+
+        # Check Prometheus metrics
+        metrics_res = client.get("/metrics")
+        assert metrics_res.status_code == 200
+        m_text = metrics_res.text
+        assert 'fraud_rules_triggered_total{action="DENY",rule_id="R_HIGH"}' in m_text
+        assert 'fraud_rules_triggered_total{action="ALLOW",rule_id="R_LOW"}' in m_text
+
+    sink.close()
+
+    # Check audit log contains rule_matches and matched_rule
+    raw_lines = sink_file.read_text(encoding="utf-8").strip().splitlines()
+    lines = [json.loads(line) for line in raw_lines]
+    assert len(lines) == 2  # one from /v1/predict, one from /v1/score
+    batch_event = lines[0]
+    assert batch_event["payload"]["rule_matches"] == {"R_HIGH": 1, "R_LOW": 1}
+    assert batch_event["payload"]["predictions"][0]["matched_rule"] == "R_HIGH"
+    assert batch_event["payload"]["predictions"][0]["rule_action"] == "DENY"
+
+
+def test_declarative_rules_file_and_precedence(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, model, dataset = api_context
+
+    rule_allow_all = DecisionRule(
+        rule_id="R_ALLOW_ALL",
+        name="Allow Low Amounts",
+        priority=1,
+        action=RuleAction.ALLOW,
+        conditions=(
+            RuleCondition(
+                field="Amount",
+                operator=RuleOperator.GREATER_THAN_OR_EQUAL,
+                value=0.0,
+            ),
+        ),
+    )
+    rules_file = tmp_path / "test_rules.json"
+    RuleSet(rules=(rule_allow_all,)).save_file(rules_file)
+
+    monkeypatch.setenv("FRAUD_RULES_PATH", str(rules_file))
+    monkeypatch.setenv("FRAUD_RULE_PRECEDENCE", "model_overrides_rules")
+
+    app = create_app(model=model)
+    with TestClient(app) as env_client:
+        h_res = env_client.get("/health")
+        assert h_res.json()["rules_count"] == 1
+        assert h_res.json()["rule_precedence"] == "model_overrides_rules"
+
+    rec = dataset.features.iloc[0].to_dict()
+    # High score mock so model outputs DENY
+    mock_model = MagicMock(wraps=model)
+    mock_model.metadata = model.metadata
+    mock_model.threshold = 0.5
+    mock_model.feature_names = model.feature_names
+    mock_model.predict_probabilities.return_value = np.array([0.99])
+
+    app_override = create_app(
+        model=mock_model,
+        rules_path=rules_file,
+        rule_precedence=RulePrecedence.MODEL_OVERRIDES_RULES,
+    )
+
+    with TestClient(app_override) as client:
+        res = client.post("/v1/predict", json={"transactions": [rec]})
+        assert res.status_code == 200
+        pred = res.json()["predictions"][0]
+        # In MODEL_OVERRIDES_RULES, model DENY takes precedence over rule ALLOW
+        assert pred["decision"] == "DENY"
+        assert pred["matched_rule"] is None

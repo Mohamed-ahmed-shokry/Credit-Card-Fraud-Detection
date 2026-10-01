@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Collection, Mapping
+from collections.abc import Collection, Iterator, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -246,6 +246,12 @@ class RuleSet:
             if rule.rule_id in seen_ids:
                 raise RuleError(f"Duplicate rule_id {rule.rule_id!r} found in RuleSet.")
             seen_ids.add(rule.rule_id)
+
+    def __len__(self) -> int:
+        return len(self.rules)
+
+    def __iter__(self) -> Iterator[DecisionRule]:
+        return iter(self.rules)
 
     def evaluate_record(self, record: Mapping[str, Any]) -> RuleEvaluationResult:
         """Evaluate a single record against the rules in priority order."""

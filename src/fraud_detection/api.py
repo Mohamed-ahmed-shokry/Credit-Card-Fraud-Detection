@@ -47,6 +47,7 @@ from fraud_detection.audit import (
 from fraud_detection.evaluation import DecisionAction, TieredThresholds
 from fraud_detection.explanations import ExplanationProvider
 from fraud_detection.model import FraudModel, ModelArtifactError, load_model
+from fraud_detection.rules import RulePrecedence, RuleSet
 from fraud_detection.telemetry import (
     DEFAULT_OTLP_TIMEOUT_SECONDS,
     DEFAULT_SERVICE_NAME,
@@ -79,6 +80,8 @@ RATE_LIMIT_REQUESTS_ENVIRONMENT_VARIABLE = "FRAUD_RATE_LIMIT_REQUESTS"
 RATE_LIMIT_WINDOW_SECONDS_ENVIRONMENT_VARIABLE = "FRAUD_RATE_LIMIT_WINDOW_SECONDS"
 MAX_CONCURRENT_SCORING_ENVIRONMENT_VARIABLE = "FRAUD_MAX_CONCURRENT_SCORING"
 ENABLE_CHAOS_HEADER_ENVIRONMENT_VARIABLE = "FRAUD_ENABLE_CHAOS_HEADER"
+RULES_PATH_ENVIRONMENT_VARIABLE = "FRAUD_RULES_PATH"
+RULE_PRECEDENCE_ENVIRONMENT_VARIABLE = "FRAUD_RULE_PRECEDENCE"
 REQUEST_ID_HEADER = "X-Request-ID"
 PROCESS_TIME_HEADER = "X-Process-Time-Ms"
 MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024
@@ -104,21 +107,28 @@ class _RateLimitDecision:
 
 @dataclass(frozen=True)
 class _OperationalStatus:
-    """Fallback, degraded, circuit-breaker, and shadow detail for operational endpoints."""
+    """Fallback, degraded, circuit-breaker, shadow, and rules detail for operational endpoints."""
 
     fallback_mode: str
     degraded_mode: bool
     circuit_breaker: dict[str, Any] | None
     shadow_model_version: str | None
+    rules_count: int | None = None
+    rule_precedence: str | None = None
 
     def response_fields(self) -> dict[str, Any]:
         """Return the response fields shared by `/health` and `/ready`."""
-        return {
+        fields: dict[str, Any] = {
             "degraded_mode": True if self.degraded_mode else None,
             "fallback_mode": self.fallback_mode if self.fallback_mode != "raise" else None,
             "circuit_breaker": self.circuit_breaker,
             "shadow_model_version": self.shadow_model_version,
         }
+        if self.rules_count is not None:
+            fields["rules_count"] = self.rules_count
+        if self.rule_precedence is not None:
+            fields["rule_precedence"] = self.rule_precedence
+        return fields
 
 
 class _ScoringOverloadedError(Exception):
@@ -458,6 +468,8 @@ class PredictionResult(BaseModel):
     fraud_probability: float
     is_fraud: bool
     decision: str = "ALLOW"
+    matched_rule: str | None = None
+    rule_action: str | None = None
     contributions: dict[str, float] | None = None
     explanation: str | None = None
 
@@ -527,6 +539,8 @@ class HealthResponse(BaseModel):
     fallback_mode: str | None = None
     circuit_breaker: dict[str, Any] | None = None
     shadow_model_version: str | None = None
+    rules_count: int | None = None
+    rule_precedence: str | None = None
 
 
 class LivenessResponse(BaseModel):
@@ -549,6 +563,8 @@ class ReadinessResponse(BaseModel):
     fallback_mode: str | None = None
     circuit_breaker: dict[str, Any] | None = None
     shadow_model_version: str | None = None
+    rules_count: int | None = None
+    rule_precedence: str | None = None
 
 
 def create_app(
@@ -578,6 +594,9 @@ def create_app(
     otlp_timeout_seconds: float = DEFAULT_OTLP_TIMEOUT_SECONDS,
     attestation_path: Path | str | None = None,
     trust_bundle_path: Path | str | None = None,
+    rules: RuleSet | None = None,
+    rules_path: Path | str | None = None,
+    rule_precedence: RulePrecedence | None = None,
 ) -> FastAPI:
     """Create an application using an injected model or a trusted artifact path.
 
@@ -625,6 +644,9 @@ def create_app(
         otlp_timeout_seconds: Collector request timeout for the optional OTLP exporter.
         attestation_path: Optional signed deployment attestation required before model load.
         trust_bundle_path: Optional rotation-aware trust bundle paired with attestation_path.
+        rules: Optional pre-loaded declarative RuleSet.
+        rules_path: Optional path to JSON or YAML declarative rules file.
+        rule_precedence: Optional RulePrecedence strategy governing rule vs model priority.
     """
     logging.basicConfig(level=logging.INFO)
 
@@ -729,6 +751,19 @@ def create_app(
             latency_budget_ms=resolved_latency_budget_ms,
         )
 
+    resolved_rules_path = rules_path or os.getenv(RULES_PATH_ENVIRONMENT_VARIABLE)
+    resolved_rules: RuleSet | None = rules
+    if resolved_rules is None and resolved_rules_path is not None:
+        resolved_rules = RuleSet.load_file(resolved_rules_path)
+
+    raw_precedence = os.getenv(RULE_PRECEDENCE_ENVIRONMENT_VARIABLE)
+    if rule_precedence is not None:
+        resolved_precedence = rule_precedence
+    elif raw_precedence:
+        resolved_precedence = RulePrecedence(raw_precedence.strip().lower())
+    else:
+        resolved_precedence = RulePrecedence.RULES_OVERRIDE_MODEL
+
     metrics_registry = CollectorRegistry()
     request_counter = Counter(
         "http_requests_total",
@@ -792,6 +827,12 @@ def create_app(
         "fraud_scoring_rejected_total",
         "Total requests rejected before scoring by an optional guardrail.",
         ["reason"],
+        registry=metrics_registry,
+    )
+    rules_counter = Counter(
+        "fraud_rules_triggered_total",
+        "Total transactions triggering declarative decision rules.",
+        ["rule_id", "action"],
         registry=metrics_registry,
     )
 
@@ -903,6 +944,9 @@ def create_app(
         application.state.circuit_breaker_tripped_counter = circuit_breaker_tripped_counter
         application.state.circuit_breaker_gauge = circuit_breaker_gauge
         application.state.trace_exporter = resolved_trace_exporter
+        application.state.rules = resolved_rules
+        application.state.rule_precedence = resolved_precedence
+        application.state.rules_counter = rules_counter
         shadow_tasks: set[asyncio.Task[None]] = set()
         application.state.shadow_tasks = shadow_tasks
         yield
@@ -1172,26 +1216,26 @@ def create_app(
         eff_deny: float,
         explain: bool,
         explain_llm: bool,
+        rules: RuleSet | None = None,
+        rule_precedence: RulePrecedence = RulePrecedence.RULES_OVERRIDE_MODEL,
     ) -> list[PredictionResult]:
         """Classify primary probabilities using tiered thresholds and build
         per-transaction results.
         """
-        decision_actions: list[str] = []
-        is_fraud_flags: list[bool] = []
         for prob in probabilities:
-            p_val = float(prob)
-            score_histogram.observe(p_val)
-            if p_val < eff_review:
-                act = DecisionAction.ALLOW.value
-                flag = False
-            elif p_val >= eff_deny:
-                act = DecisionAction.DENY.value
-                flag = True
-            else:
-                act = DecisionAction.CHALLENGE.value
-                flag = False
-            decision_actions.append(act)
-            is_fraud_flags.append(flag)
+            score_histogram.observe(float(prob))
+
+        final_decisions, matched_rule_ids, _ = loaded.predict_decisions_with_details(
+            frame,
+            probabilities=probabilities,
+            review_threshold=eff_review,
+            deny_threshold=eff_deny,
+            rules=rules,
+            rule_precedence=rule_precedence,
+        )
+
+        decision_actions = [str(act) for act in final_decisions]
+        is_fraud_flags: list[bool] = [act == DecisionAction.DENY.value for act in decision_actions]
 
         local_explanations = loaded.explain_local(frame) if explain or explain_llm else None
         natural_language = (
@@ -1207,14 +1251,16 @@ def create_app(
             else None
         )
         results: list[PredictionResult] = []
-        for index, (prob, is_fraud, action) in enumerate(
-            zip(probabilities, is_fraud_flags, decision_actions, strict=True)
+        for index, (prob, is_fraud, action, matched_id) in enumerate(
+            zip(probabilities, is_fraud_flags, decision_actions, matched_rule_ids, strict=True)
         ):
             results.append(
                 PredictionResult(
                     fraud_probability=float(prob),
                     is_fraud=is_fraud,
                     decision=action,
+                    matched_rule=matched_id,
+                    rule_action=action if matched_id is not None else None,
                     contributions=(
                         local_explanations[index]
                         if explain and local_explanations is not None
@@ -1234,6 +1280,9 @@ def create_app(
             act_count = sum(1 for a in decision_actions if a == action)
             if act_count > 0:
                 decision_counter.labels(action=action).inc(act_count)
+        for matched_id, act in zip(matched_rule_ids, decision_actions, strict=True):
+            if matched_id is not None:
+                rules_counter.labels(rule_id=matched_id, action=act).inc()
         return results
 
     def _require_probabilities(probabilities: Any, expected_rows: int) -> np.ndarray:
@@ -1267,6 +1316,8 @@ def create_app(
         fallback_amount_threshold: float = 1000.0,
         force_degraded: bool = False,
         circuit_breaker: CircuitBreaker | None = None,
+        rules: RuleSet | None = None,
+        rule_precedence: RulePrecedence = RulePrecedence.RULES_OVERRIDE_MODEL,
     ) -> tuple[float, list[PredictionResult], bool, str | None, float, float]:
         """Score transactions with runtime guardrails and resilient degraded-state fallback."""
         # Reject a request whose feature schema does not match the artifact before any
@@ -1324,6 +1375,8 @@ def create_app(
                     eff_deny=eff_deny,
                     explain=explain,
                     explain_llm=explain_llm,
+                    rules=rules,
+                    rule_precedence=rule_precedence,
                 )
             except Exception as exc:
                 if circuit_breaker is not None:
@@ -1431,6 +1484,10 @@ def create_app(
         fb_score = float(getattr(request.app.state, "fallback_score", 0.5))
         fb_amount = float(getattr(request.app.state, "fallback_amount_threshold", 1000.0))
         cb: CircuitBreaker | None = getattr(request.app.state, "circuit_breaker", None)
+        active_rules: RuleSet | None = getattr(request.app.state, "rules", None)
+        active_rule_precedence: RulePrecedence = getattr(
+            request.app.state, "rule_precedence", RulePrecedence.RULES_OVERRIDE_MODEL
+        )
 
         if scoring_semaphore is not None:
             if scoring_semaphore.locked():
@@ -1459,6 +1516,8 @@ def create_app(
                 fallback_amount_threshold=fb_amount,
                 force_degraded=force_degraded,
                 circuit_breaker=cb,
+                rules=active_rules,
+                rule_precedence=active_rule_precedence,
             )
         finally:
             if scoring_semaphore is not None:
@@ -1479,6 +1538,8 @@ def create_app(
                         "fraud_probability": r.fraud_probability,
                         "is_fraud": r.is_fraud,
                         "decision": r.decision,
+                        "matched_rule": r.matched_rule,
+                        "rule_action": r.rule_action,
                         "contributions": r.contributions,
                         "explanation": r.explanation,
                     }
@@ -1760,11 +1821,18 @@ def _shadow_model_version(shadow_model: FraudModel | None) -> str | None:
 
 
 def _operational_status(request: Request) -> _OperationalStatus:
-    """Collect the circuit-breaker, fallback, degraded, and shadow detail of a service."""
+    """Collect the circuit-breaker, fallback, degraded, shadow, and rules detail of a service."""
     circuit_breaker: CircuitBreaker | None = getattr(request.app.state, "circuit_breaker", None)
     degraded_mode = bool(getattr(request.app.state, "degraded_mode", False))
     if circuit_breaker is not None and circuit_breaker.state == "open":
         degraded_mode = True
+    active_rules: RuleSet | None = getattr(request.app.state, "rules", None)
+    prec = getattr(request.app.state, "rule_precedence", None)
+    prec_str = (
+        prec.value
+        if isinstance(prec, RulePrecedence)
+        else (str(prec) if prec is not None else None)
+    )
     return _OperationalStatus(
         fallback_mode=str(getattr(request.app.state, "fallback_mode", "raise")),
         degraded_mode=degraded_mode,
@@ -1772,6 +1840,8 @@ def _operational_status(request: Request) -> _OperationalStatus:
         shadow_model_version=_shadow_model_version(
             cast(FraudModel | None, getattr(request.app.state, "shadow_model", None))
         ),
+        rules_count=len(active_rules) if active_rules is not None else None,
+        rule_precedence=prec_str if active_rules is not None else None,
     )
 
 

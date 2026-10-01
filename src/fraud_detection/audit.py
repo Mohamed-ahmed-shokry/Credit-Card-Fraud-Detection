@@ -247,6 +247,14 @@ def build_scoring_audit_event(
         if counts:
             payload["decision_counts"] = counts
 
+    rule_counts: dict[str, int] = {}
+    for p in predictions:
+        rule_id = p.get("matched_rule")
+        if rule_id:
+            rule_counts[str(rule_id)] = rule_counts.get(str(rule_id), 0) + 1
+    if rule_counts:
+        payload["rule_matches"] = rule_counts
+
     if features is not None:
         payload["features"] = list(features)
     if fallback_applied:

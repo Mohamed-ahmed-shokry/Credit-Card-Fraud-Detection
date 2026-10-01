@@ -301,13 +301,15 @@ class FraudModel:
         self,
         features: pd.DataFrame,
         *,
+        probabilities: np.ndarray | None = None,
         review_threshold: float | None = None,
         deny_threshold: float | None = None,
         rules: RuleSet | None = None,
         rule_precedence: RulePrecedence = RulePrecedence.RULES_OVERRIDE_MODEL,
     ) -> tuple[np.ndarray, list[str | None], list[str | None]]:
         """Return (decisions, matched_rule_ids, matched_rule_names) applying model and rules."""
-        probabilities = self.predict_probabilities(features)
+        if probabilities is None:
+            probabilities = self.predict_probabilities(features)
         r_thresh = review_threshold
         d_thresh = deny_threshold
         if r_thresh is None or d_thresh is None:
