@@ -52,6 +52,7 @@ from fraud_detection.explanations import (
     ExplanationRequest,
     TemplateExplanationProvider,
 )
+from fraud_detection.rules import RulePrecedence, RuleSet
 from fraud_detection.signing import sign_payload
 
 ARTIFACT_VERSION = 2
@@ -283,8 +284,29 @@ class FraudModel:
         *,
         review_threshold: float | None = None,
         deny_threshold: float | None = None,
+        rules: RuleSet | None = None,
+        rule_precedence: RulePrecedence = RulePrecedence.RULES_OVERRIDE_MODEL,
     ) -> np.ndarray:
         """Return tiered risk decisions ('ALLOW', 'CHALLENGE', 'DENY') for input features."""
+        decisions, _, _ = self.predict_decisions_with_details(
+            features,
+            review_threshold=review_threshold,
+            deny_threshold=deny_threshold,
+            rules=rules,
+            rule_precedence=rule_precedence,
+        )
+        return decisions
+
+    def predict_decisions_with_details(
+        self,
+        features: pd.DataFrame,
+        *,
+        review_threshold: float | None = None,
+        deny_threshold: float | None = None,
+        rules: RuleSet | None = None,
+        rule_precedence: RulePrecedence = RulePrecedence.RULES_OVERRIDE_MODEL,
+    ) -> tuple[np.ndarray, list[str | None], list[str | None]]:
+        """Return (decisions, matched_rule_ids, matched_rule_names) applying model and rules."""
         probabilities = self.predict_probabilities(features)
         r_thresh = review_threshold
         d_thresh = deny_threshold
@@ -305,13 +327,39 @@ class FraudModel:
                 r_thresh = r_thresh if r_thresh is not None else self.threshold
                 d_thresh = d_thresh if d_thresh is not None else self.threshold
         try:
-            return assign_tiered_decisions(
+            model_decisions = assign_tiered_decisions(
                 probabilities,
                 review_threshold=r_thresh,
                 deny_threshold=d_thresh,
             )
         except (TypeError, ValueError) as exc:
             raise ModelArtifactError(str(exc)) from exc
+
+        if rules is None or not rules.rules:
+            none_ids: list[str | None] = [None] * len(model_decisions)
+            none_names: list[str | None] = [None] * len(model_decisions)
+            return model_decisions, none_ids, none_names
+
+        records = features.to_dict(orient="records")
+        final_decisions = np.array(model_decisions, copy=True)
+        matched_rule_ids: list[str | None] = [None] * len(records)
+        matched_rule_names: list[str | None] = [None] * len(records)
+
+        for i, record in enumerate(records):
+            str_record = {str(k): v for k, v in record.items()}
+            eval_res = rules.evaluate_record(str_record)
+            if eval_res.matched and eval_res.action is not None:
+                if rule_precedence == RulePrecedence.RULES_OVERRIDE_MODEL:
+                    final_decisions[i] = eval_res.action.value
+                    matched_rule_ids[i] = eval_res.matched_rule_id
+                    matched_rule_names[i] = eval_res.matched_rule_name
+                elif rule_precedence == RulePrecedence.MODEL_OVERRIDES_RULES:
+                    if model_decisions[i] != "DENY":
+                        final_decisions[i] = eval_res.action.value
+                        matched_rule_ids[i] = eval_res.matched_rule_id
+                        matched_rule_names[i] = eval_res.matched_rule_name
+
+        return final_decisions, matched_rule_ids, matched_rule_names
 
     @property
     def score_profile(self) -> ScoreProfile | None:

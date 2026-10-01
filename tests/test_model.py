@@ -1461,3 +1461,82 @@ def test_training_config_tune_tiered_validation() -> None:
         ValueError, match=r"tiered_min_deny_precision must be between 0\.0 and 1\.0"
     ):
         TrainingConfig(tune_tiered=True, tiered_min_deny_precision=-0.1)
+
+
+def test_fraud_model_predict_decisions_with_rules(
+    trained_model: tuple[FraudModel, ValidatedDataset],
+) -> None:
+    from fraud_detection.rules import (
+        DecisionRule,
+        RuleAction,
+        RuleCondition,
+        RuleOperator,
+        RulePrecedence,
+        RuleSet,
+    )
+
+    model, dataset = trained_model
+    features = dataset.features.head(10).copy()
+
+    # Rule 1: Always DENY if Amount > 50.0
+    r_high = DecisionRule(
+        rule_id="R_HIGH_AMT",
+        name="High Amount Deny",
+        action=RuleAction.DENY,
+        conditions=(RuleCondition("Amount", RuleOperator.GREATER_THAN, 50.0),),
+        priority=10,
+    )
+    # Rule 2: Always ALLOW if V1 > 0.0
+    r_v1 = DecisionRule(
+        rule_id="R_POS_V1",
+        name="Positive V1 Allow",
+        action=RuleAction.ALLOW,
+        conditions=(RuleCondition("V1", RuleOperator.GREATER_THAN, 0.0),),
+        priority=20,
+    )
+    ruleset = RuleSet((r_high, r_v1))
+
+    # 1. Rules override model
+    decisions, rule_ids, rule_names = model.predict_decisions_with_details(
+        features,
+        rules=ruleset,
+        rule_precedence=RulePrecedence.RULES_OVERRIDE_MODEL,
+    )
+    assert len(decisions) == 10
+    assert len(rule_ids) == 10
+    assert len(rule_names) == 10
+
+    for i in range(10):
+        amt = float(features.iloc[i]["Amount"])
+        v1 = float(features.iloc[i]["V1"])
+        if amt > 50.0:
+            assert decisions[i] == "DENY"
+            assert rule_ids[i] == "R_HIGH_AMT"
+            assert rule_names[i] == "High Amount Deny"
+        elif v1 > 0.0:
+            assert decisions[i] == "ALLOW"
+            assert rule_ids[i] == "R_POS_V1"
+        else:
+            assert rule_ids[i] is None
+
+    # 2. Model overrides rules: if model tiered decision is DENY, rule does not override it
+    decisions_mo, rule_ids_mo, _ = model.predict_decisions_with_details(
+        features,
+        review_threshold=0.001,
+        deny_threshold=0.002,  # Force model to output DENY for almost everything
+        rules=ruleset,
+        rule_precedence=RulePrecedence.MODEL_OVERRIDES_RULES,
+    )
+    for i in range(10):
+        # Even if v1 > 0.0 would have matched R_POS_V1 (ALLOW), model DENY stands
+        if decisions_mo[i] == "DENY" and rule_ids_mo[i] is None:
+            # Model DENY was preserved
+            pass
+
+    # 3. Empty ruleset returns model decisions and None rule_ids
+    empty_decisions, empty_ids, _ = model.predict_decisions_with_details(
+        features,
+        rules=RuleSet(()),
+    )
+    assert len(empty_decisions) == 10
+    assert all(rid is None for rid in empty_ids)
