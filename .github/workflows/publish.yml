@@ -122,7 +122,7 @@ jobs:
 
       - name: Extract image tags
         id: docker_meta
-        uses: docker/metadata-action@v5.7.0
+        uses: docker/metadata-action@v6.2.0
         with:
           images: ghcr.io/mohamed-ahmed-shokry/credit-card-fraud-detection
           tags: |
