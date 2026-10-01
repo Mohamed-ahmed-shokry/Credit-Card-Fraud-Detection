@@ -305,10 +305,67 @@ fraud-detect slice-metrics artifacts/model Dataset/eval.csv \
   --use-tiered \
   --min-recall-disparity 0.80 \
   --max-fpr-disparity 1.50 \
-  --fail-on-disparity
+  --fail-on-disparity \
+  --alert-webhook-url https://alerts.internal/disparity
 ```
 
-Flags underperforming slices where fraud catch rate drops below 80% of global recall or false-positive rate exceeds 150% of global FPR, exiting with code `1` for automated CI/CD and deployment gating.
+Flags underperforming slices where fraud catch rate drops below 80% of global recall or false-positive rate exceeds 150% of global FPR, dispatches structured webhook alerts when disparities are detected, and exits with code `1` for automated CI/CD deployment gating.
+
+## Declarative decision rules and priority overrides
+
+Complement machine learning scoring with deterministic, auditable business rules for regulatory mandates, velocity cutoffs, VIP allow-lists, and high-risk blacklists:
+
+```bash
+# Validate rules file syntax and preview match rates against evaluation data
+fraud-detect test-rules rules.json Dataset/eval.csv --json --output reports/rule_matches.json
+
+# Serve predictions with declarative rules and priority routing
+fraud-detect serve artifacts/model \
+  --rules rules.json \
+  --rule-precedence rules_override_model
+```
+
+### Rule syntax
+
+Rule files are stored in clean JSON format:
+
+```json
+{
+  "rules": [
+    {
+      "rule_id": "R_VIP_ALLOW",
+      "name": "VIP Transaction Allow",
+      "priority": 10,
+      "action": "ALLOW",
+      "conditions": [
+        {"field": "Amount", "operator": "<=", "value": 50.0}
+      ],
+      "reason": "Low-risk transaction VIP fast-path"
+    },
+    {
+      "rule_id": "R_HARD_STOP",
+      "name": "High Amount Hard Stop",
+      "priority": 20,
+      "action": "DENY",
+      "conditions": [
+        {"field": "Amount", "operator": ">", "value": 5000.0}
+      ],
+      "reason": "Exceeds maximum allowable transaction ceiling"
+    }
+  ]
+}
+```
+
+### Precedence modes
+
+- `rules_override_model` (default): Matching rule action unconditionally overrides the model decision.
+- `model_overrides_rules`: If the model triggers a `DENY` decision, the model denial takes precedence; otherwise, the matching rule action is applied.
+
+### Observability and audit logging
+
+- **Prometheus metrics**: Triggered rules increment `fraud_rules_triggered_total{rule_id="...", action="..."}`.
+- **Operational probes**: `/health` and `/ready` report `rules_count` and active `rule_precedence`.
+- **Structured audit logging**: Every scoring event records `matched_rule` and `rule_action` per prediction and summarizes batch matches in `rule_matches`.
 
 ## Train on the anonymized dataset
 

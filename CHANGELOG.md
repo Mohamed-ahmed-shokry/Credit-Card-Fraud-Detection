@@ -8,6 +8,23 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- Declarative decision rules and priority overrides: added `RuleCondition`, `RuleOperator`, `RuleAction`,
+  `DecisionRule`, and `RuleSet` in `rules.py` with multi-operator predicate evaluation (`==`, `!=`, `>`, `>=`,
+  `<`, `<=`, `in`, `not_in`), priority ranking, and JSON serialization.
+- Rules-based model decision overrides: integrated declarative rules into `FraudModel.predict_decisions()`
+  and `predict_decisions_with_details()` in `model.py` with configurable `RulePrecedence` (`rules_override_model`
+  vs `model_overrides_rules`).
+- Serving API declarative rules support: updated `create_app` and `serve` CLI command to accept `--rules` /
+  `FRAUD_RULES_PATH` and `--rule-precedence` / `FRAUD_RULE_PRECEDENCE`, returning `matched_rule` and `rule_action`
+  in `PredictionResult`, exposing Prometheus `fraud_rules_triggered_total` counter, and populating `rules_count`
+  and `rule_precedence` in `/health` and `/ready`.
+- Automated disparity alerting webhooks: added `--alert-webhook-url` to `fraud-detect slice-metrics` to dispatch
+  webhook alerts when underperforming slices are detected.
+- Rules testing CLI: added `fraud-detect test-rules` to validate rule syntax, report per-rule standalone
+  and priority-effective match counts and rates, and output structured JSON.
+- Audit event rule match logging: updated scoring audit events to persist `matched_rule` and `rule_action`
+  per prediction and emit `rule_matches` summary counts.
+
 - Automated decision tier threshold optimization: added `tune_tiered_thresholds()` in `evaluation.py`
   supporting both cost-minimization and review-capacity-constrained objectives, integrated tiered
   boundary tuning into `TrainingConfig` and `train_model()`, and added `--tune-tiered`,

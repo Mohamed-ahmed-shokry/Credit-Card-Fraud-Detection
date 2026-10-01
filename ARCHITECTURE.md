@@ -58,6 +58,7 @@ financial-services platform.
 13. `trust.py` validates rotation-aware public-key bundles, performs add/revoke
     operations, and exposes the admission check used by API startup. Revocation
     is evaluated before the model artifact is loaded.
+14. `rules.py` defines declarative decision rule conditions, operators (`==`, `!=`, `>`, `>=`, `<`, `<=`, `in`, `not_in`), actions (`ALLOW`, `CHALLENGE`, `DENY`), priority evaluation, and serialization for `RuleSet`. `model.py` and `api.py` integrate rule sets with configurable precedence (`rules_override_model` vs `model_overrides_rules`), Prometheus instrumentation (`fraud_rules_triggered_total`), and structured audit logging.
 
 ## Artifact contract
 
