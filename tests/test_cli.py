@@ -34,6 +34,14 @@ from fraud_detection.model import (
     train_model,
     verify_attestation,
 )
+from fraud_detection.rules import (
+    DecisionRule,
+    RuleAction,
+    RuleCondition,
+    RuleOperator,
+    RulePrecedence,
+    RuleSet,
+)
 from fraud_detection.signing import write_keypair
 
 runner = CliRunner()
@@ -4403,3 +4411,132 @@ def test_slice_metrics_alert_webhook(tmp_path: Path, trained_artifact: Path) -> 
         )
         assert res_clean.exit_code == 0
         mock_post_clean.assert_not_called()
+
+
+def test_serve_passes_rules_options_to_create_app(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact_path = tmp_path / "artifact"
+    artifact_path.mkdir()
+    rules_path = tmp_path / "rules.json"
+    rules_path.write_text("{}", encoding="utf-8")
+    created: dict[str, Any] = {}
+
+    def fake_load_model(_path: Path | str) -> object:
+        return object()
+
+    def fake_create_app(**kwargs: Any) -> object:
+        created.update(kwargs)
+        return object()
+
+    def fake_run(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr("fraud_detection.cli.load_model", fake_load_model)
+    monkeypatch.setattr("fraud_detection.api.create_app", fake_create_app)
+    monkeypatch.setattr("fraud_detection.cli.uvicorn.run", fake_run)
+
+    served = runner.invoke(
+        app,
+        [
+            "serve",
+            str(artifact_path),
+            "--rules",
+            str(rules_path),
+            "--rule-precedence",
+            "model_overrides_rules",
+        ],
+    )
+
+    assert served.exit_code == 0, served.output
+    assert created["rules_path"] == rules_path
+    assert created["rule_precedence"] == RulePrecedence.MODEL_OVERRIDES_RULES
+
+
+def test_rules_cli_success_and_json_output(tmp_path: Path) -> None:
+    data = generate_synthetic_data(rows=200, fraud_rate=0.1, random_state=42)
+    data["Amount"] = [600.0 if i < 20 else 20.0 for i in range(200)]
+    csv_path = tmp_path / "data.csv"
+    data.to_csv(csv_path, index=False)
+
+    rule1 = DecisionRule(
+        rule_id="R_HIGH",
+        name="High Amount Deny",
+        priority=10,
+        action=RuleAction.DENY,
+        conditions=(
+            RuleCondition(field="Amount", operator=RuleOperator.GREATER_THAN, value=500.0),
+        ),
+    )
+    rule2 = DecisionRule(
+        rule_id="R_LOW",
+        name="Low Amount Allow",
+        priority=20,
+        action=RuleAction.ALLOW,
+        conditions=(
+            RuleCondition(field="Amount", operator=RuleOperator.LESS_THAN_OR_EQUAL, value=50.0),
+        ),
+    )
+    rules_path = tmp_path / "rules.json"
+    RuleSet(rules=(rule1, rule2)).save_file(rules_path)
+
+    # 1. Plain text table output
+    res_table = runner.invoke(app, ["test-rules", str(rules_path), str(csv_path)])
+    assert res_table.exit_code == 0
+    assert "Rule Evaluation: 2 rules evaluated across 200 records" in res_table.output
+    assert "R_HIGH" in res_table.output
+    assert "R_LOW" in res_table.output
+
+    # 2. JSON output with output file destination
+    out_file = tmp_path / "out_report.json"
+    res_json = runner.invoke(
+        app,
+        ["test-rules", str(rules_path), str(csv_path), "--json", "--output", str(out_file)],
+    )
+    assert res_json.exit_code == 0
+    parsed = json.loads(res_json.output)
+    assert parsed["total_records"] == 200
+    assert parsed["total_rules"] == 2
+    assert parsed["matched_records"] == 200
+    assert parsed["match_rate"] == 1.0
+
+    file_parsed = json.loads(out_file.read_text(encoding="utf-8"))
+    assert file_parsed["matched_records"] == 200
+
+
+def test_rules_cli_errors(tmp_path: Path) -> None:
+    data_path = tmp_path / "dummy.csv"
+    pd.DataFrame({"Amount": [1.0, 2.0]}).to_csv(data_path, index=False)
+
+    bad_rules = tmp_path / "bad_rules.json"
+    bad_rules.write_text("{invalid json", encoding="utf-8")
+
+    # Syntax error in rules file
+    res_bad_rules = runner.invoke(app, ["test-rules", str(bad_rules), str(data_path)])
+    assert res_bad_rules.exit_code == 2
+    assert "Failed to load rules" in res_bad_rules.output
+
+    # Nonexistent rules file
+    res_missing_rules = runner.invoke(
+        app, ["test-rules", str(tmp_path / "missing.json"), str(data_path)]
+    )
+    assert res_missing_rules.exit_code == 2
+
+    # Nonexistent data file
+    good_rules = tmp_path / "good.json"
+    RuleSet(rules=()).save_file(good_rules)
+    res_missing_data = runner.invoke(
+        app, ["test-rules", str(good_rules), str(tmp_path / "missing.csv")]
+    )
+    assert res_missing_data.exit_code == 2
+
+    # Output already exists without overwrite
+    existing_out = tmp_path / "existing.json"
+    existing_out.write_text("{}", encoding="utf-8")
+    res_exist = runner.invoke(
+        app,
+        ["test-rules", str(good_rules), str(data_path), "--output", str(existing_out)],
+    )
+    assert res_exist.exit_code == 2
+    assert "Output already exists" in res_exist.output

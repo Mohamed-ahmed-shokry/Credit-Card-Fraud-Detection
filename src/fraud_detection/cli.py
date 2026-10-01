@@ -3504,9 +3504,35 @@ def serve_command(
             ),
         ),
     ] = 0,
+    rules: Annotated[
+        Path | None,
+        typer.Option(
+            "--rules",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="Optional declarative JSON rules file for decision policy overrides.",
+        ),
+    ] = None,
+    rule_precedence: Annotated[
+        str,
+        typer.Option(
+            "--rule-precedence",
+            help="Precedence: 'rules_override_model' or 'model_overrides_rules'.",
+        ),
+    ] = "rules_override_model",
 ) -> None:
     """Run the versioned HTTP prediction service with optional trace export."""
     from fraud_detection.api import create_app
+    from fraud_detection.rules import RulePrecedence
+
+    try:
+        resolved_prec = RulePrecedence(rule_precedence.strip().lower())
+    except ValueError:
+        _abort(
+            f"Invalid --rule-precedence '{rule_precedence}'. "
+            "Must be 'rules_override_model' or 'model_overrides_rules'."
+        )
 
     try:
         model = load_model(model_path)
@@ -3524,6 +3550,8 @@ def serve_command(
             otlp_timeout_seconds=otlp_timeout_seconds,
             attestation_path=attestation,
             trust_bundle_path=trust_bundle,
+            rules_path=rules,
+            rule_precedence=resolved_prec,
         ),
         host=host,
         port=port,
@@ -3784,6 +3812,126 @@ def slice_metrics_command(
 
     if fail_on_disparity and report.underperforming_slices:
         raise typer.Exit(code=1)
+
+
+@app.command("test-rules")
+def test_rules_command(
+    rules_file: Annotated[
+        Path,
+        typer.Argument(
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="Declarative JSON rules file to evaluate.",
+        ),
+    ],
+    data: Annotated[
+        Path,
+        typer.Argument(
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="Dataset CSV to evaluate rules against.",
+        ),
+    ],
+    output: Annotated[
+        Path | None,
+        typer.Option("--output", "-o", help="Optional output JSON destination."),
+    ] = None,
+    overwrite: Annotated[
+        bool,
+        typer.Option(help="Replace an existing output file."),
+    ] = False,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Output raw JSON instead of table."),
+    ] = False,
+) -> None:
+    """Validate declarative rules syntax and report match statistics against a dataset."""
+    _guard_output(output, overwrite)
+    from fraud_detection.rules import RuleError, RuleSet
+
+    try:
+        rule_set = RuleSet.load_file(rules_file)
+    except (RuleError, OSError, ValueError, FileNotFoundError) as exc:
+        _abort(f"Failed to load rules from {rules_file}: {exc}")
+
+    try:
+        df = pd.read_csv(data)
+    except (OSError, pd.errors.ParserError, pd.errors.EmptyDataError, ValueError) as exc:
+        _abort(f"Failed to load dataset from {data}: {exc}")
+
+    total_records = len(df)
+    records = df.to_dict(orient="records")
+
+    per_rule_matches: dict[str, int] = {rule.rule_id: 0 for rule in rule_set.rules}
+    per_rule_effective_matches: dict[str, int] = {rule.rule_id: 0 for rule in rule_set.rules}
+    total_effective_matched = 0
+
+    for rec in records:
+        str_rec = {str(k): v for k, v in rec.items()}
+        for rule in rule_set.rules:
+            if rule.evaluate(str_rec):
+                per_rule_matches[rule.rule_id] += 1
+        eval_res = rule_set.evaluate_record(str_rec)
+        if eval_res.matched and eval_res.matched_rule_id:
+            per_rule_effective_matches[eval_res.matched_rule_id] += 1
+            total_effective_matched += 1
+
+    match_rate = round(total_effective_matched / total_records, 4) if total_records > 0 else 0.0
+    summary: dict[str, Any] = {
+        "rules_file": str(rules_file),
+        "total_rules": len(rule_set),
+        "data_file": str(data),
+        "total_records": total_records,
+        "matched_records": total_effective_matched,
+        "match_rate": match_rate,
+        "unmatched_records": total_records - total_effective_matched,
+        "rules": [
+            {
+                "rule_id": rule.rule_id,
+                "name": rule.name,
+                "priority": rule.priority,
+                "action": rule.action.value,
+                "standalone_matches": per_rule_matches[rule.rule_id],
+                "standalone_match_rate": (
+                    round(per_rule_matches[rule.rule_id] / total_records, 4)
+                    if total_records > 0
+                    else 0.0
+                ),
+                "effective_matches": per_rule_effective_matches[rule.rule_id],
+                "effective_match_rate": (
+                    round(per_rule_effective_matches[rule.rule_id] / total_records, 4)
+                    if total_records > 0
+                    else 0.0
+                ),
+            }
+            for rule in rule_set.rules
+        ],
+    }
+
+    report_json = json.dumps(summary, indent=2)
+    if output is not None:
+        _atomic_write_text(report_json + "\n", output)
+
+    if json_output or output is None:
+        if json_output:
+            typer.echo(report_json)
+        else:
+            typer.echo(
+                f"Rule Evaluation: {len(rule_set)} rules evaluated across {total_records} records\n"
+                f"Total Matched: {total_effective_matched} ({match_rate:.2%})\n"
+                f"{'Rule ID':<16} {'Priority':<10} {'Action':<10} {'Standalone':<12} "
+                f"{'Effective':<12} {'Eff Rate':<10} {'Name'}"
+            )
+            for r in summary["rules"]:
+                standalone = r["standalone_matches"]
+                effective = r["effective_matches"]
+                eff_rate = r["effective_match_rate"]
+                typer.echo(
+                    f"{r['rule_id']:<16} {r['priority']:<10} {r['action']:<10} "
+                    f"{standalone:<12} {effective:<12} {eff_rate:<10.2%} {r['name']}"
+                )
 
 
 def _abort(message: str) -> NoReturn:
