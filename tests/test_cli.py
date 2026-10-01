@@ -4350,3 +4350,56 @@ def test_slice_metrics_cli_disparity_flagging_and_errors(
     )
     assert res_exist.exit_code == 2
     assert "Output already exists" in res_exist.output
+
+
+def test_slice_metrics_alert_webhook(tmp_path: Path, trained_artifact: Path) -> None:
+    data = generate_synthetic_data(rows=200, fraud_rate=0.1, random_state=42)
+    data["channel"] = ["web" if i < 180 else "mobile" for i in range(len(data))]
+    csv_path = tmp_path / "slice_data.csv"
+    data.to_csv(csv_path, index=False)
+
+    # 1. Underperforming slice detected with webhook configured
+    with patch("fraud_detection.cli._post_webhook") as mock_post:
+        res = runner.invoke(
+            app,
+            [
+                "slice-metrics",
+                str(trained_artifact),
+                str(csv_path),
+                "--slice-column",
+                "channel",
+                "--min-recall-disparity",
+                "1.5",
+                "--alert-webhook-url",
+                "https://alerts.internal/disparity",
+            ],
+        )
+        assert res.exit_code == 0
+        mock_post.assert_called_once()
+        call_args = mock_post.call_args[0]
+        assert call_args[0] == "https://alerts.internal/disparity"
+        payload = call_args[1]
+        assert payload["alert"] == "SLICE_DISPARITY"
+        assert payload["slice_column"] == "channel"
+        assert len(payload["underperforming_slices"]) > 0
+
+    # 2. No underperforming slices -> webhook not called
+    with patch("fraud_detection.cli._post_webhook") as mock_post_clean:
+        res_clean = runner.invoke(
+            app,
+            [
+                "slice-metrics",
+                str(trained_artifact),
+                str(csv_path),
+                "--slice-column",
+                "channel",
+                "--min-recall-disparity",
+                "0.01",
+                "--max-fpr-disparity",
+                "100.0",
+                "--alert-webhook-url",
+                "https://alerts.internal/disparity",
+            ],
+        )
+        assert res_clean.exit_code == 0
+        mock_post_clean.assert_not_called()

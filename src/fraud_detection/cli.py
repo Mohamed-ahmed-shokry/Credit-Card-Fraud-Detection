@@ -47,6 +47,7 @@ from fraud_detection.drift import (
 )
 from fraud_detection.edge import EdgeArtifactError, build_edge_model, score_batch_file
 from fraud_detection.evaluation import (
+    SliceDisparityReport,
     ThresholdRow,
     TieredThresholds,
     TieredTuningObjective,
@@ -2241,6 +2242,28 @@ def _send_score_drift_alert(
     _post_webhook(webhook_url, payload)
 
 
+def _send_slice_disparity_alert(
+    *,
+    report: SliceDisparityReport,
+    webhook_url: str,
+    model_version: str,
+    slice_column: str,
+) -> None:
+    """Post slice disparity alert payload to webhook URL."""
+    payload = {
+        "alert": "SLICE_DISPARITY",
+        "model_version": model_version,
+        "slice_column": slice_column,
+        "total_records": report.total_records,
+        "underperforming_slices": list(report.underperforming_slices),
+        "slices_evaluated": len(report.slices),
+        "global_recall": round(report.global_recall, 4),
+        "global_fpr": round(report.global_false_positive_rate, 4),
+        "slices": [s.to_dict() for s in report.slices if s.is_underperforming],
+    }
+    _post_webhook(webhook_url, payload)
+
+
 @app.command("score-drift")
 def score_drift_command(
     model_path: Annotated[
@@ -3671,6 +3694,16 @@ def slice_metrics_command(
         bool,
         typer.Option("--json", help="Output raw JSON instead of formatted text."),
     ] = False,
+    alert_webhook_url: Annotated[
+        str | None,
+        typer.Option(
+            "--alert-webhook-url",
+            help=(
+                "HTTP webhook URL to receive disparity alert when "
+                "underperforming slices are detected."
+            ),
+        ),
+    ] = None,
 ) -> None:
     """Evaluate decision performance and disparity across data sub-populations."""
     _guard_output(output, overwrite)
@@ -3706,6 +3739,14 @@ def slice_metrics_command(
             min_recall_disparity=min_recall_disparity,
             max_fpr_disparity=max_fpr_disparity,
         )
+
+        if alert_webhook_url and report.underperforming_slices:
+            _send_slice_disparity_alert(
+                report=report,
+                webhook_url=alert_webhook_url,
+                model_version=str(model.metadata.get("dataset_fingerprint", ""))[:12],
+                slice_column=slice_column,
+            )
     except (OSError, ValueError, TypeError, ModelArtifactError) as exc:
         _abort(str(exc))
 
