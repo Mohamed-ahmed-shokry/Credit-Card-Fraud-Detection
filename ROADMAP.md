@@ -1117,7 +1117,7 @@ This phase does not implement dynamic rule graph execution (AST evaluation of ar
 - **CLI commands & training flags**: added `fraud-detect backtest-policy` and `fraud-detect slice-metrics` commands, added `--tune-tiered` and tiered tuning options to `fraud-detect train`, and implemented comprehensive CLI integration tests (`d3647b4`).
 - **Documentation & quality gate verification**: documented all new commands and capabilities across `README.md`, `ARCHITECTURE.md`, `CHANGELOG.md`, and `ROADMAP.md`; verified 602 passing tests, 97.64% branch coverage, clean Ruff formatting and linting, and strict mypy verification.
 
-## Phase 27 — Declarative Decision Rules, Priority Overrides, and Sub-population Disparity Alerting (In progress)
+## Phase 27 — Declarative Decision Rules, Priority Overrides, and Sub-population Disparity Alerting (Done)
 
 ### Objective
 
@@ -1141,6 +1141,36 @@ Complement statistical machine learning scores with deterministic declarative bu
 ### Explicit exclusions
 
 This phase does not implement distributed stateful CEP (complex event processing) engines, graphical rule builders, or live hot-reloading rule databases.
+
+### Delivery Record
+
+- `0795289`: docs: define Phase 27 declarative decision rules and disparity alerting
+- `cc01642`: feat: add declarative decision rules engine and priority evaluation
+- `cd262df`: feat: integrate declarative rules and precedence into FraudModel decision pipeline
+- `9f3e3a2`: feat: integrate declarative rules into serving API, metrics, and audit events
+- `79e4f33`: feat: add automated webhook alerting to slice disparity CLI
+- `a814a96`: feat: add test-rules CLI command for rule syntax and match verification
+- `e6e4fb2`: docs: document declarative decision rules, priority routing, and disparity alerting
+
+## Phase 28 — Transaction Velocity Profiling, Sliding Feature Windows, and Stream Enrichment (Proposed)
+
+### Objective
+
+Bridge raw instantaneous transaction features with dynamic behavioral velocity metrics, calculating in-memory sliding window frequency and aggregation features (e.g. transaction counts, cumulative amounts, velocity ratios across cards/devices/entities) for richer fraud signal extraction.
+
+### Scope
+
+- **Sliding window velocity buffer** — implement typed, bounded in-memory sliding window accumulators (`VelocityWindowBuffer`, `SlidingWindow`, `VelocityConfig` in `velocity.py`) tracking count, sum, min, max, and exponential moving averages over configurable intervals (e.g. 5m, 1h, 24h).
+- **Velocity feature transformer** — provide streaming record enrichment (`enrich_record_velocity`) and vectorized offline dataset computation (`compute_batch_velocity`) computing delta features and velocity ratios without lookahead bias.
+- **Serving API stream integration** — optionally attach stateful sliding window accumulators to `create_app(velocity_config=...)` for real-time velocity calculation on inbound transactions.
+- **CLI & offline feature engineering** — implement `fraud-detect compute-velocity` CLI command generating enriched training sets with sliding window behavioral signals.
+
+### Acceptance criteria
+
+- Sliding window updates execute with bounded $O(1)$ amortized insertion and eviction latency.
+- Feature enrichment guarantees strict temporal causality without future-data leakage.
+- Serving API and CLI pipelines validate velocity schema consistency and handle cold-start entities gracefully.
+- Test suite achieves 100% pass rate, branch coverage remains $\ge 97.0\%$, Ruff and strict mypy pass with zero errors.
 
 ## Contributing to the roadmap
 
