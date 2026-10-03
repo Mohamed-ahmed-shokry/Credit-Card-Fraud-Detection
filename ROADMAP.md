@@ -1152,7 +1152,7 @@ This phase does not implement distributed stateful CEP (complex event processing
 - `a814a96`: feat: add test-rules CLI command for rule syntax and match verification
 - `e6e4fb2`: docs: document declarative decision rules, priority routing, and disparity alerting
 
-## Phase 28 — Transaction Velocity Profiling, Sliding Feature Windows, and Stream Enrichment (Proposed)
+## Phase 28 — Transaction Velocity Profiling, Sliding Feature Windows, and Stream Enrichment (In Progress)
 
 ### Objective
 
@@ -1171,6 +1171,11 @@ Bridge raw instantaneous transaction features with dynamic behavioral velocity m
 - Feature enrichment guarantees strict temporal causality without future-data leakage.
 - Serving API and CLI pipelines validate velocity schema consistency and handle cold-start entities gracefully.
 - Test suite achieves 100% pass rate, branch coverage remains $\ge 97.0\%$, Ruff and strict mypy pass with zero errors.
+
+### Explicit exclusions
+
+This phase does not implement distributed Redis / Kafka state stores, distributed stream engines (Flink/Spark Streaming), or asynchronous event-bus brokers.
+
 
 ## Contributing to the roadmap
 
