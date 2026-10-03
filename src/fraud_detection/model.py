@@ -52,6 +52,12 @@ from fraud_detection.explanations import (
     ExplanationRequest,
     TemplateExplanationProvider,
 )
+from fraud_detection.recalibration import (
+    BaseRecalibrator,
+    RecalibrationMethod,
+    compute_calibration_diagnostics,
+    create_recalibrator,
+)
 from fraud_detection.rules import RulePrecedence, RuleSet
 from fraud_detection.signing import sign_payload
 
@@ -250,9 +256,19 @@ class FraudModel:
     feature_names: tuple[str, ...]
     metadata: dict[str, Any]
     artifact_version: int = ARTIFACT_VERSION
+    recalibrator: BaseRecalibrator | None = None
 
-    def predict_probabilities(self, features: pd.DataFrame) -> np.ndarray:
-        """Return fraud probabilities after enforcing the training schema."""
+    def predict_probabilities(
+        self,
+        features: pd.DataFrame,
+        *,
+        raw: bool = False,
+    ) -> np.ndarray:
+        """Return fraud probabilities after enforcing the training schema.
+
+        If `raw` is False and the model has an attached post-hoc `recalibrator`,
+        calibrated probabilities are returned.
+        """
         ordered = self.validate_features(features)
         try:
             probability_matrix = np.asarray(
@@ -272,6 +288,10 @@ class FraudModel:
             raise ModelArtifactError(
                 "Model returned fraud probabilities outside the finite range from 0 to 1."
             )
+        if not raw and getattr(self, "recalibrator", None) is not None:
+            recal = self.recalibrator
+            if recal is not None:
+                probabilities = recal.transform(probabilities)
         return probabilities
 
     def predict(self, features: pd.DataFrame) -> np.ndarray:
@@ -797,6 +817,155 @@ def train_model(
     )
 
 
+def recalibrate_model(
+    model: FraudModel,
+    dataset: ValidatedDataset,
+    *,
+    method: RecalibrationMethod | str = RecalibrationMethod.ISOTONIC,
+    retune_threshold: bool = True,
+    threshold_strategy: ThresholdStrategy | None = None,
+    bins: int = 10,
+) -> FraudModel:
+    """Fit a post-hoc probability recalibrator and return an updated FraudModel.
+
+    Evaluates raw probabilities from the existing model, fits the recalibrator,
+    computes pre- and post-recalibration calibration diagnostics, optionally retunes
+    decision thresholds on the newly calibrated scale, and updates model metadata.
+    """
+    _validate_loaded_model(model)
+    ordered_features = model.validate_features(dataset.features)
+    y_true = dataset.target.to_numpy()
+
+    # Obtain uncalibrated/raw probabilities
+    raw_probabilities = model.predict_probabilities(ordered_features, raw=True)
+
+    # Compute pre-recalibration diagnostics
+    pre_diagnostics = compute_calibration_diagnostics(y_true, raw_probabilities, bins=bins)
+
+    # Fit recalibrator
+    recalibrator = create_recalibrator(method)
+    recalibrator.fit(raw_probabilities, y_true)
+
+    # Compute calibrated probabilities
+    calibrated_probabilities = recalibrator.transform(raw_probabilities)
+
+    # Compute post-recalibration diagnostics
+    post_diagnostics = compute_calibration_diagnostics(y_true, calibrated_probabilities, bins=bins)
+
+    strategy = threshold_strategy
+    if strategy is None:
+        cfg = model.metadata.get("training_config")
+        strategy_str = cfg.get("threshold_strategy", "f1") if isinstance(cfg, dict) else "f1"
+        strategy = ThresholdStrategy.COST if strategy_str == "cost" else ThresholdStrategy.F1
+
+    cost_policy = model.metadata.get("cost_policy")
+    fp_cost = (
+        float(cost_policy.get("false_positive_cost", 1.0)) if isinstance(cost_policy, dict) else 1.0
+    )
+    fn_cost = (
+        float(cost_policy.get("false_negative_cost", 10.0))
+        if isinstance(cost_policy, dict)
+        else 10.0
+    )
+
+    if retune_threshold:
+        if strategy is ThresholdStrategy.COST:
+            new_threshold = select_cost_threshold(
+                y_true,
+                calibrated_probabilities,
+                false_positive_cost=fp_cost,
+                false_negative_cost=fn_cost,
+            )
+        else:
+            new_threshold = select_f1_threshold(y_true, calibrated_probabilities)
+    else:
+        transformed_threshold = float(recalibrator.transform(np.array([model.threshold]))[0])
+        new_threshold = float(np.clip(transformed_threshold, 0.0, 1.0))
+
+    new_metadata = dict(model.metadata)
+    new_metadata["recalibration"] = {
+        "method": recalibrator.method.value,
+        "recalibrator": recalibrator.to_dict(),
+        "pre_diagnostics": pre_diagnostics.to_dict(),
+        "post_diagnostics": post_diagnostics.to_dict(),
+        "created_at": datetime.now(UTC).isoformat(),
+        "retuned_threshold": retune_threshold,
+        "prior_threshold": model.threshold,
+    }
+    new_metadata["score_profile"] = build_score_profile(
+        calibrated_probabilities,
+        threshold=new_threshold,
+    ).to_dict()
+
+    # Retune or transform tiered thresholds if present
+    tiered_meta = model.metadata.get("tiered_thresholds")
+    if (
+        isinstance(tiered_meta, dict)
+        and "review_threshold" in tiered_meta
+        and "deny_threshold" in tiered_meta
+    ):
+        if retune_threshold:
+            tuning_cfg = model.metadata.get("tiered_tuning")
+            objective = (
+                str(tuning_cfg.get("objective", "cost_minimization"))
+                if isinstance(tuning_cfg, dict)
+                else "cost_minimization"
+            )
+            manual_cost = (
+                float(tuning_cfg.get("manual_review_cost", 5.0))
+                if isinstance(tuning_cfg, dict)
+                else 5.0
+            )
+            max_review = (
+                float(tuning_cfg["max_review_rate"])
+                if isinstance(tuning_cfg, dict) and tuning_cfg.get("max_review_rate") is not None
+                else None
+            )
+            min_deny_prec = (
+                float(tuning_cfg["min_deny_precision"])
+                if isinstance(tuning_cfg, dict) and tuning_cfg.get("min_deny_precision") is not None
+                else None
+            )
+            try:
+                tuning_res = tune_tiered_thresholds(
+                    y_true,
+                    calibrated_probabilities,
+                    objective=objective,
+                    manual_review_cost=manual_cost,
+                    false_deny_cost=fp_cost,
+                    missed_fraud_cost=fn_cost,
+                    max_review_rate=max_review,
+                    min_deny_precision=min_deny_prec,
+                )
+                new_metadata["tiered_thresholds"] = tuning_res.best_thresholds.to_dict()
+                new_metadata["tiered_tuning"] = tuning_res.to_dict()
+            except (ValueError, RuntimeError):
+                r_old = float(tiered_meta["review_threshold"])
+                d_old = float(tiered_meta["deny_threshold"])
+                mapped = recalibrator.transform(np.array([r_old, d_old]))
+                new_metadata["tiered_thresholds"] = {
+                    "review_threshold": float(np.clip(mapped[0], 0.0, 1.0)),
+                    "deny_threshold": float(np.clip(mapped[1], mapped[0], 1.0)),
+                }
+        else:
+            r_old = float(tiered_meta["review_threshold"])
+            d_old = float(tiered_meta["deny_threshold"])
+            mapped = recalibrator.transform(np.array([r_old, d_old]))
+            new_metadata["tiered_thresholds"] = {
+                "review_threshold": float(np.clip(mapped[0], 0.0, 1.0)),
+                "deny_threshold": float(np.clip(mapped[1], mapped[0], 1.0)),
+            }
+
+    return FraudModel(
+        estimator=model.estimator,
+        threshold=new_threshold,
+        feature_names=model.feature_names,
+        metadata=new_metadata,
+        artifact_version=model.artifact_version,
+        recalibrator=recalibrator,
+    )
+
+
 def save_model(model: FraudModel, output_directory: Path | str) -> Path:
     """Persist a model, metadata, and integrity manifest with atomic file swaps."""
     _validate_loaded_model(model)
@@ -907,6 +1076,13 @@ def _validate_loaded_model(candidate: FraudModel) -> None:
     if not isinstance(candidate.metadata, dict):
         raise ModelArtifactError("Artifact metadata must be a mapping.")
     _validate_sklearn_compatibility(candidate.metadata)
+    if not hasattr(candidate, "recalibrator"):
+        object.__setattr__(candidate, "recalibrator", None)
+    elif candidate.recalibrator is not None and (
+        not isinstance(candidate.recalibrator, BaseRecalibrator)
+        or not callable(getattr(candidate.recalibrator, "transform", None))
+    ):
+        raise ModelArtifactError("Artifact recalibrator is invalid.")
 
     required_metadata = {
         "artifact_version": candidate.artifact_version,

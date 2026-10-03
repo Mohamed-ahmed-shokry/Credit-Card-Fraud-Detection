@@ -32,12 +32,20 @@ from fraud_detection.model import (
     TrainingConfig,
     _build_lineage,
     _extract_feature_effects,
+    _validate_loaded_model,
     generate_attestation,
     load_model,
+    recalibrate_model,
     save_model,
     train_model,
     validate_artifact,
     verify_attestation,
+)
+from fraud_detection.recalibration import (
+    IsotonicRecalibrator,
+    PlattRecalibrator,
+    RecalibrationMethod,
+    TemperatureRecalibrator,
 )
 
 
@@ -1540,3 +1548,127 @@ def test_fraud_model_predict_decisions_with_rules(
     )
     assert len(empty_decisions) == 10
     assert all(rid is None for rid in empty_ids)
+
+
+def test_recalibrate_model_isotonic_pipeline(tmp_path: Path) -> None:
+    data = validate_frame(generate_synthetic_data(rows=400, fraud_rate=0.08, random_state=42))
+    cfg = TrainingConfig(calibration_method=CalibrationMethod.NONE)
+    base_model = train_model(data, config=cfg)
+    assert base_model.recalibrator is None
+
+    # Recalibrate on validation data
+    cal_data = validate_frame(generate_synthetic_data(rows=200, fraud_rate=0.08, random_state=99))
+    recal_model = recalibrate_model(
+        base_model,
+        cal_data,
+        method="isotonic",
+        retune_threshold=True,
+    )
+
+    assert recal_model.recalibrator is not None
+    assert isinstance(recal_model.recalibrator, IsotonicRecalibrator)
+    assert "recalibration" in recal_model.metadata
+    assert recal_model.metadata["recalibration"]["method"] == "isotonic"
+    assert "pre_diagnostics" in recal_model.metadata["recalibration"]
+    assert "post_diagnostics" in recal_model.metadata["recalibration"]
+
+    # Verify raw vs calibrated probabilities
+    raw_probs = recal_model.predict_probabilities(cal_data.features, raw=True)
+    cal_probs = recal_model.predict_probabilities(cal_data.features, raw=False)
+    assert not np.array_equal(raw_probs, cal_probs)
+    assert np.all((cal_probs >= 0.0) & (cal_probs <= 1.0))
+
+    # Binary decisions use calibrated threshold
+    decisions = recal_model.predict(cal_data.features)
+    assert np.array_equal(decisions, (cal_probs >= recal_model.threshold).astype("int8"))
+
+    # Save and reload artifact
+    art_dir = tmp_path / "recal_art"
+    save_model(recal_model, art_dir)
+    loaded = load_model(art_dir)
+    assert loaded.recalibrator is not None
+    assert isinstance(loaded.recalibrator, IsotonicRecalibrator)
+    assert np.allclose(
+        loaded.predict_probabilities(cal_data.features),
+        recal_model.predict_probabilities(cal_data.features),
+    )
+
+
+def test_recalibrate_model_sigmoid_and_temperature() -> None:
+    data = validate_frame(generate_synthetic_data(rows=300, fraud_rate=0.08, random_state=42))
+    base_model = train_model(data)
+    cal_data = validate_frame(generate_synthetic_data(rows=250, fraud_rate=0.08, random_state=123))
+
+    # Sigmoid (Platt) scaling with retune_threshold=False
+    sig_model = recalibrate_model(
+        base_model,
+        cal_data,
+        method=RecalibrationMethod.SIGMOID,
+        retune_threshold=False,
+    )
+    assert isinstance(sig_model.recalibrator, PlattRecalibrator)
+    assert sig_model.metadata["recalibration"]["retuned_threshold"] is False
+    assert 0.0 <= sig_model.threshold <= 1.0
+
+    # Temperature scaling with cost threshold strategy
+    temp_model = recalibrate_model(
+        base_model,
+        cal_data,
+        method=RecalibrationMethod.TEMPERATURE,
+        retune_threshold=True,
+        threshold_strategy=ThresholdStrategy.COST,
+    )
+    assert isinstance(temp_model.recalibrator, TemperatureRecalibrator)
+    assert 0.0 <= temp_model.threshold <= 1.0
+
+
+def test_recalibrate_model_tiered_thresholds() -> None:
+    data = validate_frame(generate_synthetic_data(rows=350, fraud_rate=0.08, random_state=42))
+    cfg = TrainingConfig(review_threshold=0.10, deny_threshold=0.60)
+    base_model = train_model(data, config=cfg)
+    cal_data = validate_frame(generate_synthetic_data(rows=250, fraud_rate=0.08, random_state=77))
+
+    # Recalibrate with retune_threshold=True
+    recal_retuned = recalibrate_model(
+        base_model, cal_data, method="isotonic", retune_threshold=True
+    )
+    assert recal_retuned.tiered_thresholds is not None
+    assert (
+        0.0
+        <= recal_retuned.tiered_thresholds.review_threshold
+        <= recal_retuned.tiered_thresholds.deny_threshold
+        <= 1.0
+    )
+
+    # Recalibrate with retune_threshold=False
+    recal_mapped = recalibrate_model(
+        base_model, cal_data, method="isotonic", retune_threshold=False
+    )
+    assert recal_mapped.tiered_thresholds is not None
+    assert (
+        0.0
+        <= recal_mapped.tiered_thresholds.review_threshold
+        <= recal_mapped.tiered_thresholds.deny_threshold
+        <= 1.0
+    )
+
+
+def test_validate_loaded_model_recalibrator() -> None:
+    data = validate_frame(generate_synthetic_data(rows=200, fraud_rate=0.08, random_state=42))
+    model = train_model(data)
+
+    # Valid model validates without error
+    _validate_loaded_model(model)
+
+    # Invalid recalibrator type
+    object.__setattr__(model, "recalibrator", "not_a_recalibrator")
+    with pytest.raises(ModelArtifactError, match="Artifact recalibrator is invalid"):
+        _validate_loaded_model(model)
+
+    # Non-callable transform
+    class FakeRecal(IsotonicRecalibrator):
+        transform = "not_callable"  # type: ignore[assignment]
+
+    object.__setattr__(model, "recalibrator", FakeRecal())
+    with pytest.raises(ModelArtifactError, match="Artifact recalibrator is invalid"):
+        _validate_loaded_model(model)
