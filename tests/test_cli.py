@@ -43,6 +43,7 @@ from fraud_detection.rules import (
     RuleSet,
 )
 from fraud_detection.signing import write_keypair
+from fraud_detection.velocity import VelocityConfig, VelocityWindow
 
 runner = CliRunner()
 
@@ -4540,3 +4541,190 @@ def test_rules_cli_errors(tmp_path: Path) -> None:
     )
     assert res_exist.exit_code == 2
     assert "Output already exists" in res_exist.output
+
+
+def test_compute_velocity_cli_success(tmp_path: Path) -> None:
+    data_path = tmp_path / "transactions.csv"
+    df = pd.DataFrame(
+        {
+            "card_id": ["c1", "c2", "c1", "c1"],
+            "Time": [10.0, 20.0, 50.0, 100.0],
+            "Amount": [100.0, 50.0, 200.0, 150.0],
+            "V1": [0.1, 0.2, 0.3, 0.4],
+        }
+    )
+    df.to_csv(data_path, index=False)
+
+    out_csv = tmp_path / "enriched.csv"
+    result = runner.invoke(
+        app,
+        [
+            "compute-velocity",
+            "--data",
+            str(data_path),
+            "--output",
+            str(out_csv),
+            "--json",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    summary = json.loads(result.stdout)
+    assert summary["rows_processed"] == 4
+    assert summary["distinct_entities"] == 2
+    assert summary["features_generated_count"] > 0
+    assert out_csv.exists()
+
+    enriched_df = pd.read_csv(out_csv)
+    assert len(enriched_df) == 4
+    assert "velocity_count_5m" in enriched_df.columns
+    assert "velocity_sum_5m" in enriched_df.columns
+
+    # Test table output
+    out_table_csv = tmp_path / "enriched_table.csv"
+    table_result = runner.invoke(
+        app,
+        [
+            "compute-velocity",
+            "--data",
+            str(data_path),
+            "--output",
+            str(out_table_csv),
+        ],
+    )
+    assert table_result.exit_code == 0
+    assert "Velocity Feature Enrichment Complete" in table_result.output
+    assert "Rows processed:       4" in table_result.output
+
+
+def test_compute_velocity_cli_custom_config_and_windows(tmp_path: Path) -> None:
+    data_path = tmp_path / "transactions.csv"
+    df = pd.DataFrame(
+        {
+            "card_id": ["c1", "c1"],
+            "Time": [10.0, 50.0],
+            "Amount": [100.0, 200.0],
+        }
+    )
+    df.to_csv(data_path, index=False)
+
+    config_path = tmp_path / "custom_velocity.json"
+    cfg = VelocityConfig(
+        windows=(VelocityWindow(duration_seconds=120.0, name="2m"),),
+    )
+    cfg.save_file(config_path)
+
+    out_csv = tmp_path / "custom_enriched.csv"
+    res = runner.invoke(
+        app,
+        [
+            "compute-velocity",
+            "--data",
+            str(data_path),
+            "--output",
+            str(out_csv),
+            "--config",
+            str(config_path),
+            "--windows",
+            "60,300",
+            "--json",
+        ],
+    )
+    assert res.exit_code == 0, res.output
+    summary = json.loads(res.stdout)
+    assert summary["windows"] == ["1m", "5m"]
+    enriched = pd.read_csv(out_csv)
+    assert "velocity_count_1m" in enriched.columns
+    assert "velocity_count_5m" in enriched.columns
+
+
+def test_compute_velocity_cli_errors(tmp_path: Path) -> None:
+    data_path = tmp_path / "transactions.csv"
+    df = pd.DataFrame(
+        {
+            "Time": [10.0, 20.0],
+            "Amount": [50.0, 100.0],
+        }
+    )
+    df.to_csv(data_path, index=False)
+
+    out_csv = tmp_path / "enriched.csv"
+    out_csv.write_text("existing", encoding="utf-8")
+
+    # Output already exists without overwrite
+    res_exist = runner.invoke(
+        app,
+        [
+            "compute-velocity",
+            "--data",
+            str(data_path),
+            "--output",
+            str(out_csv),
+        ],
+    )
+    assert res_exist.exit_code == 2
+    assert "Output already exists" in res_exist.output
+
+    # Malformed config file
+    bad_cfg = tmp_path / "malformed.json"
+    bad_cfg.write_text("{invalid json", encoding="utf-8")
+    res_bad_cfg = runner.invoke(
+        app,
+        [
+            "compute-velocity",
+            "--data",
+            str(data_path),
+            "--output",
+            str(tmp_path / "out2.csv"),
+            "--config",
+            str(bad_cfg),
+        ],
+    )
+    assert res_bad_cfg.exit_code == 2
+    assert "Failed to load velocity configuration" in res_bad_cfg.output
+
+    # Invalid windows string
+    res_bad_win = runner.invoke(
+        app,
+        [
+            "compute-velocity",
+            "--data",
+            str(data_path),
+            "--output",
+            str(tmp_path / "out3.csv"),
+            "--windows",
+            "not_numbers",
+        ],
+    )
+    assert res_bad_win.exit_code == 2
+    assert "Invalid window specification" in res_bad_win.output
+
+    # Empty data
+    empty_csv = tmp_path / "empty.csv"
+    pd.DataFrame().to_csv(empty_csv, index=False)
+    res_empty = runner.invoke(
+        app,
+        [
+            "compute-velocity",
+            "--data",
+            str(empty_csv),
+            "--output",
+            str(tmp_path / "out4.csv"),
+        ],
+    )
+    assert res_empty.exit_code == 2
+
+    # Missing required timestamp column
+    bad_cols_csv = tmp_path / "bad_cols.csv"
+    pd.DataFrame({"V1": [1.0, 2.0]}).to_csv(bad_cols_csv, index=False)
+    res_bad_cols = runner.invoke(
+        app,
+        [
+            "compute-velocity",
+            "--data",
+            str(bad_cols_csv),
+            "--output",
+            str(tmp_path / "out5.csv"),
+        ],
+    )
+    assert res_bad_cols.exit_code == 2
+    assert "Velocity computation failed" in res_bad_cols.output

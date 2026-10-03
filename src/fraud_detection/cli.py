@@ -3934,6 +3934,169 @@ def test_rules_command(
                 )
 
 
+@app.command("compute-velocity")
+def compute_velocity(
+    data: Annotated[
+        Path,
+        typer.Option(
+            "--data",
+            "-d",
+            help="Path to CSV dataset to enrich with sliding window velocity features.",
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            readable=True,
+        ),
+    ],
+    output: Annotated[
+        Path,
+        typer.Option("--output", "-o", help="Destination path for enriched dataset (CSV)."),
+    ],
+    config_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--config",
+            "-c",
+            help="Optional path to custom VelocityConfig JSON file.",
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            readable=True,
+        ),
+    ] = None,
+    entity_col: Annotated[
+        str | None,
+        typer.Option(
+            "--entity-col",
+            help="Column name identifying entity stream (e.g. card_id, user_id).",
+        ),
+    ] = None,
+    timestamp_col: Annotated[
+        str | None,
+        typer.Option(
+            "--timestamp-col",
+            help="Column name containing transaction timestamps (default: Time).",
+        ),
+    ] = None,
+    amount_col: Annotated[
+        str | None,
+        typer.Option(
+            "--amount-col",
+            help="Column name containing transaction amounts (default: Amount).",
+        ),
+    ] = None,
+    windows: Annotated[
+        str | None,
+        typer.Option(
+            "--windows",
+            help="Comma-separated window durations in seconds (e.g. 300,3600,86400).",
+        ),
+    ] = None,
+    overwrite: Annotated[
+        bool,
+        typer.Option(help="Replace an existing output file."),
+    ] = False,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Output execution summary in JSON."),
+    ] = False,
+) -> None:
+    """Compute sliding window behavioral velocity features across a dataset."""
+    _guard_output(output, overwrite)
+    from fraud_detection.velocity import (
+        VelocityConfig,
+        VelocityError,
+        VelocityWindow,
+        compute_batch_velocity,
+    )
+
+    try:
+        if config_file is not None:
+            base_cfg = VelocityConfig.load_file(config_file)
+        else:
+            base_cfg = VelocityConfig()
+    except (VelocityError, OSError, ValueError, FileNotFoundError) as exc:
+        _abort(f"Failed to load velocity configuration: {exc}")
+
+    # Apply overrides
+    parsed_windows: tuple[VelocityWindow, ...] = base_cfg.windows
+    if windows is not None:
+        try:
+            durations = [float(w.strip()) for w in windows.split(",") if w.strip()]
+            if not durations:
+                raise ValueError("No durations provided in --windows.")
+            parsed_windows = tuple(VelocityWindow(duration_seconds=dur) for dur in durations)
+        except (ValueError, VelocityError) as exc:
+            _abort(f"Invalid window specification {windows!r}: {exc}")
+
+    try:
+        cfg = VelocityConfig(
+            entity_key=entity_col if entity_col is not None else base_cfg.entity_key,
+            timestamp_key=timestamp_col if timestamp_col is not None else base_cfg.timestamp_key,
+            amount_key=amount_col if amount_col is not None else base_cfg.amount_key,
+            windows=parsed_windows,
+            include_ratios=base_cfg.include_ratios,
+            include_deltas=base_cfg.include_deltas,
+            feature_prefix=base_cfg.feature_prefix,
+            max_events_per_entity=base_cfg.max_events_per_entity,
+            max_entities=base_cfg.max_entities,
+            default_entity_id=base_cfg.default_entity_id,
+        )
+    except VelocityError as exc:
+        _abort(f"Invalid velocity configuration: {exc}")
+
+    try:
+        df = pd.read_csv(data)
+    except (OSError, pd.errors.ParserError, pd.errors.EmptyDataError, ValueError) as exc:
+        _abort(f"Failed to load dataset from {data}: {exc}")
+
+    if df.empty:
+        _abort("Input dataset is empty.")
+
+    try:
+        enriched_df = compute_batch_velocity(
+            df,
+            config=cfg,
+            timestamp_col=timestamp_col,
+            amount_col=amount_col,
+            entity_col=entity_col,
+        )
+    except (VelocityError, ValueError) as exc:
+        _abort(f"Velocity computation failed: {exc}")
+
+    try:
+        _atomic_write_csv(enriched_df, output)
+    except OSError as exc:
+        _abort(f"Failed to save enriched dataset to {output}: {exc}")
+
+    generated_features = [col for col in enriched_df.columns if col.startswith(cfg.feature_prefix)]
+    e_col = entity_col or cfg.entity_key
+    distinct_entities = int(df[e_col].nunique()) if e_col in df.columns else 1
+
+    window_names = [w.name or str(w.duration_seconds) for w in cfg.windows]
+    summary = {
+        "data_file": str(data),
+        "output_file": str(output),
+        "rows_processed": len(df),
+        "distinct_entities": distinct_entities,
+        "features_generated_count": len(generated_features),
+        "features_generated": generated_features,
+        "windows": window_names,
+    }
+
+    if json_output:
+        typer.echo(json.dumps(summary, indent=2))
+    else:
+        typer.echo(
+            f"Velocity Feature Enrichment Complete\n"
+            f"Rows processed:       {len(df):,}\n"
+            f"Distinct entities:    {distinct_entities:,}\n"
+            f"Features generated:   {len(generated_features)} columns\n"
+            f"Configured windows:   {', '.join(window_names)}\n"
+            f"Enriched output:      {output}"
+        )
+
+
 def _abort(message: str) -> NoReturn:
     typer.echo(f"Error: {message}", err=True)
     raise typer.Exit(code=2)
