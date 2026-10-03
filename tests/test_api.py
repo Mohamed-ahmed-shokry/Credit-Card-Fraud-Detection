@@ -56,6 +56,7 @@ from fraud_detection.rules import (
 from fraud_detection.signing import load_private_key, load_public_key, write_keypair
 from fraud_detection.telemetry import TraceContext, TraceSpan
 from fraud_detection.trust import TrustBundle, write_trust_bundle
+from fraud_detection.velocity import VelocityConfig, VelocityWindow
 
 
 class _RecordingTraceExporter:
@@ -2463,3 +2464,93 @@ def test_declarative_rules_file_and_precedence(
         # In MODEL_OVERRIDES_RULES, model DENY takes precedence over rule ALLOW
         assert pred["decision"] == "DENY"
         assert pred["matched_rule"] is None
+
+
+def test_velocity_endpoints_disabled(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    client, _, _ = api_context
+    stats_res = client.get("/v1/velocity/stats")
+    assert stats_res.status_code == 200
+    assert stats_res.json()["enabled"] is False
+    assert stats_res.json()["entities_tracked"] == 0
+
+    prof_res = client.get("/v1/velocity/profile/card_test")
+    assert prof_res.status_code == 404
+    assert "Velocity tracking is not enabled" in prof_res.json()["detail"]
+
+
+def test_velocity_endpoints_enabled_and_scoring(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, model, dataset = api_context
+    cfg = VelocityConfig(
+        windows=(VelocityWindow(duration_seconds=300.0, name="5m"),),
+    )
+    app = create_app(model=model, velocity_config=cfg)
+
+    with TestClient(app) as vel_client:
+        h_res = vel_client.get("/health")
+        assert h_res.json()["velocity_enabled"] is True
+        assert h_res.json()["velocity_entities_count"] == 0
+
+        stats_res = vel_client.get("/v1/velocity/stats")
+        assert stats_res.status_code == 200
+        assert stats_res.json()["enabled"] is True
+        assert stats_res.json()["configured_windows"] == ["5m"]
+
+        # Score single transaction with X-Entity-ID header
+        single = dataset.features.iloc[0].to_dict()
+        score_res = vel_client.post(
+            "/v1/score",
+            headers={"X-Entity-ID": "user_42"},
+            json={"transaction": single},
+        )
+        assert score_res.status_code == 200
+
+        # Check entity profile is now tracked
+        prof_res = vel_client.get("/v1/velocity/profile/user_42")
+        assert prof_res.status_code == 200
+        assert prof_res.json()["tracked"] is True
+        assert prof_res.json()["events_count"] == 1
+
+        # Check metrics
+        metrics_res = vel_client.get("/metrics")
+        assert "fraud_velocity_enrichments_total 1.0" in metrics_res.text
+        assert "fraud_velocity_entities_active 1.0" in metrics_res.text
+
+        # Predict batch
+        batch = dataset.features.iloc[:2].to_dict(orient="records")
+        pred_res = vel_client.post(
+            "/v1/predict",
+            headers={"X-Entity-ID": "user_42"},
+            json={"transactions": batch},
+        )
+        assert pred_res.status_code == 200
+
+        prof_after = vel_client.get("/v1/velocity/profile/user_42")
+        assert prof_after.json()["events_count"] == 3
+
+
+def test_velocity_config_file_and_env(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, model, _ = api_context
+    cfg_file = tmp_path / "velocity_test.json"
+    cfg = VelocityConfig(
+        windows=(
+            VelocityWindow(duration_seconds=60.0, name="1m"),
+            VelocityWindow(duration_seconds=600.0, name="10m"),
+        )
+    )
+    cfg.save_file(cfg_file)
+
+    monkeypatch.setenv("FRAUD_VELOCITY_CONFIG_PATH", str(cfg_file))
+    app = create_app(model=model)
+
+    with TestClient(app) as env_client:
+        stats_res = env_client.get("/v1/velocity/stats")
+        assert stats_res.status_code == 200
+        assert stats_res.json()["configured_windows"] == ["1m", "10m"]

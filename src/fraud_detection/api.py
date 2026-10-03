@@ -60,6 +60,11 @@ from fraud_detection.telemetry import (
     TraceSpan,
     parse_traceparent,
 )
+from fraud_detection.velocity import (
+    VelocityConfig,
+    VelocityWindowBuffer,
+    enrich_record_velocity,
+)
 
 MODEL_PATH_ENVIRONMENT_VARIABLE = "FRAUD_MODEL_PATH"
 AUDIT_LOG_ENVIRONMENT_VARIABLE = "FRAUD_AUDIT_LOG_PATH"
@@ -82,6 +87,7 @@ MAX_CONCURRENT_SCORING_ENVIRONMENT_VARIABLE = "FRAUD_MAX_CONCURRENT_SCORING"
 ENABLE_CHAOS_HEADER_ENVIRONMENT_VARIABLE = "FRAUD_ENABLE_CHAOS_HEADER"
 RULES_PATH_ENVIRONMENT_VARIABLE = "FRAUD_RULES_PATH"
 RULE_PRECEDENCE_ENVIRONMENT_VARIABLE = "FRAUD_RULE_PRECEDENCE"
+VELOCITY_CONFIG_PATH_ENVIRONMENT_VARIABLE = "FRAUD_VELOCITY_CONFIG_PATH"
 REQUEST_ID_HEADER = "X-Request-ID"
 PROCESS_TIME_HEADER = "X-Process-Time-Ms"
 MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024
@@ -115,6 +121,8 @@ class _OperationalStatus:
     shadow_model_version: str | None
     rules_count: int | None = None
     rule_precedence: str | None = None
+    velocity_enabled: bool | None = None
+    velocity_entities_count: int | None = None
 
     def response_fields(self) -> dict[str, Any]:
         """Return the response fields shared by `/health` and `/ready`."""
@@ -128,6 +136,10 @@ class _OperationalStatus:
             fields["rules_count"] = self.rules_count
         if self.rule_precedence is not None:
             fields["rule_precedence"] = self.rule_precedence
+        if self.velocity_enabled is not None:
+            fields["velocity_enabled"] = self.velocity_enabled
+        if self.velocity_entities_count is not None:
+            fields["velocity_entities_count"] = self.velocity_entities_count
         return fields
 
 
@@ -541,6 +553,8 @@ class HealthResponse(BaseModel):
     shadow_model_version: str | None = None
     rules_count: int | None = None
     rule_precedence: str | None = None
+    velocity_enabled: bool | None = None
+    velocity_entities_count: int | None = None
 
 
 class LivenessResponse(BaseModel):
@@ -565,6 +579,8 @@ class ReadinessResponse(BaseModel):
     shadow_model_version: str | None = None
     rules_count: int | None = None
     rule_precedence: str | None = None
+    velocity_enabled: bool | None = None
+    velocity_entities_count: int | None = None
 
 
 def create_app(
@@ -597,6 +613,8 @@ def create_app(
     rules: RuleSet | None = None,
     rules_path: Path | str | None = None,
     rule_precedence: RulePrecedence | None = None,
+    velocity_config: VelocityConfig | None = None,
+    velocity_config_path: Path | str | None = None,
 ) -> FastAPI:
     """Create an application using an injected model or a trusted artifact path.
 
@@ -647,6 +665,8 @@ def create_app(
         rules: Optional pre-loaded declarative RuleSet.
         rules_path: Optional path to JSON or YAML declarative rules file.
         rule_precedence: Optional RulePrecedence strategy governing rule vs model priority.
+        velocity_config: Optional pre-configured VelocityConfig specification.
+        velocity_config_path: Optional path to JSON file defining VelocityConfig.
     """
     logging.basicConfig(level=logging.INFO)
 
@@ -764,6 +784,19 @@ def create_app(
     else:
         resolved_precedence = RulePrecedence.RULES_OVERRIDE_MODEL
 
+    resolved_velocity_path = velocity_config_path or os.getenv(
+        VELOCITY_CONFIG_PATH_ENVIRONMENT_VARIABLE
+    )
+    resolved_velocity_config: VelocityConfig | None = velocity_config
+    if resolved_velocity_config is None and resolved_velocity_path is not None:
+        resolved_velocity_config = VelocityConfig.load_file(resolved_velocity_path)
+
+    resolved_velocity_buffer: VelocityWindowBuffer | None = (
+        VelocityWindowBuffer(config=resolved_velocity_config)
+        if resolved_velocity_config is not None
+        else None
+    )
+
     metrics_registry = CollectorRegistry()
     request_counter = Counter(
         "http_requests_total",
@@ -833,6 +866,16 @@ def create_app(
         "fraud_rules_triggered_total",
         "Total transactions triggering declarative decision rules.",
         ["rule_id", "action"],
+        registry=metrics_registry,
+    )
+    velocity_enrichments_counter = Counter(
+        "fraud_velocity_enrichments_total",
+        "Total transactions enriched with sliding window velocity features.",
+        registry=metrics_registry,
+    )
+    velocity_entities_gauge = Gauge(
+        "fraud_velocity_entities_active",
+        "Number of active unique entities tracked in the velocity window buffer.",
         registry=metrics_registry,
     )
 
@@ -947,6 +990,10 @@ def create_app(
         application.state.rules = resolved_rules
         application.state.rule_precedence = resolved_precedence
         application.state.rules_counter = rules_counter
+        application.state.velocity_config = resolved_velocity_config
+        application.state.velocity_buffer = resolved_velocity_buffer
+        application.state.velocity_enrichments_counter = velocity_enrichments_counter
+        application.state.velocity_entities_gauge = velocity_entities_gauge
         shadow_tasks: set[asyncio.Task[None]] = set()
         application.state.shadow_tasks = shadow_tasks
         yield
@@ -1589,6 +1636,35 @@ def create_app(
         request: Request,
     ) -> PredictionResponse | JSONResponse:
         loaded = _model_from_request(request)
+        vel_buf: VelocityWindowBuffer | None = getattr(request.app.state, "velocity_buffer", None)
+        vel_cfg: VelocityConfig | None = getattr(request.app.state, "velocity_config", None)
+        vel_counter: Counter | None = getattr(
+            request.app.state, "velocity_enrichments_counter", None
+        )
+        vel_gauge: Gauge | None = getattr(request.app.state, "velocity_entities_gauge", None)
+
+        if vel_buf is not None and vel_cfg is not None:
+            enriched_records: list[dict[str, float]] = []
+            expected_cols = set(loaded.feature_names)
+            for tx in payload.transactions:
+                header_entity = request.headers.get("X-Entity-ID")
+                tx_copy = dict(tx)
+                if header_entity and vel_cfg.entity_key not in tx_copy:
+                    tx_copy[vel_cfg.entity_key] = header_entity  # type: ignore[assignment]
+                enriched = enrich_record_velocity(tx_copy, vel_buf, vel_cfg, update=True)
+                frame_row: dict[str, float] = {}
+                for k, v in enriched.items():
+                    if k in expected_cols or (k in tx and k != vel_cfg.entity_key):
+                        frame_row[k] = float(v)
+                enriched_records.append(frame_row)
+            frame_records = enriched_records
+            if vel_counter is not None:
+                vel_counter.inc(len(payload.transactions))
+            if vel_gauge is not None:
+                vel_gauge.set(vel_buf.entity_count)
+        else:
+            frame_records = payload.transactions
+
         try:
             (
                 applied_threshold,
@@ -1600,8 +1676,8 @@ def create_app(
             ) = await _score_with_guardrails(
                 request,
                 loaded,
-                pd.DataFrame(payload.transactions),
-                features=payload.transactions,
+                pd.DataFrame(frame_records),
+                features=frame_records,
                 explain=payload.explain,
                 explain_llm=payload.explain_llm,
                 threshold=payload.threshold,
@@ -1632,6 +1708,32 @@ def create_app(
         request: Request,
     ) -> ScoreResponse | JSONResponse:
         loaded = _model_from_request(request)
+        vel_buf: VelocityWindowBuffer | None = getattr(request.app.state, "velocity_buffer", None)
+        vel_cfg: VelocityConfig | None = getattr(request.app.state, "velocity_config", None)
+        vel_counter: Counter | None = getattr(
+            request.app.state, "velocity_enrichments_counter", None
+        )
+        vel_gauge: Gauge | None = getattr(request.app.state, "velocity_entities_gauge", None)
+
+        if vel_buf is not None and vel_cfg is not None:
+            expected_cols = set(loaded.feature_names)
+            header_entity = request.headers.get("X-Entity-ID")
+            tx_copy = dict(payload.transaction)
+            if header_entity and vel_cfg.entity_key not in tx_copy:
+                tx_copy[vel_cfg.entity_key] = header_entity  # type: ignore[assignment]
+            enriched = enrich_record_velocity(tx_copy, vel_buf, vel_cfg, update=True)
+            frame_row: dict[str, float] = {}
+            for k, v in enriched.items():
+                if k in expected_cols or (k in payload.transaction and k != vel_cfg.entity_key):
+                    frame_row[k] = float(v)
+            frame_records = [frame_row]
+            if vel_counter is not None:
+                vel_counter.inc()
+            if vel_gauge is not None:
+                vel_gauge.set(vel_buf.entity_count)
+        else:
+            frame_records = [payload.transaction]
+
         try:
             (
                 applied_threshold,
@@ -1643,8 +1745,8 @@ def create_app(
             ) = await _score_with_guardrails(
                 request,
                 loaded,
-                pd.DataFrame([payload.transaction]),
-                features=[payload.transaction],
+                pd.DataFrame(frame_records),
+                features=frame_records,
                 explain=payload.explain,
                 explain_llm=payload.explain_llm,
                 threshold=payload.threshold,
@@ -1663,6 +1765,34 @@ def create_app(
             fallback_applied=fallback_applied,
             fallback_reason=fallback_reason,
         )
+
+    @application.get("/v1/velocity/stats", tags=["velocity"])
+    async def velocity_stats(request: Request) -> dict[str, Any]:
+        """Return operational metrics of the in-memory velocity window buffer."""
+        buf: VelocityWindowBuffer | None = getattr(request.app.state, "velocity_buffer", None)
+        if buf is None:
+            return {
+                "enabled": False,
+                "entities_tracked": 0,
+                "total_events": 0,
+                "max_entities": 0,
+                "max_events_per_entity": 0,
+                "configured_windows": [],
+            }
+        out_stats = buf.stats()
+        out_stats["enabled"] = True
+        return out_stats
+
+    @application.get("/v1/velocity/profile/{entity_id}", tags=["velocity"])
+    async def velocity_profile(entity_id: str, request: Request) -> Any:
+        """Inspect real-time sliding window velocity profile for an entity."""
+        buf: VelocityWindowBuffer | None = getattr(request.app.state, "velocity_buffer", None)
+        if buf is None:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": "Velocity tracking is not enabled on this service."},
+            )
+        return buf.get_entity_profile(entity_id)
 
     @application.get("/metrics", tags=["operations"])
     async def metrics() -> Response:
@@ -1833,6 +1963,7 @@ def _operational_status(request: Request) -> _OperationalStatus:
         if isinstance(prec, RulePrecedence)
         else (str(prec) if prec is not None else None)
     )
+    vel_buf: VelocityWindowBuffer | None = getattr(request.app.state, "velocity_buffer", None)
     return _OperationalStatus(
         fallback_mode=str(getattr(request.app.state, "fallback_mode", "raise")),
         degraded_mode=degraded_mode,
@@ -1842,6 +1973,8 @@ def _operational_status(request: Request) -> _OperationalStatus:
         ),
         rules_count=len(active_rules) if active_rules is not None else None,
         rule_precedence=prec_str if active_rules is not None else None,
+        velocity_enabled=True if vel_buf is not None else None,
+        velocity_entities_count=vel_buf.entity_count if vel_buf is not None else None,
     )
 
 
