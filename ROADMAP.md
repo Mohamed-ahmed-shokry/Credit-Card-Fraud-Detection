@@ -1184,7 +1184,7 @@ This phase does not implement distributed Redis / Kafka state stores, distribute
 - `9ca8140`: feat: add compute-velocity CLI command for batch feature engineering
 - `d3ef9b8`: docs: document transaction velocity profiling, sliding windows, and CLI workflows
 
-## Phase 29 — Model Calibration Surveillance, Post-Hoc Recalibration, and Reliability Diagnostics (Proposed)
+## Phase 29 — Model Calibration Surveillance, Post-Hoc Recalibration, and Reliability Diagnostics (In Progress)
 
 ### Objective
 
