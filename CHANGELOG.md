@@ -8,6 +8,18 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- Transaction velocity profiling and sliding feature window engine: added `VelocityConfig`, `VelocityWindow`,
+  `SlidingWindow`, and thread-safe `VelocityWindowBuffer` in `velocity.py` computing sliding window count,
+  sum, min, max, mean, population standard deviation, and exponential moving averages with bounded $O(1)$
+  amortized insertion and eviction latency.
+- Streaming and batch velocity feature engineering: added `enrich_record_velocity()` for real-time
+  streaming transaction enrichment and `compute_batch_velocity()` for vectorized historical dataset computation,
+  preserving strict temporal causality without future-data leakage or lookahead bias.
+- Serving API velocity stream enrichment: extended `create_app` with `velocity_config` and `velocity_config_path`
+  (supported via `FRAUD_VELOCITY_CONFIG_PATH` env var), added `/v1/velocity/stats` and `/v1/velocity/profile/{entity_id}`
+  operational endpoints, and exposed `fraud_velocity_enrichments_total` counter and `fraud_velocity_entities_active` gauge.
+- Batch velocity CLI command: added `fraud-detect compute-velocity` CLI command generating enriched datasets
+  with sliding window behavioral signals, custom window overrides, and structured JSON / formatted table summaries.
 - Declarative decision rules and priority overrides: added `RuleCondition`, `RuleOperator`, `RuleAction`,
   `DecisionRule`, and `RuleSet` in `rules.py` with multi-operator predicate evaluation (`==`, `!=`, `>`, `>=`,
   `<`, `<=`, `in`, `not_in`), priority ranking, and JSON serialization.

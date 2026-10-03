@@ -59,6 +59,7 @@ financial-services platform.
     operations, and exposes the admission check used by API startup. Revocation
     is evaluated before the model artifact is loaded.
 14. `rules.py` defines declarative decision rule conditions, operators (`==`, `!=`, `>`, `>=`, `<`, `<=`, `in`, `not_in`), actions (`ALLOW`, `CHALLENGE`, `DENY`), priority evaluation, and serialization for `RuleSet`. `model.py` and `api.py` integrate rule sets with configurable precedence (`rules_override_model` vs `model_overrides_rules`), Prometheus instrumentation (`fraud_rules_triggered_total`), and structured audit logging.
+15. `velocity.py` provides in-memory sliding window accumulators (`VelocityWindowBuffer`, `SlidingWindow`, `VelocityConfig`) tracking count, sum, min, max, mean, std, and exponential moving averages over configurable intervals with bounded $O(1)$ amortized insertion and eviction latency. It guarantees strict temporal causality without future-data leakage in both real-time streaming enrichment (`enrich_record_velocity`) and vectorized offline dataset transformations (`compute_batch_velocity`). `api.py` attaches velocity buffers to `create_app` with dedicated operational endpoints (`/v1/velocity/stats`, `/v1/velocity/profile/{entity_id}`) and Prometheus instrumentation (`fraud_velocity_enrichments_total`, `fraud_velocity_entities_active`).
 
 ## Artifact contract
 

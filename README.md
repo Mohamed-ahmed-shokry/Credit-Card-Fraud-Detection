@@ -367,6 +367,41 @@ Rule files are stored in clean JSON format:
 - **Operational probes**: `/health` and `/ready` report `rules_count` and active `rule_precedence`.
 - **Structured audit logging**: Every scoring event records `matched_rule` and `rule_action` per prediction and summarizes batch matches in `rule_matches`.
 
+## Transaction velocity profiling and sliding feature windows
+
+Dynamic behavioral velocity metrics capture frequency, amount spikes, and abnormal transaction acceleration across cards, accounts, and entities over time:
+
+```bash
+# Offline dataset enrichment with behavioral velocity features
+fraud-detect compute-velocity \
+  --data Dataset/transactions.csv \
+  --output Dataset/transactions_enriched.csv \
+  --windows 300,3600,86400 \
+  --entity-col card_id
+
+# Serve predictions with live sliding-window velocity profiling
+fraud-detect serve artifacts/model \
+  --velocity-config configs/velocity.json
+```
+
+### Velocity features generated
+
+For each configured time window (e.g. `5m` [300s], `1h` [3600s], `24h` [86400s]):
+- **Window aggregations**: `velocity_count_{win}`, `velocity_sum_{win}`, `velocity_min_{win}`, `velocity_max_{win}`, `velocity_mean_{win}`, `velocity_std_{win}`, `velocity_ema_{win}`.
+- **Ratios & Deltas**: `velocity_amount_to_mean_{win}` (instantaneous anomaly ratio), `velocity_count_ratio_{short}_{long}` (window acceleration ratio), `velocity_time_delta_prev` (seconds since entity's previous transaction), and `velocity_amount_delta_prev`.
+
+### Strict temporal causality
+
+- **Zero lookahead bias**: When enriching record $i$ at $(t_i, \text{amount}_i)$, window aggregations strictly incorporate prior transactions $j < i$ with $t_j \le t_i$.
+- **Amortized $O(1)$ operations**: Stateful `SlidingWindow` buffers use bounded double-ended queues with amortized $O(1)$ insertion and window eviction.
+- **Bounded memory & LRU eviction**: Thread-safe `VelocityWindowBuffer` limits max tracked entities (`max_entities`) and events per entity (`max_events_per_entity`), evicting least-recently-used records to maintain fixed memory footprints.
+
+### Observability and endpoints
+
+- **Operational endpoints**: `GET /v1/velocity/stats` returns buffer capacity and entity counts; `GET /v1/velocity/profile/{entity_id}` returns real-time sliding window activity for an entity.
+- **Prometheus metrics**: `fraud_velocity_enrichments_total` counts enriched inbound transactions; `fraud_velocity_entities_active` tracks currently active entities.
+- **Service health probes**: `/health` and `/ready` report `velocity_enabled` and `velocity_entities_count`.
+
 ## Train on the anonymized dataset
 
 Place the downloaded CSV under the ignored `Dataset/` directory; raw financial data
