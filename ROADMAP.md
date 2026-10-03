@@ -1152,7 +1152,7 @@ This phase does not implement distributed stateful CEP (complex event processing
 - `a814a96`: feat: add test-rules CLI command for rule syntax and match verification
 - `e6e4fb2`: docs: document declarative decision rules, priority routing, and disparity alerting
 
-## Phase 28 — Transaction Velocity Profiling, Sliding Feature Windows, and Stream Enrichment (In Progress)
+## Phase 28 — Transaction Velocity Profiling, Sliding Feature Windows, and Stream Enrichment (Done)
 
 ### Objective
 
@@ -1176,6 +1176,37 @@ Bridge raw instantaneous transaction features with dynamic behavioral velocity m
 
 This phase does not implement distributed Redis / Kafka state stores, distributed stream engines (Flink/Spark Streaming), or asynchronous event-bus brokers.
 
+### Delivery Record
+
+- `3a742f1`: docs: set Phase 28 transaction velocity profiling in progress
+- `68975a0`: feat: add transaction velocity profiling and sliding feature window engine
+- `e5c66ab`: feat: integrate sliding window velocity profiling into serving API
+- `9ca8140`: feat: add compute-velocity CLI command for batch feature engineering
+- `d3ef9b8`: docs: document transaction velocity profiling, sliding windows, and CLI workflows
+
+## Phase 29 — Model Calibration Surveillance, Post-Hoc Recalibration, and Reliability Diagnostics (Proposed)
+
+### Objective
+
+Continuously monitor probability calibration in production, detect score distortion and confidence drift across decision tiers, provide post-hoc recalibration transformations (Platt scaling and Isotonic regression), and verify calibrated risk intervals for risk-sensitive operational routing.
+
+### Scope
+
+- **Calibration diagnostics & surveillance** — compute Expected Calibration Error (ECE), Maximum Calibration Error (MCE), and adaptive quantile-binned reliability curves for model predictions.
+- **Post-hoc recalibrator suite** — implement Platt scaling (logistic sigmoid fit) and non-parametric isotonic regression recalibrators with monotonic probability mapping.
+- **Artifact & serving integration** — serialize recalibrator checkpoints within model artifacts, enabling transparent runtime score adjustment in `FraudModel.predict_proba()` and API serving.
+- **CLI diagnostic commands** — add `fraud-detect calibrate-eval` and `fraud-detect recalibrate` commands generating calibration reports, reliability plots, and recalibrated model artifacts.
+
+### Acceptance criteria
+
+- ECE and binned calibration metrics compute deterministically with zero division or empty-bin failure modes.
+- Recalibrated probabilities are monotonically non-decreasing and bounded strictly within $[0, 1]$.
+- Recalibrators serialize and deserialize seamlessly within artifact bundles without breaking model card schemas or backward compatibility.
+- Test suite achieves 100% pass rate, branch coverage remains $\ge 97.0\%$, Ruff and strict mypy pass with zero errors.
+
+### Explicit exclusions
+
+This phase does not implement online gradient-based temperature scaling or Bayesian neural network calibration.
 
 ## Contributing to the roadmap
 
