@@ -21,6 +21,7 @@ from fraud_detection.audit import (
     backtest_audit_policy,
     build_promotion_audit_event,
     build_scoring_audit_event,
+    build_shadow_scoring_audit_event,
     redact_data,
     replay_audit_log,
 )
@@ -169,6 +170,47 @@ def test_build_scoring_audit_event() -> None:
     assert event.payload["fraud_count"] == 1
     assert event.payload["request_id"] == "req_999"
     assert event.payload["client_metadata"] == {"client_ip": "127.0.0.1"}
+
+
+def test_build_scoring_audit_event_multi_model_routing() -> None:
+    event = build_scoring_audit_event(
+        model_version="champ_v1",
+        dataset_fingerprint="fp1",
+        threshold=0.5,
+        predictions=[{"fraud_probability": 0.8, "is_fraud": True}],
+        model_role="challenger",
+        routed_model_version="chall_v2",
+        shadow_predictions=[{"shadow_probability": 0.2, "shadow_decision": False}],
+    )
+    assert event.event_type == "scoring"
+    assert event.payload["model_role"] == "challenger"
+    assert event.payload["routed_model_version"] == "chall_v2"
+    assert len(event.payload["shadow_predictions"]) == 1
+    assert event.payload["shadow_predictions"][0]["shadow_probability"] == 0.2
+
+
+def test_build_shadow_scoring_audit_event() -> None:
+    event = build_shadow_scoring_audit_event(
+        shadow_model_version="chall_v2",
+        shadow_dataset_fingerprint="fp_chall",
+        evaluated_count=10,
+        discrepancy_count=2,
+        discrepancies=[{"index": 0, "primary_decision": True, "shadow_decision": False}],
+        request_id="req_shadow_123",
+        mean_probability_divergence=0.08,
+        max_probability_divergence=0.25,
+        primary_model_version="champ_v1",
+    )
+    assert event.event_type == "shadow_scoring"
+    assert event.model_version == "chall_v2"
+    assert event.dataset_fingerprint == "fp_chall"
+    assert event.payload["evaluated_count"] == 10
+    assert event.payload["discrepancy_count"] == 2
+    assert len(event.payload["discrepancies"]) == 1
+    assert event.payload["request_id"] == "req_shadow_123"
+    assert event.payload["mean_probability_divergence"] == 0.08
+    assert event.payload["max_probability_divergence"] == 0.25
+    assert event.payload["primary_model_version"] == "champ_v1"
 
 
 def test_build_promotion_audit_event() -> None:

@@ -223,6 +223,9 @@ def build_scoring_audit_event(
     review_threshold: float | None = None,
     deny_threshold: float | None = None,
     decision_counts: Mapping[str, int] | None = None,
+    model_role: str | None = None,
+    routed_model_version: str | None = None,
+    shadow_predictions: Sequence[dict[str, Any]] | None = None,
 ) -> AuditEvent:
     """Construct a structured scoring audit event."""
     fraud_count = sum(1 for p in predictions if p.get("is_fraud"))
@@ -232,6 +235,12 @@ def build_scoring_audit_event(
         "fraud_count": fraud_count,
         "predictions": list(predictions),
     }
+    if model_role is not None:
+        payload["model_role"] = model_role
+    if routed_model_version is not None:
+        payload["routed_model_version"] = routed_model_version
+    if shadow_predictions is not None:
+        payload["shadow_predictions"] = list(shadow_predictions)
     if review_threshold is not None:
         payload["review_threshold"] = review_threshold
     if deny_threshold is not None:
@@ -304,6 +313,9 @@ def build_shadow_scoring_audit_event(
     discrepancy_count: int,
     discrepancies: Sequence[dict[str, Any]],
     request_id: str | None = None,
+    mean_probability_divergence: float | None = None,
+    max_probability_divergence: float | None = None,
+    primary_model_version: str | None = None,
 ) -> AuditEvent:
     """Construct a structured shadow scoring audit event."""
     payload: dict[str, Any] = {
@@ -313,6 +325,12 @@ def build_shadow_scoring_audit_event(
     }
     if request_id is not None:
         payload["request_id"] = request_id
+    if mean_probability_divergence is not None:
+        payload["mean_probability_divergence"] = mean_probability_divergence
+    if max_probability_divergence is not None:
+        payload["max_probability_divergence"] = max_probability_divergence
+    if primary_model_version is not None:
+        payload["primary_model_version"] = primary_model_version
 
     return AuditEvent(
         event_type="shadow_scoring",
