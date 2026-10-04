@@ -47,6 +47,7 @@ from fraud_detection.audit import (
 from fraud_detection.evaluation import DecisionAction, TieredThresholds
 from fraud_detection.explanations import ExplanationProvider
 from fraud_detection.model import FraudModel, ModelArtifactError, load_model
+from fraud_detection.recalibration import BaseRecalibrator
 from fraud_detection.rules import RulePrecedence, RuleSet
 from fraud_detection.telemetry import (
     DEFAULT_OTLP_TIMEOUT_SECONDS,
@@ -123,6 +124,8 @@ class _OperationalStatus:
     rule_precedence: str | None = None
     velocity_enabled: bool | None = None
     velocity_entities_count: int | None = None
+    recalibration_enabled: bool | None = None
+    recalibration_method: str | None = None
 
     def response_fields(self) -> dict[str, Any]:
         """Return the response fields shared by `/health` and `/ready`."""
@@ -140,6 +143,10 @@ class _OperationalStatus:
             fields["velocity_enabled"] = self.velocity_enabled
         if self.velocity_entities_count is not None:
             fields["velocity_entities_count"] = self.velocity_entities_count
+        if self.recalibration_enabled is not None:
+            fields["recalibration_enabled"] = self.recalibration_enabled
+        if self.recalibration_method is not None:
+            fields["recalibration_method"] = self.recalibration_method
         return fields
 
 
@@ -484,6 +491,7 @@ class PredictionResult(BaseModel):
     rule_action: str | None = None
     contributions: dict[str, float] | None = None
     explanation: str | None = None
+    raw_probability: float | None = None
 
 
 class PredictionResponse(BaseModel):
@@ -555,6 +563,8 @@ class HealthResponse(BaseModel):
     rule_precedence: str | None = None
     velocity_enabled: bool | None = None
     velocity_entities_count: int | None = None
+    recalibration_enabled: bool | None = None
+    recalibration_method: str | None = None
 
 
 class LivenessResponse(BaseModel):
@@ -581,6 +591,8 @@ class ReadinessResponse(BaseModel):
     rule_precedence: str | None = None
     velocity_enabled: bool | None = None
     velocity_entities_count: int | None = None
+    recalibration_enabled: bool | None = None
+    recalibration_method: str | None = None
 
 
 def create_app(
@@ -876,6 +888,12 @@ def create_app(
     velocity_entities_gauge = Gauge(
         "fraud_velocity_entities_active",
         "Number of active unique entities tracked in the velocity window buffer.",
+        registry=metrics_registry,
+    )
+    recalibrated_predictions_counter = Counter(
+        "fraud_recalibrated_predictions_total",
+        "Total predictions processed with post-hoc probability recalibration.",
+        ["method"],
         registry=metrics_registry,
     )
 
@@ -1258,6 +1276,7 @@ def create_app(
         frame: pd.DataFrame,
         probabilities: np.ndarray,
         *,
+        raw_probabilities: np.ndarray | None = None,
         applied_threshold: float,
         eff_review: float,
         eff_deny: float,
@@ -1314,6 +1333,9 @@ def create_app(
                         else None
                     ),
                     explanation=(natural_language[index] if natural_language else None),
+                    raw_probability=(
+                        float(raw_probabilities[index]) if raw_probabilities is not None else None
+                    ),
                 )
             )
         fraud_sum = sum(1 for f in is_fraud_flags if f)
@@ -1330,6 +1352,9 @@ def create_app(
         for matched_id, act in zip(matched_rule_ids, decision_actions, strict=True):
             if matched_id is not None:
                 rules_counter.labels(rule_id=matched_id, action=act).inc()
+        recal = getattr(loaded, "recalibrator", None)
+        if isinstance(recal, BaseRecalibrator):
+            recalibrated_predictions_counter.labels(method=recal.method.value).inc(len(results))
         return results
 
     def _require_probabilities(probabilities: Any, expected_rows: int) -> np.ndarray:
@@ -1401,9 +1426,19 @@ def create_app(
         else:
             t0 = perf_counter()
             try:
-                probabilities = _require_probabilities(
-                    loaded.predict_probabilities(frame), len(frame)
-                )
+                recal = getattr(loaded, "recalibrator", None)
+                if isinstance(recal, BaseRecalibrator):
+                    raw_probabilities = _require_probabilities(
+                        loaded.predict_probabilities(frame, raw=True), len(frame)
+                    )
+                    probabilities = _require_probabilities(
+                        recal.transform(raw_probabilities), len(frame)
+                    )
+                else:
+                    raw_probabilities = None
+                    probabilities = _require_probabilities(
+                        loaded.predict_probabilities(frame), len(frame)
+                    )
                 elapsed_ms = (perf_counter() - t0) * 1000.0
                 if circuit_breaker is not None:
                     if (
@@ -1417,6 +1452,7 @@ def create_app(
                     loaded,
                     frame,
                     probabilities,
+                    raw_probabilities=raw_probabilities,
                     applied_threshold=applied_threshold,
                     eff_review=eff_review,
                     eff_deny=eff_deny,
@@ -1583,6 +1619,7 @@ def create_app(
                 predictions=[
                     {
                         "fraud_probability": r.fraud_probability,
+                        "raw_probability": r.raw_probability,
                         "is_fraud": r.is_fraud,
                         "decision": r.decision,
                         "matched_rule": r.matched_rule,
@@ -1964,6 +2001,14 @@ def _operational_status(request: Request) -> _OperationalStatus:
         else (str(prec) if prec is not None else None)
     )
     vel_buf: VelocityWindowBuffer | None = getattr(request.app.state, "velocity_buffer", None)
+    loaded_model: FraudModel | None = getattr(request.app.state, "model", None)
+    recalibration_enabled: bool | None = None
+    recalibration_method: str | None = None
+    recal = getattr(loaded_model, "recalibrator", None)
+    if isinstance(recal, BaseRecalibrator):
+        recalibration_enabled = True
+        recalibration_method = recal.method.value
+
     return _OperationalStatus(
         fallback_mode=str(getattr(request.app.state, "fallback_mode", "raise")),
         degraded_mode=degraded_mode,
@@ -1975,6 +2020,8 @@ def _operational_status(request: Request) -> _OperationalStatus:
         rule_precedence=prec_str if active_rules is not None else None,
         velocity_enabled=True if vel_buf is not None else None,
         velocity_entities_count=vel_buf.entity_count if vel_buf is not None else None,
+        recalibration_enabled=recalibration_enabled,
+        recalibration_method=recalibration_method,
     )
 
 

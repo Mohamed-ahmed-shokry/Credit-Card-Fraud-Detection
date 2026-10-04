@@ -45,6 +45,7 @@ from fraud_detection.api import (
 from fraud_detection.audit import JsonlAuditSink
 from fraud_detection.data import ValidatedDataset, generate_synthetic_data, validate_frame
 from fraud_detection.model import FraudModel, save_model, train_model, validate_artifact
+from fraud_detection.recalibration import PlattRecalibrator
 from fraud_detection.rules import (
     DecisionRule,
     RuleAction,
@@ -2554,3 +2555,70 @@ def test_velocity_config_file_and_env(
         stats_res = env_client.get("/v1/velocity/stats")
         assert stats_res.status_code == 200
         assert stats_res.json()["configured_windows"] == ["1m", "10m"]
+
+
+def test_recalibration_operational_probes_and_metrics(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, base_model, dataset = api_context
+    recal = PlattRecalibrator(a=1.5, b=-0.5, is_fitted=True)
+    cal_model = deepcopy(base_model)
+    cal_model.recalibrator = recal
+
+    app = create_app(model=cal_model)
+    with TestClient(app) as test_client:
+        h_res = test_client.get("/health")
+        assert h_res.status_code == 200
+        assert h_res.json()["recalibration_enabled"] is True
+        assert h_res.json()["recalibration_method"] == "sigmoid"
+
+        r_res = test_client.get("/ready")
+        assert r_res.status_code == 200
+        assert r_res.json()["recalibration_enabled"] is True
+        assert r_res.json()["recalibration_method"] == "sigmoid"
+
+        # Predict batch
+        batch = dataset.features.iloc[:3].to_dict(orient="records")
+        p_res = test_client.post("/v1/predict", json={"transactions": batch})
+        assert p_res.status_code == 200
+        preds = p_res.json()["predictions"]
+        assert len(preds) == 3
+        for pred in preds:
+            assert pred["raw_probability"] is not None
+            assert 0.0 <= pred["raw_probability"] <= 1.0
+            assert 0.0 <= pred["fraud_probability"] <= 1.0
+
+        # Check metrics
+        m_res = test_client.get("/metrics")
+        assert m_res.status_code == 200
+        assert 'fraud_recalibrated_predictions_total{method="sigmoid"} 3.0' in m_res.text
+
+
+def test_recalibration_predictions_and_audit_event(
+    tmp_path: Path,
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, base_model, dataset = api_context
+    recal = PlattRecalibrator(a=2.0, b=0.1, is_fitted=True)
+    cal_model = deepcopy(base_model)
+    cal_model.recalibrator = recal
+
+    sink_file = tmp_path / "audit_recal.jsonl"
+    sink = JsonlAuditSink(sink_file)
+    app = create_app(model=cal_model, audit_sink=sink)
+
+    with TestClient(app) as test_client:
+        rec = dataset.features.iloc[0].to_dict()
+        s_res = test_client.post("/v1/score", json={"transaction": rec})
+        assert s_res.status_code == 200
+        data = s_res.json()
+        assert data["prediction"]["raw_probability"] is not None
+        assert data["prediction"]["fraud_probability"] is not None
+
+    sink.close()
+    raw_lines = sink_file.read_text(encoding="utf-8").strip().splitlines()
+    assert len(raw_lines) == 1
+    event = json.loads(raw_lines[0])
+    pred_payload = event["payload"]["predictions"][0]
+    assert "raw_probability" in pred_payload
+    assert pred_payload["raw_probability"] is not None
