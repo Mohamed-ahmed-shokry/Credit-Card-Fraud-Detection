@@ -447,6 +447,60 @@ fraud-detect recalibrate artifacts/model Dataset/calibration.csv \
 - **Prometheus Metrics**: Inbound predictions scored with post-hoc recalibration increment `fraud_recalibrated_predictions_total{method="..."}`.
 - **Dual Probabilities**: Scored predictions and structured audit events expose both calibrated `fraud_probability` and uncalibrated `raw_probability`.
 
+## Champion/Challenger Multi-Model Routing, Shadow Inference, and Canary Governance
+
+Deploy, evaluate, and safely roll out candidate models using deterministic traffic splitting, non-blocking shadow inference, and automated canary divergence safeguards with zero-latency rollback:
+
+```bash
+# Offline evaluation of Champion vs Challenger models on CSV or JSONL audit event logs
+fraud-detect route-eval \
+  --champion artifacts/champion \
+  --challenger artifacts/challenger \
+  --data Dataset/eval.csv \
+  --max-discrepancy-rate 0.10 \
+  --max-divergence 0.20 \
+  --output reports/route_eval.json
+
+# Fail with exit code 1 if divergence exceeds thresholds (for CI/CD gating)
+fraud-detect route-eval \
+  -c artifacts/champion \
+  -k artifacts/challenger \
+  -d logs/audit_events.jsonl \
+  --fail-on-discrepancy
+
+# Run production API with 10% canary traffic routed to Challenger with deterministic entity stickiness
+fraud-detect serve artifacts/champion \
+  --challenger-model artifacts/challenger \
+  --routing-strategy canary \
+  --challenger-weight 0.10 \
+  --routing-entity-key card_id \
+  --canary-max-discrepancy 0.15 \
+  --canary-auto-rollback
+```
+
+### Routing strategies
+
+- **Champion-Only (`champion_only`)**: 100% of live inference traffic routes to the production Champion model.
+- **Challenger-Only (`challenger_only`)**: 100% of live traffic routes to the candidate Challenger model.
+- **Random Split (`random_split`)**: Statistical Bernoulli split with configurable `--challenger-weight` ($0.0 \le w \le 1.0$).
+- **Deterministic Entity Hash (`canary` / `hash_split`)**: Deterministic SHA-256 hash modulo partitioning over entity identifiers (`card_id`, `user_id`, or `transaction_id`), guaranteeing model stickiness across transactions for the same entity during rolling migrations.
+- **Shadow Inference (`shadow`)**: Live traffic is scored by Champion; Challenger asynchronously evaluates transactions in the background without affecting latency, availability, or error codes.
+
+### Canary divergence safeguards and automated rollback
+
+- **Decision Flip Surveillance**: Measures the fraction of transactions where Champion and Challenger disagree on fraud decisions (`is_fraud` or tiered action `ALLOW`/`CHALLENGE`/`DENY`).
+- **Probability Divergence Tracking**: Calculates mean absolute difference across predicted fraud probabilities: $\frac{1}{N} \sum |p_{\text{champ}} - p_{\text{chall}}|$.
+- **Automatic Rollback**: If discrepancy rate or mean divergence exceeds configured tolerances after `--min-evaluations`, the router automatically trips to `ROLLED_BACK` status, routing 100% of traffic back to the Champion with zero downtime.
+- **Operational Endpoints**:
+  - `GET /v1/routing/status`: Inspect live canary metrics, divergence stats, evaluated sample counts, and rollback status.
+  - `POST /v1/routing/rollback`: Manual operational killswitch forcing immediate zero-latency fallback to Champion.
+  - `POST /v1/routing/reset`: Reset discrepancy metrics and restore active canary traffic splitting.
+- **Prometheus Metrics**:
+  - `fraud_routing_predictions_total{role="champion|challenger",strategy="..."}`: Counter tracking routed inferences.
+  - `fraud_shadow_discrepancy_total{discrepancy="match|decision_flip"}`: Discrepancy counter for shadow evaluations.
+  - `fraud_canary_status`: Gauge reflecting canary state (0: Champion Only, 1: Active, 2: Warning, 3: Rolled Back).
+- **Audit Lineage**: Scored transactions and audit event logs expose `model_role` and `routed_model_version`, providing tamper-evident traceability during canary rollouts.
+
 ## Train on the anonymized dataset
 
 Place the downloaded CSV under the ignored `Dataset/` directory; raw financial data
@@ -1367,20 +1421,24 @@ Project layout:
 
 ```text
 src/fraud_detection/
-├── api.py          # versioned online prediction service, circuit breakers, and traffic shadowing
-├── audit.py        # structured JSONL audit logs with Luhn PAN redaction and log replay
-├── cli.py          # training, comparison, surveillance, profiling, simulation, and serving CLI
-├── data.py         # ingestion, schema validation, and synthetic data
-├── drift.py        # multi-window drift surveillance and streaming quantile profiler
-├── edge.py         # dependency-light quantized logistic runtime
-├── evaluation.py   # threshold tuning, imbalance-aware metrics, and calibration reports
-├── explanations.py # isolated explanation provider protocols and cost controls
-├── reporting.py    # self-contained HTML compliance report rendering
-├── signing.py      # Ed25519 signing and trusted public-key verification
-├── telemetry.py    # trace propagation and optional OTLP export
-├── trust.py        # rotating trust bundles and deployment admission
-└── model.py        # training, model card, inference, and cryptographic attestation
-tests/              # unit, integration, CLI, and API tests
+├── api.py            # versioned online prediction service, circuit breakers, and traffic shadowing
+├── audit.py          # structured JSONL audit logs with Luhn PAN redaction and log replay
+├── cli.py            # training, comparison, surveillance, profiling, simulation, and serving CLI
+├── data.py           # ingestion, schema validation, and synthetic data
+├── drift.py          # multi-window drift surveillance and streaming quantile profiler
+├── edge.py           # dependency-light quantized logistic runtime
+├── evaluation.py     # threshold tuning, imbalance-aware metrics, and calibration reports
+├── explanations.py   # isolated explanation provider protocols and cost controls
+├── model.py          # training, model card, inference, and cryptographic attestation
+├── recalibration.py  # ECE diagnostics, reliability curves, and post-hoc recalibration
+├── reporting.py      # self-contained HTML compliance report rendering
+├── routing.py        # champion/challenger multi-model routing and canary governance
+├── rules.py          # declarative rule engine and expert override policies
+├── signing.py        # Ed25519 signing and trusted public-key verification
+├── telemetry.py      # trace propagation and optional OTLP export
+├── trust.py          # rotating trust bundles and deployment admission
+└── velocity.py       # sliding-window behavioral aggregations and feature enrichment
+tests/                # unit, integration, CLI, and API tests
 ```
 
 ## Responsible use and limitations

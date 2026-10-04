@@ -8,6 +8,29 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- Champion/Challenger multi-model routing engine: added `ChampionChallengerRouter`, `RoutingPolicy`,
+  `TrafficSplitStrategy`, `ModelRole`, and `CanaryStatus` in `routing.py`, providing dynamic model resolution
+  across champion and challenger candidates with statistical random splitting and deterministic entity-hash
+  modulo partitioning (`card_id`, `user_id`, `transaction_id`) to ensure transaction stickiness.
+- Automated canary divergence safeguards and circuit-breaker rollback: implemented `RoutingMetricsTracker`
+  and `DivergenceReport` in `routing.py` tracking classification decision flips, mean absolute probability divergence,
+  and maximum probability divergence, with automated state tripping to `ROLLED_BACK` and failover to Champion
+  when safeguard thresholds are violated.
+- Non-blocking asynchronous shadow evaluation: updated `create_app` in `api.py` to decouple candidate Challenger
+  scoring into background worker threads, ensuring Champion latency, status codes, and availability remain
+  100% isolated from candidate failures or performance degradation.
+- Serving API canary governance endpoints and Prometheus metrics: added `/v1/routing/status`, `/v1/routing/rollback`,
+  and `/v1/routing/reset` endpoints, along with Prometheus metrics `fraud_routing_predictions_total`,
+  `fraud_shadow_discrepancy_total`, and `fraud_canary_status`.
+- Model role and version lineage in audit events: extended `build_scoring_audit_event()` and
+  `build_shadow_scoring_audit_event()` in `audit.py` to record `model_role` (`champion` or `challenger`)
+  and `routed_model_version`, maintaining full regulatory auditability during canary rollouts.
+- Offline canary evaluation CLI: added `fraud-detect route-eval` command in `cli.py` evaluating decision discrepancies
+  and probability divergence between Champion and Challenger models over CSV datasets or JSONL audit event logs,
+  with `--fail-on-discrepancy` exit code gating for CI/CD pipelines.
+- Multi-model routing CLI options: added `--challenger-model`, `--routing-strategy`, `--challenger-weight`,
+  `--routing-entity-key`, `--canary-max-discrepancy`, `--canary-max-divergence`, and `--canary-auto-rollback`
+  to `fraud-detect serve`.
 - Model calibration surveillance and reliability diagnostics: added `compute_calibration_diagnostics()` in
   `recalibration.py` calculating Expected Calibration Error (ECE), Maximum Calibration Error (MCE), Root Mean
   Squared Calibration Error (RMSCE), and complete Brier score decomposition (reliability, resolution, uncertainty)

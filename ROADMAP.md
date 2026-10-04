@@ -20,7 +20,7 @@ Status legend: `Proposed` (not started), `In progress`, `Done`.
 ## Current state
 
 The project is a production-grade reference implementation with the implementation work in
-Phases 2 through 25 complete. Phase 1's workflows are in place, but the first
+Phases 2 through 30 complete. Phase 1's workflows are in place, but the first
 real PyPI release still requires maintainer-side trusted-publisher setup. The
 shipped system covers leakage-safe training, multiple calibrated estimators,
 threshold and calibration analysis, label-delay temporal gaps, drift surveillance,
@@ -33,7 +33,11 @@ edge runtime export, distributed telemetry, continuous operational
 surveillance, an operational serving contract with liveness/readiness probes,
 deployable reference middleware, an optional scoring concurrency cap, synchronized
 circuit-breaker safety, detached traffic shadowing, honest schema error responses,
-and bounded operational metrics.
+bounded operational metrics, declarative rule sets with priority overrides,
+sliding-window velocity behavioral profiles, post-hoc probability recalibration
+(Platt, isotonic, temperature scaling) with calibration drift surveillance, and
+champion/challenger multi-model routing with deterministic entity stickiness and
+automated canary divergence safeguards.
 
 ## Phase 1 — Distribution
 
@@ -1217,7 +1221,7 @@ This phase does not implement online gradient-based temperature scaling or Bayes
 - `d4f6cba`: feat: add calibrate-eval and recalibrate CLI commands
 - `ac591e4`: docs: document calibration surveillance and post-hoc recalibration workflows
 
-## Phase 30 — Champion/Challenger Multi-Model Routing, Shadow Inference, and Canary Rollout Governance (In Progress)
+## Phase 30 — Champion/Challenger Multi-Model Routing, Shadow Inference, and Canary Rollout Governance (Done)
 
 ### Objective
 
@@ -1241,14 +1245,38 @@ Enable safe production model deployment, continuous model comparison, and zero-d
 
 This phase does not implement external service meshes (Istio/Envoy), Kubernetes CRDs, or distributed message queues.
 
-### Implementation tasks
+### Delivery Record
 
-1. `routing.py`: Core routing models, strategies, sticky hash splitting, canary safeguard metrics, and batch divergence evaluation.
-2. `audit.py`: Extend scoring audit events to record routed model version, role (`champion` / `challenger`), and shadow output comparisons.
-3. `api.py`: Integrate router, multi-model serving, non-blocking shadow inference, `/v1/routing/status` endpoint, Prometheus telemetry, and `/health` probe routing details.
-4. `cli.py`: Implement `fraud-detect route-eval` CLI command with divergence thresholds, audit replay, and CSV dataset support; expose routing options in `fraud-detect serve`.
-5. `tests/`: Add comprehensive test coverage across unit tests (`test_routing.py`), API integration (`test_api.py`), CLI integration (`test_cli.py`), and audit logging (`test_audit.py`).
-6. `docs`: Update `README.md`, `ARCHITECTURE.md`, `CHANGELOG.md`, and complete `ROADMAP.md` delivery record.
+- `49e92fe`: fix(test): replace constant getattr calls with direct attribute access in test_recalibration
+- `7dd60fd`: docs: set Phase 30 multi-model routing and canary governance in progress
+- `98bdd56`: feat: add multi-model routing engine and canary divergence safeguards
+- `28ea5f1`: feat(audit): record model role, routed model version, and shadow divergence in audit events
+- `8d77d0f`: feat(api): integrate multi-model routing, canary status endpoints, and shadow telemetry
+- `d57e211`: feat(cli): add route-eval command and multi-model routing serve options
+- `f4c1e02`: docs: document multi-model routing, canary governance, and complete Phase 30
+
+## Phase 31 — Feature Store Integration & Point-in-Time Offline/Online Consistency Governance (Proposed)
+
+### Objective
+
+Provide feature store integration abstractions and point-in-time join consistency guarantees between offline model training and real-time inference, preventing training-serving skew, offline target leakage, and uncoordinated entity state drift.
+
+### Scope
+
+- **Feature store entity contract** (`features.py`): Typed feature view definitions, entity key specifications, feature value schemas, and offline/online storage interfaces.
+- **Point-in-time historical join engine**: Time-travel join semantics joining transaction timestamps with historical feature snapshots without future-feature leakage.
+- **Training-serving skew surveillance**: Quantify statistical feature divergence (KS test, Wasserstein distance, PSI) between online request features and offline reference feature views.
+- **Offline / Online consistency validation CLI**: `fraud-detect feature-check` and `fraud-detect feature-sync` commands.
+
+### Acceptance criteria
+
+- Historical joins strictly satisfy $t_{\text{feature}} \le t_{\text{tx}}$ without lookahead bias.
+- Real-time online feature lookup integrates cleanly into `create_app` scoring lifecycle.
+- Test suite achieves 100% pass rate, branch coverage remains $\ge 97.0\%$, Ruff and strict mypy pass with zero errors.
+
+### Explicit exclusions
+
+This phase does not implement external cloud database drivers (Feast, Snowflake, BigQuery, Redis) as hard dependencies; it provides an in-memory/file-backed canonical reference implementation with pluggable store protocols.
 
 ## Contributing to the roadmap
 
@@ -1256,3 +1284,4 @@ Open an issue or a pull request that references the relevant phase item.
 Proposing a new item is welcome; keep it scoped to this project's stated
 mission rather than general production-readiness concerns already assigned
 to the deploying operator in SECURITY.md.
+
