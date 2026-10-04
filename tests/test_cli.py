@@ -5116,3 +5116,296 @@ def test_cli_recalibrate_error_handling(
         )
         assert res_save_fail.exit_code == 2
         assert "Failed to save recalibrated model" in res_save_fail.output
+
+
+def test_cli_route_eval_help() -> None:
+    res = runner.invoke(app, ["route-eval", "--help"])
+    assert res.exit_code == 0
+    assert "--champion" in res.output
+    assert "--challenger" in res.output
+    assert "--data" in res.output
+    assert "Evaluate decision discrepancies" in res.output
+    assert "--json" in res.output
+    assert "--output" in res.output
+
+
+def test_cli_route_eval_csv_and_json(
+    tmp_path: Path,
+    trained_artifact: Path,
+) -> None:
+    # Prepare challenger model
+    base_model = load_model(trained_artifact)
+    challenger = deepcopy(base_model)
+    challenger.metadata["dataset_fingerprint"] = "c" * 64
+    chall_path = tmp_path / "challenger_artifact"
+    save_model(challenger, chall_path)
+
+    # Prepare evaluation data CSV
+    eval_df = generate_synthetic_data(rows=200, random_state=42)
+    data_csv = tmp_path / "eval_data.csv"
+    eval_df.to_csv(data_csv, index=False)
+
+    # 1. Text output
+    res_text = runner.invoke(
+        app,
+        [
+            "route-eval",
+            "--champion",
+            str(trained_artifact),
+            "--challenger",
+            str(chall_path),
+            "--data",
+            str(data_csv),
+        ],
+    )
+    assert res_text.exit_code == 0
+    assert "Canary Multi-Model Divergence Evaluation Report" in res_text.output
+    assert "Champion Version:" in res_text.output
+    assert "Challenger Version:" in res_text.output
+    assert "Decision Flips:" in res_text.output
+    assert "Rollout Recommendation:" in res_text.output
+
+    # 2. JSON output and file
+    out_json = tmp_path / "report.json"
+    res_json = runner.invoke(
+        app,
+        [
+            "route-eval",
+            "--champion",
+            str(trained_artifact),
+            "--challenger",
+            str(chall_path),
+            "--data",
+            str(data_csv),
+            "--json",
+            "--output",
+            str(out_json),
+        ],
+    )
+    assert res_json.exit_code == 0
+    data = json.loads(res_json.output)
+    assert data["total_samples"] == 200
+    assert "flip_rate" in data
+    assert "mean_probability_divergence" in data
+    assert out_json.exists()
+
+
+def test_cli_route_eval_jsonl_audit_input(
+    tmp_path: Path,
+    trained_artifact: Path,
+) -> None:
+    base_model = load_model(trained_artifact)
+    challenger = deepcopy(base_model)
+    challenger.metadata["dataset_fingerprint"] = "c" * 64
+    chall_path = tmp_path / "challenger_audit_eval"
+    save_model(challenger, chall_path)
+
+    # Generate synthetic audit JSONL
+    eval_df = generate_synthetic_data(rows=200, random_state=99)
+    audit_file = tmp_path / "audit_events.jsonl"
+    records = eval_df.drop(columns="Class", errors="ignore").to_dict(orient="records")
+    with audit_file.open("w", encoding="utf-8") as f:
+        for rec in records:
+            event = {
+                "event_type": "scoring",
+                "payload": {"features": [rec]},
+            }
+            f.write(json.dumps(event) + "\n")
+
+    res = runner.invoke(
+        app,
+        [
+            "route-eval",
+            "--champion",
+            str(trained_artifact),
+            "--challenger",
+            str(chall_path),
+            "--data",
+            str(audit_file),
+            "--json",
+        ],
+    )
+    assert res.exit_code == 0
+    data = json.loads(res.output)
+    assert data["total_samples"] == 200
+
+
+def test_cli_route_eval_fail_on_discrepancy(
+    tmp_path: Path,
+    trained_artifact: Path,
+) -> None:
+    base_model = load_model(trained_artifact)
+    divergent = deepcopy(base_model)
+    divergent.metadata["dataset_fingerprint"] = "d" * 64
+    divergent.threshold = 0.01  # will trigger flips against normal threshold
+    div_path = tmp_path / "divergent_artifact"
+    save_model(divergent, div_path)
+
+    eval_df = generate_synthetic_data(rows=200, random_state=12)
+    data_csv = tmp_path / "eval_div.csv"
+    eval_df.to_csv(data_csv, index=False)
+
+    res = runner.invoke(
+        app,
+        [
+            "route-eval",
+            "--champion",
+            str(trained_artifact),
+            "--challenger",
+            str(div_path),
+            "--data",
+            str(data_csv),
+            "--max-discrepancy-rate",
+            "0.01",
+            "--min-evaluations",
+            "5",
+            "--fail-on-discrepancy",
+        ],
+    )
+    assert res.exit_code == 1
+    assert "Safeguard Tripped:           True" in res.output
+
+
+def test_cli_route_eval_errors(
+    tmp_path: Path,
+    trained_artifact: Path,
+) -> None:
+    # 1. Invalid champion
+    res1 = runner.invoke(
+        app,
+        [
+            "route-eval",
+            "--champion",
+            str(tmp_path / "nonexistent"),
+            "--challenger",
+            str(trained_artifact),
+            "--data",
+            str(tmp_path / "data.csv"),
+        ],
+    )
+    assert res1.exit_code != 0
+
+    # 2. Corrupt data
+    bad_data = tmp_path / "bad.csv"
+    bad_data.write_text("not,a,valid,csv\n1\n", encoding="utf-8")
+    res2 = runner.invoke(
+        app,
+        [
+            "route-eval",
+            "--champion",
+            str(trained_artifact),
+            "--challenger",
+            str(trained_artifact),
+            "--data",
+            str(bad_data),
+        ],
+    )
+    assert res2.exit_code == 2
+
+    # 3. Empty JSONL
+    empty_jsonl = tmp_path / "empty.jsonl"
+    empty_jsonl.write_text("\n\n", encoding="utf-8")
+    res3 = runner.invoke(
+        app,
+        [
+            "route-eval",
+            "--champion",
+            str(trained_artifact),
+            "--challenger",
+            str(trained_artifact),
+            "--data",
+            str(empty_jsonl),
+        ],
+    )
+    assert res3.exit_code == 2
+    assert "No valid transaction features" in res3.output
+
+    # 4. Output exists without overwrite
+    existing_out = tmp_path / "exists.json"
+    existing_out.write_text("{}", encoding="utf-8")
+    valid_data = tmp_path / "valid.csv"
+    generate_synthetic_data(rows=200).to_csv(valid_data, index=False)
+    res4 = runner.invoke(
+        app,
+        [
+            "route-eval",
+            "--champion",
+            str(trained_artifact),
+            "--challenger",
+            str(trained_artifact),
+            "--data",
+            str(valid_data),
+            "--output",
+            str(existing_out),
+        ],
+    )
+    assert res4.exit_code == 2
+    assert "Output already exists" in res4.output
+
+
+def test_cli_serve_routing_options(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact_path = tmp_path / "artifact"
+    artifact_path.mkdir()
+    chall_path = tmp_path / "challenger"
+    chall_path.mkdir()
+
+    created: dict[str, Any] = {}
+
+    def fake_load_model(_path: Path | str) -> object:
+        return object()
+
+    def fake_create_app(**kwargs: Any) -> object:
+        created.update(kwargs)
+        return object()
+
+    def fake_run(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr("fraud_detection.cli.load_model", fake_load_model)
+    monkeypatch.setattr("fraud_detection.api.create_app", fake_create_app)
+    monkeypatch.setattr("fraud_detection.cli.uvicorn.run", fake_run)
+
+    # Valid routing options
+    served = runner.invoke(
+        app,
+        [
+            "serve",
+            str(artifact_path),
+            "--challenger-model",
+            str(chall_path),
+            "--routing-strategy",
+            "canary",
+            "--challenger-weight",
+            "0.15",
+            "--routing-entity-key",
+            "card_id",
+            "--canary-max-discrepancy",
+            "0.10",
+            "--canary-max-divergence",
+            "0.20",
+        ],
+    )
+    assert served.exit_code == 0, served.output
+    assert created["challenger_model_path"] == chall_path
+    assert created["routing_strategy"].value == "canary"
+    assert created["challenger_weight"] == 0.15
+    assert created["routing_entity_key"] == "card_id"
+    assert created["canary_max_discrepancy"] == 0.10
+    assert created["canary_max_divergence"] == 0.20
+
+    # Invalid routing strategy
+    invalid = runner.invoke(
+        app,
+        [
+            "serve",
+            str(artifact_path),
+            "--routing-strategy",
+            "nonexistent_strategy",
+        ],
+    )
+    assert invalid.exit_code == 2
+    assert "Invalid --routing-strategy" in invalid.output
+

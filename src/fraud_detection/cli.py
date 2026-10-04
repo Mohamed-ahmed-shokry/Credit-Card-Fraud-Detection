@@ -83,6 +83,11 @@ from fraud_detection.recalibration import (
     compute_calibration_drift,
 )
 from fraud_detection.reporting import ComplianceReportError, render_compliance_report
+from fraud_detection.routing import (
+    CanaryConfig,
+    TrafficSplitStrategy,
+    evaluate_model_divergence,
+)
 from fraud_detection.signing import (
     SigningError,
     load_private_key,
@@ -3529,6 +3534,63 @@ def serve_command(
             help="Precedence: 'rules_override_model' or 'model_overrides_rules'.",
         ),
     ] = "rules_override_model",
+    challenger_model: Annotated[
+        Path | None,
+        typer.Option(
+            "--challenger-model",
+            exists=True,
+            readable=True,
+            help="Optional candidate Challenger model artifact directory or file.",
+        ),
+    ] = None,
+    routing_strategy: Annotated[
+        str | None,
+        typer.Option(
+            "--routing-strategy",
+            help="Traffic split strategy (e.g. champion_only, canary, hash, percentage).",
+        ),
+    ] = None,
+    challenger_weight: Annotated[
+        float | None,
+        typer.Option(
+            "--challenger-weight",
+            min=0.0,
+            max=1.0,
+            help="Traffic weight assigned to Challenger (0.0 to 1.0).",
+        ),
+    ] = None,
+    routing_entity_key: Annotated[
+        str | None,
+        typer.Option(
+            "--routing-entity-key",
+            help="Entity identifier key for sticky hash partitioning (default 'card_id').",
+        ),
+    ] = None,
+    canary_max_discrepancy: Annotated[
+        float | None,
+        typer.Option(
+            "--canary-max-discrepancy",
+            min=0.0,
+            max=1.0,
+            help="Max allowable canary flip rate before safeguard trip.",
+        ),
+    ] = None,
+    canary_max_divergence: Annotated[
+        float | None,
+        typer.Option(
+            "--canary-max-divergence",
+            min=0.0,
+            max=1.0,
+            help="Max allowable canary mean probability divergence before safeguard trip.",
+        ),
+    ] = None,
+    canary_auto_rollback: Annotated[
+        bool,
+        typer.Option(
+            "--canary-auto-rollback/--no-canary-auto-rollback",
+            help="Automatically roll back canary routing if discrepancy safeguards trip.",
+        ),
+    ] = True,
 ) -> None:
     """Run the versioned HTTP prediction service with optional trace export."""
     from fraud_detection.api import create_app
@@ -3541,6 +3603,17 @@ def serve_command(
             f"Invalid --rule-precedence '{rule_precedence}'. "
             "Must be 'rules_override_model' or 'model_overrides_rules'."
         )
+
+    resolved_strategy: TrafficSplitStrategy | None = None
+    if routing_strategy is not None:
+        try:
+            resolved_strategy = TrafficSplitStrategy(routing_strategy.strip().lower())
+        except ValueError:
+            valid_strategies = ", ".join(s.value for s in TrafficSplitStrategy)
+            _abort(
+                f"Invalid --routing-strategy '{routing_strategy}'. "
+                f"Must be one of: {valid_strategies}."
+            )
 
     try:
         model = load_model(model_path)
@@ -3560,6 +3633,13 @@ def serve_command(
             trust_bundle_path=trust_bundle,
             rules_path=rules,
             rule_precedence=resolved_prec,
+            challenger_model_path=challenger_model,
+            routing_strategy=resolved_strategy,
+            challenger_weight=challenger_weight,
+            routing_entity_key=routing_entity_key,
+            canary_max_discrepancy=canary_max_discrepancy,
+            canary_max_divergence=canary_max_divergence,
+            canary_auto_rollback=canary_auto_rollback,
         ),
         host=host,
         port=port,
@@ -4342,6 +4422,169 @@ def recalibrate_command(
             f"(Brier: {post_diag.brier_score:.4f})"
         )
         typer.echo(f"Artifact Saved:       {output}")
+
+
+@app.command("route-eval")
+def route_eval_command(
+    champion: Annotated[
+        Path,
+        typer.Option(
+            "--champion",
+            "-c",
+            exists=True,
+            readable=True,
+            help="Path to production Champion model artifact directory or file.",
+        ),
+    ],
+    challenger: Annotated[
+        Path,
+        typer.Option(
+            "--challenger",
+            "-k",
+            exists=True,
+            readable=True,
+            help="Path to candidate Challenger model artifact directory or file.",
+        ),
+    ],
+    data: Annotated[
+        Path,
+        typer.Option(
+            "--data",
+            "-d",
+            exists=True,
+            readable=True,
+            help="Evaluation dataset file (CSV or JSONL audit event log).",
+        ),
+    ],
+    max_discrepancy_rate: Annotated[
+        float,
+        typer.Option(
+            "--max-discrepancy-rate",
+            min=0.0,
+            max=1.0,
+            help="Maximum acceptable fraction of classification decision flips.",
+        ),
+    ] = 0.15,
+    max_divergence: Annotated[
+        float,
+        typer.Option(
+            "--max-divergence",
+            min=0.0,
+            max=1.0,
+            help="Maximum acceptable mean absolute difference in predicted probabilities.",
+        ),
+    ] = 0.25,
+    min_evaluations: Annotated[
+        int,
+        typer.Option(
+            "--min-evaluations",
+            min=1,
+            help="Minimum evaluated samples before safeguard trip triggers.",
+        ),
+    ] = 10,
+    fail_on_discrepancy: Annotated[
+        bool,
+        typer.Option(
+            "--fail-on-discrepancy",
+            help="Exit with non-zero exit code (1) if discrepancy safeguards trip.",
+        ),
+    ] = False,
+    output: Annotated[
+        Path | None,
+        typer.Option("--output", "-o", help="Optional JSON report output destination."),
+    ] = None,
+    overwrite: Annotated[
+        bool,
+        typer.Option(help="Replace an existing report file."),
+    ] = False,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Output raw JSON instead of formatted text."),
+    ] = False,
+) -> None:
+    """Evaluate decision discrepancies and probability divergence between
+    Champion and Challenger models.
+    """
+    _guard_output(output, overwrite)
+
+    try:
+        champ_model = load_model(champion)
+    except ModelArtifactError as exc:
+        _abort(f"Failed to load Champion model: {exc}")
+
+    try:
+        chall_model = load_model(challenger)
+    except ModelArtifactError as exc:
+        _abort(f"Failed to load Challenger model: {exc}")
+
+    try:
+        if data.suffix.lower() == ".jsonl":
+            records: list[dict[str, Any]] = []
+            with data.open("r", encoding="utf-8") as f:
+                for line in f:
+                    line_str = line.strip()
+                    if not line_str:
+                        continue
+                    event = json.loads(line_str)
+                    payload = event.get("payload", {})
+                    feats = payload.get("features", event.get("features"))
+                    if isinstance(feats, list):
+                        records.extend(feats)
+                    elif isinstance(feats, dict):
+                        records.append(feats)
+            if not records:
+                _abort(f"No valid transaction features found in JSONL audit log '{data}'.")
+            eval_frame = pd.DataFrame(records)
+        else:
+            eval_frame = pd.read_csv(data).drop(columns="Class", errors="ignore")
+    except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
+        _abort(f"Failed to load evaluation dataset: {exc}")
+
+    canary_cfg = CanaryConfig(
+        max_discrepancy_rate=max_discrepancy_rate,
+        max_probability_divergence=max_divergence,
+        min_evaluations=min_evaluations,
+        auto_rollback=True,
+    )
+
+    try:
+        report = evaluate_model_divergence(
+            champion_model=champ_model,
+            challenger_model=chall_model,
+            data=eval_frame,
+            canary_config=canary_cfg,
+        )
+    except (ValueError, TypeError, ModelArtifactError) as exc:
+        _abort(f"Divergence evaluation failed: {exc}")
+
+    report_dict = report.to_dict()
+    report_json = json.dumps(report_dict, indent=2)
+
+    if output is not None:
+        _atomic_write_text(report_json + "\n", output)
+
+    if json_output:
+        typer.echo(report_json)
+    else:
+        champ_ver = str(champ_model.metadata.get("dataset_fingerprint", "unknown"))[:12]
+        chall_ver = str(chall_model.metadata.get("dataset_fingerprint", "unknown"))[:12]
+        typer.echo("Canary Multi-Model Divergence Evaluation Report")
+        typer.echo(f"Champion Version:            {champ_ver}")
+        typer.echo(f"Challenger Version:          {chall_ver}")
+        typer.echo(f"Evaluated Transactions:      {report.total_samples}")
+        typer.echo(f"Decision Flips:              {report.discrepancies} ({report.flip_rate:.2%})")
+        typer.echo(f"Mean Probability Divergence:  {report.mean_probability_divergence:.4f}")
+        typer.echo(f"Max Probability Divergence:   {report.max_probability_divergence:.4f}")
+        typer.echo(f"Champion Flagged Rate:       {report.champion_flagged_rate:.2%}")
+        typer.echo(f"Challenger Flagged Rate:     {report.challenger_flagged_rate:.2%}")
+        typer.echo(f"Canary Safeguard Status:     {report.canary_status.value.upper()}")
+        typer.echo(f"Safeguard Tripped:           {report.safeguard_tripped}")
+        typer.echo(f"Rollout Recommendation:      {report.recommendation}")
+        if output is not None:
+            typer.echo(f"Report Saved:                {output}")
+
+    if fail_on_discrepancy and report.safeguard_tripped:
+        raise typer.Exit(code=1)
 
 
 def _abort(message: str) -> NoReturn:
