@@ -1184,22 +1184,22 @@ This phase does not implement distributed Redis / Kafka state stores, distribute
 - `9ca8140`: feat: add compute-velocity CLI command for batch feature engineering
 - `d3ef9b8`: docs: document transaction velocity profiling, sliding windows, and CLI workflows
 
-## Phase 29 — Model Calibration Surveillance, Post-Hoc Recalibration, and Reliability Diagnostics (In Progress)
+## Phase 29 — Model Calibration Surveillance, Post-Hoc Recalibration, and Reliability Diagnostics (Done)
 
 ### Objective
 
-Continuously monitor probability calibration in production, detect score distortion and confidence drift across decision tiers, provide post-hoc recalibration transformations (Platt scaling and Isotonic regression), and verify calibrated risk intervals for risk-sensitive operational routing.
+Continuously monitor probability calibration in production, detect score distortion and confidence drift across decision tiers, provide post-hoc recalibration transformations (Platt scaling, Isotonic regression, and Temperature scaling), and verify calibrated risk intervals for risk-sensitive operational routing.
 
 ### Scope
 
-- **Calibration diagnostics & surveillance** — compute Expected Calibration Error (ECE), Maximum Calibration Error (MCE), and adaptive quantile-binned reliability curves for model predictions.
-- **Post-hoc recalibrator suite** — implement Platt scaling (logistic sigmoid fit) and non-parametric isotonic regression recalibrators with monotonic probability mapping.
-- **Artifact & serving integration** — serialize recalibrator checkpoints within model artifacts, enabling transparent runtime score adjustment in `FraudModel.predict_proba()` and API serving.
-- **CLI diagnostic commands** — add `fraud-detect calibrate-eval` and `fraud-detect recalibrate` commands generating calibration reports, reliability plots, and recalibrated model artifacts.
+- **Calibration diagnostics & surveillance** — compute Expected Calibration Error (ECE), Maximum Calibration Error (MCE), Root Mean Squared Calibration Error (RMSCE), Brier score decomposition (reliability, resolution, uncertainty), and adaptive quantile-binned reliability curves for imbalanced fraud distributions.
+- **Post-hoc recalibrator suite** — implement Platt scaling (monotonic logistic sigmoid fit with Laplace smoothing), non-parametric isotonic regression, and rank-preserving temperature scaling recalibrators.
+- **Artifact & serving integration** — serialize recalibrator checkpoints within model artifacts, enabling transparent runtime score adjustment in `FraudModel.predict_probabilities(raw=...)` and API serving with `/health` and `/ready` telemetry and Prometheus instrumentation.
+- **CLI diagnostic commands** — add `fraud-detect calibrate-eval` and `fraud-detect recalibrate` commands generating calibration reports, drift surveillance gating, and recalibrated model artifacts with retuned decision thresholds.
 
 ### Acceptance criteria
 
-- ECE and binned calibration metrics compute deterministically with zero division or empty-bin failure modes.
+- ECE and binned calibration metrics compute deterministically with zero division or empty-bin failure modes across uniform, quantile, and tiered binning strategies.
 - Recalibrated probabilities are monotonically non-decreasing and bounded strictly within $[0, 1]$.
 - Recalibrators serialize and deserialize seamlessly within artifact bundles without breaking model card schemas or backward compatibility.
 - Test suite achieves 100% pass rate, branch coverage remains $\ge 97.0\%$, Ruff and strict mypy pass with zero errors.
@@ -1207,6 +1207,39 @@ Continuously monitor probability calibration in production, detect score distort
 ### Explicit exclusions
 
 This phase does not implement online gradient-based temperature scaling or Bayesian neural network calibration.
+
+### Delivery Record
+
+- `55bf888`: docs: set Phase 29 model calibration surveillance and recalibration in progress
+- `47ee93c`: feat: add model calibration surveillance and post-hoc recalibration engine
+- `0974587`: feat: integrate post-hoc recalibration into FraudModel and artifact pipeline
+- `571e42a`: feat: integrate model recalibration status and metrics into serving API
+- `d4f6cba`: feat: add calibrate-eval and recalibrate CLI commands
+- `ac591e4`: docs: document calibration surveillance and post-hoc recalibration workflows
+
+## Phase 30 — Champion/Challenger Multi-Model Routing, Shadow Inference, and Canary Rollout Governance
+
+### Objective
+
+Enable safe production model deployment, continuous model comparison, and zero-downtime cutovers by supporting multi-model serving topologies: Champion/Challenger routing with deterministic traffic splitting (hash-based or percentage-based), non-blocking shadow traffic evaluation (mirroring requests asynchronously to candidate challenger models without impacting champion latency or availability), and automated canary evaluation with rollback safeguards based on divergence thresholds.
+
+### Scope
+
+- **Multi-model routing engine** — implement typed routing policies (`ChampionChallengerRouter`, `RoutingPolicy`, `TrafficSplitStrategy`) supporting sticky hash-partitioned or percentage-weighted distribution between active Champion and candidate Challenger models.
+- **Non-blocking shadow inference** — support asynchronous shadow mirroring in serving requests, scoring challenger candidates concurrently without impacting champion latency, availability, or error responses.
+- **Discrepancy surveillance & telemetry** — compute real-time decision flip rates, probability divergences, and score disparity metrics between Champion and Challenger runs, exposed via Prometheus metrics (`fraud_routing_predictions_total`, `fraud_shadow_discrepancy_total`) and `/v1/routing/status` endpoint.
+- **Canary evaluation CLI** — add `fraud-detect route-eval` CLI command to evaluate traffic splitting and shadow divergence against historical datasets or streaming audit logs.
+
+### Acceptance criteria
+
+- Champion responses remain unaffected by challenger latency, timeout, or execution failures during shadow mode.
+- Hash-based traffic splitting guarantees stable entity stickiness without session state stores.
+- Scoring endpoints and audit logs record routed model versions, roles (`champion` vs `challenger`), and shadow prediction outputs.
+- Test suite achieves 100% pass rate, branch coverage remains $\ge 97.0\%$, Ruff and strict mypy pass with zero errors.
+
+### Explicit exclusions
+
+This phase does not implement external service meshes (Istio/Envoy), Kubernetes CRDs, or distributed message queues.
 
 ## Contributing to the roadmap
 
