@@ -402,6 +402,51 @@ For each configured time window (e.g. `5m` [300s], `1h` [3600s], `24h` [86400s])
 - **Prometheus metrics**: `fraud_velocity_enrichments_total` counts enriched inbound transactions; `fraud_velocity_entities_active` tracks currently active entities.
 - **Service health probes**: `/health` and `/ready` report `velocity_enabled` and `velocity_entities_count`.
 
+## Model calibration surveillance and post-hoc recalibration
+
+Probability calibration aligns predicted fraud probabilities with true empirical risk. When models exhibit miscalibration or drift under changing base rates or class imbalance, calibration surveillance detects divergence and post-hoc recalibration restores statistical reliability without requiring costly full model retraining:
+
+```bash
+# Evaluate calibration diagnostics and reliability curves (uniform, quantile, or tiered binning)
+fraud-detect calibrate-eval artifacts/model Dataset/eval.csv \
+  --bins 10 \
+  --strategy quantile \
+  --output reports/calibration_eval.json
+
+# Assess calibration drift against a reference baseline and fail if degraded
+fraud-detect calibrate-eval artifacts/model Dataset/recent.csv \
+  --baseline reports/baseline_calibration.json \
+  --fail-on-drift
+
+# Fit a post-hoc recalibrator (sigmoid, isotonic, or temperature) and export updated model
+fraud-detect recalibrate artifacts/model Dataset/calibration.csv \
+  --output artifacts/recalibrated_model \
+  --method sigmoid \
+  --retune-threshold
+```
+
+### Surveillance metrics and reliability diagnostics
+
+- **Expected Calibration Error (ECE)**: Sample-weighted mean gap across probability bins: $\text{ECE} = \sum_{b=1}^B \frac{|B_b|}{N} |\text{acc}(B_b) - \text{conf}(B_b)|$.
+- **Maximum Calibration Error (MCE)**: Worst-case probability error across all bins: $\text{MCE} = \max_b |\text{acc}(B_b) - \text{conf}(B_b)|$.
+- **Root Mean Squared Calibration Error (RMSCE)**: Penalizes larger probability errors quadratically: $\text{RMSCE} = \sqrt{\sum_{b=1}^B \frac{|B_b|}{N} (\text{acc}(B_b) - \text{conf}(B_b))^2}$.
+- **Brier Score Decomposition**: Decomposes total Brier score into $\text{Reliability} - \text{Resolution} + \text{Uncertainty}$.
+- **Imbalance-Aware Quantile Binning**: Generates equal-frequency quantile partitions, preventing sparse or collapsed upper bins on highly imbalanced fraud distributions (e.g. 0.17% fraud rate).
+- **Calibration Drift Detection**: Compares current reliability curves against reference baselines, tracking ECE shift, Brier shift, and maximum bin divergence with `STABLE`, `WARNING`, and `DEGRADED` operational statuses.
+
+### Post-hoc recalibration algorithms
+
+- **Platt Scaling (`sigmoid`)**: Logistic sigmoid on uncalibrated log-odds with monotonic constraint $A \ge 0$ and Bayesian Laplace smoothing targets ($t_+ = \frac{N_+ + 1}{N_+ + 2}$, $t_- = \frac{1}{N_- + 2}$).
+- **Isotonic Regression (`isotonic`)**: Non-parametric piecewise constant isotonic regression with boundary clipping, strictly preserving non-decreasing probability ordering.
+- **Temperature Scaling (`temperature`)**: Single-parameter log-odds temperature scaling $\sigma(\text{logit}(p) / T)$ with $T > 0$, strictly preserving AUC-ROC and decision ranking while calibrating confidence.
+- **Automated Threshold Retuning**: Updates operational decision thresholds (cost-optimal or F1-optimal) on the recalibrated scale to maintain target recall and false positive rates.
+
+### Operational serving and telemetry
+
+- **Health Probes**: `/health` and `/ready` report `recalibration_enabled: true` and `recalibration_method: "sigmoid" | "isotonic" | "temperature"` when an attached recalibrator is serving.
+- **Prometheus Metrics**: Inbound predictions scored with post-hoc recalibration increment `fraud_recalibrated_predictions_total{method="..."}`.
+- **Dual Probabilities**: Scored predictions and structured audit events expose both calibrated `fraud_probability` and uncalibrated `raw_probability`.
+
 ## Train on the anonymized dataset
 
 Place the downloaded CSV under the ignored `Dataset/` directory; raw financial data

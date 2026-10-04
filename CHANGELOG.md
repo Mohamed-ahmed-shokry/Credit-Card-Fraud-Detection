@@ -8,6 +8,27 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- Model calibration surveillance and reliability diagnostics: added `compute_calibration_diagnostics()` in
+  `recalibration.py` calculating Expected Calibration Error (ECE), Maximum Calibration Error (MCE), Root Mean
+  Squared Calibration Error (RMSCE), and complete Brier score decomposition (reliability, resolution, uncertainty)
+  across uniform, quantile (equal-frequency for imbalanced distributions), and tiered probability binning strategies.
+- Post-hoc probability recalibration engine: added `PlattRecalibrator` (monotonic logistic sigmoid with Bayesian
+  Laplace smoothing priors), `IsotonicRecalibrator` (non-parametric piecewise constant isotonic regression), and
+  `TemperatureRecalibrator` (rank-preserving log-odds temperature scaling), with factory creation (`create_recalibrator`),
+  serialization, and deserialization (`load_recalibrator`).
+- Model artifact recalibration pipeline: integrated post-hoc recalibration into `FraudModel` with
+  `predict_probabilities(raw=...)`, and added `recalibrate_model()` in `model.py` with automated decision threshold
+  retuning (cost-optimal and F1-optimal) and bundle packaging.
+- Calibration drift surveillance: added `CalibrationDriftReport` and `detect_calibration_drift()` in
+  `recalibration.py` comparing empirical reliability curves against reference baselines with multi-level
+  operational drift gating (`STABLE`, `WARNING`, `DEGRADED`).
+- Serving API calibration telemetry: updated `create_app` in `api.py` to report `recalibration_enabled` and
+  `recalibration_method` in `/health` and `/ready` probes, increment Prometheus counter `fraud_recalibrated_predictions_total`,
+  and expose both calibrated `fraud_probability` and uncalibrated `raw_probability` in predictions and audit logs.
+- Calibration CLI commands: added `fraud-detect calibrate-eval` for standalone calibration evaluation and baseline
+  drift surveillance (with `--fail-on-drift`), and `fraud-detect recalibrate` for fitting post-hoc recalibrators and
+  exporting updated model artifacts with retuned decision thresholds.
+
 - Transaction velocity profiling and sliding feature window engine: added `VelocityConfig`, `VelocityWindow`,
   `SlidingWindow`, and thread-safe `VelocityWindowBuffer` in `velocity.py` computing sliding window count,
   sum, min, max, mean, population standard deviation, and exponential moving averages with bounded $O(1)$
