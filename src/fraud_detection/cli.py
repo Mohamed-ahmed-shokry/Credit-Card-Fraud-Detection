@@ -68,11 +68,19 @@ from fraud_detection.model import (
     ThresholdStrategy,
     TrainingConfig,
     load_model,
+    recalibrate_model,
     save_model,
     split_dataset,
     train_model,
     validate_artifact,
     verify_attestation,
+)
+from fraud_detection.recalibration import (
+    CalibrationDiagnostics,
+    CalibrationStrategy,
+    RecalibrationMethod,
+    compute_calibration_diagnostics,
+    compute_calibration_drift,
 )
 from fraud_detection.reporting import ComplianceReportError, render_compliance_report
 from fraud_detection.signing import (
@@ -4095,6 +4103,245 @@ def compute_velocity(
             f"Configured windows:   {', '.join(window_names)}\n"
             f"Enriched output:      {output}"
         )
+
+
+@app.command("calibrate-eval")
+def calibrate_eval(
+    model_path: Annotated[
+        Path,
+        typer.Argument(exists=True, readable=True, help="Model artifact directory or file."),
+    ],
+    data: Annotated[
+        Path,
+        typer.Argument(exists=True, dir_okay=False, readable=True, help="Evaluation dataset CSV."),
+    ],
+    target: Annotated[
+        str,
+        typer.Option(help="Binary label column containing 0 and 1."),
+    ] = DEFAULT_TARGET,
+    bins: Annotated[
+        int,
+        typer.Option(min=2, max=100, help="Number of probability bins."),
+    ] = 10,
+    strategy: Annotated[
+        CalibrationStrategy,
+        typer.Option(help="Binning strategy: uniform, quantile, or tiered."),
+    ] = CalibrationStrategy.UNIFORM,
+    baseline: Annotated[
+        Path | None,
+        typer.Option(
+            "--baseline",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="Path to baseline calibration JSON report for drift detection.",
+        ),
+    ] = None,
+    output: Annotated[
+        Path | None,
+        typer.Option("--output", "-o", help="Optional JSON report destination."),
+    ] = None,
+    overwrite: Annotated[
+        bool,
+        typer.Option(help="Allow overwriting an existing report file."),
+    ] = False,
+    fail_on_drift: Annotated[
+        bool,
+        typer.Option(help="Exit with non-zero status code if calibration drift is detected."),
+    ] = False,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Print machine-readable JSON output."),
+    ] = False,
+) -> None:
+    """Evaluate model probability calibration surveillance diagnostics and detect drift."""
+    _guard_output(output, overwrite)
+
+    try:
+        model = load_model(model_path)
+    except ModelArtifactError as exc:
+        _abort(f"Failed to load model from {model_path}: {exc}")
+
+    try:
+        dataset = load_csv(data, target_column=target)
+    except (DataValidationError, ValueError, OSError) as exc:
+        _abort(f"Failed to load dataset from {data}: {exc}")
+
+    probabilities = model.predict_probabilities(dataset.features)
+    y_true = dataset.target.to_numpy(dtype=float)
+
+    try:
+        diagnostics = compute_calibration_diagnostics(
+            y_true,
+            probabilities,
+            bins=bins,
+            strategy=strategy,
+        )
+    except ValueError as exc:
+        _abort(f"Calibration diagnostics computation failed: {exc}")
+
+    drift_report = None
+    if baseline is not None:
+        try:
+            baseline_payload = json.loads(baseline.read_text(encoding="utf-8"))
+            if isinstance(baseline_payload, dict) and "diagnostics" in baseline_payload:
+                baseline_diag = CalibrationDiagnostics.from_dict(baseline_payload["diagnostics"])
+            else:
+                baseline_diag = CalibrationDiagnostics.from_dict(baseline_payload)
+            drift_report = compute_calibration_drift(diagnostics, baseline_diag)
+        except (json.JSONDecodeError, KeyError, ValueError, TypeError, OSError) as exc:
+            _abort(f"Failed to load or compare baseline calibration report from {baseline}: {exc}")
+
+    result_payload: dict[str, Any]
+    if drift_report is not None:
+        result_payload = {
+            "diagnostics": diagnostics.to_dict(),
+            "drift": drift_report.to_dict(),
+        }
+    else:
+        result_payload = diagnostics.to_dict()
+
+    if output is not None:
+        _atomic_write_text(json.dumps(result_payload, indent=2) + "\n", output)
+
+    if json_output:
+        typer.echo(json.dumps(result_payload, indent=2))
+    else:
+        typer.echo("Calibration Surveillance Diagnostics")
+        typer.echo(f"Rows:                       {diagnostics.rows:,}")
+        typer.echo(f"Bins:                       {diagnostics.bins} ({diagnostics.strategy})")
+        typer.echo(f"Expected Calibration Error: {diagnostics.expected_calibration_error:.4f}")
+        typer.echo(f"Maximum Calibration Error:  {diagnostics.max_calibration_error:.4f}")
+        typer.echo(f"Root Mean Squared Error:    {diagnostics.root_mean_squared_error:.4f}")
+        typer.echo(f"Brier Score:                {diagnostics.brier_score:.4f}")
+        typer.echo(f"Reliability:                {diagnostics.reliability:.4f}")
+        typer.echo(f"Monotonicity Violations:    {diagnostics.monotonicity_violations}")
+        if drift_report is not None:
+            status_str = "DRIFT DETECTED" if drift_report.drift_detected else "STABLE"
+            typer.echo(f"Calibration Drift:          {status_str}")
+            typer.echo(f"ECE Shift:                  {drift_report.ece_shift:+.4f}")
+            typer.echo(f"Max Gap Shift:              {drift_report.max_gap_shift:+.4f}")
+            typer.echo(f"Brier Shift:                {drift_report.brier_shift:+.4f}")
+
+    if fail_on_drift and drift_report is not None and drift_report.drift_detected:
+        _abort(
+            f"Calibration drift detected (ECE shift={drift_report.ece_shift:+.4f}, "
+            f"max gap shift={drift_report.max_gap_shift:+.4f})."
+        )
+
+
+@app.command("recalibrate")
+def recalibrate_command(
+    model_path: Annotated[
+        Path,
+        typer.Argument(exists=True, readable=True, help="Source model artifact directory or file."),
+    ],
+    data: Annotated[
+        Path,
+        typer.Argument(exists=True, dir_okay=False, readable=True, help="Calibration dataset CSV."),
+    ],
+    output: Annotated[
+        Path,
+        typer.Option(
+            "--output",
+            "-o",
+            help="Destination directory for recalibrated model artifact.",
+        ),
+    ],
+    method: Annotated[
+        RecalibrationMethod,
+        typer.Option(help="Recalibration algorithm: sigmoid, isotonic, or temperature."),
+    ] = RecalibrationMethod.SIGMOID,
+    retune_threshold: Annotated[
+        bool,
+        typer.Option(
+            "--retune-threshold/--no-retune-threshold",
+            help="Retune operational decision threshold on recalibrated probabilities.",
+        ),
+    ] = True,
+    target: Annotated[
+        str,
+        typer.Option(help="Binary label column containing 0 and 1."),
+    ] = DEFAULT_TARGET,
+    overwrite: Annotated[
+        bool,
+        typer.Option(help="Replace existing destination directory."),
+    ] = False,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Print machine-readable JSON summary."),
+    ] = False,
+) -> None:
+    """Fit a post-hoc probability recalibrator on a dataset and export updated artifact."""
+    if output.exists() and (output / "model.joblib").exists() and not overwrite:
+        _abort(f"Model artifact already exists at {output}. Pass --overwrite to replace it.")
+
+    try:
+        model = load_model(model_path)
+    except ModelArtifactError as exc:
+        _abort(f"Failed to load model from {model_path}: {exc}")
+
+    try:
+        dataset = load_csv(data, target_column=target)
+    except (DataValidationError, ValueError, OSError) as exc:
+        _abort(f"Failed to load dataset from {data}: {exc}")
+
+    raw_probs = model.predict_probabilities(dataset.features, raw=True)
+    y_true = dataset.target.to_numpy(dtype=float)
+    pre_diag = compute_calibration_diagnostics(y_true, raw_probs)
+
+    try:
+        recalibrated = recalibrate_model(
+            model,
+            dataset,
+            method=method,
+            retune_threshold=retune_threshold,
+        )
+    except (ValueError, TypeError, ModelArtifactError) as exc:
+        _abort(f"Model recalibration failed: {exc}")
+
+    post_probs = recalibrated.predict_probabilities(dataset.features)
+    post_diag = compute_calibration_diagnostics(y_true, post_probs)
+
+    try:
+        save_model(recalibrated, output)
+    except (ModelArtifactError, OSError) as exc:
+        _abort(f"Failed to save recalibrated model to {output}: {exc}")
+
+    summary = {
+        "method": method.value,
+        "model_version": str(recalibrated.metadata.get("dataset_fingerprint", ""))[:12],
+        "previous_threshold": round(float(model.threshold), 6),
+        "updated_threshold": round(float(recalibrated.threshold), 6),
+        "pre_calibration": {
+            "expected_calibration_error": round(pre_diag.expected_calibration_error, 6),
+            "max_calibration_error": round(pre_diag.max_calibration_error, 6),
+            "brier_score": round(pre_diag.brier_score, 6),
+        },
+        "post_calibration": {
+            "expected_calibration_error": round(post_diag.expected_calibration_error, 6),
+            "max_calibration_error": round(post_diag.max_calibration_error, 6),
+            "brier_score": round(post_diag.brier_score, 6),
+        },
+        "artifact_path": str(output),
+    }
+
+    if json_output:
+        typer.echo(json.dumps(summary, indent=2))
+    else:
+        typer.echo("Post-Hoc Model Recalibration Complete")
+        typer.echo(f"Algorithm:            {method.value}")
+        typer.echo(f"Original Threshold:   {model.threshold:.4f}")
+        typer.echo(f"Updated Threshold:    {recalibrated.threshold:.4f}")
+        typer.echo(
+            f"Pre-Calibration ECE:  {pre_diag.expected_calibration_error:.4f} "
+            f"(Brier: {pre_diag.brier_score:.4f})"
+        )
+        typer.echo(
+            f"Post-Calibration ECE: {post_diag.expected_calibration_error:.4f} "
+            f"(Brier: {post_diag.brier_score:.4f})"
+        )
+        typer.echo(f"Artifact Saved:       {output}")
 
 
 def _abort(message: str) -> NoReturn:

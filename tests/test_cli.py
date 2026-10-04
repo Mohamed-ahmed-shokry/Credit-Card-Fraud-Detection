@@ -28,12 +28,14 @@ from fraud_detection.model import (
     MODEL_FILENAME,
     CalibrationMethod,
     FraudModel,
+    ModelArtifactError,
     TrainingConfig,
     load_model,
     save_model,
     train_model,
     verify_attestation,
 )
+from fraud_detection.recalibration import CalibrationDiagnostics
 from fraud_detection.rules import (
     DecisionRule,
     RuleAction,
@@ -4728,3 +4730,389 @@ def test_compute_velocity_cli_errors(tmp_path: Path) -> None:
     )
     assert res_bad_cols.exit_code == 2
     assert "Velocity computation failed" in res_bad_cols.output
+
+
+def test_cli_calibrate_eval_basic_and_json(
+    trained_artifact: Path,
+    tmp_path: Path,
+) -> None:
+    data_csv = tmp_path / "eval_data.csv"
+    generate_synthetic_data(rows=200, random_state=42).to_csv(data_csv, index=False)
+
+    # Human-readable table
+    res_table = runner.invoke(
+        app,
+        ["calibrate-eval", str(trained_artifact), str(data_csv)],
+    )
+    assert res_table.exit_code == 0
+    assert "Calibration Surveillance Diagnostics" in res_table.output
+    assert "Expected Calibration Error:" in res_table.output
+    assert "Brier Score:" in res_table.output
+
+    # JSON output and output file saving
+    report_file = tmp_path / "cal_report.json"
+    res_json = runner.invoke(
+        app,
+        [
+            "calibrate-eval",
+            str(trained_artifact),
+            str(data_csv),
+            "--bins",
+            "5",
+            "--strategy",
+            "quantile",
+            "--output",
+            str(report_file),
+            "--json",
+        ],
+    )
+    assert res_json.exit_code == 0
+    payload = json.loads(res_json.output)
+    assert payload["strategy"] == "quantile"
+    assert payload["bins"] >= 2
+    assert len(payload["detail"]) == payload["bins"]
+    assert "expected_calibration_error" in payload
+    assert report_file.exists()
+
+    # Re-running with existing output without overwrite fails
+    res_no_ovw = runner.invoke(
+        app,
+        ["calibrate-eval", str(trained_artifact), str(data_csv), "--output", str(report_file)],
+    )
+    assert res_no_ovw.exit_code == 2
+
+    # Re-running with --overwrite succeeds
+    res_ovw = runner.invoke(
+        app,
+        [
+            "calibrate-eval",
+            str(trained_artifact),
+            str(data_csv),
+            "--output",
+            str(report_file),
+            "--overwrite",
+        ],
+    )
+    assert res_ovw.exit_code == 0
+
+
+def test_cli_calibrate_eval_baseline_and_drift(
+    trained_artifact: Path,
+    tmp_path: Path,
+) -> None:
+    data_csv = tmp_path / "eval_data.csv"
+    generate_synthetic_data(rows=200, random_state=42).to_csv(data_csv, index=False)
+
+    baseline_file = tmp_path / "baseline.json"
+    res_base = runner.invoke(
+        app,
+        ["calibrate-eval", str(trained_artifact), str(data_csv), "--output", str(baseline_file)],
+    )
+    assert res_base.exit_code == 0
+
+    # Compare against identical baseline -> no drift
+    res_comp = runner.invoke(
+        app,
+        [
+            "calibrate-eval",
+            str(trained_artifact),
+            str(data_csv),
+            "--baseline",
+            str(baseline_file),
+            "--fail-on-drift",
+        ],
+    )
+    assert res_comp.exit_code == 0
+    assert "Calibration Drift:          STABLE" in res_comp.output
+
+    # Compare against an altered baseline that trips drift
+    base_data = json.loads(baseline_file.read_text(encoding="utf-8"))
+    base_data["expected_calibration_error"] = 0.99
+    base_data["max_calibration_error"] = 0.99
+    drifted_base_file = tmp_path / "drifted_baseline.json"
+    drifted_base_file.write_text(json.dumps(base_data), encoding="utf-8")
+
+    res_drift = runner.invoke(
+        app,
+        [
+            "calibrate-eval",
+            str(trained_artifact),
+            str(data_csv),
+            "--baseline",
+            str(drifted_base_file),
+            "--fail-on-drift",
+        ],
+    )
+    assert res_drift.exit_code == 2
+    assert "Calibration drift detected" in res_drift.output
+
+
+def test_cli_calibrate_eval_error_handling(
+    trained_artifact: Path,
+    tmp_path: Path,
+) -> None:
+    data_csv = tmp_path / "eval_data.csv"
+    generate_synthetic_data(rows=200, random_state=42).to_csv(data_csv, index=False)
+
+    # Missing model
+    res_no_mod = runner.invoke(
+        app,
+        ["calibrate-eval", str(tmp_path / "missing_model"), str(data_csv)],
+    )
+    assert res_no_mod.exit_code != 0
+
+    # Corrupt model directory
+    corrupt_model = tmp_path / "corrupt_model"
+    corrupt_model.mkdir()
+    (corrupt_model / "model.joblib").write_bytes(b"garbage")
+    res_corrupt_mod = runner.invoke(app, ["calibrate-eval", str(corrupt_model), str(data_csv)])
+    assert res_corrupt_mod.exit_code == 2
+    assert "Failed to load model" in res_corrupt_mod.output
+
+    # Missing data
+    res_no_dat = runner.invoke(
+        app,
+        ["calibrate-eval", str(trained_artifact), str(tmp_path / "missing.csv")],
+    )
+    assert res_no_dat.exit_code != 0
+
+    # Corrupt CSV
+    bad_csv = tmp_path / "bad_data.csv"
+    pd.DataFrame({"V1": [1.0, 2.0], "Class": [5, 6]}).to_csv(bad_csv, index=False)
+    res_bad_csv = runner.invoke(app, ["calibrate-eval", str(trained_artifact), str(bad_csv)])
+    assert res_bad_csv.exit_code == 2
+    assert "Failed to load dataset" in res_bad_csv.output
+
+    # Bad baseline file
+    bad_base = tmp_path / "bad_baseline.json"
+    bad_base.write_text("invalid json", encoding="utf-8")
+    res_bad_base = runner.invoke(
+        app,
+        [
+            "calibrate-eval",
+            str(trained_artifact),
+            str(data_csv),
+            "--baseline",
+            str(bad_base),
+        ],
+    )
+    assert res_bad_base.exit_code == 2
+
+    # Baseline with nested "diagnostics" payload
+    base_file = tmp_path / "nested_base.json"
+    base_diag = CalibrationDiagnostics(
+        rows=100,
+        bins=2,
+        strategy="uniform",
+        brier_score=0.1,
+        expected_calibration_error=0.05,
+        max_calibration_error=0.05,
+        root_mean_squared_error=0.05,
+        reliability=0.01,
+        resolution=0.01,
+        uncertainty=0.01,
+        monotonicity_violations=0,
+        detail=(),
+    )
+    base_file.write_text(json.dumps({"diagnostics": base_diag.to_dict()}), encoding="utf-8")
+    res_nested = runner.invoke(
+        app,
+        [
+            "calibrate-eval",
+            str(trained_artifact),
+            str(data_csv),
+            "--baseline",
+            str(base_file),
+        ],
+    )
+    assert res_nested.exit_code == 0
+
+
+def test_cli_recalibrate_basic_and_json(
+    trained_artifact: Path,
+    tmp_path: Path,
+) -> None:
+    cal_data_csv = tmp_path / "cal_data.csv"
+    generate_synthetic_data(rows=250, random_state=123).to_csv(cal_data_csv, index=False)
+
+    out_artifact = tmp_path / "recal_model"
+    res_recal = runner.invoke(
+        app,
+        [
+            "recalibrate",
+            str(trained_artifact),
+            str(cal_data_csv),
+            "--output",
+            str(out_artifact),
+            "--method",
+            "sigmoid",
+            "--json",
+        ],
+    )
+    assert res_recal.exit_code == 0
+    summary = json.loads(res_recal.output)
+    assert summary["method"] == "sigmoid"
+    assert "pre_calibration" in summary
+    assert "post_calibration" in summary
+    assert (out_artifact / "model.joblib").exists()
+
+    # Load and verify recalibrated artifact
+    loaded_recal = load_model(out_artifact)
+    assert loaded_recal.recalibrator is not None
+    assert loaded_recal.recalibrator.method.value == "sigmoid"
+
+    # Overwrite protection
+    res_no_ovw = runner.invoke(
+        app,
+        [
+            "recalibrate",
+            str(trained_artifact),
+            str(cal_data_csv),
+            "--output",
+            str(out_artifact),
+        ],
+    )
+    assert res_no_ovw.exit_code == 2
+
+    # Overwrite succeeds
+    res_ovw = runner.invoke(
+        app,
+        [
+            "recalibrate",
+            str(trained_artifact),
+            str(cal_data_csv),
+            "--output",
+            str(out_artifact),
+            "--method",
+            "isotonic",
+            "--overwrite",
+        ],
+    )
+    assert res_ovw.exit_code == 0
+    assert "Post-Hoc Model Recalibration Complete" in res_ovw.output
+    loaded_iso = load_model(out_artifact)
+    assert loaded_iso.recalibrator is not None
+    assert loaded_iso.recalibrator.method.value == "isotonic"
+
+    # Temperature and no retune threshold
+    out_temp = tmp_path / "temp_model"
+    res_temp = runner.invoke(
+        app,
+        [
+            "recalibrate",
+            str(trained_artifact),
+            str(cal_data_csv),
+            "--output",
+            str(out_temp),
+            "--method",
+            "temperature",
+            "--no-retune-threshold",
+            "--json",
+        ],
+    )
+    assert res_temp.exit_code == 0
+    loaded_temp = load_model(out_temp)
+    assert loaded_temp.recalibrator is not None
+    assert loaded_temp.recalibrator.method.value == "temperature"
+
+
+def test_cli_recalibrate_error_handling(
+    trained_artifact: Path,
+    tmp_path: Path,
+) -> None:
+    cal_data_csv = tmp_path / "cal_data.csv"
+    generate_synthetic_data(rows=250, random_state=123).to_csv(cal_data_csv, index=False)
+
+    # Missing model
+    res_bad_mod = runner.invoke(
+        app,
+        [
+            "recalibrate",
+            str(tmp_path / "nonexistent_model"),
+            str(cal_data_csv),
+            "--output",
+            str(tmp_path / "out"),
+        ],
+    )
+    assert res_bad_mod.exit_code != 0
+
+    # Corrupt model directory
+    corrupt_model = tmp_path / "corrupt_model"
+    corrupt_model.mkdir()
+    (corrupt_model / "model.joblib").write_bytes(b"garbage")
+    res_corrupt_mod = runner.invoke(
+        app,
+        [
+            "recalibrate",
+            str(corrupt_model),
+            str(cal_data_csv),
+            "--output",
+            str(tmp_path / "out_corrupt"),
+        ],
+    )
+    assert res_corrupt_mod.exit_code == 2
+    assert "Failed to load model" in res_corrupt_mod.output
+
+    # Missing data
+    res_bad_dat = runner.invoke(
+        app,
+        [
+            "recalibrate",
+            str(trained_artifact),
+            str(tmp_path / "nonexistent.csv"),
+            "--output",
+            str(tmp_path / "out"),
+        ],
+    )
+    assert res_bad_dat.exit_code != 0
+
+    # Corrupt dataset
+    bad_csv = tmp_path / "bad_data.csv"
+    pd.DataFrame({"V1": [1.0, 2.0], "Class": [5, 6]}).to_csv(bad_csv, index=False)
+    res_corrupt_csv = runner.invoke(
+        app,
+        [
+            "recalibrate",
+            str(trained_artifact),
+            str(bad_csv),
+            "--output",
+            str(tmp_path / "out_corrupt_csv"),
+        ],
+    )
+    assert res_corrupt_csv.exit_code == 2
+    assert "Failed to load dataset" in res_corrupt_csv.output
+
+    # Recalibration failure
+    with patch(
+        "fraud_detection.cli.recalibrate_model",
+        side_effect=ValueError("Simulated calibration failure"),
+    ):
+        res_fail = runner.invoke(
+            app,
+            [
+                "recalibrate",
+                str(trained_artifact),
+                str(cal_data_csv),
+                "--output",
+                str(tmp_path / "out_fail"),
+            ],
+        )
+        assert res_fail.exit_code == 2
+        assert "Model recalibration failed" in res_fail.output
+
+    # Save failure
+    with patch(
+        "fraud_detection.cli.save_model", side_effect=ModelArtifactError("Simulated save failure")
+    ):
+        res_save_fail = runner.invoke(
+            app,
+            [
+                "recalibrate",
+                str(trained_artifact),
+                str(cal_data_csv),
+                "--output",
+                str(tmp_path / "out_save_fail"),
+            ],
+        )
+        assert res_save_fail.exit_code == 2
+        assert "Failed to save recalibrated model" in res_save_fail.output

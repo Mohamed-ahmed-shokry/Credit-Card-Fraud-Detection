@@ -530,3 +530,7 @@ def test_diagnostics_with_enums_and_drift_branches() -> None:
     )
     drift_brier = compute_calibration_drift(ref_base, cur_brier)
     assert drift_brier.status == "WARNING"
+    assert drift_brier.drift_detected is True
+    assert drift_brier.ece_shift == drift_brier.ece_delta
+    assert drift_brier.brier_shift == drift_brier.brier_delta
+    assert drift_brier.max_gap_shift == drift_brier.max_divergence

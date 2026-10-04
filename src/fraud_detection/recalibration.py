@@ -173,6 +173,26 @@ class CalibrationDriftReport:
     status: str
     warnings: tuple[str, ...]
 
+    @property
+    def drift_detected(self) -> bool:
+        """True if calibration drift warning or degradation was detected."""
+        return self.status != "STABLE"
+
+    @property
+    def ece_shift(self) -> float:
+        """Alias for ece_delta."""
+        return self.ece_delta
+
+    @property
+    def brier_shift(self) -> float:
+        """Alias for brier_delta."""
+        return self.brier_delta
+
+    @property
+    def max_gap_shift(self) -> float:
+        """Alias for max_divergence."""
+        return self.max_divergence
+
     def to_dict(self) -> dict[str, Any]:
         """Serialize drift report to dictionary."""
         return {
