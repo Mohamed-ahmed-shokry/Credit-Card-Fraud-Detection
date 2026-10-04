@@ -74,13 +74,13 @@ def test_platt_recalibrator_fit_and_transform() -> None:
 
     recal = PlattRecalibrator()
     assert recal.method == RecalibrationMethod.SIGMOID
-    assert not recal.is_fitted
+    assert getattr(recal, "is_fitted") is False
     # Unfitted transform returns original probabilities
     unfitted_out = recal.transform(probs)
     assert np.allclose(unfitted_out, probs)
 
     recal.fit(probs, y)
-    assert recal.is_fitted
+    assert getattr(recal, "is_fitted") is True
     assert recal.a_ >= 0.0
 
     calibrated = recal.transform(probs)
@@ -127,12 +127,12 @@ def test_isotonic_recalibrator_fit_and_transform() -> None:
 
     recal = IsotonicRecalibrator()
     assert recal.method == RecalibrationMethod.ISOTONIC
-    assert not recal.is_fitted
+    assert getattr(recal, "is_fitted") is False
     # Unfitted
     assert np.allclose(recal.transform(probs), probs)
 
     recal.fit(probs, y)
-    assert recal.is_fitted
+    assert getattr(recal, "is_fitted") is True
     assert len(recal.x_thresholds_) > 0
     assert len(recal.y_thresholds_) > 0
 
