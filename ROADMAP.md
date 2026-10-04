@@ -1217,7 +1217,7 @@ This phase does not implement online gradient-based temperature scaling or Bayes
 - `d4f6cba`: feat: add calibrate-eval and recalibrate CLI commands
 - `ac591e4`: docs: document calibration surveillance and post-hoc recalibration workflows
 
-## Phase 30 — Champion/Challenger Multi-Model Routing, Shadow Inference, and Canary Rollout Governance
+## Phase 30 — Champion/Challenger Multi-Model Routing, Shadow Inference, and Canary Rollout Governance (In Progress)
 
 ### Objective
 
@@ -1240,6 +1240,15 @@ Enable safe production model deployment, continuous model comparison, and zero-d
 ### Explicit exclusions
 
 This phase does not implement external service meshes (Istio/Envoy), Kubernetes CRDs, or distributed message queues.
+
+### Implementation tasks
+
+1. `routing.py`: Core routing models, strategies, sticky hash splitting, canary safeguard metrics, and batch divergence evaluation.
+2. `audit.py`: Extend scoring audit events to record routed model version, role (`champion` / `challenger`), and shadow output comparisons.
+3. `api.py`: Integrate router, multi-model serving, non-blocking shadow inference, `/v1/routing/status` endpoint, Prometheus telemetry, and `/health` probe routing details.
+4. `cli.py`: Implement `fraud-detect route-eval` CLI command with divergence thresholds, audit replay, and CSV dataset support; expose routing options in `fraud-detect serve`.
+5. `tests/`: Add comprehensive test coverage across unit tests (`test_routing.py`), API integration (`test_api.py`), CLI integration (`test_cli.py`), and audit logging (`test_audit.py`).
+6. `docs`: Update `README.md`, `ARCHITECTURE.md`, `CHANGELOG.md`, and complete `ROADMAP.md` delivery record.
 
 ## Contributing to the roadmap
 
