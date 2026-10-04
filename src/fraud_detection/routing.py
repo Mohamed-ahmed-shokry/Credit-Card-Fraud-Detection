@@ -495,11 +495,8 @@ class ChampionChallengerRouter:
                 is_shadow_candidate=True,
             )
 
-        # 5. Check Canary Safeguard Status
-        if (
-            strategy == TrafficSplitStrategy.CANARY
-            and self.metrics.canary_status == CanaryStatus.ROLLED_BACK
-        ):
+        # 5. Check Canary Safeguard Status (Emergency rollback killswitch)
+        if self.metrics.canary_status == CanaryStatus.ROLLED_BACK:
             return RouteDecision(
                 role=ModelRole.CHAMPION,
                 model_version=self.champion_version,

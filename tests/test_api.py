@@ -21,6 +21,11 @@ from fraud_detection import __version__
 from fraud_detection.api import (
     API_KEYS_ENVIRONMENT_VARIABLE,
     AUDIT_LOG_ENVIRONMENT_VARIABLE,
+    CANARY_AUTO_ROLLBACK_ENVIRONMENT_VARIABLE,
+    CANARY_MAX_DISCREPANCY_ENVIRONMENT_VARIABLE,
+    CANARY_MAX_DIVERGENCE_ENVIRONMENT_VARIABLE,
+    CHALLENGER_MODEL_PATH_ENVIRONMENT_VARIABLE,
+    CHALLENGER_WEIGHT_ENVIRONMENT_VARIABLE,
     CIRCUIT_BREAKER_ENABLED_ENVIRONMENT_VARIABLE,
     CIRCUIT_BREAKER_FAILURE_THRESHOLD_ENVIRONMENT_VARIABLE,
     CIRCUIT_BREAKER_LATENCY_BUDGET_ENVIRONMENT_VARIABLE,
@@ -34,6 +39,8 @@ from fraud_detection.api import (
     RATE_LIMIT_REQUESTS_ENVIRONMENT_VARIABLE,
     RATE_LIMIT_WINDOW_SECONDS_ENVIRONMENT_VARIABLE,
     REQUEST_ID_HEADER,
+    ROUTING_ENTITY_KEY_ENVIRONMENT_VARIABLE,
+    ROUTING_STRATEGY_ENVIRONMENT_VARIABLE,
     SHADOW_MODEL_PATH_ENVIRONMENT_VARIABLE,
     CircuitBreaker,
     _api_key_is_valid,
@@ -46,6 +53,7 @@ from fraud_detection.audit import JsonlAuditSink
 from fraud_detection.data import ValidatedDataset, generate_synthetic_data, validate_frame
 from fraud_detection.model import FraudModel, save_model, train_model, validate_artifact
 from fraud_detection.recalibration import PlattRecalibrator
+from fraud_detection.routing import TrafficSplitStrategy
 from fraud_detection.rules import (
     DecisionRule,
     RuleAction,
@@ -2622,3 +2630,354 @@ def test_recalibration_predictions_and_audit_event(
     pred_payload = event["payload"]["predictions"][0]
     assert "raw_probability" in pred_payload
     assert pred_payload["raw_probability"] is not None
+
+
+def _make_challenger_model(base_model: FraudModel) -> FraudModel:
+    challenger = deepcopy(base_model)
+    challenger.metadata = dict(base_model.metadata)
+    challenger.metadata["dataset_fingerprint"] = "c" * 64
+    challenger.metadata["artifact_fingerprint"] = "challenger_sha256_abcdef123456"
+    return challenger
+
+
+def test_routing_status_endpoint_default(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    client, _, _ = api_context
+    res = client.get("/v1/routing/status")
+    assert res.status_code == 200
+    data = res.json()
+    assert data["routing_policy"]["strategy"] == "champion_only"
+    assert data["challenger_model_version"] is None
+    assert data["canary_status"] == "healthy"
+    assert data["rollback_reason"] is None
+    assert "metrics" in data
+    assert data["metrics"]["champion_requests"] >= 0
+
+
+def test_routing_status_endpoint_with_challenger(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, base_model, _ = api_context
+    challenger = _make_challenger_model(base_model)
+    app = create_app(
+        model=base_model,
+        challenger_model=challenger,
+        routing_strategy=TrafficSplitStrategy.CANARY,
+        challenger_weight=0.1,
+    )
+    with TestClient(app) as test_client:
+        res = test_client.get("/v1/routing/status")
+        assert res.status_code == 200
+        data = res.json()
+        assert data["routing_policy"]["strategy"] == "canary"
+        assert data["challenger_model_version"] == "c" * 12
+        assert data["canary_status"] == "healthy"
+
+        # Check /health and /ready operational status
+        h_res = test_client.get("/health")
+        assert h_res.status_code == 200
+        h_data = h_res.json()
+        assert h_data["routing_strategy"] == "canary"
+        assert h_data["challenger_model_version"] == "c" * 12
+        assert h_data["canary_status"] == "healthy"
+
+
+def test_routing_status_503_when_no_model(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, model, _ = api_context
+    app = create_app(model=model)
+    with TestClient(app) as test_client:
+        del app.state.model
+        del app.state.router
+        res = test_client.get("/v1/routing/status")
+        assert res.status_code == 503
+        assert res.json()["detail"] == "Model not loaded."
+
+        rb_res = test_client.post("/v1/routing/rollback")
+        assert rb_res.status_code == 503
+
+        rst_res = test_client.post("/v1/routing/reset")
+        assert rst_res.status_code == 503
+
+
+def test_routing_operational_rollback_and_reset(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, base_model, dataset = api_context
+    challenger = _make_challenger_model(base_model)
+    app = create_app(
+        model=base_model,
+        challenger_model=challenger,
+        routing_strategy=TrafficSplitStrategy.PERCENTAGE,
+        challenger_weight=0.5,
+    )
+    with TestClient(app) as test_client:
+        # Initial status
+        init_res = test_client.get("/v1/routing/status")
+        assert init_res.status_code == 200
+        assert init_res.json()["canary_status"] == "healthy"
+
+        # Rollback
+        rb_res = test_client.post("/v1/routing/rollback?reason=Manual%20safety%20trigger")
+        assert rb_res.status_code == 200
+        rb_data = rb_res.json()
+        assert rb_data["canary_status"] == "rolled_back"
+        assert rb_data["rollback_reason"] == "Manual safety trigger"
+        assert rb_data["routing_policy"]["strategy"] == "percentage"
+
+        # While rolled back, traffic routes exclusively to Champion
+        batch = dataset.features.iloc[:2].to_dict(orient="records")
+        p_res = test_client.post("/v1/predict", json={"transactions": batch})
+        assert p_res.status_code == 200
+        assert p_res.json()["model_role"] == "champion"
+
+        # Reset
+        rst_res = test_client.post("/v1/routing/reset")
+        assert rst_res.status_code == 200
+        rst_data = rst_res.json()
+        assert rst_data["canary_status"] == "healthy"
+        assert rst_data["rollback_reason"] is None
+        assert rst_data["routing_policy"]["strategy"] == "percentage"
+
+
+def test_routing_predictions_model_roles_and_versions(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, base_model, dataset = api_context
+    challenger = _make_challenger_model(base_model)
+    app = create_app(
+        model=base_model,
+        challenger_model=challenger,
+        routing_strategy=TrafficSplitStrategy.CHALLENGER_ONLY,
+    )
+    with TestClient(app) as test_client:
+        batch = dataset.features.iloc[:2].to_dict(orient="records")
+        p_res = test_client.post("/v1/predict", json={"transactions": batch})
+        assert p_res.status_code == 200
+        p_data = p_res.json()
+        assert p_data["model_role"] == "challenger"
+        assert p_data["routed_model_version"] == "c" * 12
+
+        # Score single
+        s_res = test_client.post("/v1/score", json={"transaction": batch[0]})
+        assert s_res.status_code == 200
+        s_data = s_res.json()
+        assert s_data["model_role"] == "challenger"
+        assert s_data["routed_model_version"] == "c" * 12
+
+
+def test_routing_predictions_hash_split(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, base_model, dataset = api_context
+    challenger = _make_challenger_model(base_model)
+    app = create_app(
+        model=base_model,
+        challenger_model=challenger,
+        routing_strategy=TrafficSplitStrategy.HASH,
+        challenger_weight=0.5,
+        routing_entity_key="card_id",
+    )
+    with TestClient(app) as test_client:
+        rec = dataset.features.iloc[0].to_dict()
+        res_a = test_client.post(
+            "/v1/score",
+            headers={"X-Entity-ID": "card_fixed_entity_alpha"},
+            json={"transaction": rec},
+        )
+        assert res_a.status_code == 200
+        role_a = res_a.json()["model_role"]
+
+        # Sending same entity produces deterministic role
+        res_a2 = test_client.post(
+            "/v1/score",
+            headers={"X-Entity-ID": "card_fixed_entity_alpha"},
+            json={"transaction": rec},
+        )
+        assert res_a2.status_code == 200
+        assert res_a2.json()["model_role"] == role_a
+
+
+def test_routing_synchronous_shadow_prediction(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, base_model, dataset = api_context
+    challenger = _make_challenger_model(base_model)
+    app = create_app(
+        model=base_model,
+        challenger_model=challenger,
+        routing_strategy=TrafficSplitStrategy.CHAMPION_ONLY,
+    )
+    with TestClient(app) as test_client:
+        batch = dataset.features.iloc[:3].to_dict(orient="records")
+        p_res = test_client.post(
+            "/v1/predict",
+            json={"transactions": batch, "include_shadow": True},
+        )
+        assert p_res.status_code == 200
+        p_data = p_res.json()
+        assert p_data["shadow_predictions"] is not None
+        assert len(p_data["shadow_predictions"]) == 3
+        for sh in p_data["shadow_predictions"]:
+            assert sh["shadow_model_version"] == "c" * 12
+            assert "shadow_probability" in sh
+            assert "shadow_decision" in sh
+
+        s_res = test_client.post(
+            "/v1/score",
+            json={"transaction": batch[0], "include_shadow": True},
+        )
+        assert s_res.status_code == 200
+        s_data = s_res.json()
+        assert s_data["shadow_prediction"] is not None
+        assert s_data["shadow_prediction"]["shadow_model_version"] == "c" * 12
+
+
+def test_routing_synchronous_shadow_graceful_failure(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, base_model, dataset = api_context
+    challenger = MagicMock(wraps=base_model)
+    challenger.metadata = {"artifact_fingerprint": "failing_challenger"}
+    challenger.threshold = 0.5
+    challenger.feature_names = base_model.feature_names
+    challenger.predict_probabilities.side_effect = RuntimeError("Inference boom")
+
+    app = create_app(
+        model=base_model,
+        challenger_model=challenger,
+        routing_strategy=TrafficSplitStrategy.CHAMPION_ONLY,
+    )
+    with TestClient(app) as test_client:
+        rec = dataset.features.iloc[0].to_dict()
+        s_res = test_client.post(
+            "/v1/score",
+            json={"transaction": rec, "include_shadow": True},
+        )
+        # Primary prediction succeeds despite challenger failure
+        assert s_res.status_code == 200
+        assert s_res.json()["shadow_prediction"] is None
+
+
+def test_routing_canary_auto_rollback_on_discrepancy(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, base_model, dataset = api_context
+    divergent_challenger = MagicMock(wraps=base_model)
+    divergent_challenger.metadata = {"artifact_fingerprint": "divergent_challenger"}
+    divergent_challenger.threshold = 0.5
+    divergent_challenger.feature_names = base_model.feature_names
+    # Always return 1.0 (fraud), triggering high discrepancy and divergence
+    divergent_challenger.predict_probabilities.side_effect = (
+        lambda df: np.array([1.0] * len(df))
+    )
+
+    app = create_app(
+        model=base_model,
+        challenger_model=divergent_challenger,
+        routing_strategy=TrafficSplitStrategy.CANARY,
+        challenger_weight=0.0,
+        canary_max_discrepancy=0.01,
+        canary_max_divergence=0.05,
+        canary_auto_rollback=True,
+    )
+    with TestClient(app) as test_client:
+        batch = dataset.features.iloc[:10].to_dict(orient="records")
+        for _ in range(3):
+            p_res = test_client.post("/v1/predict", json={"transactions": batch})
+            assert p_res.status_code == 200
+
+        # Status should report rolled back due to divergence
+        st_res = test_client.get("/v1/routing/status")
+        assert st_res.status_code == 200
+        st_data = st_res.json()
+        assert st_data["canary_status"] == "rolled_back"
+        assert st_data["rollback_reason"] is not None
+
+        # Check prometheus metrics
+        m_res = test_client.get("/metrics")
+        assert m_res.status_code == 200
+        assert "fraud_shadow_discrepancy_total" in m_res.text
+        assert 'fraud_canary_status{status="rolled_back"} 1.0' in m_res.text
+
+
+def test_routing_configuration_via_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, base_model, _ = api_context
+    challenger = _make_challenger_model(base_model)
+    chall_path = tmp_path / "challenger_model.joblib"
+    save_model(challenger, chall_path)
+
+    monkeypatch.setenv(CHALLENGER_MODEL_PATH_ENVIRONMENT_VARIABLE, str(chall_path))
+    monkeypatch.setenv(ROUTING_STRATEGY_ENVIRONMENT_VARIABLE, "percentage")
+    monkeypatch.setenv(CHALLENGER_WEIGHT_ENVIRONMENT_VARIABLE, "0.35")
+    monkeypatch.setenv(ROUTING_ENTITY_KEY_ENVIRONMENT_VARIABLE, "user_id")
+    monkeypatch.setenv(CANARY_MAX_DISCREPANCY_ENVIRONMENT_VARIABLE, "0.08")
+    monkeypatch.setenv(CANARY_MAX_DIVERGENCE_ENVIRONMENT_VARIABLE, "0.18")
+    monkeypatch.setenv(CANARY_AUTO_ROLLBACK_ENVIRONMENT_VARIABLE, "false")
+
+    app = create_app(model=base_model)
+    with TestClient(app) as test_client:
+        res = test_client.get("/v1/routing/status")
+        assert res.status_code == 200
+        data = res.json()
+        assert data["challenger_model_version"] == "c" * 12
+        policy = data["routing_policy"]
+        assert policy["strategy"] == "percentage"
+        assert policy["challenger_weight"] == 0.35
+        assert policy["entity_key"] == "user_id"
+        assert policy["canary_config"]["max_discrepancy_rate"] == 0.08
+        assert policy["canary_config"]["max_probability_divergence"] == 0.18
+        assert policy["canary_config"]["auto_rollback"] is False
+
+
+def test_routing_predictions_mixed_batch(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, base_model, dataset = api_context
+    challenger = _make_challenger_model(base_model)
+    app = create_app(
+        model=base_model,
+        challenger_model=challenger,
+        routing_strategy=TrafficSplitStrategy.HASH,
+        challenger_weight=0.5,
+        routing_entity_key="V1",
+    )
+    with TestClient(app) as test_client:
+        # V1=1.0 hashes to 0.18 (< 0.5 -> challenger), V1=4.0 hashes to 0.57 (>= 0.5 -> champion)
+        rec_challenger = dataset.features.iloc[0].to_dict()
+        rec_challenger["V1"] = 1.0
+        rec_champion = dataset.features.iloc[1].to_dict()
+        rec_champion["V1"] = 4.0
+
+        res = test_client.post(
+            "/v1/predict",
+            json={"transactions": [rec_challenger, rec_champion]},
+        )
+        assert res.status_code == 200
+        data = res.json()
+        assert data["model_role"] == "mixed"
+        assert "c" * 12 in data["routed_model_version"]
+        preds = data["predictions"]
+        assert len(preds) == 2
+
+
+def test_routing_status_when_router_is_none(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, base_model, _ = api_context
+    app = create_app(model=base_model)
+    with TestClient(app) as test_client:
+        del app.state.router
+        res = test_client.get("/v1/routing/status")
+        assert res.status_code == 200
+        data = res.json()
+        assert data["routing_policy"]["strategy"] == "champion_only"
+        assert data["challenger_model_version"] is None
+
+

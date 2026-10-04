@@ -25,19 +25,19 @@ from fraud_detection.routing import (
 
 
 def test_enums() -> None:
-    assert TrafficSplitStrategy.CHAMPION_ONLY == "champion_only"
-    assert TrafficSplitStrategy.CHALLENGER_ONLY == "challenger_only"
-    assert TrafficSplitStrategy.HASH == "hash"
-    assert TrafficSplitStrategy.PERCENTAGE == "percentage"
-    assert TrafficSplitStrategy.SHADOW == "shadow"
-    assert TrafficSplitStrategy.CANARY == "canary"
+    assert TrafficSplitStrategy.CHAMPION_ONLY.value == "champion_only"
+    assert TrafficSplitStrategy.CHALLENGER_ONLY.value == "challenger_only"
+    assert TrafficSplitStrategy.HASH.value == "hash"
+    assert TrafficSplitStrategy.PERCENTAGE.value == "percentage"
+    assert TrafficSplitStrategy.SHADOW.value == "shadow"
+    assert TrafficSplitStrategy.CANARY.value == "canary"
 
-    assert ModelRole.CHAMPION == "champion"
-    assert ModelRole.CHALLENGER == "challenger"
+    assert ModelRole.CHAMPION.value == "champion"
+    assert ModelRole.CHALLENGER.value == "challenger"
 
-    assert CanaryStatus.HEALTHY == "healthy"
-    assert CanaryStatus.DEGRADED == "degraded"
-    assert CanaryStatus.ROLLED_BACK == "rolled_back"
+    assert CanaryStatus.HEALTHY.value == "healthy"
+    assert CanaryStatus.DEGRADED.value == "degraded"
+    assert CanaryStatus.ROLLED_BACK.value == "rolled_back"
 
 
 def test_route_decision_properties() -> None:
@@ -148,11 +148,11 @@ def test_routing_metrics_tracker_and_safeguards() -> None:
     # Record comparisons below min_evaluations
     flip1 = tracker.record_comparison(0.8, True, 0.2, False, canary_cfg)
     assert flip1 is True
-    assert tracker.canary_status == CanaryStatus.HEALTHY
+    assert tracker.get_summary()["canary_status"] == "healthy"
 
     flip2 = tracker.record_comparison(0.7, True, 0.75, True, canary_cfg)
     assert flip2 is False
-    assert tracker.canary_status == CanaryStatus.HEALTHY
+    assert tracker.get_summary()["canary_status"] == "healthy"
 
     # Batch comparison pushing over threshold
     # 2 evaluations: both flips, large divergence
@@ -172,22 +172,28 @@ def test_routing_metrics_tracker_and_safeguards() -> None:
 
     # Further comparisons do not change ROLLED_BACK state
     tracker.record_comparison(0.5, False, 0.5, False, canary_cfg)
-    assert tracker.canary_status == CanaryStatus.ROLLED_BACK
-
-    # Reset canary
-    tracker.reset_canary()
-    assert tracker.canary_status == CanaryStatus.HEALTHY
-    assert tracker.rollback_reason is None
-    assert tracker.discrepancy_count == 0
-
-    # Manual rollback
-    tracker.trigger_rollback("Manual intervention")
-    assert tracker.canary_status == CanaryStatus.ROLLED_BACK
-    assert tracker.rollback_reason == "Manual intervention"
+    assert tracker.get_summary()["canary_status"] == "rolled_back"
 
     # Batch mismatch error
     with pytest.raises(RoutingError, match="must match"):
         tracker.record_batch_comparison([0.1], [False], [0.1, 0.2], [False, True])
+
+
+def test_routing_metrics_tracker_manual_rollback() -> None:
+    tracker = RoutingMetricsTracker()
+    assert tracker.canary_status == CanaryStatus.HEALTHY
+    tracker.trigger_rollback("Manual safety stop")
+    assert tracker.rollback_reason == "Manual safety stop"
+    assert tracker.get_summary()["canary_status"] == "rolled_back"
+
+
+def test_routing_metrics_tracker_reset() -> None:
+    tracker = RoutingMetricsTracker()
+    tracker.trigger_rollback("Manual safety stop")
+    tracker.reset_canary()
+    assert tracker.canary_status == CanaryStatus.HEALTHY
+    assert tracker.rollback_reason is None
+    assert tracker.discrepancy_count == 0
 
 
 def test_routing_metrics_degraded_when_auto_rollback_disabled() -> None:

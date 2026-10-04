@@ -48,6 +48,15 @@ from fraud_detection.evaluation import DecisionAction, TieredThresholds
 from fraud_detection.explanations import ExplanationProvider
 from fraud_detection.model import FraudModel, ModelArtifactError, load_model
 from fraud_detection.recalibration import BaseRecalibrator
+from fraud_detection.routing import (
+    CanaryConfig,
+    CanaryStatus,
+    ChampionChallengerRouter,
+    ModelRole,
+    RoutingMetricsTracker,
+    RoutingPolicy,
+    TrafficSplitStrategy,
+)
 from fraud_detection.rules import RulePrecedence, RuleSet
 from fraud_detection.telemetry import (
     DEFAULT_OTLP_TIMEOUT_SECONDS,
@@ -89,12 +98,29 @@ ENABLE_CHAOS_HEADER_ENVIRONMENT_VARIABLE = "FRAUD_ENABLE_CHAOS_HEADER"
 RULES_PATH_ENVIRONMENT_VARIABLE = "FRAUD_RULES_PATH"
 RULE_PRECEDENCE_ENVIRONMENT_VARIABLE = "FRAUD_RULE_PRECEDENCE"
 VELOCITY_CONFIG_PATH_ENVIRONMENT_VARIABLE = "FRAUD_VELOCITY_CONFIG_PATH"
+CHALLENGER_MODEL_PATH_ENVIRONMENT_VARIABLE = "FRAUD_CHALLENGER_MODEL_PATH"
+ROUTING_STRATEGY_ENVIRONMENT_VARIABLE = "FRAUD_ROUTING_STRATEGY"
+CHALLENGER_WEIGHT_ENVIRONMENT_VARIABLE = "FRAUD_CHALLENGER_WEIGHT"
+ROUTING_ENTITY_KEY_ENVIRONMENT_VARIABLE = "FRAUD_ROUTING_ENTITY_KEY"
+CANARY_MAX_DISCREPANCY_ENVIRONMENT_VARIABLE = "FRAUD_CANARY_MAX_DISCREPANCY"
+CANARY_MAX_DIVERGENCE_ENVIRONMENT_VARIABLE = "FRAUD_CANARY_MAX_DIVERGENCE"
+CANARY_AUTO_ROLLBACK_ENVIRONMENT_VARIABLE = "FRAUD_CANARY_AUTO_ROLLBACK"
 REQUEST_ID_HEADER = "X-Request-ID"
 PROCESS_TIME_HEADER = "X-Process-Time-Ms"
 MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024
 RATE_LIMIT_TRACKED_KEY_LIMIT = 10_000
 SHADOW_SHUTDOWN_TIMEOUT_SECONDS = 5.0
-OPERATIONAL_PATHS = frozenset({"/health", "/metrics", "/live", "/ready"})
+OPERATIONAL_PATHS = frozenset(
+    {
+        "/health",
+        "/metrics",
+        "/live",
+        "/ready",
+        "/v1/routing/status",
+        "/v1/routing/rollback",
+        "/v1/routing/reset",
+    }
+)
 UNMATCHED_ROUTE_LABEL = "unmatched"
 _REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 _BODY_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
@@ -126,6 +152,9 @@ class _OperationalStatus:
     velocity_entities_count: int | None = None
     recalibration_enabled: bool | None = None
     recalibration_method: str | None = None
+    routing_strategy: str | None = None
+    challenger_model_version: str | None = None
+    canary_status: str | None = None
 
     def response_fields(self) -> dict[str, Any]:
         """Return the response fields shared by `/health` and `/ready`."""
@@ -147,6 +176,12 @@ class _OperationalStatus:
             fields["recalibration_enabled"] = self.recalibration_enabled
         if self.recalibration_method is not None:
             fields["recalibration_method"] = self.recalibration_method
+        if self.routing_strategy is not None:
+            fields["routing_strategy"] = self.routing_strategy
+        if self.challenger_model_version is not None:
+            fields["challenger_model_version"] = self.challenger_model_version
+        if self.canary_status is not None:
+            fields["canary_status"] = self.canary_status
         return fields
 
 
@@ -465,6 +500,7 @@ class PredictionRequest(BaseModel):
     threshold: float | None = Field(default=None, ge=0.0, le=1.0)
     review_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
     deny_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
+    include_shadow: bool = False
 
     @model_validator(mode="after")
     def validate_tiered_thresholds(self) -> Self:
@@ -505,6 +541,9 @@ class PredictionResponse(BaseModel):
     predictions: list[PredictionResult]
     fallback_applied: bool = False
     fallback_reason: str | None = None
+    model_role: str | None = None
+    routed_model_version: str | None = None
+    shadow_predictions: list[dict[str, Any]] | None = None
 
 
 class ScoreRequest(BaseModel):
@@ -518,6 +557,7 @@ class ScoreRequest(BaseModel):
     threshold: float | None = Field(default=None, ge=0.0, le=1.0)
     review_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
     deny_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
+    include_shadow: bool = False
 
     @model_validator(mode="after")
     def validate_tiered_thresholds(self) -> Self:
@@ -545,6 +585,9 @@ class ScoreResponse(BaseModel):
     prediction: PredictionResult
     fallback_applied: bool = False
     fallback_reason: str | None = None
+    model_role: str | None = None
+    routed_model_version: str | None = None
+    shadow_prediction: dict[str, Any] | None = None
 
 
 class HealthResponse(BaseModel):
@@ -565,6 +608,9 @@ class HealthResponse(BaseModel):
     velocity_entities_count: int | None = None
     recalibration_enabled: bool | None = None
     recalibration_method: str | None = None
+    routing_strategy: str | None = None
+    challenger_model_version: str | None = None
+    canary_status: str | None = None
 
 
 class LivenessResponse(BaseModel):
@@ -593,6 +639,20 @@ class ReadinessResponse(BaseModel):
     velocity_entities_count: int | None = None
     recalibration_enabled: bool | None = None
     recalibration_method: str | None = None
+    routing_strategy: str | None = None
+    challenger_model_version: str | None = None
+    canary_status: str | None = None
+
+
+class RoutingStatusResponse(BaseModel):
+    """Multi-model traffic routing topology and canary telemetry status."""
+
+    champion_model_version: str
+    challenger_model_version: str | None = None
+    routing_policy: dict[str, Any]
+    metrics: dict[str, Any]
+    canary_status: str
+    rollback_reason: str | None = None
 
 
 def create_app(
@@ -627,6 +687,17 @@ def create_app(
     rule_precedence: RulePrecedence | None = None,
     velocity_config: VelocityConfig | None = None,
     velocity_config_path: Path | str | None = None,
+    challenger_model: FraudModel | None = None,
+    challenger_model_path: Path | str | None = None,
+    router: ChampionChallengerRouter | None = None,
+    routing_policy: RoutingPolicy | None = None,
+    routing_strategy: TrafficSplitStrategy | str | None = None,
+    challenger_weight: float | None = None,
+    routing_entity_key: str | None = None,
+    canary_config: CanaryConfig | None = None,
+    canary_max_discrepancy: float | None = None,
+    canary_max_divergence: float | None = None,
+    canary_auto_rollback: bool | None = None,
 ) -> FastAPI:
     """Create an application using an injected model or a trusted artifact path.
 
@@ -896,6 +967,24 @@ def create_app(
         ["method"],
         registry=metrics_registry,
     )
+    routing_predictions_counter = Counter(
+        "fraud_routing_predictions_total",
+        "Total prediction decisions routed by model role and version.",
+        ["route", "model_version"],
+        registry=metrics_registry,
+    )
+    shadow_discrepancy_total_counter = Counter(
+        "fraud_shadow_discrepancy_total",
+        "Total shadow challenger classification discrepancies with primary model.",
+        ["shadow_decision", "primary_decision"],
+        registry=metrics_registry,
+    )
+    canary_status_gauge = Gauge(
+        "fraud_canary_status",
+        "Current operational status of canary routing (1=active, 0=inactive).",
+        ["status"],
+        registry=metrics_registry,
+    )
 
     if resolved_cb is not None:
         # Keep a caller-supplied callback: the metrics counter is chained onto it
@@ -985,12 +1074,91 @@ def create_app(
                 )
             loaded_model = load_model(configured_path)
 
-        loaded_shadow = shadow_model
-        if loaded_shadow is None and resolved_shadow_path is not None:
-            loaded_shadow = load_model(resolved_shadow_path)
+        resolved_challenger_path = (
+            challenger_model_path
+            or os.getenv(CHALLENGER_MODEL_PATH_ENVIRONMENT_VARIABLE)
+            or resolved_shadow_path
+        )
+        loaded_challenger = challenger_model or shadow_model
+        if loaded_challenger is None and resolved_challenger_path is not None:
+            loaded_challenger = load_model(resolved_challenger_path)
+
+        active_router = router
+        if active_router is None and loaded_model is not None:
+            if routing_policy is not None:
+                active_router = ChampionChallengerRouter(
+                    champion_model=loaded_model,
+                    challenger_model=loaded_challenger,
+                    policy=routing_policy,
+                )
+            else:
+                strat_str = routing_strategy or os.getenv(ROUTING_STRATEGY_ENVIRONMENT_VARIABLE)
+                if strat_str is not None:
+                    parsed_strat = TrafficSplitStrategy(str(strat_str))
+                elif (
+                    loaded_challenger is not None
+                    and challenger_model is None
+                    and challenger_model_path is None
+                    and (shadow_model is not None or resolved_shadow_path is not None)
+                ):
+                    parsed_strat = TrafficSplitStrategy.SHADOW
+                else:
+                    parsed_strat = TrafficSplitStrategy.CHAMPION_ONLY
+
+                c_weight = challenger_weight
+                if c_weight is None:
+                    raw_w = os.getenv(CHALLENGER_WEIGHT_ENVIRONMENT_VARIABLE)
+                    c_weight = float(raw_w) if raw_w is not None else 0.0
+
+                e_key = str(
+                    routing_entity_key
+                    or os.getenv(ROUTING_ENTITY_KEY_ENVIRONMENT_VARIABLE)
+                    or "card_id"
+                )
+
+                c_disc = canary_max_discrepancy
+                if c_disc is None:
+                    raw_d = os.getenv(CANARY_MAX_DISCREPANCY_ENVIRONMENT_VARIABLE)
+                    c_disc = float(raw_d) if raw_d is not None else 0.15
+
+                c_div = canary_max_divergence
+                if c_div is None:
+                    raw_div = os.getenv(CANARY_MAX_DIVERGENCE_ENVIRONMENT_VARIABLE)
+                    c_div = float(raw_div) if raw_div is not None else 0.25
+
+                c_auto = canary_auto_rollback
+                if c_auto is None:
+                    raw_auto = os.getenv(CANARY_AUTO_ROLLBACK_ENVIRONMENT_VARIABLE)
+                    c_auto = (
+                        raw_auto.lower() in ("true", "1", "yes")
+                        if raw_auto is not None
+                        else True
+                    )
+
+                built_canary_cfg = canary_config or CanaryConfig(
+                    max_discrepancy_rate=c_disc,
+                    max_probability_divergence=c_div,
+                    auto_rollback=c_auto,
+                )
+                built_policy = RoutingPolicy(
+                    strategy=parsed_strat,
+                    challenger_weight=c_weight,
+                    entity_key=e_key,
+                    canary_config=built_canary_cfg,
+                    shadow_challenger=(
+                        parsed_strat in (TrafficSplitStrategy.SHADOW, TrafficSplitStrategy.CANARY)
+                    ),
+                )
+                active_router = ChampionChallengerRouter(
+                    champion_model=loaded_model,
+                    challenger_model=loaded_challenger,
+                    policy=built_policy,
+                )
 
         application.state.model = loaded_model
-        application.state.shadow_model = loaded_shadow
+        application.state.shadow_model = loaded_challenger
+        application.state.challenger_model = loaded_challenger
+        application.state.router = active_router
         application.state.circuit_breaker = resolved_cb
         application.state.audit_sink = resolved_audit_sink
         application.state.explanation_provider = explanation_provider
@@ -1012,6 +1180,9 @@ def create_app(
         application.state.velocity_buffer = resolved_velocity_buffer
         application.state.velocity_enrichments_counter = velocity_enrichments_counter
         application.state.velocity_entities_gauge = velocity_entities_gauge
+        application.state.routing_predictions_counter = routing_predictions_counter
+        application.state.shadow_discrepancy_total_counter = shadow_discrepancy_total_counter
+        application.state.canary_status_gauge = canary_status_gauge
         shadow_tasks: set[asyncio.Task[None]] = set()
         application.state.shadow_tasks = shadow_tasks
         yield
@@ -1553,7 +1724,18 @@ def create_app(
         threshold: float | None,
         review_threshold: float | None = None,
         deny_threshold: float | None = None,
-    ) -> tuple[float, list[PredictionResult], bool, str | None, float, float]:
+        include_shadow: bool = False,
+    ) -> tuple[
+        float,
+        list[PredictionResult],
+        bool,
+        str | None,
+        float,
+        float,
+        str,
+        str,
+        list[dict[str, Any]] | None,
+    ]:
         """Run the shared scoring pipeline: cap, inference, audit emit, and shadow scheduling.
 
         Raises:
@@ -1577,34 +1759,158 @@ def create_app(
                 scoring_rejected_counter.labels(reason="concurrency_cap").inc()
                 raise _ScoringOverloadedError
             await scoring_semaphore.acquire()
-        try:
-            (
-                applied_threshold,
-                results,
-                fallback_applied,
-                fallback_reason,
-                eff_review,
-                eff_deny,
-            ) = await run_in_threadpool(
-                score_frame,
-                loaded,
-                frame,
-                explain=explain,
-                explain_llm=explain_llm,
-                threshold=threshold,
-                review_threshold=review_threshold,
-                deny_threshold=deny_threshold,
-                fallback_mode=fb_mode,
-                fallback_score=fb_score,
-                fallback_amount_threshold=fb_amount,
-                force_degraded=force_degraded,
-                circuit_breaker=cb,
-                rules=active_rules,
-                rule_precedence=active_rule_precedence,
+
+        router: ChampionChallengerRouter | None = getattr(request.app.state, "router", None)
+        model_to_use = loaded
+        model_role = "champion"
+        routed_version = _model_version(loaded)
+        decisions = []
+        is_mixed = False
+        champ_indices: list[int] = []
+        chall_indices: list[int] = []
+
+        if router is not None and router.challenger_model is not None:
+            decisions = router.route_batch(features)
+            r_counter: Counter | None = getattr(
+                request.app.state, "routing_predictions_counter", None
             )
+            for d in decisions:
+                router.metrics.record_route(d.role)
+                if r_counter is not None:
+                    r_counter.labels(route=d.role.value, model_version=d.model_version).inc()
+
+            chall_count = sum(1 for d in decisions if d.role == ModelRole.CHALLENGER)
+            if chall_count == len(decisions):
+                model_to_use = router.challenger_model
+                model_role = "challenger"
+                routed_version = router.challenger_version or "challenger"
+            elif chall_count == 0:
+                model_to_use = router.champion_model
+                model_role = "champion"
+                routed_version = router.champion_version
+            else:
+                is_mixed = True
+                model_role = "mixed"
+                routed_version = f"{router.champion_version}+{router.challenger_version}"
+                champ_indices = [
+                    i for i, d in enumerate(decisions) if d.role == ModelRole.CHAMPION
+                ]
+                chall_indices = [
+                    i for i, d in enumerate(decisions) if d.role == ModelRole.CHALLENGER
+                ]
+
+        try:
+            if not is_mixed:
+                (
+                    applied_threshold,
+                    results,
+                    fallback_applied,
+                    fallback_reason,
+                    eff_review,
+                    eff_deny,
+                ) = await run_in_threadpool(
+                    score_frame,
+                    model_to_use,
+                    frame,
+                    explain=explain,
+                    explain_llm=explain_llm,
+                    threshold=threshold,
+                    review_threshold=review_threshold,
+                    deny_threshold=deny_threshold,
+                    fallback_mode=fb_mode,
+                    fallback_score=fb_score,
+                    fallback_amount_threshold=fb_amount,
+                    force_degraded=force_degraded,
+                    circuit_breaker=cb,
+                    rules=active_rules,
+                    rule_precedence=active_rule_precedence,
+                )
+            else:
+                champ_res: list[PredictionResult] = []
+                chall_res: list[PredictionResult] = []
+                applied_threshold = loaded.threshold
+                eff_review = 0.0
+                eff_deny = 1.0
+                fallback_applied = False
+                fallback_reason = None
+                if champ_indices and router is not None:
+                    (
+                        applied_threshold,
+                        champ_res,
+                        fallback_applied,
+                        fallback_reason,
+                        eff_review,
+                        eff_deny,
+                    ) = await run_in_threadpool(
+                        score_frame,
+                        router.champion_model,
+                        frame.iloc[champ_indices],
+                        explain=explain,
+                        explain_llm=explain_llm,
+                        threshold=threshold,
+                        review_threshold=review_threshold,
+                        deny_threshold=deny_threshold,
+                        fallback_mode=fb_mode,
+                        fallback_score=fb_score,
+                        fallback_amount_threshold=fb_amount,
+                        force_degraded=force_degraded,
+                        circuit_breaker=cb,
+                        rules=active_rules,
+                        rule_precedence=active_rule_precedence,
+                    )
+                if chall_indices and router is not None and router.challenger_model is not None:
+                    (
+                        _,
+                        chall_res,
+                        _,
+                        _,
+                        _,
+                        _,
+                    ) = await run_in_threadpool(
+                        score_frame,
+                        router.challenger_model,
+                        frame.iloc[chall_indices],
+                        explain=explain,
+                        explain_llm=explain_llm,
+                        threshold=threshold,
+                        review_threshold=review_threshold,
+                        deny_threshold=deny_threshold,
+                        fallback_mode=fb_mode,
+                        fallback_score=fb_score,
+                        fallback_amount_threshold=fb_amount,
+                        force_degraded=force_degraded,
+                        circuit_breaker=cb,
+                        rules=active_rules,
+                        rule_precedence=active_rule_precedence,
+                    )
+                merged_results: list[PredictionResult] = [None] * len(decisions)  # type: ignore[list-item]
+                for idx, res in zip(champ_indices, champ_res, strict=True):
+                    merged_results[idx] = res
+                for idx, res in zip(chall_indices, chall_res, strict=True):
+                    merged_results[idx] = res
+                results = merged_results
         finally:
             if scoring_semaphore is not None:
                 scoring_semaphore.release()
+
+        sh_model: FraudModel | None = getattr(request.app.state, "shadow_model", None)
+        shadow_results_sync: list[dict[str, Any]] | None = None
+        if include_shadow and sh_model is not None:
+            try:
+                sh_probs = await run_in_threadpool(sh_model.predict_probabilities, frame)
+                sh_decs = sh_probs >= sh_model.threshold
+                shadow_results_sync = [
+                    {
+                        "shadow_probability": float(sp),
+                        "shadow_decision": bool(sd),
+                        "shadow_model_version": _model_version(sh_model),
+                    }
+                    for sp, sd in zip(sh_probs, sh_decs, strict=True)
+                ]
+            except Exception:
+                logger.exception("Synchronous shadow scoring evaluation failed.")
+                shadow_results_sync = None
+
         sink: AuditSink = getattr(request.app.state, "audit_sink", resolved_audit_sink)
         try:
             audit_event = build_scoring_audit_event(
@@ -1630,16 +1936,17 @@ def create_app(
                     for r in results
                 ],
                 request_id=getattr(request.state, "request_id", None),
+                model_role=model_role,
+                routed_model_version=routed_version,
+                shadow_predictions=shadow_results_sync,
             )
             await run_in_threadpool(sink.emit, audit_event)
         except Exception:
             logger.exception("Failed to emit scoring audit event.")
 
-        sh_model: FraudModel | None = getattr(request.app.state, "shadow_model", None)
-        if sh_model is not None:
-            # Scheduled on the event loop instead of as a response background task: a
-            # background task still runs before the request is finished, which held the
-            # connection open for the whole challenger evaluation.
+        # Asynchronous non-blocking shadow evaluation
+        should_shadow_async = sh_model is not None and model_role == "champion" and not is_mixed
+        if should_shadow_async and sh_model is not None:
             shadow_tasks: set[asyncio.Task[None]] = request.app.state.shadow_tasks
             shadow_task = asyncio.ensure_future(
                 run_in_threadpool(
@@ -1655,12 +1962,30 @@ def create_app(
                     shadow_discrepancies_counter=getattr(
                         request.app.state, "shadow_discrepancies_counter", None
                     ),
+                    primary_model_version=routed_version,
+                    router=router,
+                    shadow_discrepancy_total_counter=getattr(
+                        request.app.state, "shadow_discrepancy_total_counter", None
+                    ),
+                    canary_status_gauge=getattr(
+                        request.app.state, "canary_status_gauge", None
+                    ),
                 )
             )
             shadow_tasks.add(shadow_task)
             shadow_task.add_done_callback(shadow_tasks.discard)
 
-        return applied_threshold, results, fallback_applied, fallback_reason, eff_review, eff_deny
+        return (
+            applied_threshold,
+            results,
+            fallback_applied,
+            fallback_reason,
+            eff_review,
+            eff_deny,
+            model_role,
+            routed_version,
+            shadow_results_sync,
+        )
 
     @application.post(
         "/v1/predict",
@@ -1710,6 +2035,9 @@ def create_app(
                 fallback_reason,
                 eff_review,
                 eff_deny,
+                model_role,
+                routed_version,
+                shadow_results,
             ) = await _score_with_guardrails(
                 request,
                 loaded,
@@ -1720,6 +2048,7 @@ def create_app(
                 threshold=payload.threshold,
                 review_threshold=payload.review_threshold,
                 deny_threshold=payload.deny_threshold,
+                include_shadow=payload.include_shadow,
             )
         except _ScoringOverloadedError:
             return _scoring_overloaded_response()
@@ -1732,6 +2061,9 @@ def create_app(
             predictions=results,
             fallback_applied=fallback_applied,
             fallback_reason=fallback_reason,
+            model_role=model_role,
+            routed_model_version=routed_version,
+            shadow_predictions=shadow_results,
         )
 
     @application.post(
@@ -1779,6 +2111,9 @@ def create_app(
                 fallback_reason,
                 eff_review,
                 eff_deny,
+                model_role,
+                routed_version,
+                shadow_results,
             ) = await _score_with_guardrails(
                 request,
                 loaded,
@@ -1789,6 +2124,7 @@ def create_app(
                 threshold=payload.threshold,
                 review_threshold=payload.review_threshold,
                 deny_threshold=payload.deny_threshold,
+                include_shadow=payload.include_shadow,
             )
         except _ScoringOverloadedError:
             return _scoring_overloaded_response()
@@ -1801,6 +2137,9 @@ def create_app(
             prediction=results[0],
             fallback_applied=fallback_applied,
             fallback_reason=fallback_reason,
+            model_role=model_role,
+            routed_model_version=routed_version,
+            shadow_prediction=shadow_results[0] if shadow_results else None,
         )
 
     @application.get("/v1/velocity/stats", tags=["velocity"])
@@ -1831,6 +2170,72 @@ def create_app(
             )
         return buf.get_entity_profile(entity_id)
 
+    @application.get(
+        "/v1/routing/status",
+        response_model=RoutingStatusResponse,
+        responses={503: {"description": "Model not loaded."}},
+        tags=["routing"],
+    )
+    async def routing_status(request: Request) -> RoutingStatusResponse | JSONResponse:
+        """Inspect multi-model routing topology, weights, and canary telemetry status."""
+        loaded = getattr(request.app.state, "model", None)
+        if loaded is None:
+            return JSONResponse(status_code=503, content={"detail": "Model not loaded."})
+        router: ChampionChallengerRouter | None = getattr(request.app.state, "router", None)
+        champ_ver = _model_version(loaded)
+        if router is None:
+            return RoutingStatusResponse(
+                champion_model_version=champ_ver,
+                challenger_model_version=None,
+                routing_policy=RoutingPolicy().to_dict(),
+                metrics=RoutingMetricsTracker().get_summary(),
+                canary_status="healthy",
+                rollback_reason=None,
+            )
+        return RoutingStatusResponse(
+            champion_model_version=router.champion_version,
+            challenger_model_version=router.challenger_version,
+            routing_policy=router.policy.to_dict(),
+            metrics=router.metrics.get_summary(),
+            canary_status=router.metrics.canary_status.value,
+            rollback_reason=router.metrics.rollback_reason,
+        )
+
+    @application.post(
+        "/v1/routing/rollback",
+        response_model=RoutingStatusResponse,
+        responses={503: {"description": "Model not loaded."}},
+        tags=["routing"],
+    )
+    async def routing_rollback(
+        request: Request,
+        reason: str = "Operational rollback triggered via API",
+    ) -> RoutingStatusResponse | JSONResponse:
+        """Trigger manual operational rollback of canary routing back to Champion."""
+        loaded = getattr(request.app.state, "model", None)
+        if loaded is None:
+            return JSONResponse(status_code=503, content={"detail": "Model not loaded."})
+        router: ChampionChallengerRouter | None = getattr(request.app.state, "router", None)
+        if router is not None:
+            router.metrics.trigger_rollback(reason)
+        return await routing_status(request)
+
+    @application.post(
+        "/v1/routing/reset",
+        response_model=RoutingStatusResponse,
+        responses={503: {"description": "Model not loaded."}},
+        tags=["routing"],
+    )
+    async def routing_reset(request: Request) -> RoutingStatusResponse | JSONResponse:
+        """Reset canary divergence metrics and operational status back to HEALTHY."""
+        loaded = getattr(request.app.state, "model", None)
+        if loaded is None:
+            return JSONResponse(status_code=503, content={"detail": "Model not loaded."})
+        router: ChampionChallengerRouter | None = getattr(request.app.state, "router", None)
+        if router is not None:
+            router.metrics.reset_canary()
+        return await routing_status(request)
+
     @application.get("/metrics", tags=["operations"])
     async def metrics() -> Response:
         cb: CircuitBreaker | None = getattr(application.state, "circuit_breaker", None)
@@ -1856,6 +2261,10 @@ def _evaluate_shadow_traffic(
     request_id: str | None,
     shadow_evaluations_counter: Counter | None = None,
     shadow_discrepancies_counter: Counter | None = None,
+    primary_model_version: str | None = None,
+    router: ChampionChallengerRouter | None = None,
+    shadow_discrepancy_total_counter: Counter | None = None,
+    canary_status_gauge: Gauge | None = None,
 ) -> None:
     """Evaluate candidate transactions against shadow model asynchronously."""
     try:
@@ -1884,12 +2293,39 @@ def _evaluate_shadow_traffic(
                         shadow_decision=str(s_dec_bool).lower(),
                         primary_decision=str(p_res.is_fraud).lower(),
                     ).inc()
+                if shadow_discrepancy_total_counter is not None:
+                    shadow_discrepancy_total_counter.labels(
+                        shadow_decision=str(s_dec_bool).lower(),
+                        primary_decision=str(p_res.is_fraud).lower(),
+                    ).inc()
 
         has_discrepancy = discrepancies > 0
         if shadow_evaluations_counter is not None:
             shadow_evaluations_counter.labels(has_discrepancy=str(has_discrepancy).lower()).inc(
                 len(primary_results)
             )
+
+        primary_probs = [p.fraud_probability for p in primary_results]
+        prob_diffs = [
+            abs(p - float(s))
+            for p, s in zip(primary_probs, shadow_probabilities, strict=True)
+        ]
+        mean_div = float(np.mean(prob_diffs)) if prob_diffs else 0.0
+        max_div = float(np.max(prob_diffs)) if prob_diffs else 0.0
+
+        if router is not None:
+            router.metrics.record_batch_comparison(
+                champion_probs=primary_probs,
+                champion_decs=[p.is_fraud for p in primary_results],
+                challenger_probs=[float(s) for s in shadow_probabilities],
+                challenger_decs=[bool(s) for s in shadow_decisions],
+                canary_config=router.policy.canary_config,
+            )
+            if canary_status_gauge is not None:
+                for c_stat in CanaryStatus:
+                    canary_status_gauge.labels(status=c_stat.value).set(
+                        1.0 if router.metrics.canary_status == c_stat else 0.0
+                    )
 
         shadow_event = build_shadow_scoring_audit_event(
             shadow_model_version=_model_version(shadow_model),
@@ -1898,6 +2334,9 @@ def _evaluate_shadow_traffic(
             discrepancy_count=discrepancies,
             discrepancies=discrepancy_details,
             request_id=request_id,
+            mean_probability_divergence=mean_div,
+            max_probability_divergence=max_div,
+            primary_model_version=primary_model_version,
         )
         audit_sink.emit(shadow_event)
     except Exception:
@@ -2009,6 +2448,18 @@ def _operational_status(request: Request) -> _OperationalStatus:
         recalibration_enabled = True
         recalibration_method = recal.method.value
 
+    router: ChampionChallengerRouter | None = getattr(request.app.state, "router", None)
+    routing_strategy: str | None = None
+    challenger_model_version: str | None = None
+    canary_status: str | None = None
+    if router is not None and (
+        router.challenger_model is not None
+        or router.policy.strategy != TrafficSplitStrategy.CHAMPION_ONLY
+    ):
+        routing_strategy = router.policy.strategy.value
+        challenger_model_version = router.challenger_version
+        canary_status = router.metrics.canary_status.value
+
     return _OperationalStatus(
         fallback_mode=str(getattr(request.app.state, "fallback_mode", "raise")),
         degraded_mode=degraded_mode,
@@ -2022,6 +2473,9 @@ def _operational_status(request: Request) -> _OperationalStatus:
         velocity_entities_count=vel_buf.entity_count if vel_buf is not None else None,
         recalibration_enabled=recalibration_enabled,
         recalibration_method=recalibration_method,
+        routing_strategy=routing_strategy,
+        challenger_model_version=challenger_model_version,
+        canary_status=canary_status,
     )
 
 
