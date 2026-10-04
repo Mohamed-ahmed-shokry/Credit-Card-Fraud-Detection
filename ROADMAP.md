@@ -1253,7 +1253,7 @@ This phase does not implement external service meshes (Istio/Envoy), Kubernetes 
 - `28ea5f1`: feat(audit): record model role, routed model version, and shadow divergence in audit events
 - `8d77d0f`: feat(api): integrate multi-model routing, canary status endpoints, and shadow telemetry
 - `d57e211`: feat(cli): add route-eval command and multi-model routing serve options
-- `f4c1e02`: docs: document multi-model routing, canary governance, and complete Phase 30
+- `1f3c122`: docs: document multi-model routing, canary governance, and complete Phase 30
 
 ## Phase 31 — Feature Store Integration & Point-in-Time Offline/Online Consistency Governance (Proposed)
 
