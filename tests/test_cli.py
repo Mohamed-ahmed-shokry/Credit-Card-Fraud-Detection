@@ -22,6 +22,13 @@ from fraud_detection.data import (
     generate_synthetic_data,
     validate_frame,
 )
+from fraud_detection.features import (
+    FeatureDefinition,
+    FeatureSnapshot,
+    FeatureType,
+    FeatureView,
+    FileFeatureStore,
+)
 from fraud_detection.model import (
     MANIFEST_FILENAME,
     METADATA_FILENAME,
@@ -5408,4 +5415,190 @@ def test_cli_serve_routing_options(
     )
     assert invalid.exit_code == 2
     assert "Invalid --routing-strategy" in invalid.output
+
+
+def test_cli_feature_join_command(tmp_path: Path) -> None:
+    obs_df = pd.DataFrame(
+        {
+            "user_id": ["u1", "u2", "u1"],
+            "Time": [10.0, 20.0, 30.0],
+            "Amount": [100.0, 50.0, 75.0],
+        }
+    )
+    obs_file = tmp_path / "obs.csv"
+    obs_df.to_csv(obs_file, index=False)
+
+    view = FeatureView(
+        name="user_view",
+        entity_key="user_id",
+        features=(
+            FeatureDefinition(
+                name="user_risk",
+                feature_type=FeatureType.FLOAT,
+                default_value=0.1,
+            ),
+        ),
+    )
+    store = FileFeatureStore(views=[view])
+    store.put_snapshot(
+        "user_view",
+        FeatureSnapshot(entity_id="u1", timestamp=5.0, values={"user_risk": 0.9}),
+    )
+    store_file = tmp_path / "store.json"
+    store.save_to_file(store_file)
+
+    out_file = tmp_path / "enriched.csv"
+    result = runner.invoke(
+        app,
+        [
+            "feature-join",
+            str(obs_file),
+            "--store",
+            str(store_file),
+            "--output",
+            str(out_file),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "Point-in-Time Feature Join Completed" in result.output
+    assert out_file.exists()
+    enriched = pd.read_csv(out_file)
+    assert "user_risk" in enriched.columns
+    assert enriched.loc[0, "user_risk"] == 0.9
+    assert enriched.loc[1, "user_risk"] == 0.1
+
+    # Overwrite protection
+    blocked = runner.invoke(
+        app,
+        [
+            "feature-join",
+            str(obs_file),
+            "--store",
+            str(store_file),
+            "--output",
+            str(out_file),
+        ],
+    )
+    assert blocked.exit_code == 2
+
+    # Invalid file
+    bad = runner.invoke(
+        app,
+        [
+            "feature-join",
+            str(tmp_path / "missing.csv"),
+            "--store",
+            str(store_file),
+        ],
+    )
+    assert bad.exit_code == 2
+
+
+def test_cli_feature_check_command(tmp_path: Path) -> None:
+    import numpy as np
+
+    np.random.seed(42)
+    ref_df = pd.DataFrame(
+        {
+            "feat_a": np.random.normal(0, 1, 200),
+            "feat_b": np.random.normal(5, 2, 200),
+        }
+    )
+    curr_df = pd.DataFrame(
+        {
+            "feat_a": np.random.normal(0, 1, 200),
+            "feat_b": np.random.normal(25, 2, 200),
+        }
+    )
+    ref_file = tmp_path / "ref.csv"
+    curr_file = tmp_path / "curr.csv"
+    ref_df.to_csv(ref_file, index=False)
+    curr_df.to_csv(curr_file, index=False)
+
+    # Standard human-readable output
+    res = runner.invoke(
+        app,
+        [
+            "feature-check",
+            "--reference",
+            str(ref_file),
+            "--current",
+            str(curr_file),
+        ],
+    )
+    assert res.exit_code == 0, res.output
+    assert "Training-Serving Feature Skew Report" in res.output
+    assert "feat_b" in res.output
+
+    # JSON output with file export
+    json_out = tmp_path / "skew_report.json"
+    res_json = runner.invoke(
+        app,
+        [
+            "feature-check",
+            "--reference",
+            str(ref_file),
+            "--current",
+            str(curr_file),
+            "--json",
+            "--output",
+            str(json_out),
+        ],
+    )
+    assert res_json.exit_code == 0, res_json.output
+    report = json.loads(res_json.output)
+    assert report["overall_status"] in ("drifted", "warning")
+    assert json_out.exists()
+
+    # Fail on skew option when critical drift occurs
+    res_fail = runner.invoke(
+        app,
+        [
+            "feature-check",
+            "--reference",
+            str(ref_file),
+            "--current",
+            str(curr_file),
+            "--fail-on-skew",
+        ],
+    )
+    assert res_fail.exit_code == 1
+
+
+def test_cli_serve_feature_store_option(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact_path = tmp_path / "artifact"
+    artifact_path.mkdir()
+    store_path = tmp_path / "store.json"
+    store_path.write_text("{}", encoding="utf-8")
+    created: dict[str, Any] = {}
+
+    def fake_load_model(_p: Path | str) -> object:
+        return object()
+
+    def fake_create_app(**kwargs: Any) -> object:
+        created.update(kwargs)
+        return object()
+
+    def fake_run(*_a: Any, **_kw: Any) -> None:
+        return None
+
+    monkeypatch.setattr("fraud_detection.cli.load_model", fake_load_model)
+    monkeypatch.setattr("fraud_detection.api.create_app", fake_create_app)
+    monkeypatch.setattr("fraud_detection.cli.uvicorn.run", fake_run)
+
+    res = runner.invoke(
+        app,
+        [
+            "serve",
+            str(artifact_path),
+            "--feature-store",
+            str(store_path),
+        ],
+    )
+    assert res.exit_code == 0, res.output
+    assert created["feature_store_path"] == store_path
+
 

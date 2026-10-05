@@ -58,6 +58,13 @@ from fraud_detection.evaluation import (
     summarize_thresholds,
 )
 from fraud_detection.explanations import ExplanationProvider
+from fraud_detection.features import (
+    FeatureSkewAnalyzer,
+    FeatureStoreError,
+    FileFeatureStore,
+    SkewStatus,
+    point_in_time_join,
+)
 from fraud_detection.model import (
     MANIFEST_FILENAME,
     CalibrationMethod,
@@ -3591,6 +3598,19 @@ def serve_command(
             help="Automatically roll back canary routing if discrepancy safeguards trip.",
         ),
     ] = True,
+    feature_store: Annotated[
+        Path | None,
+        typer.Option(
+            "--feature-store",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help=(
+                "Optional path to serialized feature store JSON file. "
+                "Env fallback is FRAUD_FEATURE_STORE_PATH."
+            ),
+        ),
+    ] = None,
 ) -> None:
     """Run the versioned HTTP prediction service with optional trace export."""
     from fraud_detection.api import create_app
@@ -3640,6 +3660,7 @@ def serve_command(
             canary_max_discrepancy=canary_max_discrepancy,
             canary_max_divergence=canary_max_divergence,
             canary_auto_rollback=canary_auto_rollback,
+            feature_store_path=feature_store,
         ),
         host=host,
         port=port,
@@ -4584,6 +4605,214 @@ def route_eval_command(
             typer.echo(f"Report Saved:                {output}")
 
     if fail_on_discrepancy and report.safeguard_tripped:
+        raise typer.Exit(code=1)
+
+
+@app.command("feature-join")
+def feature_join_command(
+    observations: Annotated[
+        Path,
+        typer.Argument(
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="Path to observation frame CSV (e.g. transactions).",
+        ),
+    ],
+    store: Annotated[
+        Path,
+        typer.Option(
+            "--store",
+            "-s",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="Path to serialized FileFeatureStore JSON file.",
+        ),
+    ],
+    views: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--view",
+            "-v",
+            help="Specific feature view(s) to join. Repeat for multiple views. Default joins all.",
+        ),
+    ] = None,
+    timestamp_col: Annotated[
+        str,
+        typer.Option(
+            "--timestamp-col",
+            "-t",
+            help="Observation timestamp column name for time-travel point-in-time join.",
+        ),
+    ] = "Time",
+    output: Annotated[
+        Path | None,
+        typer.Option(
+            "--output",
+            "-o",
+            help="Destination CSV path for enriched observation frame.",
+        ),
+    ] = None,
+    overwrite: Annotated[
+        bool,
+        typer.Option("--overwrite/--no-overwrite", help="Allow overwriting output file."),
+    ] = False,
+) -> None:
+    """Execute point-in-time time-travel feature join with zero lookahead bias guarantee."""
+    _guard_output(output, overwrite)
+
+    try:
+        obs_df = pd.read_csv(observations)
+    except (OSError, ValueError, TypeError) as exc:
+        _abort(f"Failed to read observations file '{observations}': {exc}")
+
+    try:
+        feature_store = FileFeatureStore.from_file(store)
+    except (OSError, ValueError, TypeError, KeyError, FeatureStoreError) as exc:
+        _abort(f"Failed to load feature store from '{store}': {exc}")
+
+    try:
+        enriched_df, summary = point_in_time_join(
+            observations=obs_df,
+            store=feature_store,
+            view_names=views,
+            timestamp_col=timestamp_col,
+        )
+    except (FeatureStoreError, ValueError, KeyError) as exc:
+        _abort(f"Feature join failed: {exc}")
+
+    if output is not None:
+        _atomic_write_csv(enriched_df, output)
+
+    views_str = ", ".join(summary.views_applied) or "None"
+    features_str = ", ".join(summary.enriched_features) or "None"
+    typer.echo("Point-in-Time Feature Join Completed:")
+    typer.echo(f"  Total observations:    {summary.total_observations}")
+    typer.echo(f"  Matched observations:  {summary.matched_observations}")
+    typer.echo(f"  Defaulted:             {summary.defaulted_observations}")
+    typer.echo(f"  Stale observations:    {summary.stale_observations}")
+    typer.echo(f"  Match rate:            {summary.match_rate:.1%}")
+    typer.echo(f"  Views applied:         {views_str}")
+    typer.echo(f"  Enriched features:     {features_str}")
+    if output is not None:
+        typer.echo(f"  Saved to:              {output}")
+
+
+@app.command("feature-check")
+def feature_check_command(
+    reference: Annotated[
+        Path,
+        typer.Option(
+            "--reference",
+            "-r",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="Path to reference feature CSV (e.g. baseline or training dataset).",
+        ),
+    ],
+    current: Annotated[
+        Path,
+        typer.Option(
+            "--current",
+            "-c",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="Path to current serving or inference feature CSV.",
+        ),
+    ],
+    features: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--feature",
+            "-f",
+            help="Specific feature name(s) to analyze. Repeat for multiple features.",
+        ),
+    ] = None,
+    warning_psi: Annotated[
+        float,
+        typer.Option(
+            "--warning-psi",
+            min=0.01,
+            max=1.0,
+            help="PSI threshold above which status is WARNING.",
+        ),
+    ] = 0.1,
+    drift_psi: Annotated[
+        float,
+        typer.Option(
+            "--drift-psi",
+            min=0.01,
+            max=2.0,
+            help="PSI threshold above which status is DRIFTED.",
+        ),
+    ] = 0.25,
+    fail_on_skew: Annotated[
+        bool,
+        typer.Option(
+            "--fail-on-skew/--no-fail-on-skew",
+            help="Exit with code 1 if critical feature skew (DRIFTED) is detected.",
+        ),
+    ] = False,
+    output: Annotated[
+        Path | None,
+        typer.Option(
+            "--output",
+            "-o",
+            help="Optional path to write JSON skew report.",
+        ),
+    ] = None,
+    as_json: Annotated[
+        bool,
+        typer.Option(
+            "--json",
+            help="Print report in JSON format.",
+        ),
+    ] = False,
+    overwrite: Annotated[
+        bool,
+        typer.Option("--overwrite/--no-overwrite", help="Allow overwriting output file."),
+    ] = False,
+) -> None:
+    """Analyze training-serving distribution skew (PSI, KS, Wasserstein) across features."""
+    _guard_output(output, overwrite)
+
+    try:
+        ref_df = pd.read_csv(reference)
+    except (OSError, ValueError, TypeError) as exc:
+        _abort(f"Failed to read reference dataset '{reference}': {exc}")
+
+    try:
+        curr_df = pd.read_csv(current)
+    except (OSError, ValueError, TypeError) as exc:
+        _abort(f"Failed to read current dataset '{current}': {exc}")
+
+    try:
+        analyzer = FeatureSkewAnalyzer(
+            warning_threshold_psi=warning_psi,
+            drift_threshold_psi=drift_psi,
+        )
+        report = analyzer.analyze_skew(ref_df, curr_df, feature_names=features)
+    except (FeatureStoreError, ValueError) as exc:
+        _abort(f"Feature skew analysis failed: {exc}")
+
+    report_dict = report.to_dict()
+    report_json = json.dumps(report_dict, indent=2)
+
+    if output is not None:
+        _atomic_write_text(report_json + "\n", output)
+
+    if as_json:
+        typer.echo(report_json)
+    else:
+        typer.echo("Training-Serving Feature Skew Report:")
+        typer.echo(report.summary_table())
+        if output is not None:
+            typer.echo(f"Report written to: {output}")
+
+    if fail_on_skew and report.overall_status == SkewStatus.DRIFTED:
         raise typer.Exit(code=1)
 
 
