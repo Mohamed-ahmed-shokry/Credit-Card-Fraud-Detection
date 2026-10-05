@@ -20,7 +20,7 @@ Status legend: `Proposed` (not started), `In progress`, `Done`.
 ## Current state
 
 The project is a production-grade reference implementation with the implementation work in
-Phases 2 through 30 complete. Phase 1's workflows are in place, but the first
+Phases 2 through 31 complete. Phase 1's workflows are in place, but the first
 real PyPI release still requires maintainer-side trusted-publisher setup. The
 shipped system covers leakage-safe training, multiple calibrated estimators,
 threshold and calibration analysis, label-delay temporal gaps, drift surveillance,
@@ -35,9 +35,10 @@ deployable reference middleware, an optional scoring concurrency cap, synchroniz
 circuit-breaker safety, detached traffic shadowing, honest schema error responses,
 bounded operational metrics, declarative rule sets with priority overrides,
 sliding-window velocity behavioral profiles, post-hoc probability recalibration
-(Platt, isotonic, temperature scaling) with calibration drift surveillance, and
+(Platt, isotonic, temperature scaling) with calibration drift surveillance,
 champion/challenger multi-model routing with deterministic entity stickiness and
-automated canary divergence safeguards.
+automated canary divergence safeguards, and feature store integration with
+point-in-time time-travel as-of joins and training-serving skew surveillance.
 
 ## Phase 1 — Distribution
 
@@ -1255,7 +1256,7 @@ This phase does not implement external service meshes (Istio/Envoy), Kubernetes 
 - `d57e211`: feat(cli): add route-eval command and multi-model routing serve options
 - `1f3c122`: docs: document multi-model routing, canary governance, and complete Phase 30
 
-## Phase 31 — Feature Store Integration & Point-in-Time Offline/Online Consistency Governance (In Progress)
+## Phase 31 — Feature Store Integration & Point-in-Time Offline/Online Consistency Governance (Done)
 
 ### Objective
 
@@ -1266,7 +1267,7 @@ Provide feature store integration abstractions and point-in-time join consistenc
 - **Feature store entity contract** (`features.py`): Typed feature view definitions, entity key specifications (`card_id`, `user_id`, `merchant_id`), feature value schemas, and offline/online storage interfaces with TTL support.
 - **Point-in-time historical join engine**: Time-travel join semantics joining transaction timestamps with historical feature snapshots without future-feature leakage ($t_{\text{feature}} \le t_{\text{tx}}$) and configurable max staleness.
 - **Training-serving skew surveillance**: Quantify statistical feature divergence (PSI, Kolmogorov-Smirnov test, Wasserstein distance, null rate disparity) between online request features and offline reference feature views.
-- **API serving integration & telemetry**: Online feature store enrichment in `create_app` scoring flow, lookup and stats endpoints (`/v1/features/lookup/{entity_key}/{entity_id}`, `/v1/features/stats`), and Prometheus metrics (`fraud_feature_lookups_total`, `fraud_feature_lookup_latency_seconds`).
+- **API serving integration & telemetry**: Online feature store enrichment in `create_app` scoring flow, lookup and stats endpoints (`/v1/features/lookup/{entity_key}/{entity_id}`, `/v1/features/stats`), and Prometheus metrics (`fraud_feature_lookups_total`).
 - **Offline / Online consistency validation CLI**: `fraud-detect feature-join` (point-in-time enrichment) and `fraud-detect feature-check` (training-serving skew surveillance with `--fail-on-skew`).
 
 ### Acceptance criteria
@@ -1282,15 +1283,38 @@ Provide feature store integration abstractions and point-in-time join consistenc
 
 This phase does not implement external cloud database drivers (Feast, Snowflake, BigQuery, Redis) as hard dependencies; it provides an in-memory/file-backed canonical reference implementation with pluggable store protocols.
 
-### Implementation tasks
+### Delivery history
 
-1. `features.py` (Core Contracts & Join Engine): Implement `FeatureType`, `FeatureDefinition`, `FeatureView`, `FeatureSnapshot`, `InMemoryFeatureStore`, `FileFeatureStore`, and `point_in_time_join()` with strict temporal causality.
-2. `features.py` (Skew Surveillance): Implement `FeatureSkewAnalyzer`, `FeatureSkewMetric`, `FeatureSkewReport`, and divergence computations (PSI, KS test, Wasserstein distance, null rate disparity).
-3. `audit.py`: Extend scoring audit events to record feature enrichment metadata (`enriched_features`, `feature_view_names`).
-4. `api.py`: Integrate online feature store into `create_app` scoring pipeline, expose `/v1/features/lookup/{entity_key}/{entity_id}` and `/v1/features/stats` endpoints, and Prometheus metrics.
-5. `cli.py`: Add `fraud-detect feature-join` and `fraud-detect feature-check` commands; add `--feature-store` option to `fraud-detect serve`.
-6. Full test suite verification, branch coverage $\ge 97.0\%$, Ruff and strict mypy verification.
-7. Documentation and completion records in `ARCHITECTURE.md`, `README.md`, `CHANGELOG.md`, and `ROADMAP.md`.
+- `42da1a7`: docs: set Phase 31 feature store and consistency governance in progress
+- `0ea99b7`: feat(features): implement feature store, point-in-time join engine, and skew surveillance
+- `7b4ce61`: feat(audit): record feature enrichment metadata in scoring audit events
+- `1895daa`: feat(api): integrate online feature store enrichment, telemetry, and lookup endpoints
+- `a97bf75`: feat(cli): add feature-join and feature-check commands and serve feature store option
+
+## Phase 32 — Real-Time Streaming Decision Graph & Adaptive Execution Pipeline (Proposed)
+
+### Objective
+
+Orchestrate complex, multi-stage fraud evaluation workflows as a directed acyclic execution graph (DAG), enabling parallel feature retrieval, asynchronous rule evaluation, conditional model inference, post-hoc recalibration, and tiered actions with strict stage-level latency budgets and adaptive fail-soft degradation.
+
+### Scope
+
+- **Typed execution graph primitives** (`pipeline.py`): Define `PipelineNode`, `PipelineEdge`, `DecisionGraph`, `ExecutionPlan`, and `StageExecutionResult` with static cycle validation and topological sort ordering.
+- **Pluggable stage processors**:
+  - *Feature Enrichment Stage*: Concurrent online feature store and velocity buffer lookup.
+  - *Rule Evaluation Stage*: Short-circuiting high-confidence deterministic business rules (`ALLOW` / `DENY`).
+  - *Inference Stage*: Conditional primary or champion/challenger model execution.
+  - *Calibration Stage*: Post-hoc probability recalibration.
+  - *Action Aggregator Stage*: Tiered thresholding, consensus voting, or cost-minimizing decision arbitration.
+- **Asynchronous parallel scheduling & latency budgets**: Concurrent execution of independent pipeline branches with per-stage deadline enforcement (e.g. 5ms feature fetch timeout, 10ms model timeout) and deterministic fallback defaults on timeout.
+- **Audit lineage & execution tracing**: Emit structured node-by-node execution paths, per-node latency measurements, and degraded branch annotations in scoring audit events.
+- **Operational telemetry & CLI evaluation**: Prometheus histogram `fraud_pipeline_stage_duration_seconds{stage="..."}`, `/v1/pipeline/topology` endpoint, and `fraud-detect pipeline-eval` command.
+
+### Acceptance criteria
+
+- DAG execution strictly obeys topological dependencies; independent branches run concurrently in asyncio task pools without thread contention.
+- Breached stage latency budgets fail fast to fallback defaults without hanging client scoring requests.
+- Full test suite maintains 100% pass rate, branch coverage remains $\ge 97.0\%$, Ruff and strict mypy pass with zero errors.
 
 ## Contributing to the roadmap
 

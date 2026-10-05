@@ -501,6 +501,51 @@ fraud-detect serve artifacts/champion \
   - `fraud_canary_status`: Gauge reflecting canary state (0: Champion Only, 1: Active, 2: Warning, 3: Rolled Back).
 - **Audit Lineage**: Scored transactions and audit event logs expose `model_role` and `routed_model_version`, providing tamper-evident traceability during canary rollouts.
 
+## Feature store & consistency governance
+
+Offline training and online inference often diverge due to temporal leakage (using future data to predict the past) or distribution drift (training-serving skew). `fraud-detect` provides a point-in-time time-travel join engine and feature skew surveillance suite:
+
+```bash
+# Execute point-in-time time-travel feature join strictly enforcing t_feature <= t_obs
+fraud-detect feature-join data/transactions.csv \
+  --store features/store.json \
+  --timestamp-col Time \
+  --output data/enriched_train.csv
+
+# Surveillance of training-serving feature distribution skew (PSI, KS, Wasserstein)
+fraud-detect feature-check \
+  --reference data/baseline_train.csv \
+  --current logs/serving_inferences.csv \
+  --warning-psi 0.10 \
+  --drift-psi 0.25 \
+  --output reports/feature_skew.json
+
+# Enforce CI/CD safety: exit code 1 if critical feature drift (DRIFTED) occurs
+fraud-detect feature-check \
+  --reference data/baseline_train.csv \
+  --current logs/serving_inferences.csv \
+  --fail-on-skew
+
+# Run production API with online feature store enrichment
+fraud-detect serve artifacts/model \
+  --feature-store features/store.json
+```
+
+### Feature store capabilities
+
+- **Temporal As-Of Joins**: `point_in_time_join` performs exact historical time-travel joins where every observation at $t_{\text{obs}}$ only matches feature snapshots with $t_{\text{feature}} \le t_{\text{obs}}$, guaranteeing zero lookahead leakage.
+- **TTL Staleness & Fallback**: Snapshots exceeding feature view `ttl_seconds` are marked stale and fall back to schema defaults.
+- **Statistical Skew Surveillance**: `FeatureSkewAnalyzer` evaluates:
+  - **Population Stability Index (PSI)**: Quantifies aggregate population distribution shift.
+  - **Two-Sample Kolmogorov-Smirnov (KS)**: Measures maximum empirical CDF divergence.
+  - **1D Wasserstein Distance**: Calculates optimal transport earth mover's distance for shift severity.
+  - **Null Rate Disparity**: Tracks missing value frequency deviations between training and serving.
+- **Online Serving Enrichment**: The API dynamically enriches inbound transactions using entity keys (e.g. `card_id`, `user_id`) or `X-Entity-ID` headers.
+- **Operational Endpoints**:
+  - `GET /v1/features/stats`: Returns store status, entity counts, registered views, and cache hit rates.
+  - `GET /v1/features/lookup/{entity_key}/{entity_id}`: Inspects live feature values and staleness for a given entity.
+- **Prometheus Telemetry**: `fraud_feature_lookups_total{entity_key="...", status="hit|miss"}` monitors online retrieval performance.
+
 ## Train on the anonymized dataset
 
 Place the downloaded CSV under the ignored `Dataset/` directory; raw financial data
@@ -1429,6 +1474,7 @@ src/fraud_detection/
 ├── edge.py           # dependency-light quantized logistic runtime
 ├── evaluation.py     # threshold tuning, imbalance-aware metrics, and calibration reports
 ├── explanations.py   # isolated explanation provider protocols and cost controls
+├── features.py       # feature store contracts, point-in-time join, and skew surveillance
 ├── model.py          # training, model card, inference, and cryptographic attestation
 ├── recalibration.py  # ECE diagnostics, reliability curves, and post-hoc recalibration
 ├── reporting.py      # self-contained HTML compliance report rendering

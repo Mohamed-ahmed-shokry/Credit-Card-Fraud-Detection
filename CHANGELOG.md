@@ -8,6 +8,12 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- Feature store entity contracts and storage abstractions: implemented `FeatureDefinition`, `FeatureType` (`FLOAT`, `INT`, `STRING`, `BOOL`), `FeatureView` (with entity key, feature definitions, timestamp column, and TTL), `FeatureSnapshot`, and thread-safe storage engines `InMemoryFeatureStore` and `FileFeatureStore` with JSON bundle serialization and deserialization in `features.py`.
+- Point-in-time historical as-of join engine: implemented `point_in_time_join()` in `features.py` performing exact temporal joins where every observation at $t_{\text{obs}}$ strictly evaluates snapshots with $t_{\text{feature}} \le t_{\text{obs}}$, mathematically eliminating lookahead bias and target leakage while enforcing TTL staleness detection and schema default value fallbacks.
+- Training-serving distribution skew surveillance: implemented `FeatureSkewAnalyzer`, `FeatureSkewReport`, `FeatureSkewMetric`, and `SkewStatus` (`STABLE`, `WARNING`, `DRIFTED`) in `features.py`, computing Population Stability Index (PSI), two-sample Kolmogorov-Smirnov (KS) statistic, 1D Wasserstein earth mover's distance, and null rate disparity across numerical features without external dependencies.
+- Scoring audit lineage for feature store enrichment: updated `build_scoring_audit_event()` in `audit.py` to record `enriched_features` and `feature_views_applied`, ensuring complete regulatory traceability.
+- Serving API online feature store integration: extended `create_app()` in `api.py` to support online feature store lookup and transaction enrichment via `feature_store` parameter or `FRAUD_FEATURE_STORE_PATH`, added operational endpoints `/v1/features/stats` and `/v1/features/lookup/{entity_key}/{entity_id}`, added Prometheus counter `fraud_feature_lookups_total{entity_key, status}`, and exposed feature store status in `/health` and `/ready` probes.
+- CLI consistency governance tooling: added `fraud-detect feature-join` (point-in-time observation enrichment with `--output`), `fraud-detect feature-check` (training-serving skew surveillance with `--fail-on-skew` exit code gating and `--json` export), and `--feature-store` option in `fraud-detect serve`.
 - Champion/Challenger multi-model routing engine: added `ChampionChallengerRouter`, `RoutingPolicy`,
   `TrafficSplitStrategy`, `ModelRole`, and `CanaryStatus` in `routing.py`, providing dynamic model resolution
   across champion and challenger candidates with statistical random splitting and deterministic entity-hash
