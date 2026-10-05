@@ -226,6 +226,8 @@ def build_scoring_audit_event(
     model_role: str | None = None,
     routed_model_version: str | None = None,
     shadow_predictions: Sequence[dict[str, Any]] | None = None,
+    enriched_features: Sequence[str] | None = None,
+    feature_views_applied: Sequence[str] | None = None,
 ) -> AuditEvent:
     """Construct a structured scoring audit event."""
     fraud_count = sum(1 for p in predictions if p.get("is_fraud"))
@@ -235,6 +237,10 @@ def build_scoring_audit_event(
         "fraud_count": fraud_count,
         "predictions": list(predictions),
     }
+    if enriched_features is not None:
+        payload["enriched_features"] = list(enriched_features)
+    if feature_views_applied is not None:
+        payload["feature_views_applied"] = list(feature_views_applied)
     if model_role is not None:
         payload["model_role"] = model_role
     if routed_model_version is not None:

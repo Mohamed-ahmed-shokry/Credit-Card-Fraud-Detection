@@ -507,12 +507,12 @@ def test_replay_audit_log_validation_and_robustness(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="tolerance must be a finite, non-negative float"):
         replay_audit_log(log_file, model, tolerance=-0.01)
     with pytest.raises(ValueError, match="tolerance must be a finite, non-negative float"):
-        replay_audit_log(log_file, model, tolerance=True)  # type: ignore[arg-type]
+        replay_audit_log(log_file, model, tolerance=True)
 
     with pytest.raises(ValueError, match="max_discrepancies_to_record must be"):
         replay_audit_log(log_file, model, max_discrepancies_to_record=-1)
     with pytest.raises(ValueError, match="max_discrepancies_to_record must be"):
-        replay_audit_log(log_file, model, max_discrepancies_to_record=True)  # type: ignore[arg-type]
+        replay_audit_log(log_file, model, max_discrepancies_to_record=True)
 
     with pytest.raises(ValueError, match=r"threshold must be a finite float between 0\.0 and 1\.0"):
         replay_audit_log(log_file, model, threshold=1.5)
@@ -763,3 +763,17 @@ def test_backtest_audit_policy_validation_errors(tmp_path: Path) -> None:
         match=r"Length of y_true \(2\) does not match number of scored transactions \(1\)",
     ):
         backtest_audit_policy(log_file, candidate, y_true=[0, 1])
+
+
+def test_build_scoring_audit_event_feature_store_enrichment() -> None:
+    event = build_scoring_audit_event(
+        model_version="v1",
+        dataset_fingerprint="fp1",
+        threshold=0.5,
+        predictions=[{"fraud_probability": 0.3, "is_fraud": False}],
+        enriched_features=["user_risk_score", "card_velocity_1h"],
+        feature_views_applied=["user_profile", "card_profile"],
+    )
+    assert event.payload["enriched_features"] == ["user_risk_score", "card_velocity_1h"]
+    assert event.payload["feature_views_applied"] == ["user_profile", "card_profile"]
+
