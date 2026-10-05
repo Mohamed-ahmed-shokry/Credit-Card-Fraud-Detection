@@ -46,6 +46,7 @@ from fraud_detection.audit import (
 )
 from fraud_detection.evaluation import DecisionAction, TieredThresholds
 from fraud_detection.explanations import ExplanationProvider
+from fraud_detection.features import FeatureStoreProtocol, FileFeatureStore
 from fraud_detection.model import FraudModel, ModelArtifactError, load_model
 from fraud_detection.recalibration import BaseRecalibrator
 from fraud_detection.routing import (
@@ -98,6 +99,7 @@ ENABLE_CHAOS_HEADER_ENVIRONMENT_VARIABLE = "FRAUD_ENABLE_CHAOS_HEADER"
 RULES_PATH_ENVIRONMENT_VARIABLE = "FRAUD_RULES_PATH"
 RULE_PRECEDENCE_ENVIRONMENT_VARIABLE = "FRAUD_RULE_PRECEDENCE"
 VELOCITY_CONFIG_PATH_ENVIRONMENT_VARIABLE = "FRAUD_VELOCITY_CONFIG_PATH"
+FEATURE_STORE_PATH_ENVIRONMENT_VARIABLE = "FRAUD_FEATURE_STORE_PATH"
 CHALLENGER_MODEL_PATH_ENVIRONMENT_VARIABLE = "FRAUD_CHALLENGER_MODEL_PATH"
 ROUTING_STRATEGY_ENVIRONMENT_VARIABLE = "FRAUD_ROUTING_STRATEGY"
 CHALLENGER_WEIGHT_ENVIRONMENT_VARIABLE = "FRAUD_CHALLENGER_WEIGHT"
@@ -119,6 +121,7 @@ OPERATIONAL_PATHS = frozenset(
         "/v1/routing/status",
         "/v1/routing/rollback",
         "/v1/routing/reset",
+        "/v1/features/stats",
     }
 )
 UNMATCHED_ROUTE_LABEL = "unmatched"
@@ -155,6 +158,9 @@ class _OperationalStatus:
     routing_strategy: str | None = None
     challenger_model_version: str | None = None
     canary_status: str | None = None
+    features_enabled: bool | None = None
+    features_views_count: int | None = None
+    features_entities_count: int | None = None
 
     def response_fields(self) -> dict[str, Any]:
         """Return the response fields shared by `/health` and `/ready`."""
@@ -182,6 +188,12 @@ class _OperationalStatus:
             fields["challenger_model_version"] = self.challenger_model_version
         if self.canary_status is not None:
             fields["canary_status"] = self.canary_status
+        if self.features_enabled is not None:
+            fields["features_enabled"] = self.features_enabled
+        if self.features_views_count is not None:
+            fields["features_views_count"] = self.features_views_count
+        if self.features_entities_count is not None:
+            fields["features_entities_count"] = self.features_entities_count
         return fields
 
 
@@ -611,6 +623,9 @@ class HealthResponse(BaseModel):
     routing_strategy: str | None = None
     challenger_model_version: str | None = None
     canary_status: str | None = None
+    features_enabled: bool | None = None
+    features_views_count: int | None = None
+    features_entities_count: int | None = None
 
 
 class LivenessResponse(BaseModel):
@@ -698,6 +713,8 @@ def create_app(
     canary_max_discrepancy: float | None = None,
     canary_max_divergence: float | None = None,
     canary_auto_rollback: bool | None = None,
+    feature_store: FeatureStoreProtocol | None = None,
+    feature_store_path: Path | str | None = None,
 ) -> FastAPI:
     """Create an application using an injected model or a trusted artifact path.
 
@@ -880,6 +897,13 @@ def create_app(
         else None
     )
 
+    resolved_feature_store_path = feature_store_path or os.getenv(
+        FEATURE_STORE_PATH_ENVIRONMENT_VARIABLE
+    )
+    resolved_feature_store: FeatureStoreProtocol | None = feature_store
+    if resolved_feature_store is None and resolved_feature_store_path is not None:
+        resolved_feature_store = FileFeatureStore.from_file(resolved_feature_store_path)
+
     metrics_registry = CollectorRegistry()
     request_counter = Counter(
         "http_requests_total",
@@ -983,6 +1007,12 @@ def create_app(
         "fraud_canary_status",
         "Current operational status of canary routing (1=active, 0=inactive).",
         ["status"],
+        registry=metrics_registry,
+    )
+    feature_lookups_counter = Counter(
+        "fraud_feature_lookups_total",
+        "Total online feature lookups performed by the feature store.",
+        ["entity_key", "status"],
         registry=metrics_registry,
     )
 
@@ -1183,6 +1213,8 @@ def create_app(
         application.state.routing_predictions_counter = routing_predictions_counter
         application.state.shadow_discrepancy_total_counter = shadow_discrepancy_total_counter
         application.state.canary_status_gauge = canary_status_gauge
+        application.state.feature_store = resolved_feature_store
+        application.state.feature_lookups_counter = feature_lookups_counter
         shadow_tasks: set[asyncio.Task[None]] = set()
         application.state.shadow_tasks = shadow_tasks
         yield
@@ -1725,6 +1757,8 @@ def create_app(
         review_threshold: float | None = None,
         deny_threshold: float | None = None,
         include_shadow: bool = False,
+        enriched_features: list[str] | None = None,
+        feature_views_applied: list[str] | None = None,
     ) -> tuple[
         float,
         list[PredictionResult],
@@ -1939,6 +1973,8 @@ def create_app(
                 model_role=model_role,
                 routed_model_version=routed_version,
                 shadow_predictions=shadow_results_sync,
+                enriched_features=enriched_features,
+                feature_views_applied=feature_views_applied,
             )
             await run_in_threadpool(sink.emit, audit_event)
         except Exception:
@@ -1987,6 +2023,75 @@ def create_app(
             shadow_results_sync,
         )
 
+    def _enrich_records_with_feature_store(
+        request: Request,
+        records: list[dict[str, float]],
+        expected_cols: set[str],
+    ) -> tuple[list[dict[str, float]], list[str], list[str]]:
+        store: FeatureStoreProtocol | None = getattr(request.app.state, "feature_store", None)
+        if store is None:
+            return records, [], []
+
+        counter: Counter | None = getattr(request.app.state, "feature_lookups_counter", None)
+        applied_views: list[str] = []
+        enriched_features: list[str] = []
+        header_entity = request.headers.get("X-Entity-ID")
+
+        enriched_records: list[dict[str, float]] = []
+        for rec in records:
+            tx = dict(rec)
+            for vn in store.list_views():
+                view = store.get_view(vn)
+                if view is None:
+                    continue
+                eid = tx.get(view.entity_key)
+                if eid is None and header_entity:
+                    eid = header_entity  # type: ignore[assignment]
+                if eid is not None:
+                    obs_t = tx.get("Time")
+                    as_of = float(obs_t) if obs_t is not None else None
+                    str_eid = (
+                        str(int(eid))
+                        if isinstance(eid, (int, float)) and float(eid).is_integer()
+                        else str(eid)
+                    )
+                    res = store.lookup_online(
+                        entity_key=view.entity_key,
+                        entity_id=str_eid,
+                        view_name=view.name,
+                        as_of_time=as_of,
+                    )
+                    if not res.found and str_eid != str(eid):
+                        alt_res = store.lookup_online(
+                            entity_key=view.entity_key,
+                            entity_id=str(eid),
+                            view_name=view.name,
+                            as_of_time=as_of,
+                        )
+                        if alt_res.found:
+                            res = alt_res
+                    if counter is not None:
+                        counter.labels(
+                            entity_key=view.entity_key,
+                            status="hit" if res.found else "miss",
+                        ).inc()
+                    if res.found:
+                        if view.name not in applied_views:
+                            applied_views.append(view.name)
+                        for fname, fval in res.values.items():
+                            if fname in expected_cols or fname in tx:
+                                tx[fname] = float(fval)
+                                if fname not in enriched_features:
+                                    enriched_features.append(fname)
+            enriched_records.append(tx)
+
+        pruned_records: list[dict[str, float]] = [
+            {k: float(v) for k, v in rec_item.items() if k in expected_cols}
+            for rec_item in enriched_records
+        ]
+
+        return pruned_records, enriched_features, applied_views
+
     @application.post(
         "/v1/predict",
         response_model=PredictionResponse,
@@ -2027,6 +2132,14 @@ def create_app(
         else:
             frame_records = payload.transactions
 
+        (
+            frame_records,
+            enriched_features,
+            feature_views_applied,
+        ) = _enrich_records_with_feature_store(
+            request, frame_records, set(loaded.feature_names)
+        )
+
         try:
             (
                 applied_threshold,
@@ -2049,6 +2162,8 @@ def create_app(
                 review_threshold=payload.review_threshold,
                 deny_threshold=payload.deny_threshold,
                 include_shadow=payload.include_shadow,
+                enriched_features=enriched_features or None,
+                feature_views_applied=feature_views_applied or None,
             )
         except _ScoringOverloadedError:
             return _scoring_overloaded_response()
@@ -2103,6 +2218,14 @@ def create_app(
         else:
             frame_records = [payload.transaction]
 
+        (
+            frame_records,
+            enriched_features,
+            feature_views_applied,
+        ) = _enrich_records_with_feature_store(
+            request, frame_records, set(loaded.feature_names)
+        )
+
         try:
             (
                 applied_threshold,
@@ -2125,6 +2248,8 @@ def create_app(
                 review_threshold=payload.review_threshold,
                 deny_threshold=payload.deny_threshold,
                 include_shadow=payload.include_shadow,
+                enriched_features=enriched_features or None,
+                feature_views_applied=feature_views_applied or None,
             )
         except _ScoringOverloadedError:
             return _scoring_overloaded_response()
@@ -2169,6 +2294,59 @@ def create_app(
                 content={"detail": "Velocity tracking is not enabled on this service."},
             )
         return buf.get_entity_profile(entity_id)
+
+    @application.get("/v1/features/stats", tags=["features"])
+    async def feature_store_stats(request: Request) -> dict[str, Any]:
+        """Return operational metrics of the integrated feature store."""
+        fs: FeatureStoreProtocol | None = getattr(request.app.state, "feature_store", None)
+        if fs is None:
+            return {
+                "enabled": False,
+                "views_count": 0,
+                "entities_count": 0,
+                "views": [],
+            }
+        base_stats = fs.get_stats()
+        views_info = []
+        for v_name in fs.list_views():
+            view = fs.get_view(v_name)
+            if view is not None:
+                views_info.append(
+                    {
+                        "name": view.name,
+                        "entity_key": view.entity_key,
+                        "features": [f.name for f in view.features],
+                        "ttl_seconds": view.ttl_seconds,
+                    }
+                )
+        return {
+            "enabled": True,
+            **base_stats,
+            "views_detail": views_info,
+        }
+
+    @application.get("/v1/features/lookup/{entity_key}/{entity_id}", tags=["features"])
+    async def feature_store_lookup(
+        entity_key: str, entity_id: str, request: Request
+    ) -> Any:
+        """Inspect online feature values for a specific entity."""
+        fs: FeatureStoreProtocol | None = getattr(request.app.state, "feature_store", None)
+        if fs is None:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": "Feature store is not enabled on this service."},
+            )
+        result = fs.lookup_online(entity_key=entity_key, entity_id=entity_id)
+        if not result.found:
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "detail": (
+                        f"Entity '{entity_id}' with key '{entity_key}' not found in feature store."
+                    )
+                },
+            )
+        return result.to_dict()
 
     @application.get(
         "/v1/routing/status",
@@ -2460,6 +2638,16 @@ def _operational_status(request: Request) -> _OperationalStatus:
         challenger_model_version = router.challenger_version
         canary_status = router.metrics.canary_status.value
 
+    fs: FeatureStoreProtocol | None = getattr(request.app.state, "feature_store", None)
+    features_enabled: bool | None = None
+    features_views_count: int | None = None
+    features_entities_count: int | None = None
+    if fs is not None:
+        features_enabled = True
+        fs_stats = fs.get_stats()
+        features_views_count = int(fs_stats.get("views_count", len(fs.list_views())))
+        features_entities_count = int(fs_stats.get("total_entities", 0))
+
     return _OperationalStatus(
         fallback_mode=str(getattr(request.app.state, "fallback_mode", "raise")),
         degraded_mode=degraded_mode,
@@ -2476,6 +2664,9 @@ def _operational_status(request: Request) -> _OperationalStatus:
         routing_strategy=routing_strategy,
         challenger_model_version=challenger_model_version,
         canary_status=canary_status,
+        features_enabled=features_enabled,
+        features_views_count=features_views_count,
+        features_entities_count=features_entities_count,
     )
 
 

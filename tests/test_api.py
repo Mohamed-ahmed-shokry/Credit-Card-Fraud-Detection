@@ -32,6 +32,7 @@ from fraud_detection.api import (
     CIRCUIT_BREAKER_RECOVERY_TIMEOUT_ENVIRONMENT_VARIABLE,
     DEGRADED_MODE_ENVIRONMENT_VARIABLE,
     ENABLE_CHAOS_HEADER_ENVIRONMENT_VARIABLE,
+    FEATURE_STORE_PATH_ENVIRONMENT_VARIABLE,
     MAX_CONCURRENT_SCORING_ENVIRONMENT_VARIABLE,
     MAX_REQUEST_BODY_BYTES,
     MODEL_PATH_ENVIRONMENT_VARIABLE,
@@ -51,6 +52,14 @@ from fraud_detection.api import (
 )
 from fraud_detection.audit import JsonlAuditSink
 from fraud_detection.data import ValidatedDataset, generate_synthetic_data, validate_frame
+from fraud_detection.features import (
+    FeatureDefinition,
+    FeatureSnapshot,
+    FeatureType,
+    FeatureView,
+    FileFeatureStore,
+    InMemoryFeatureStore,
+)
 from fraud_detection.model import FraudModel, save_model, train_model, validate_artifact
 from fraud_detection.recalibration import PlattRecalibrator
 from fraud_detection.routing import TrafficSplitStrategy
@@ -2979,5 +2988,221 @@ def test_routing_status_when_router_is_none(
         data = res.json()
         assert data["routing_policy"]["strategy"] == "champion_only"
         assert data["challenger_model_version"] is None
+
+
+def test_feature_store_enrichment_predict_and_score(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+    tmp_path: Path,
+) -> None:
+    _, base_model, dataset = api_context
+    view = FeatureView(
+        name="user_view",
+        entity_key="user_id",
+        features=(
+            FeatureDefinition(
+                name="V1",
+                feature_type=FeatureType.FLOAT,
+                default_value=0.0,
+            ),
+        ),
+    )
+    store = InMemoryFeatureStore(views=[view])
+    store.put_snapshot(
+        "user_view",
+        FeatureSnapshot(
+            entity_id="99",
+            timestamp=100.0,
+            values={"V1": 5.5},
+        ),
+    )
+
+    audit_path = tmp_path / "audit.jsonl"
+    audit_sink = JsonlAuditSink(audit_path)
+    app = create_app(
+        model=base_model,
+        feature_store=store,
+        audit_sink=audit_sink,
+    )
+
+    rec1 = dataset.features.iloc[0].to_dict()
+    rec1["user_id"] = 99.0
+    rec1["Time"] = 105.0
+
+    rec2 = dataset.features.iloc[1].to_dict()
+
+    with TestClient(app) as test_client:
+        resp = test_client.post("/v1/predict", json={"transactions": [rec1, rec2]})
+        assert resp.status_code == 200
+
+        rec_score = dataset.features.iloc[0].to_dict()
+        resp_score = test_client.post(
+            "/v1/score",
+            headers={"X-Entity-ID": "99"},
+            json={"transaction": rec_score},
+        )
+        assert resp_score.status_code == 200
+
+    events = [
+        json.loads(line)
+        for line in audit_path.read_text(encoding="utf-8").strip().splitlines()
+    ]
+    assert len(events) == 2
+
+    # Predict request was enriched with user_view
+    assert events[0]["payload"]["enriched_features"] == ["V1"]
+    assert events[0]["payload"]["feature_views_applied"] == ["user_view"]
+
+    # Score event was enriched via X-Entity-ID header
+    assert events[1]["payload"]["enriched_features"] == ["V1"]
+    assert events[1]["payload"]["feature_views_applied"] == ["user_view"]
+
+
+def test_feature_store_endpoints_enabled_and_disabled(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, base_model, _ = api_context
+
+    # Case 1: Disabled
+    app_disabled = create_app(model=base_model)
+    with TestClient(app_disabled) as client:
+        stats_resp = client.get("/v1/features/stats")
+        assert stats_resp.status_code == 200
+        stats_data = stats_resp.json()
+        assert stats_data["enabled"] is False
+        assert stats_data["views_count"] == 0
+
+        lookup_resp = client.get("/v1/features/lookup/user_id/user_99")
+        assert lookup_resp.status_code == 404
+        assert "not enabled" in lookup_resp.json()["detail"]
+
+    # Case 2: Enabled
+    view = FeatureView(
+        name="merchant_view",
+        entity_key="merchant_id",
+        features=(
+            FeatureDefinition(
+                name="V2",
+                feature_type=FeatureType.FLOAT,
+                default_value=1.2,
+            ),
+        ),
+    )
+    store = InMemoryFeatureStore(views=[view])
+    store.put_snapshot(
+        "merchant_view",
+        FeatureSnapshot(
+            entity_id="m_42",
+            timestamp=200.0,
+            values={"V2": 3.4},
+        ),
+    )
+    app_enabled = create_app(model=base_model, feature_store=store)
+    with TestClient(app_enabled) as client:
+        stats_resp = client.get("/v1/features/stats")
+        assert stats_resp.status_code == 200
+        stats_data = stats_resp.json()
+        assert stats_data["enabled"] is True
+        assert stats_data["views_count"] == 1
+        assert stats_data["total_entities"] == 1
+        assert len(stats_data["views_detail"]) == 1
+        assert stats_data["views_detail"][0]["name"] == "merchant_view"
+
+        lookup_found = client.get("/v1/features/lookup/merchant_id/m_42")
+        assert lookup_found.status_code == 200
+        lookup_data = lookup_found.json()
+        assert lookup_data["found"] is True
+        assert lookup_data["values"]["V2"] == 3.4
+
+        lookup_not_found = client.get("/v1/features/lookup/merchant_id/m_unknown")
+        assert lookup_not_found.status_code == 404
+        assert "not found" in lookup_not_found.json()["detail"]
+
+
+def test_feature_store_health_and_metrics(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, base_model, dataset = api_context
+    view = FeatureView(
+        name="account_view",
+        entity_key="account_id",
+        features=(
+            FeatureDefinition(
+                name="V1",
+                feature_type=FeatureType.FLOAT,
+                default_value=0.0,
+            ),
+        ),
+    )
+    store = InMemoryFeatureStore(views=[view])
+    store.put_snapshot(
+        "account_view",
+        FeatureSnapshot(
+            entity_id="acc_1",
+            timestamp=50.0,
+            values={"V1": 1.1},
+        ),
+    )
+    app = create_app(model=base_model, feature_store=store)
+    with TestClient(app) as client:
+        health_resp = client.get("/health")
+        assert health_resp.status_code == 200
+        health_data = health_resp.json()
+        assert health_data["features_enabled"] is True
+        assert health_data["features_views_count"] == 1
+        assert health_data["features_entities_count"] == 1
+
+        rec = dataset.features.iloc[0].to_dict()
+        client.post(
+            "/v1/score",
+            headers={"X-Entity-ID": "acc_1"},
+            json={"transaction": rec},
+        )
+
+        metrics_resp = client.get("/metrics")
+        assert metrics_resp.status_code == 200
+        metrics_text = metrics_resp.text
+        assert "fraud_feature_lookups_total" in metrics_text
+        assert 'entity_key="account_id"' in metrics_text
+        assert 'status="hit"' in metrics_text
+
+
+def test_feature_store_from_file_environment(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, base_model, _ = api_context
+    store_file = tmp_path / "features.json"
+    view = FeatureView(
+        name="env_view",
+        entity_key="env_id",
+        features=(
+            FeatureDefinition(
+                name="V3",
+                feature_type=FeatureType.FLOAT,
+                default_value=0.5,
+            ),
+        ),
+    )
+    file_store = FileFeatureStore(views=[view])
+    file_store.put_snapshot(
+        "env_view",
+        FeatureSnapshot(
+            entity_id="env_1",
+            timestamp=10.0,
+            values={"V3": 2.2},
+        ),
+    )
+    file_store.save_to_file(store_file)
+
+    monkeypatch.setenv(FEATURE_STORE_PATH_ENVIRONMENT_VARIABLE, str(store_file))
+    app = create_app(model=base_model)
+    with TestClient(app) as client:
+        stats_resp = client.get("/v1/features/stats")
+        assert stats_resp.status_code == 200
+        data = stats_resp.json()
+        assert data["enabled"] is True
+        assert data["views_count"] == 1
+        assert data["total_entities"] == 1
 
 
