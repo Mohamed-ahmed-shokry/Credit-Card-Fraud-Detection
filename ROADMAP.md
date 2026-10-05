@@ -1255,7 +1255,7 @@ This phase does not implement external service meshes (Istio/Envoy), Kubernetes 
 - `d57e211`: feat(cli): add route-eval command and multi-model routing serve options
 - `1f3c122`: docs: document multi-model routing, canary governance, and complete Phase 30
 
-## Phase 31 — Feature Store Integration & Point-in-Time Offline/Online Consistency Governance (Proposed)
+## Phase 31 — Feature Store Integration & Point-in-Time Offline/Online Consistency Governance (In Progress)
 
 ### Objective
 
@@ -1263,20 +1263,34 @@ Provide feature store integration abstractions and point-in-time join consistenc
 
 ### Scope
 
-- **Feature store entity contract** (`features.py`): Typed feature view definitions, entity key specifications, feature value schemas, and offline/online storage interfaces.
-- **Point-in-time historical join engine**: Time-travel join semantics joining transaction timestamps with historical feature snapshots without future-feature leakage.
-- **Training-serving skew surveillance**: Quantify statistical feature divergence (KS test, Wasserstein distance, PSI) between online request features and offline reference feature views.
-- **Offline / Online consistency validation CLI**: `fraud-detect feature-check` and `fraud-detect feature-sync` commands.
+- **Feature store entity contract** (`features.py`): Typed feature view definitions, entity key specifications (`card_id`, `user_id`, `merchant_id`), feature value schemas, and offline/online storage interfaces with TTL support.
+- **Point-in-time historical join engine**: Time-travel join semantics joining transaction timestamps with historical feature snapshots without future-feature leakage ($t_{\text{feature}} \le t_{\text{tx}}$) and configurable max staleness.
+- **Training-serving skew surveillance**: Quantify statistical feature divergence (PSI, Kolmogorov-Smirnov test, Wasserstein distance, null rate disparity) between online request features and offline reference feature views.
+- **API serving integration & telemetry**: Online feature store enrichment in `create_app` scoring flow, lookup and stats endpoints (`/v1/features/lookup/{entity_key}/{entity_id}`, `/v1/features/stats`), and Prometheus metrics (`fraud_feature_lookups_total`, `fraud_feature_lookup_latency_seconds`).
+- **Offline / Online consistency validation CLI**: `fraud-detect feature-join` (point-in-time enrichment) and `fraud-detect feature-check` (training-serving skew surveillance with `--fail-on-skew`).
 
 ### Acceptance criteria
 
-- Historical joins strictly satisfy $t_{\text{feature}} \le t_{\text{tx}}$ without lookahead bias.
-- Real-time online feature lookup integrates cleanly into `create_app` scoring lifecycle.
+- Historical joins strictly satisfy $t_{\text{feature}} \le t_{\text{tx}}$ without lookahead bias or future-data contamination.
+- Missing feature snapshots within TTL fall back to configured default values gracefully.
+- Real-time online feature lookup integrates cleanly into `create_app` scoring lifecycle, enriching inbound transactions prior to model inference.
+- Feature skew analyzer computes distribution drift metrics with clear operational status (`STABLE`, `WARNING`, `DRIFTED`).
+- CLI commands support both CSV and JSON formats, with `--fail-on-skew` exit code gating for CI/CD pipelines.
 - Test suite achieves 100% pass rate, branch coverage remains $\ge 97.0\%$, Ruff and strict mypy pass with zero errors.
 
 ### Explicit exclusions
 
 This phase does not implement external cloud database drivers (Feast, Snowflake, BigQuery, Redis) as hard dependencies; it provides an in-memory/file-backed canonical reference implementation with pluggable store protocols.
+
+### Implementation tasks
+
+1. `features.py` (Core Contracts & Join Engine): Implement `FeatureType`, `FeatureDefinition`, `FeatureView`, `FeatureSnapshot`, `InMemoryFeatureStore`, `FileFeatureStore`, and `point_in_time_join()` with strict temporal causality.
+2. `features.py` (Skew Surveillance): Implement `FeatureSkewAnalyzer`, `FeatureSkewMetric`, `FeatureSkewReport`, and divergence computations (PSI, KS test, Wasserstein distance, null rate disparity).
+3. `audit.py`: Extend scoring audit events to record feature enrichment metadata (`enriched_features`, `feature_view_names`).
+4. `api.py`: Integrate online feature store into `create_app` scoring pipeline, expose `/v1/features/lookup/{entity_key}/{entity_id}` and `/v1/features/stats` endpoints, and Prometheus metrics.
+5. `cli.py`: Add `fraud-detect feature-join` and `fraud-detect feature-check` commands; add `--feature-store` option to `fraud-detect serve`.
+6. Full test suite verification, branch coverage $\ge 97.0\%$, Ruff and strict mypy verification.
+7. Documentation and completion records in `ARCHITECTURE.md`, `README.md`, `CHANGELOG.md`, and `ROADMAP.md`.
 
 ## Contributing to the roadmap
 
