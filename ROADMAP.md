@@ -1290,6 +1290,7 @@ This phase does not implement external cloud database drivers (Feast, Snowflake,
 - `7b4ce61`: feat(audit): record feature enrichment metadata in scoring audit events
 - `1895daa`: feat(api): integrate online feature store enrichment, telemetry, and lookup endpoints
 - `a97bf75`: feat(cli): add feature-join and feature-check commands and serve feature store option
+- `a312096`: docs: document feature store integration, consistency governance, and complete Phase 31
 
 ## Phase 32 — Real-Time Streaming Decision Graph & Adaptive Execution Pipeline (Proposed)
 
