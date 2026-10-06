@@ -777,3 +777,28 @@ def test_build_scoring_audit_event_feature_store_enrichment() -> None:
     assert event.payload["enriched_features"] == ["user_risk_score", "card_velocity_1h"]
     assert event.payload["feature_views_applied"] == ["user_profile", "card_profile"]
 
+
+def test_build_scoring_audit_event_pipeline_execution_trace() -> None:
+    stages = [
+        {"node_name": "enrichment", "status": "success", "latency_ms": 1.2},
+        {"node_name": "inference", "status": "timeout", "latency_ms": 50.0, "degraded": True},
+    ]
+    event = build_scoring_audit_event(
+        model_version="v1",
+        dataset_fingerprint="fp1",
+        threshold=0.5,
+        predictions=[{"fraud_probability": 0.3, "is_fraud": False}],
+        execution_trace={"execution_path": ["enrichment", "inference"], "total_latency_ms": 51.2},
+        pipeline_stages=stages,
+        degraded_nodes=["inference"],
+    )
+    assert event.payload["execution_trace"]["execution_path"] == ["enrichment", "inference"]
+    assert len(event.payload["pipeline_stages"]) == 2
+    assert event.payload["degraded_nodes"] == ["inference"]
+
+    # Verify serialization and JSON redaction safety
+    serialized = event.to_json(redact=True)
+    parsed = json.loads(serialized)
+    assert parsed["payload"]["degraded_nodes"] == ["inference"]
+
+
