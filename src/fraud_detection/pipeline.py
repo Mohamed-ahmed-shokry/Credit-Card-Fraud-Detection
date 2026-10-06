@@ -647,6 +647,38 @@ class PipelineExecutionResult:
             "degraded_nodes": self.degraded_nodes,
         }
 
+    @property
+    def decision(self) -> str:
+        return str(self.final_decision.get("decision", "ALLOW"))
+
+    @property
+    def is_fraud(self) -> bool:
+        return bool(self.final_decision.get("is_fraud", False))
+
+    @property
+    def fraud_probability(self) -> float:
+        return float(self.final_decision.get("fraud_probability", 0.0))
+
+    @property
+    def raw_probability(self) -> float | None:
+        raw = self.final_decision.get("raw_probability")
+        return float(raw) if raw is not None else None
+
+    @property
+    def matched_rule(self) -> str | None:
+        res = self.final_decision.get("matched_rule")
+        return str(res) if res is not None else None
+
+    @property
+    def rule_action(self) -> str | None:
+        res = self.final_decision.get("rule_action")
+        return str(res) if res is not None else None
+
+    @property
+    def contributions(self) -> dict[str, float] | None:
+        res = self.final_decision.get("contributions")
+        return dict(res) if isinstance(res, dict) else None
+
 
 # ============================================================================
 # Asynchronous Graph Executor & Pipeline Factory
@@ -773,10 +805,22 @@ class DecisionGraphExecutor:
             node_name for node_name in self.plan.topological_order if node_name in context.results
         ]
 
-        # Final decision is taken from "action" node if present, else fallback
+        # Final decision is taken from ACTION stage node if present, else fallback
+        action_node_name: str | None = None
+        for name, node in self.graph.nodes.items():
+            if node.stage_type == StageType.ACTION:
+                action_node_name = name
+                break
+        if action_node_name is None and "action" in context.results:
+            action_node_name = "action"
+
         final_decision: dict[str, Any] = {}
-        if "action" in context.results and context.results["action"].output:
-            final_decision = dict(context.results["action"].output)
+        if (
+            action_node_name is not None
+            and action_node_name in context.results
+            and context.results[action_node_name].output
+        ):
+            final_decision = dict(context.results[action_node_name].output)
         else:
             final_decision = {
                 "decision": "ALLOW",

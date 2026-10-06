@@ -36,6 +36,7 @@ from fraud_detection.api import (
     MAX_CONCURRENT_SCORING_ENVIRONMENT_VARIABLE,
     MAX_REQUEST_BODY_BYTES,
     MODEL_PATH_ENVIRONMENT_VARIABLE,
+    PIPELINE_ENABLED_ENVIRONMENT_VARIABLE,
     PROCESS_TIME_HEADER,
     RATE_LIMIT_REQUESTS_ENVIRONMENT_VARIABLE,
     RATE_LIMIT_WINDOW_SECONDS_ENVIRONMENT_VARIABLE,
@@ -3204,5 +3205,142 @@ def test_feature_store_from_file_environment(
         assert data["enabled"] is True
         assert data["views_count"] == 1
         assert data["total_entities"] == 1
+
+
+def test_pipeline_endpoints_disabled_by_default(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, model, dataset = api_context
+    app = create_app(model=model)
+    with TestClient(app) as client:
+        h_resp = client.get("/health")
+        assert h_resp.status_code == 200
+        assert "pipeline_enabled" not in h_resp.json()
+
+        t_resp = client.get("/v1/pipeline/topology")
+        assert t_resp.status_code == 404
+        assert "not enabled" in t_resp.json()["detail"]
+
+        rec = dataset.features.iloc[0].to_dict()
+        s_resp = client.post("/v1/pipeline/score", json={"transaction": rec})
+        assert s_resp.status_code == 404
+        assert "not enabled" in s_resp.json()["detail"]
+
+
+def test_pipeline_default_pipeline_execution_and_telemetry(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, model, dataset = api_context
+    app = create_app(model=model, enable_pipeline=True)
+    with TestClient(app) as client:
+        h_resp = client.get("/health")
+        assert h_resp.status_code == 200
+        h_data = h_resp.json()
+        assert h_data["pipeline_enabled"] is True
+        assert h_data["pipeline_nodes_count"] == 5
+
+        t_resp = client.get("/v1/pipeline/topology")
+        assert t_resp.status_code == 200
+        t_data = t_resp.json()
+        assert t_data["name"] == "production_fraud_pipeline"
+        assert t_data["node_count"] == 5
+        assert len(t_data["nodes"]) == 5
+        assert "execution_plan" in t_data
+        assert len(t_data["execution_plan"]["waves"]) >= 3
+
+        rec = dataset.features.iloc[0].to_dict()
+        score_resp = client.post("/v1/pipeline/score", json={"transaction": rec})
+        assert score_resp.status_code == 200
+        s_data = score_resp.json()
+        assert "execution_id" in s_data
+        assert s_data["decision"] in ("ALLOW", "REVIEW", "DENY")
+        assert isinstance(s_data["is_fraud"], bool)
+        assert 0.0 <= s_data["fraud_probability"] <= 1.0
+        assert s_data["degraded"] is False
+        assert len(s_data["execution_path"]) == 5
+        assert "inference" in s_data["stage_results"]
+        assert "action" in s_data["stage_results"]
+
+        m_resp = client.get("/metrics")
+        assert m_resp.status_code == 200
+        m_text = m_resp.text
+        assert "fraud_pipeline_executions_total" in m_text
+        assert 'status="success"' in m_text
+        assert "fraud_pipeline_stage_duration_seconds" in m_text
+        assert 'stage="action"' in m_text
+
+
+def test_pipeline_audit_event_emission(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    from fraud_detection.audit import AuditEvent, AuditSink
+
+    _, model, dataset = api_context
+
+    class MemoryAuditSink(AuditSink):
+        def __init__(self) -> None:
+            self.events: list[AuditEvent] = []
+
+        def emit(self, event: AuditEvent) -> None:
+            self.events.append(event)
+
+        def close(self) -> None:
+            pass
+
+    sink = MemoryAuditSink()
+    app = create_app(model=model, enable_pipeline=True, audit_sink=sink)
+    with TestClient(app) as client:
+        rec = dataset.features.iloc[0].to_dict()
+        client.post("/v1/pipeline/score", json={"transaction": rec})
+
+    assert len(sink.events) == 1
+    event = sink.events[0]
+    assert event.event_type == "scoring"
+    assert "execution_trace" in event.payload
+    assert "pipeline_stages" in event.payload
+    assert len(event.payload["pipeline_stages"]) == 5
+
+
+def test_pipeline_custom_graph_and_env_var(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from fraud_detection.pipeline import DecisionGraph, PipelineNode, StageType
+
+    _, model, dataset = api_context
+
+    monkeypatch.setenv(PIPELINE_ENABLED_ENVIRONMENT_VARIABLE, "1")
+    app_env = create_app(model=model)
+    with TestClient(app_env) as client:
+        h_resp = client.get("/health")
+        assert h_resp.json().get("pipeline_enabled") is True
+
+    custom_graph = DecisionGraph("custom_mini_graph")
+    custom_graph.add_node(
+        PipelineNode(
+            name="custom_action",
+            stage_type=StageType.ACTION,
+            processor=lambda _ctx: {
+                "decision": "DENY",
+                "is_fraud": True,
+                "fraud_probability": 0.99,
+            },
+            required=True,
+        )
+    )
+    app_custom = create_app(model=model, pipeline=custom_graph)
+    with TestClient(app_custom) as client:
+        topo_resp = client.get("/v1/pipeline/topology")
+        assert topo_resp.json()["name"] == "custom_mini_graph"
+        assert topo_resp.json()["node_count"] == 1
+
+        rec = dataset.features.iloc[0].to_dict()
+        score_resp = client.post("/v1/pipeline/score", json={"transaction": rec})
+        assert score_resp.status_code == 200
+        res = score_resp.json()
+        assert res["decision"] == "DENY"
+        assert res["is_fraud"] is True
+        assert res["fraud_probability"] == 0.99
+
 
 

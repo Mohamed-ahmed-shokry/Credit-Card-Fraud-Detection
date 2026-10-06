@@ -48,6 +48,11 @@ from fraud_detection.evaluation import DecisionAction, TieredThresholds
 from fraud_detection.explanations import ExplanationProvider
 from fraud_detection.features import FeatureStoreProtocol, FileFeatureStore
 from fraud_detection.model import FraudModel, ModelArtifactError, load_model
+from fraud_detection.pipeline import (
+    DecisionGraph,
+    DecisionGraphExecutor,
+    create_default_fraud_pipeline,
+)
 from fraud_detection.recalibration import BaseRecalibrator
 from fraud_detection.routing import (
     CanaryConfig,
@@ -107,6 +112,7 @@ ROUTING_ENTITY_KEY_ENVIRONMENT_VARIABLE = "FRAUD_ROUTING_ENTITY_KEY"
 CANARY_MAX_DISCREPANCY_ENVIRONMENT_VARIABLE = "FRAUD_CANARY_MAX_DISCREPANCY"
 CANARY_MAX_DIVERGENCE_ENVIRONMENT_VARIABLE = "FRAUD_CANARY_MAX_DIVERGENCE"
 CANARY_AUTO_ROLLBACK_ENVIRONMENT_VARIABLE = "FRAUD_CANARY_AUTO_ROLLBACK"
+PIPELINE_ENABLED_ENVIRONMENT_VARIABLE = "FRAUD_PIPELINE_ENABLED"
 REQUEST_ID_HEADER = "X-Request-ID"
 PROCESS_TIME_HEADER = "X-Process-Time-Ms"
 MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024
@@ -122,6 +128,7 @@ OPERATIONAL_PATHS = frozenset(
         "/v1/routing/rollback",
         "/v1/routing/reset",
         "/v1/features/stats",
+        "/v1/pipeline/topology",
     }
 )
 UNMATCHED_ROUTE_LABEL = "unmatched"
@@ -161,6 +168,8 @@ class _OperationalStatus:
     features_enabled: bool | None = None
     features_views_count: int | None = None
     features_entities_count: int | None = None
+    pipeline_enabled: bool | None = None
+    pipeline_nodes_count: int | None = None
 
     def response_fields(self) -> dict[str, Any]:
         """Return the response fields shared by `/health` and `/ready`."""
@@ -194,6 +203,10 @@ class _OperationalStatus:
             fields["features_views_count"] = self.features_views_count
         if self.features_entities_count is not None:
             fields["features_entities_count"] = self.features_entities_count
+        if self.pipeline_enabled is not None:
+            fields["pipeline_enabled"] = self.pipeline_enabled
+        if self.pipeline_nodes_count is not None:
+            fields["pipeline_nodes_count"] = self.pipeline_nodes_count
         return fields
 
 
@@ -626,6 +639,8 @@ class HealthResponse(BaseModel):
     features_enabled: bool | None = None
     features_views_count: int | None = None
     features_entities_count: int | None = None
+    pipeline_enabled: bool | None = None
+    pipeline_nodes_count: int | None = None
 
 
 class LivenessResponse(BaseModel):
@@ -657,6 +672,8 @@ class ReadinessResponse(BaseModel):
     routing_strategy: str | None = None
     challenger_model_version: str | None = None
     canary_status: str | None = None
+    pipeline_enabled: bool | None = None
+    pipeline_nodes_count: int | None = None
 
 
 class RoutingStatusResponse(BaseModel):
@@ -668,6 +685,44 @@ class RoutingStatusResponse(BaseModel):
     metrics: dict[str, Any]
     canary_status: str
     rollback_reason: str | None = None
+
+
+class PipelineScoreRequest(BaseModel):
+    """Transaction input mapping for decision graph execution."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    transaction: dict[str, TransactionValue]
+    explain: bool = False
+
+
+class PipelineScoreResponse(BaseModel):
+    """Decision, trace, and telemetry returned by the decision graph pipeline."""
+
+    execution_id: str
+    decision: str
+    is_fraud: bool
+    fraud_probability: float
+    raw_probability: float | None = None
+    matched_rule: str | None = None
+    rule_action: str | None = None
+    contributions: dict[str, float] | None = None
+    total_latency_ms: float
+    degraded: bool
+    degraded_nodes: list[str]
+    execution_path: list[str]
+    stage_results: dict[str, Any]
+
+
+class PipelineTopologyResponse(BaseModel):
+    """Topological graph description for the registered decision pipeline."""
+
+    name: str
+    node_count: int
+    edge_count: int
+    nodes: dict[str, Any]
+    edges: list[dict[str, str]]
+    execution_plan: dict[str, Any]
 
 
 def create_app(
@@ -715,6 +770,9 @@ def create_app(
     canary_auto_rollback: bool | None = None,
     feature_store: FeatureStoreProtocol | None = None,
     feature_store_path: Path | str | None = None,
+    pipeline: DecisionGraph | None = None,
+    enable_pipeline: bool = False,
+    pipeline_executor: DecisionGraphExecutor | None = None,
 ) -> FastAPI:
     """Create an application using an injected model or a trusted artifact path.
 
@@ -904,6 +962,13 @@ def create_app(
     if resolved_feature_store is None and resolved_feature_store_path is not None:
         resolved_feature_store = FileFeatureStore.from_file(resolved_feature_store_path)
 
+    raw_pipeline_env = os.getenv(PIPELINE_ENABLED_ENVIRONMENT_VARIABLE)
+    resolved_pipeline_enabled = enable_pipeline or (
+        raw_pipeline_env.lower() in ("true", "1", "yes")
+        if raw_pipeline_env is not None
+        else False
+    ) or (pipeline is not None)
+
     metrics_registry = CollectorRegistry()
     request_counter = Counter(
         "http_requests_total",
@@ -1013,6 +1078,18 @@ def create_app(
         "fraud_feature_lookups_total",
         "Total online feature lookups performed by the feature store.",
         ["entity_key", "status"],
+        registry=metrics_registry,
+    )
+    pipeline_stage_duration_histogram = Histogram(
+        "fraud_pipeline_stage_duration_seconds",
+        "Duration of decision graph pipeline stages in seconds.",
+        ["stage", "status"],
+        registry=metrics_registry,
+    )
+    pipeline_executions_counter = Counter(
+        "fraud_pipeline_executions_total",
+        "Total decision graph pipeline executions.",
+        ["status", "degraded"],
         registry=metrics_registry,
     )
 
@@ -1185,6 +1262,26 @@ def create_app(
                     policy=built_policy,
                 )
 
+        resolved_pipeline_graph: DecisionGraph | None = pipeline
+        if (
+            resolved_pipeline_graph is None
+            and resolved_pipeline_enabled
+            and loaded_model is not None
+        ):
+            resolved_pipeline_graph = create_default_fraud_pipeline(
+                model=loaded_model,
+                rules=resolved_rules,
+                rule_precedence=resolved_precedence,
+                feature_store=resolved_feature_store,
+                velocity_buffer=resolved_velocity_buffer,
+                velocity_config=resolved_velocity_config,
+                recalibrator=getattr(loaded_model, "recalibrator", None),
+            )
+
+        resolved_pipeline_exec = pipeline_executor
+        if resolved_pipeline_exec is None and resolved_pipeline_graph is not None:
+            resolved_pipeline_exec = DecisionGraphExecutor(resolved_pipeline_graph)
+
         application.state.model = loaded_model
         application.state.shadow_model = loaded_challenger
         application.state.challenger_model = loaded_challenger
@@ -1215,6 +1312,11 @@ def create_app(
         application.state.canary_status_gauge = canary_status_gauge
         application.state.feature_store = resolved_feature_store
         application.state.feature_lookups_counter = feature_lookups_counter
+        application.state.pipeline_enabled = resolved_pipeline_enabled
+        application.state.pipeline_graph = resolved_pipeline_graph
+        application.state.pipeline_executor = resolved_pipeline_exec
+        application.state.pipeline_stage_duration_histogram = pipeline_stage_duration_histogram
+        application.state.pipeline_executions_counter = pipeline_executions_counter
         shadow_tasks: set[asyncio.Task[None]] = set()
         application.state.shadow_tasks = shadow_tasks
         yield
@@ -2414,6 +2516,131 @@ def create_app(
             router.metrics.reset_canary()
         return await routing_status(request)
 
+    @application.get(
+        "/v1/pipeline/topology",
+        response_model=PipelineTopologyResponse,
+        responses={404: {"description": "Decision graph pipeline is not enabled."}},
+        tags=["pipeline"],
+    )
+    async def pipeline_topology(request: Request) -> PipelineTopologyResponse | JSONResponse:
+        """Inspect the registered decision graph pipeline topology and execution plan."""
+        graph: DecisionGraph | None = getattr(request.app.state, "pipeline_graph", None)
+        if graph is None:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": "Decision graph pipeline is not enabled on this service."},
+            )
+        data = graph.to_dict()
+        return PipelineTopologyResponse(
+            name=data["name"],
+            node_count=data["node_count"],
+            edge_count=data["edge_count"],
+            nodes=data["nodes"],
+            edges=data["edges"],
+            execution_plan=data["execution_plan"],
+        )
+
+    @application.post(
+        "/v1/pipeline/score",
+        response_model=PipelineScoreResponse,
+        responses={404: {"description": "Decision graph pipeline is not enabled."}},
+        tags=["pipeline"],
+    )
+    async def pipeline_score(
+        payload: PipelineScoreRequest,
+        request: Request,
+    ) -> PipelineScoreResponse | JSONResponse:
+        """Execute the real-time decision graph pipeline for a single transaction."""
+        executor: DecisionGraphExecutor | None = getattr(
+            request.app.state, "pipeline_executor", None
+        )
+        if executor is None:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": "Decision graph pipeline is not enabled on this service."},
+            )
+
+        metadata = {"explain": payload.explain}
+        result = await executor.execute(payload.transaction, metadata=metadata)
+
+        stage_dur_hist: Histogram | None = getattr(
+            request.app.state, "pipeline_stage_duration_histogram", None
+        )
+        if stage_dur_hist is not None:
+            for node_name, stage_res in result.stage_results.items():
+                stage_dur_hist.labels(
+                    stage=node_name,
+                    status=stage_res.status.value,
+                ).observe(stage_res.latency_ms / 1000.0)
+
+        exec_counter: Counter | None = getattr(
+            request.app.state, "pipeline_executions_counter", None
+        )
+        if exec_counter is not None:
+            exec_counter.labels(
+                status="success" if result.success else "failed",
+                degraded=str(result.degraded).lower(),
+            ).inc()
+
+        sink: AuditSink = getattr(request.app.state, "audit_sink", resolved_audit_sink)
+        loaded_model_for_audit: FraudModel | None = getattr(request.app.state, "model", None)
+        try:
+            audit_event = build_scoring_audit_event(
+                model_version=(
+                    _model_version(loaded_model_for_audit)
+                    if loaded_model_for_audit is not None
+                    else "pipeline"
+                ),
+                dataset_fingerprint=(
+                    str(loaded_model_for_audit.metadata.get("dataset_fingerprint", ""))
+                    if loaded_model_for_audit is not None
+                    else "pipeline"
+                ),
+                threshold=(
+                    loaded_model_for_audit.threshold
+                    if loaded_model_for_audit is not None
+                    else 0.5
+                ),
+                features=[payload.transaction],
+                fallback_applied=result.degraded,
+                fallback_reason="pipeline_degraded" if result.degraded else None,
+                predictions=[
+                    {
+                        "fraud_probability": result.fraud_probability,
+                        "raw_probability": result.raw_probability,
+                        "is_fraud": result.is_fraud,
+                        "decision": result.decision,
+                        "matched_rule": result.matched_rule,
+                        "rule_action": result.rule_action,
+                        "contributions": result.contributions,
+                        "explanation": None,
+                    }
+                ],
+                request_id=getattr(request.state, "request_id", None),
+                execution_trace=result.to_dict(),
+                pipeline_stages=[s.to_dict() for s in result.stage_results.values()],
+                degraded_nodes=result.degraded_nodes,
+            )
+            await run_in_threadpool(sink.emit, audit_event)
+        except Exception:
+            logger.exception("Failed to emit pipeline scoring audit event.")
+
+        return PipelineScoreResponse(
+            execution_id=result.execution_id,
+            decision=result.decision,
+            is_fraud=result.is_fraud,
+            fraud_probability=result.fraud_probability,
+            raw_probability=result.raw_probability,
+            matched_rule=result.matched_rule,
+            rule_action=result.rule_action,
+            contributions=result.contributions,
+            total_latency_ms=result.total_latency_ms,
+            degraded=result.degraded,
+            degraded_nodes=result.degraded_nodes,
+            execution_path=result.execution_path,
+            stage_results={k: v.to_dict() for k, v in result.stage_results.items()},
+        )
+
     @application.get("/metrics", tags=["operations"])
     async def metrics() -> Response:
         cb: CircuitBreaker | None = getattr(application.state, "circuit_breaker", None)
@@ -2648,6 +2875,13 @@ def _operational_status(request: Request) -> _OperationalStatus:
         features_views_count = int(fs_stats.get("views_count", len(fs.list_views())))
         features_entities_count = int(fs_stats.get("total_entities", 0))
 
+    pipe_graph: DecisionGraph | None = getattr(request.app.state, "pipeline_graph", None)
+    raw_pipe_enabled: bool = bool(getattr(request.app.state, "pipeline_enabled", False))
+    pipe_enabled: bool | None = True if (raw_pipe_enabled and pipe_graph is not None) else None
+    pipe_nodes_count: int | None = (
+        len(pipe_graph.nodes) if pipe_enabled and pipe_graph is not None else None
+    )
+
     return _OperationalStatus(
         fallback_mode=str(getattr(request.app.state, "fallback_mode", "raise")),
         degraded_mode=degraded_mode,
@@ -2667,6 +2901,8 @@ def _operational_status(request: Request) -> _OperationalStatus:
         features_enabled=features_enabled,
         features_views_count=features_views_count,
         features_entities_count=features_entities_count,
+        pipeline_enabled=pipe_enabled,
+        pipeline_nodes_count=pipe_nodes_count,
     )
 
 
