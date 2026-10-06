@@ -9,7 +9,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Annotated, Any, NoReturn
+from typing import Annotated, Any, NoReturn, cast
 from uuid import uuid4
 
 import numpy as np
@@ -82,6 +82,10 @@ from fraud_detection.model import (
     validate_artifact,
     verify_attestation,
 )
+from fraud_detection.pipeline import (
+    DecisionGraphExecutor,
+    create_default_fraud_pipeline,
+)
 from fraud_detection.recalibration import (
     CalibrationDiagnostics,
     CalibrationStrategy,
@@ -95,6 +99,7 @@ from fraud_detection.routing import (
     TrafficSplitStrategy,
     evaluate_model_divergence,
 )
+from fraud_detection.rules import RuleSet
 from fraud_detection.signing import (
     SigningError,
     load_private_key,
@@ -110,6 +115,7 @@ from fraud_detection.trust import (
     verify_attestation_with_bundle,
     write_trust_bundle,
 )
+from fraud_detection.velocity import VelocityConfig, VelocityWindowBuffer
 
 app = typer.Typer(
     name="fraud-detect",
@@ -4813,6 +4819,232 @@ def feature_check_command(
             typer.echo(f"Report written to: {output}")
 
     if fail_on_skew and report.overall_status == SkewStatus.DRIFTED:
+        raise typer.Exit(code=1)
+
+
+@app.command("pipeline-eval")
+def pipeline_eval(
+    model: Annotated[
+        Path,
+        typer.Option(
+            "--model",
+            "-m",
+            help="Path to primary FraudModel artifact directory.",
+            exists=True,
+            file_okay=False,
+            dir_okay=True,
+            readable=True,
+            resolve_path=True,
+        ),
+    ],
+    input_data: Annotated[
+        Path,
+        typer.Option(
+            "--input",
+            "-i",
+            help="Path to input transactions CSV dataset.",
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            readable=True,
+            resolve_path=True,
+        ),
+    ],
+    rules: Annotated[
+        Path | None,
+        typer.Option(
+            "--rules",
+            "-r",
+            help="Optional declarative rules file (JSON or YAML).",
+        ),
+    ] = None,
+    feature_store: Annotated[
+        Path | None,
+        typer.Option(
+            "--feature-store",
+            "-fs",
+            help="Optional FileFeatureStore JSON snapshot path.",
+        ),
+    ] = None,
+    velocity_config: Annotated[
+        Path | None,
+        typer.Option(
+            "--velocity-config",
+            "-vc",
+            help="Optional VelocityConfig JSON file path.",
+        ),
+    ] = None,
+    max_records: Annotated[
+        int | None,
+        typer.Option(
+            "--max-records",
+            "-n",
+            help="Maximum transactions to evaluate.",
+            min=1,
+        ),
+    ] = None,
+    fail_on_degraded: Annotated[
+        bool,
+        typer.Option(
+            "--fail-on-degraded/--no-fail-on-degraded",
+            help="Exit with code 1 if any transaction executed in degraded mode.",
+        ),
+    ] = False,
+    output: Annotated[
+        Path | None,
+        typer.Option(
+            "--output",
+            "-o",
+            help="Optional path to write JSON evaluation report.",
+        ),
+    ] = None,
+    as_json: Annotated[
+        bool,
+        typer.Option(
+            "--json",
+            help="Print report in JSON format.",
+        ),
+    ] = False,
+    overwrite: Annotated[
+        bool,
+        typer.Option("--overwrite/--no-overwrite", help="Allow overwriting output file."),
+    ] = False,
+) -> None:
+    """Evaluate transactions batch through real-time Decision Graph pipeline."""
+    _guard_output(output, overwrite)
+
+    try:
+        loaded_model = load_model(model)
+    except (ModelArtifactError, OSError, ValueError) as exc:
+        _abort(f"Failed to load model from '{model}': {exc}")
+
+    loaded_rules: RuleSet | None = None
+    if rules is not None:
+        try:
+            loaded_rules = RuleSet.load_file(rules)
+        except (OSError, ValueError, TypeError, KeyError, RuntimeError) as exc:
+            _abort(f"Failed to load rules from '{rules}': {exc}")
+
+    loaded_fs: FileFeatureStore | None = None
+    if feature_store is not None:
+        try:
+            loaded_fs = FileFeatureStore.from_file(feature_store)
+        except (OSError, ValueError, TypeError, KeyError, RuntimeError) as exc:
+            _abort(f"Failed to load feature store from '{feature_store}': {exc}")
+
+    loaded_vc: VelocityConfig | None = None
+    loaded_vb: VelocityWindowBuffer | None = None
+    if velocity_config is not None:
+        try:
+            loaded_vc = VelocityConfig.load_file(velocity_config)
+            loaded_vb = VelocityWindowBuffer(config=loaded_vc)
+        except (OSError, ValueError, TypeError, KeyError, RuntimeError) as exc:
+            _abort(f"Failed to load velocity config from '{velocity_config}': {exc}")
+
+    try:
+        df = pd.read_csv(input_data)
+    except (OSError, ValueError, TypeError) as exc:
+        _abort(f"Failed to read input dataset '{input_data}': {exc}")
+
+    if max_records is not None:
+        df = df.iloc[:max_records]
+
+    pipeline_graph = create_default_fraud_pipeline(
+        model=loaded_model,
+        rules=loaded_rules,
+        feature_store=loaded_fs,
+        velocity_buffer=loaded_vb,
+        velocity_config=loaded_vc,
+        recalibrator=getattr(loaded_model, "recalibrator", None),
+    )
+    executor = DecisionGraphExecutor(pipeline_graph)
+
+    total = len(df)
+    decisions_count: dict[str, int] = {"ALLOW": 0, "REVIEW": 0, "DENY": 0}
+    fraud_count = 0
+    degraded_count = 0
+    degraded_node_counts: dict[str, int] = {}
+    latencies: list[float] = []
+    stage_latencies: dict[str, list[float]] = {
+        node_name: [] for node_name in pipeline_graph.nodes
+    }
+
+    records = cast(list[dict[str, Any]], df.to_dict(orient="records"))
+    for rec in records:
+        res = executor.execute_sync(rec)
+        latencies.append(res.total_latency_ms)
+        dec = res.decision
+        decisions_count[dec] = decisions_count.get(dec, 0) + 1
+        if res.is_fraud:
+            fraud_count += 1
+        if res.degraded:
+            degraded_count += 1
+            for node_name in res.degraded_nodes:
+                degraded_node_counts[node_name] = (
+                    degraded_node_counts.get(node_name, 0) + 1
+                )
+        for stage_name, s_res in res.stage_results.items():
+            if stage_name in stage_latencies:
+                stage_latencies[stage_name].append(s_res.latency_ms)
+
+    mean_lat = statistics.fmean(latencies) if latencies else 0.0
+    p50_lat = float(np.percentile(latencies, 50)) if latencies else 0.0
+    p95_lat = float(np.percentile(latencies, 95)) if latencies else 0.0
+    p99_lat = float(np.percentile(latencies, 99)) if latencies else 0.0
+
+    stage_stats: dict[str, dict[str, float]] = {}
+    for stage_name, slist in stage_latencies.items():
+        stage_stats[stage_name] = {
+            "mean_ms": round(statistics.fmean(slist), 3) if slist else 0.0,
+            "p95_ms": round(float(np.percentile(slist, 95)), 3) if slist else 0.0,
+        }
+
+    report_dict: dict[str, Any] = {
+        "pipeline_name": pipeline_graph.name,
+        "node_count": len(pipeline_graph.nodes),
+        "total_evaluated": total,
+        "decisions": decisions_count,
+        "fraud_count": fraud_count,
+        "fraud_rate": round(fraud_count / total, 4) if total > 0 else 0.0,
+        "degraded_count": degraded_count,
+        "degraded_rate": round(degraded_count / total, 4) if total > 0 else 0.0,
+        "degraded_nodes": degraded_node_counts,
+        "latency_ms": {
+            "mean": round(mean_lat, 3),
+            "p50": round(p50_lat, 3),
+            "p95": round(p95_lat, 3),
+            "p99": round(p99_lat, 3),
+        },
+        "stage_latency_ms": stage_stats,
+    }
+
+    report_json = json.dumps(report_dict, indent=2)
+    if output is not None:
+        _atomic_write_text(report_json + "\n", output)
+
+    if as_json:
+        typer.echo(report_json)
+    else:
+        typer.echo("Decision Graph Pipeline Evaluation Report:")
+        typer.echo(f"  Pipeline: {pipeline_graph.name} ({len(pipeline_graph.nodes)} nodes)")
+        typer.echo(f"  Evaluated: {total} transactions")
+        dec_str = ", ".join(f"{k}={v}" for k, v in decisions_count.items())
+        typer.echo(f"  Decisions: {dec_str}")
+        fraud_pct = (fraud_count / total * 100.0) if total > 0 else 0.0
+        typer.echo(f"  Fraud Count: {fraud_count} ({fraud_pct:.2f}%)")
+        deg_pct = (degraded_count / total * 100.0) if total > 0 else 0.0
+        typer.echo(f"  Degraded Executions: {degraded_count} ({deg_pct:.2f}%)")
+        typer.echo(
+            f"  Latency (ms): Mean={mean_lat:.2f}ms, P50={p50_lat:.2f}ms, "
+            f"P95={p95_lat:.2f}ms, P99={p99_lat:.2f}ms"
+        )
+        typer.echo("  Stage Latencies (mean / p95):")
+        for sname, sdata in stage_stats.items():
+            typer.echo(f"    - {sname}: {sdata['mean_ms']:.2f}ms / {sdata['p95_ms']:.2f}ms")
+        if output is not None:
+            typer.echo(f"Report written to: {output}")
+
+    if fail_on_degraded and degraded_count > 0:
         raise typer.Exit(code=1)
 
 

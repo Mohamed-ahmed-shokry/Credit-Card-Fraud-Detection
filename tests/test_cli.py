@@ -5602,3 +5602,147 @@ def test_cli_serve_feature_store_option(
     assert created["feature_store_path"] == store_path
 
 
+def test_cli_pipeline_eval_success(tmp_path: Path, trained_artifact: Path) -> None:
+    data_path = tmp_path / "eval_data.csv"
+    generate_synthetic_data(rows=250, random_state=42).to_csv(data_path, index=False)
+
+    result = runner.invoke(
+        app,
+        [
+            "pipeline-eval",
+            "--model",
+            str(trained_artifact),
+            "--input",
+            str(data_path),
+            "--json",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    report = json.loads(result.stdout)
+    assert report["total_evaluated"] == 250
+    assert report["pipeline_name"] == "production_fraud_pipeline"
+    assert report["node_count"] == 5
+    assert "decisions" in report
+    assert "ALLOW" in report["decisions"]
+    assert "latency_ms" in report
+    assert "mean" in report["latency_ms"]
+    assert "stage_latency_ms" in report
+    assert "inference" in report["stage_latency_ms"]
+    assert "action" in report["stage_latency_ms"]
+
+
+def test_cli_pipeline_eval_table_output_and_file(
+    tmp_path: Path, trained_artifact: Path
+) -> None:
+    data_path = tmp_path / "eval_data.csv"
+    generate_synthetic_data(rows=250, random_state=42).to_csv(data_path, index=False)
+    out_file = tmp_path / "pipeline_report.json"
+
+    result = runner.invoke(
+        app,
+        [
+            "pipeline-eval",
+            "--model",
+            str(trained_artifact),
+            "--input",
+            str(data_path),
+            "--max-records",
+            "50",
+            "--output",
+            str(out_file),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "Decision Graph Pipeline Evaluation Report:" in result.output
+    assert "Evaluated: 50 transactions" in result.output
+    assert "Stage Latencies" in result.output
+    assert out_file.exists()
+
+    saved_data = json.loads(out_file.read_text(encoding="utf-8"))
+    assert saved_data["total_evaluated"] == 50
+
+
+def test_cli_pipeline_eval_with_rules_and_velocity(
+    tmp_path: Path, trained_artifact: Path
+) -> None:
+    data_path = tmp_path / "eval_data.csv"
+    generate_synthetic_data(rows=250, random_state=42).to_csv(data_path, index=False)
+
+    rules_path = tmp_path / "rules.json"
+    rules_path.write_text(
+        json.dumps(
+            {
+                "rules": [
+                    {
+                        "rule_id": "rule_high_amount",
+                        "name": "High Amount Deny",
+                        "description": "Deny amounts over 5000",
+                        "action": "DENY",
+                        "priority": 100,
+                        "conditions": [
+                            {"field": "Amount", "operator": ">", "value": 5000.0}
+                        ],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    vel_path = tmp_path / "velocity.json"
+    vel_path.write_text(
+        json.dumps(
+            {
+                "entity_key": "card_id",
+                "windows": [
+                    {
+                        "duration_seconds": 3600.0,
+                        "aggregations": ["count", "sum"],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "pipeline-eval",
+            "--model",
+            str(trained_artifact),
+            "--input",
+            str(data_path),
+            "--rules",
+            str(rules_path),
+            "--velocity-config",
+            str(vel_path),
+            "--json",
+            "--fail-on-degraded",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.stdout)
+    assert data["total_evaluated"] == 250
+    assert data["degraded_count"] == 0
+
+
+def test_cli_pipeline_eval_missing_model_or_input(tmp_path: Path) -> None:
+    missing_model = tmp_path / "non_existent_model"
+    data_path = tmp_path / "data.csv"
+    data_path.write_text("Time,Amount\n0,10.0\n", encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        [
+            "pipeline-eval",
+            "--model",
+            str(missing_model),
+            "--input",
+            str(data_path),
+        ],
+    )
+    assert result.exit_code != 0
+
+
+
