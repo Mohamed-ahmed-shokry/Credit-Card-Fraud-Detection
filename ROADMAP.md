@@ -1292,7 +1292,7 @@ This phase does not implement external cloud database drivers (Feast, Snowflake,
 - `a97bf75`: feat(cli): add feature-join and feature-check commands and serve feature store option
 - `a312096`: docs: document feature store integration, consistency governance, and complete Phase 31
 
-## Phase 32 — Real-Time Streaming Decision Graph & Adaptive Execution Pipeline (Proposed)
+## Phase 32 — Real-Time Streaming Decision Graph & Adaptive Execution Pipeline (In progress)
 
 ### Objective
 
@@ -1300,22 +1300,34 @@ Orchestrate complex, multi-stage fraud evaluation workflows as a directed acycli
 
 ### Scope
 
-- **Typed execution graph primitives** (`pipeline.py`): Define `PipelineNode`, `PipelineEdge`, `DecisionGraph`, `ExecutionPlan`, and `StageExecutionResult` with static cycle validation and topological sort ordering.
+- **Typed execution graph primitives** (`pipeline.py`): Define `StageType`, `PipelineNode`, `PipelineEdge`, `DecisionGraph`, `ExecutionPlan`, and `StageExecutionResult` with static cycle validation and topological sort ordering.
 - **Pluggable stage processors**:
   - *Feature Enrichment Stage*: Concurrent online feature store and velocity buffer lookup.
   - *Rule Evaluation Stage*: Short-circuiting high-confidence deterministic business rules (`ALLOW` / `DENY`).
   - *Inference Stage*: Conditional primary or champion/challenger model execution.
   - *Calibration Stage*: Post-hoc probability recalibration.
   - *Action Aggregator Stage*: Tiered thresholding, consensus voting, or cost-minimizing decision arbitration.
+  - *Default Fraud Pipeline Factory*: `create_default_fraud_pipeline(...)` constructing standard production topologies.
 - **Asynchronous parallel scheduling & latency budgets**: Concurrent execution of independent pipeline branches with per-stage deadline enforcement (e.g. 5ms feature fetch timeout, 10ms model timeout) and deterministic fallback defaults on timeout.
 - **Audit lineage & execution tracing**: Emit structured node-by-node execution paths, per-node latency measurements, and degraded branch annotations in scoring audit events.
-- **Operational telemetry & CLI evaluation**: Prometheus histogram `fraud_pipeline_stage_duration_seconds{stage="..."}`, `/v1/pipeline/topology` endpoint, and `fraud-detect pipeline-eval` command.
+- **Operational telemetry & CLI evaluation**: Prometheus histogram `fraud_pipeline_stage_duration_seconds{stage="..."}`, `/v1/pipeline/topology` and `/v1/pipeline/score` endpoints, and `fraud-detect pipeline-eval` command.
 
 ### Acceptance criteria
 
 - DAG execution strictly obeys topological dependencies; independent branches run concurrently in asyncio task pools without thread contention.
 - Breached stage latency budgets fail fast to fallback defaults without hanging client scoring requests.
+- Scoring audit events record complete node-by-node execution paths, per-node latency measurements, and degraded branch annotations.
+- API serves `/v1/pipeline/topology` and `/v1/pipeline/score` with full operational telemetry and Prometheus instrumentation.
+- CLI provides `pipeline-eval` command supporting CSV evaluation, stage latency breakdown, and `--fail-on-degraded` gating.
 - Full test suite maintains 100% pass rate, branch coverage remains $\ge 97.0\%$, Ruff and strict mypy pass with zero errors.
+
+### Explicit exclusions
+
+This phase does not implement heavy distributed workflow engines (Airflow, Celery, Temporal, Prefect) or distributed multi-node message brokers; it provides a high-throughput, asynchronous, in-process DAG execution pipeline.
+
+### Delivery Record
+
+- In progress
 
 ## Contributing to the roadmap
 
