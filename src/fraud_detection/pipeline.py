@@ -2,14 +2,31 @@
 
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
+import inspect
 import logging
 from collections import defaultdict, deque
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
+from time import perf_counter
 from typing import Any, Protocol, runtime_checkable
+from uuid import uuid4
 
+import numpy as np
 import pandas as pd
+
+from fraud_detection.evaluation import DecisionAction
+from fraud_detection.features import FeatureStoreProtocol
+from fraud_detection.model import FraudModel
+from fraud_detection.recalibration import BaseRecalibrator
+from fraud_detection.rules import RuleAction, RulePrecedence, RuleSet
+from fraud_detection.velocity import (
+    VelocityConfig,
+    VelocityWindowBuffer,
+    enrich_record_velocity,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -205,7 +222,6 @@ class DecisionGraph:
                     raise PipelineCycleError(f"Node '{name}' depends on itself.")
 
         # Cycle detection using 3-color DFS
-        # 0 = unvisited, 1 = visiting (in stack), 2 = visited
         visited: dict[str, int] = dict.fromkeys(self.nodes, 0)
 
         def dfs(curr: str, path: list[str]) -> None:
@@ -302,6 +318,309 @@ class DecisionGraph:
         }
 
 
+# ============================================================================
+# Pluggable Stage Processors
+# ============================================================================
+
+
+class EnrichmentStageProcessor:
+    """Enriches transaction features using online feature store and velocity buffers."""
+
+    def __init__(
+        self,
+        feature_store: FeatureStoreProtocol | None = None,
+        velocity_buffer: VelocityWindowBuffer | None = None,
+        velocity_config: VelocityConfig | None = None,
+        expected_columns: Sequence[str] | None = None,
+        update_velocity: bool = True,
+    ) -> None:
+        self.feature_store = feature_store
+        self.velocity_buffer = velocity_buffer
+        self.velocity_config = velocity_config
+        self.expected_columns = set(expected_columns) if expected_columns else None
+        self.update_velocity = update_velocity
+
+    def __call__(self, context: PipelineContext) -> dict[str, Any]:
+        tx = dict(context.transaction)
+        enriched_features: list[str] = []
+        feature_views_applied: list[str] = []
+        velocity_features: list[str] = []
+
+        if self.feature_store is not None:
+            for view_name in self.feature_store.list_views():
+                view = self.feature_store.get_view(view_name)
+                if view is None:
+                    continue
+                eid = tx.get(view.entity_key)
+                if eid is not None:
+                    obs_t = tx.get("Time")
+                    as_of = float(obs_t) if obs_t is not None else None
+                    str_eid = (
+                        str(int(eid))
+                        if isinstance(eid, (int, float)) and float(eid).is_integer()
+                        else str(eid)
+                    )
+                    res = self.feature_store.lookup_online(
+                        entity_key=view.entity_key,
+                        entity_id=str_eid,
+                        view_name=view.name,
+                        as_of_time=as_of,
+                    )
+                    if res.found:
+                        if view.name not in feature_views_applied:
+                            feature_views_applied.append(view.name)
+                        for fname, fval in res.values.items():
+                            if (
+                                self.expected_columns is None
+                                or fname in self.expected_columns
+                                or fname in tx
+                            ):
+                                tx[fname] = float(fval)
+                                if fname not in enriched_features:
+                                    enriched_features.append(fname)
+
+        if self.velocity_buffer is not None:
+            prev_keys = set(tx.keys())
+            tx = dict(
+                enrich_record_velocity(
+                    tx,
+                    buffer=self.velocity_buffer,
+                    config=self.velocity_config,
+                    update=self.update_velocity,
+                )
+            )
+            v_cols = [k for k in tx if k not in prev_keys]
+            velocity_features.extend(v_cols)
+
+        context.transaction = tx
+        context.metadata["enriched_features"] = enriched_features
+        context.metadata["feature_views_applied"] = feature_views_applied
+        context.metadata["velocity_features"] = velocity_features
+
+        return {
+            "enriched_features": enriched_features,
+            "feature_views_applied": feature_views_applied,
+            "velocity_features": velocity_features,
+        }
+
+
+class RuleStageProcessor:
+    """Evaluates declarative rules against current transaction features."""
+
+    def __init__(
+        self,
+        rules: RuleSet | None = None,
+        short_circuit_actions: Sequence[RuleAction] | None = None,
+    ) -> None:
+        self.rules = rules
+        self.short_circuit_actions = (
+            tuple(short_circuit_actions)
+            if short_circuit_actions is not None
+            else (RuleAction.DENY, RuleAction.ALLOW)
+        )
+
+    def __call__(self, context: PipelineContext) -> dict[str, Any]:
+        if self.rules is None or not self.rules.rules:
+            return {
+                "matched": False,
+                "matched_rule_id": None,
+                "matched_rule_name": None,
+                "action": None,
+                "reason": "",
+                "short_circuited": False,
+            }
+
+        eval_res = self.rules.evaluate_record(context.transaction)
+        short_circuit = False
+        if eval_res.matched and eval_res.action in self.short_circuit_actions:
+            short_circuit = True
+            context.metadata["short_circuit"] = True
+            context.metadata["short_circuit_action"] = eval_res.action.value
+            context.metadata["matched_rule_id"] = eval_res.matched_rule_id
+            context.metadata["matched_rule_name"] = eval_res.matched_rule_name
+
+        return {
+            "matched": eval_res.matched,
+            "matched_rule_id": eval_res.matched_rule_id,
+            "matched_rule_name": eval_res.matched_rule_name,
+            "action": eval_res.action.value if eval_res.action is not None else None,
+            "reason": eval_res.reason,
+            "short_circuited": short_circuit,
+        }
+
+
+class InferenceStageProcessor:
+    """Computes fraud risk score from model given transaction features."""
+
+    def __init__(
+        self,
+        model: FraudModel,
+        explain: bool = False,
+        skip_if_short_circuited: bool = True,
+    ) -> None:
+        self.model = model
+        self.explain = explain
+        self.skip_if_short_circuited = skip_if_short_circuited
+
+    def __call__(self, context: PipelineContext) -> dict[str, Any]:
+        if self.skip_if_short_circuited and context.metadata.get("short_circuit"):
+            return {
+                "skipped": True,
+                "probability": None,
+                "raw_probability": None,
+                "contributions": None,
+                "model_threshold": self.model.threshold,
+            }
+
+        row_dict: dict[str, float] = {}
+        for f in self.model.feature_names:
+            v = context.transaction.get(f, 0.0)
+            try:
+                row_dict[f] = float(v)
+            except (ValueError, TypeError):
+                row_dict[f] = 0.0
+        frame = pd.DataFrame([row_dict])
+        context.frame = frame
+
+        probs = self.model.predict_probabilities(frame, raw=True)
+        prob = float(probs[0])
+
+        contributions: dict[str, float] | None = None
+        if self.explain:
+            exps = self.model.explain_local(frame)
+            if exps:
+                contributions = exps[0]
+
+        return {
+            "skipped": False,
+            "probability": prob,
+            "raw_probability": prob,
+            "model_threshold": self.model.threshold,
+            "contributions": contributions,
+            "model_version": getattr(self.model, "version", "primary"),
+        }
+
+
+class CalibrationStageProcessor:
+    """Applies post-hoc probability recalibration to model output."""
+
+    def __init__(
+        self,
+        recalibrator: BaseRecalibrator | None = None,
+        inference_node_name: str = "inference",
+    ) -> None:
+        self.recalibrator = recalibrator
+        self.inference_node_name = inference_node_name
+
+    def __call__(self, context: PipelineContext) -> dict[str, Any]:
+        inf_output = context.get_output(self.inference_node_name)
+        if not inf_output or inf_output.get("skipped") or inf_output.get("probability") is None:
+            return {
+                "calibrated_probability": None,
+                "raw_probability": None,
+                "method": "none",
+            }
+
+        raw_prob = float(inf_output["probability"])
+        if self.recalibrator is not None:
+            calibrated_arr = self.recalibrator.transform(np.array([raw_prob], dtype=float))
+            cal_prob = float(calibrated_arr[0])
+            method = getattr(self.recalibrator, "method", "custom")
+            method_str = method.value if hasattr(method, "value") else str(method)
+        else:
+            cal_prob = raw_prob
+            method_str = "none"
+
+        return {
+            "calibrated_probability": cal_prob,
+            "raw_probability": raw_prob,
+            "method": method_str,
+        }
+
+
+class ActionAggregatorStageProcessor:
+    """Arbitrates deterministic rules and calibrated probability into a final decision."""
+
+    def __init__(
+        self,
+        threshold: float = 0.5,
+        review_threshold: float | None = None,
+        deny_threshold: float | None = None,
+        rule_precedence: RulePrecedence = RulePrecedence.RULES_OVERRIDE_MODEL,
+        rules_node_name: str = "rules",
+        calibration_node_name: str = "calibration",
+        inference_node_name: str = "inference",
+    ) -> None:
+        self.threshold = threshold
+        self.review_threshold = review_threshold
+        self.deny_threshold = deny_threshold
+        self.rule_precedence = rule_precedence
+        self.rules_node_name = rules_node_name
+        self.calibration_node_name = calibration_node_name
+        self.inference_node_name = inference_node_name
+
+    def __call__(self, context: PipelineContext) -> dict[str, Any]:
+        rules_out = context.get_output(self.rules_node_name) or {}
+        cal_out = context.get_output(self.calibration_node_name) or {}
+        inf_out = context.get_output(self.inference_node_name) or {}
+
+        matched_rule = rules_out.get("matched_rule_id")
+        rule_action = rules_out.get("action")
+        contributions = inf_out.get("contributions")
+
+        prob = cal_out.get("calibrated_probability")
+        raw_prob = cal_out.get("raw_probability", inf_out.get("raw_probability"))
+
+        if prob is None and inf_out.get("probability") is not None:
+            prob = inf_out.get("probability")
+
+        model_action: str
+        if prob is not None:
+            if self.review_threshold is not None and self.deny_threshold is not None:
+                if prob >= self.deny_threshold:
+                    model_action = DecisionAction.DENY.value
+                elif prob >= self.review_threshold:
+                    model_action = DecisionAction.CHALLENGE.value
+                else:
+                    model_action = DecisionAction.ALLOW.value
+            else:
+                model_action = (
+                    DecisionAction.DENY.value
+                    if prob >= self.threshold
+                    else DecisionAction.ALLOW.value
+                )
+        else:
+            model_action = DecisionAction.ALLOW.value
+
+        final_action: str
+        if matched_rule is not None and rule_action is not None:
+            if (
+                self.rule_precedence == RulePrecedence.MODEL_OVERRIDES_RULES
+                and model_action == DecisionAction.DENY.value
+            ):
+                final_action = model_action
+            else:
+                final_action = str(rule_action)
+        else:
+            final_action = model_action
+
+        is_fraud = final_action == DecisionAction.DENY.value
+        final_prob = float(prob) if prob is not None else (1.0 if is_fraud else 0.0)
+
+        return {
+            "decision": final_action,
+            "is_fraud": is_fraud,
+            "fraud_probability": round(final_prob, 5),
+            "raw_probability": round(float(raw_prob), 5) if raw_prob is not None else None,
+            "matched_rule": matched_rule,
+            "rule_action": rule_action,
+            "contributions": contributions,
+            "threshold": self.threshold,
+            "review_threshold": self.review_threshold,
+            "deny_threshold": self.deny_threshold,
+        }
+
+
 @dataclass
 class PipelineExecutionResult:
     """Comprehensive output, trace, and telemetry for a pipeline execution."""
@@ -327,3 +646,305 @@ class PipelineExecutionResult:
             "degraded": self.degraded,
             "degraded_nodes": self.degraded_nodes,
         }
+
+
+# ============================================================================
+# Asynchronous Graph Executor & Pipeline Factory
+# ============================================================================
+
+
+class DecisionGraphExecutor:
+    """Executes a DecisionGraph with concurrent waves, timeouts, and fail-soft fallback."""
+
+    def __init__(self, graph: DecisionGraph) -> None:
+        self.graph = graph
+        self.graph.validate()
+        self.plan = self.graph.build_execution_plan()
+
+    async def _execute_node(self, node_name: str, context: PipelineContext) -> None:
+        node = self.graph.nodes[node_name]
+
+        if node.condition is not None:
+            try:
+                if not node.condition(context):
+                    context.results[node_name] = StageExecutionResult(
+                        node_name=node.name,
+                        stage_type=node.stage_type,
+                        status=StageStatus.SKIPPED,
+                        output=node.fallback_value,
+                    )
+                    return
+            except (ValueError, TypeError, KeyError, AttributeError, RuntimeError) as cond_exc:
+                logger.warning("Condition for node '%s' raised: %s", node_name, cond_exc)
+
+        start = perf_counter()
+        try:
+            is_async = inspect.iscoroutinefunction(node.processor)
+
+            if is_async:
+                proc_coro = node.processor(context)
+            else:
+                proc_coro = asyncio.to_thread(node.processor, context)
+
+            if node.timeout_seconds is not None:
+                output = await asyncio.wait_for(proc_coro, timeout=node.timeout_seconds)
+            else:
+                output = await proc_coro
+
+            elapsed = (perf_counter() - start) * 1000.0
+            context.results[node_name] = StageExecutionResult(
+                node_name=node.name,
+                stage_type=node.stage_type,
+                status=StageStatus.SUCCESS,
+                latency_ms=elapsed,
+                output=output,
+                degraded=False,
+            )
+
+        except TimeoutError:
+            elapsed = (perf_counter() - start) * 1000.0
+            logger.warning(
+                "Pipeline stage '%s' timed out after %.2f ms (budget %.2f s)",
+                node_name,
+                elapsed,
+                node.timeout_seconds or 0.0,
+            )
+            if node.required:
+                raise PipelineTimeoutError(
+                    f"Required stage '{node_name}' exceeded latency budget "
+                    f"of {node.timeout_seconds}s."
+                ) from None
+            context.results[node_name] = StageExecutionResult(
+                node_name=node.name,
+                stage_type=node.stage_type,
+                status=StageStatus.TIMEOUT,
+                latency_ms=elapsed,
+                output=node.fallback_value,
+                error="Stage latency budget exceeded",
+                degraded=True,
+            )
+
+        except Exception as exc:
+            elapsed = (perf_counter() - start) * 1000.0
+            logger.exception("Pipeline stage '%s' failed: %s", node_name, exc)
+            if node.required:
+                raise PipelineExecutionError(
+                    f"Required stage '{node_name}' failed: {exc}"
+                ) from exc
+            context.results[node_name] = StageExecutionResult(
+                node_name=node.name,
+                stage_type=node.stage_type,
+                status=StageStatus.FALLBACK,
+                latency_ms=elapsed,
+                output=node.fallback_value,
+                error=str(exc),
+                degraded=True,
+            )
+
+    async def execute(
+        self,
+        transaction: dict[str, Any],
+        *,
+        metadata: dict[str, Any] | None = None,
+        global_timeout_seconds: float | None = None,
+    ) -> PipelineExecutionResult:
+        """Execute decision graph across topologically scheduled parallel waves."""
+        start_total = perf_counter()
+        execution_id = uuid4().hex
+        context = PipelineContext(
+            transaction=dict(transaction),
+            metadata=dict(metadata or {}),
+        )
+
+        async def _run_waves() -> None:
+            for wave in self.plan.waves:
+                tasks = [self._execute_node(node_name, context) for node_name in wave]
+                await asyncio.gather(*tasks)
+
+        if global_timeout_seconds is not None:
+            await asyncio.wait_for(_run_waves(), timeout=global_timeout_seconds)
+        else:
+            await _run_waves()
+
+        total_latency = (perf_counter() - start_total) * 1000.0
+
+        # Collect execution path in topological order
+        execution_path = [
+            node_name for node_name in self.plan.topological_order if node_name in context.results
+        ]
+
+        # Final decision is taken from "action" node if present, else fallback
+        final_decision: dict[str, Any] = {}
+        if "action" in context.results and context.results["action"].output:
+            final_decision = dict(context.results["action"].output)
+        else:
+            final_decision = {
+                "decision": "ALLOW",
+                "is_fraud": False,
+                "fraud_probability": 0.0,
+                "raw_probability": None,
+                "matched_rule": None,
+                "rule_action": None,
+                "contributions": None,
+            }
+
+        degraded_nodes = [
+            node_name for node_name, res in context.results.items() if res.degraded
+        ]
+
+        return PipelineExecutionResult(
+            execution_id=execution_id,
+            success=True,
+            total_latency_ms=total_latency,
+            stage_results=context.results,
+            execution_path=execution_path,
+            final_decision=final_decision,
+            degraded=len(degraded_nodes) > 0,
+            degraded_nodes=degraded_nodes,
+        )
+
+    def execute_sync(
+        self,
+        transaction: dict[str, Any],
+        *,
+        metadata: dict[str, Any] | None = None,
+        global_timeout_seconds: float | None = None,
+    ) -> PipelineExecutionResult:
+        """Synchronously execute graph, safely handling nested or ambient event loops."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop and loop.is_running():
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                return pool.submit(
+                    asyncio.run,
+                    self.execute(
+                        transaction,
+                        metadata=metadata,
+                        global_timeout_seconds=global_timeout_seconds,
+                    ),
+                ).result()
+
+        return asyncio.run(
+            self.execute(
+                transaction,
+                metadata=metadata,
+                global_timeout_seconds=global_timeout_seconds,
+            )
+        )
+
+
+def create_default_fraud_pipeline(
+    model: FraudModel,
+    *,
+    rules: RuleSet | None = None,
+    rule_precedence: RulePrecedence = RulePrecedence.RULES_OVERRIDE_MODEL,
+    feature_store: FeatureStoreProtocol | None = None,
+    velocity_buffer: VelocityWindowBuffer | None = None,
+    velocity_config: VelocityConfig | None = None,
+    recalibrator: BaseRecalibrator | None = None,
+    threshold: float | None = None,
+    review_threshold: float | None = None,
+    deny_threshold: float | None = None,
+    enrichment_timeout_seconds: float | None = 0.05,
+    inference_timeout_seconds: float | None = 0.05,
+    calibration_timeout_seconds: float | None = 0.02,
+    rules_timeout_seconds: float | None = 0.02,
+    action_timeout_seconds: float | None = 0.02,
+    explain: bool = False,
+) -> DecisionGraph:
+    """Build a standard, production-ready fraud decision execution graph."""
+    applied_threshold = model.threshold if threshold is None else threshold
+    graph = DecisionGraph("production_fraud_pipeline")
+
+    enrich_proc = EnrichmentStageProcessor(
+        feature_store=feature_store,
+        velocity_buffer=velocity_buffer,
+        velocity_config=velocity_config,
+        expected_columns=model.feature_names,
+    )
+    graph.add_node(
+        PipelineNode(
+            name="enrichment",
+            stage_type=StageType.ENRICHMENT,
+            processor=enrich_proc,
+            timeout_seconds=enrichment_timeout_seconds,
+            fallback_value={},
+            required=False,
+        )
+    )
+
+    rule_proc = RuleStageProcessor(rules=rules)
+    graph.add_node(
+        PipelineNode(
+            name="rules",
+            stage_type=StageType.RULES,
+            processor=rule_proc,
+            dependencies=["enrichment"],
+            timeout_seconds=rules_timeout_seconds,
+            fallback_value={"matched": False, "short_circuited": False},
+            required=False,
+        )
+    )
+
+    inf_proc = InferenceStageProcessor(model=model, explain=explain)
+    graph.add_node(
+        PipelineNode(
+            name="inference",
+            stage_type=StageType.INFERENCE,
+            processor=inf_proc,
+            dependencies=["enrichment"],
+            timeout_seconds=inference_timeout_seconds,
+            fallback_value={
+                "skipped": False,
+                "probability": applied_threshold,
+                "raw_probability": applied_threshold,
+                "contributions": None,
+            },
+            required=False,
+        )
+    )
+
+    cal_proc = CalibrationStageProcessor(
+        recalibrator=recalibrator,
+        inference_node_name="inference",
+    )
+    graph.add_node(
+        PipelineNode(
+            name="calibration",
+            stage_type=StageType.CALIBRATION,
+            processor=cal_proc,
+            dependencies=["inference"],
+            timeout_seconds=calibration_timeout_seconds,
+            fallback_value={
+                "calibrated_probability": applied_threshold,
+                "raw_probability": applied_threshold,
+                "method": "fallback",
+            },
+            required=False,
+        )
+    )
+
+    act_proc = ActionAggregatorStageProcessor(
+        threshold=applied_threshold,
+        review_threshold=review_threshold,
+        deny_threshold=deny_threshold,
+        rule_precedence=rule_precedence,
+        rules_node_name="rules",
+        calibration_node_name="calibration",
+        inference_node_name="inference",
+    )
+    graph.add_node(
+        PipelineNode(
+            name="action",
+            stage_type=StageType.ACTION,
+            processor=act_proc,
+            dependencies=["rules", "calibration"],
+            timeout_seconds=action_timeout_seconds,
+            required=True,
+        )
+    )
+
+    return graph
