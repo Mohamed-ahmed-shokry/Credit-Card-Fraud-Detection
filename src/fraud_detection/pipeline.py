@@ -463,6 +463,14 @@ class InferenceStageProcessor:
         self.skip_if_short_circuited = skip_if_short_circuited
 
     def __call__(self, context: PipelineContext) -> dict[str, Any]:
+        if self.model is None:
+            return {
+                "skipped": False,
+                "probability": None,
+                "raw_probability": None,
+                "contributions": None,
+            }
+
         if self.skip_if_short_circuited and context.metadata.get("short_circuit"):
             return {
                 "skipped": True,

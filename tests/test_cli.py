@@ -5745,4 +5745,36 @@ def test_cli_pipeline_eval_missing_model_or_input(tmp_path: Path) -> None:
     assert result.exit_code != 0
 
 
+def test_cli_pipeline_eval_corrupt_configs(tmp_path: Path, trained_artifact: Path) -> None:
+    data_path = tmp_path / "data.csv"
+    generate_synthetic_data(rows=250, random_state=42).to_csv(data_path, index=False)
+    bad_file = tmp_path / "bad.json"
+    bad_file.write_text("{corrupt json", encoding="utf-8")
+
+    # Bad rules
+    res_r = runner.invoke(
+        app,
+        ["pipeline-eval", "-m", str(trained_artifact), "-i", str(data_path), "-r", str(bad_file)],
+    )
+    assert res_r.exit_code == 2
+    assert "Failed to load rules" in res_r.output
+
+    # Bad feature store
+    res_fs = runner.invoke(
+        app,
+        ["pipeline-eval", "-m", str(trained_artifact), "-i", str(data_path), "-fs", str(bad_file)],
+    )
+    assert res_fs.exit_code == 2
+    assert "Failed to load feature store" in res_fs.output
+
+    # Bad velocity
+    res_vc = runner.invoke(
+        app,
+        ["pipeline-eval", "-m", str(trained_artifact), "-i", str(data_path), "-vc", str(bad_file)],
+    )
+    assert res_vc.exit_code == 2
+    assert "Failed to load velocity config" in res_vc.output
+
+
+
 

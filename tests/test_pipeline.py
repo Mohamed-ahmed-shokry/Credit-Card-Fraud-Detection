@@ -509,3 +509,105 @@ def test_create_default_fraud_pipeline_e2e() -> None:
     assert res_flagged.final_decision["decision"] == "DENY"
     assert res_flagged.final_decision["is_fraud"] is True
     assert res_flagged.final_decision["matched_rule"] == "R99"
+
+
+def test_action_aggregator_precedence_and_thresholds() -> None:
+    # 1. MODEL_OVERRIDES_RULES
+    proc_override = ActionAggregatorStageProcessor(
+        threshold=0.5,
+        rule_precedence=RulePrecedence.MODEL_OVERRIDES_RULES,
+    )
+    ctx1 = PipelineContext(transaction={"Amount": 10.0})
+    ctx1.results["rules"] = StageExecutionResult(
+        node_name="rules",
+        stage_type=StageType.RULES,
+        status=StageStatus.SUCCESS,
+        output={"matched": True, "matched_rule_id": "R1", "action": "ALLOW"},
+    )
+    ctx1.results["calibration"] = StageExecutionResult(
+        node_name="calibration",
+        stage_type=StageType.CALIBRATION,
+        status=StageStatus.SUCCESS,
+        output={"calibrated_probability": 0.95, "raw_probability": 0.95},
+    )
+    out1 = proc_override(ctx1)
+    assert out1["decision"] == "DENY"
+    assert out1["is_fraud"] is True
+
+    # 2. Tiered Challenge Review Threshold
+    proc_tiered = ActionAggregatorStageProcessor(
+        threshold=0.5,
+        review_threshold=0.3,
+        deny_threshold=0.7,
+    )
+    ctx2 = PipelineContext(transaction={"Amount": 10.0})
+    ctx2.results["calibration"] = StageExecutionResult(
+        node_name="calibration",
+        stage_type=StageType.CALIBRATION,
+        status=StageStatus.SUCCESS,
+        output={"calibrated_probability": 0.45, "raw_probability": 0.45},
+    )
+    out2 = proc_tiered(ctx2)
+    assert out2["decision"] == "CHALLENGE"
+    assert out2["is_fraud"] is False
+
+    # 3. No probability provided
+    ctx3 = PipelineContext(transaction={"Amount": 10.0})
+    out3 = proc_tiered(ctx3)
+    assert out3["decision"] == "ALLOW"
+    assert out3["is_fraud"] is False
+
+
+def test_decision_graph_executor_fail_soft_processor_error() -> None:
+    def buggy_processor(_ctx: PipelineContext) -> None:
+        raise RuntimeError("Transient store failure")
+
+    graph = DecisionGraph("fail_soft_graph")
+    graph.add_node(
+        PipelineNode(
+            name="optional_node",
+            stage_type=StageType.ENRICHMENT,
+            processor=buggy_processor,
+            fallback_value={"recovered": True},
+            required=False,
+        )
+    )
+    graph.add_node(
+        PipelineNode(
+            name="action",
+            stage_type=StageType.ACTION,
+            processor=lambda ctx: {
+                "decision": "ALLOW",
+                "is_fraud": False,
+                "data": ctx.get_output("optional_node"),
+            },
+            dependencies=["optional_node"],
+        )
+    )
+
+    executor = DecisionGraphExecutor(graph)
+    res = asyncio.run(executor.execute({"Amount": 10.0}))
+    assert res.success is True
+    assert res.degraded is True
+    assert "optional_node" in res.degraded_nodes
+    assert res.stage_results["optional_node"].status == StageStatus.FALLBACK
+    assert res.stage_results["optional_node"].output == {"recovered": True}
+    assert res.final_decision["data"] == {"recovered": True}
+
+
+def test_pipeline_context_set_output_and_inference_none_model() -> None:
+    ctx = PipelineContext(transaction={"Amount": 5.0})
+    ctx.results["stage1"] = StageExecutionResult(
+        node_name="stage1",
+        stage_type=StageType.CUSTOM,
+        status=StageStatus.SUCCESS,
+        output="old",
+    )
+    ctx.set_output("stage1", "new")
+    assert ctx.get_output("stage1") == "new"
+
+    # InferenceStageProcessor with model=None
+    inf_proc = InferenceStageProcessor(model=None)
+    inf_res = inf_proc(ctx)
+    assert inf_res["probability"] is None
+
