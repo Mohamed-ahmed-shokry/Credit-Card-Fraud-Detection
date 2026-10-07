@@ -1292,7 +1292,7 @@ This phase does not implement external cloud database drivers (Feast, Snowflake,
 - `a97bf75`: feat(cli): add feature-join and feature-check commands and serve feature store option
 - `a312096`: docs: document feature store integration, consistency governance, and complete Phase 31
 
-## Phase 32 — Real-Time Streaming Decision Graph & Adaptive Execution Pipeline (In progress)
+## Phase 32 — Real-Time Streaming Decision Graph & Adaptive Execution Pipeline (Done)
 
 ### Objective
 
@@ -1327,7 +1327,19 @@ This phase does not implement heavy distributed workflow engines (Airflow, Celer
 
 ### Delivery Record
 
-- In progress
+- `90c2c56`: docs(roadmap): set Phase 32 real-time decision graph in progress
+- `fdf9291`: feat(pipeline): define typed execution graph primitives, static cycle validation, and topological sorting
+- `b228ec0`: feat(pipeline): implement stage processors, asynchronous DAG executor, and default fraud pipeline
+- `28b87e8`: feat(audit): record pipeline execution traces and degraded stage annotations in scoring audit events
+- `72af427`: feat(api): integrate decision graph pipeline execution, topology endpoint, and telemetry
+- `c73631a`: feat(cli): add pipeline-eval command for decision graph evaluation
+- `c984ea4`: test(pipeline): expand branch coverage for precedence, edge cases, and CLI configs
+
+## Phase 33 — Real-Time Graph Node Cache & Speculative Model Evaluation (Planned)
+
+### Objective
+
+Accelerate decision pipeline throughput by introducing deterministic in-memory node caching for pure stage computations and speculative asynchronous model inference execution during upstream enrichment phases.
 
 ## Contributing to the roadmap
 

@@ -251,6 +251,9 @@ the request and response, while the tuned artifact threshold remains visible as
 - Entity hash routing guarantees deterministic model stickiness across transactions for the same entity key, preventing alternating model decisions during rolling canary deployments.
 - Point-in-time feature store as-of joins strictly enforce temporal causality ($t_{\text{feature}} \le t_{\text{observation}}$), eliminating future target leakage in offline training set generation.
 - Training-serving feature skew surveillance monitors feature distribution drift across serving traffic against training baselines, evaluating PSI, Kolmogorov-Smirnov test, and Wasserstein distance with configurable drift thresholds and automated safeguard exit codes.
+- Decision graph DAG execution organizes stage dependencies into topologically ordered parallel execution waves, executing concurrent non-interdependent stages (e.g. feature store lookups and heuristic rules) via `asyncio.gather()`.
+- Per-stage latency budgets and fail-soft degradation guarantee pipeline resilience; when non-required stages (enrichment, recalibration, explainability) time out or fail, they fall back to pre-configured safe outputs and flag `degraded=True`, allowing final action arbitration to complete within SLA.
+- Full execution tracing records complete pipeline DAG lineage, stage durations, and degraded node lists in structured audit events and Prometheus telemetry (`fraud_pipeline_stage_duration_seconds`, `fraud_pipeline_executions_total`).
 
 ## Extension guidance
 

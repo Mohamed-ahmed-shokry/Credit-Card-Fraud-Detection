@@ -546,6 +546,55 @@ fraud-detect serve artifacts/model \
   - `GET /v1/features/lookup/{entity_key}/{entity_id}`: Inspects live feature values and staleness for a given entity.
 - **Prometheus Telemetry**: `fraud_feature_lookups_total{entity_key="...", status="hit|miss"}` monitors online retrieval performance.
 
+## Real-Time Streaming Decision Graph & Adaptive Execution Pipeline
+
+Orchestrate complex online fraud decisioning with directed acyclic graph (DAG) pipelines, parallel topological wave scheduling, per-stage latency budgets, and fail-soft degradation:
+
+```bash
+# Evaluate a transaction dataset through the decision graph pipeline with stage latency telemetry
+fraud-detect pipeline-eval \
+  --model artifacts/model \
+  --input Dataset/eval.csv \
+  --rules rules/fraud_rules.json \
+  --velocity-config config/velocity.json \
+  --output reports/pipeline_eval.json
+
+# Enforce strict SLA in CI/CD: fail if any transaction executes in degraded mode
+fraud-detect pipeline-eval \
+  --model artifacts/model \
+  --input Dataset/eval.csv \
+  --fail-on-degraded \
+  --json
+
+# Serve API with real-time decision graph pipeline enabled
+fraud-detect serve artifacts/model \
+  --rules rules/fraud_rules.json \
+  --feature-store features/store.json \
+  --velocity-config config/velocity.json
+```
+
+Or enable via environment variable:
+```bash
+export FRAUD_PIPELINE_ENABLED="true"
+```
+
+### Decision graph architecture
+
+- **Topological Wave Scheduling**: `DecisionGraph` models dependencies across enrichment, rules, inference, calibration, and action arbitration. Independent stages execute concurrently in parallel waves via `asyncio.gather()`.
+- **Per-Stage Latency Budgets & Fail-Soft Degradation**: Non-critical stages (enrichment, recalibration, explainability) operate within strict millisecond timeout budgets. If an optional stage times out or experiences transient errors, it returns pre-configured fallback values and flags `degraded=True`, allowing final action arbitration to complete without client timeouts.
+- **Pluggable Stage Processors**:
+  - `EnrichmentStageProcessor`: Lookahead-safe feature store snapshots and sliding-window entity velocity features.
+  - `RuleStageProcessor`: Deterministic business rules with short-circuit evaluation.
+  - `InferenceStageProcessor`: Model risk scoring and SHAP/Tree feature contributions.
+  - `CalibrationStageProcessor`: Post-hoc probability recalibration (Platt scaling, isotonic regression, temperature scaling).
+  - `ActionAggregatorStageProcessor`: Precedence arbitration and tiered thresholding (`ALLOW`, `REVIEW`, `DENY`).
+- **Operational Endpoints**:
+  - `GET /v1/pipeline/topology`: Inspect registered graph DAG topology, node dependencies, stage types, and parallel execution wave plans.
+  - `POST /v1/pipeline/score`: Execute real-time decision graph for an incoming transaction with full stage-by-stage latency breakdowns and lineage traces.
+- **Prometheus Telemetry**:
+  - `fraud_pipeline_stage_duration_seconds{stage="...", status="..."}`: Histogram monitoring per-stage execution durations.
+  - `fraud_pipeline_executions_total{status="...", degraded="true|false"}`: Counter tracking total and degraded graph executions.
+
 ## Train on the anonymized dataset
 
 Place the downloaded CSV under the ignored `Dataset/` directory; raw financial data
