@@ -5836,3 +5836,28 @@ def test_cli_pipeline_eval_with_cache_and_speculation(
 
 
 
+
+
+def test_cli_pipeline_eval_rejects_corrupt_model_and_empty_input(
+    tmp_path: Path, trained_artifact: Path
+) -> None:
+    data_path = tmp_path / "data.csv"
+    generate_synthetic_data(rows=250, random_state=42).to_csv(data_path, index=False)
+
+    corrupt_model_dir = tmp_path / "corrupt_model"
+    corrupt_model_dir.mkdir()
+    res_model = runner.invoke(
+        app,
+        ["pipeline-eval", "-m", str(corrupt_model_dir), "-i", str(data_path)],
+    )
+    assert res_model.exit_code == 2
+    assert "Failed to load model" in res_model.output
+
+    empty_csv = tmp_path / "empty.csv"
+    empty_csv.write_text("", encoding="utf-8")
+    res_csv = runner.invoke(
+        app,
+        ["pipeline-eval", "-m", str(trained_artifact), "-i", str(empty_csv)],
+    )
+    assert res_csv.exit_code == 2
+    assert "Failed to read input dataset" in res_csv.output
