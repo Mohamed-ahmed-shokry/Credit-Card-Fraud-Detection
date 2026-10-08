@@ -802,3 +802,26 @@ def test_build_scoring_audit_event_pipeline_execution_trace() -> None:
     assert parsed["payload"]["degraded_nodes"] == ["inference"]
 
 
+def test_build_scoring_audit_event_cache_and_speculative() -> None:
+    event = build_scoring_audit_event(
+        model_version="v2",
+        dataset_fingerprint="fp2",
+        threshold=0.5,
+        predictions=[{"fraud_probability": 0.1, "is_fraud": False}],
+        cache_hits=2,
+        cache_misses=1,
+        speculative_executed=True,
+        speculative_hit=True,
+    )
+    assert event.payload["cache_hits"] == 2
+    assert event.payload["cache_misses"] == 1
+    assert event.payload["speculative_executed"] is True
+    assert event.payload["speculative_hit"] is True
+
+    serialized = event.to_json(redact=True)
+    parsed = json.loads(serialized)
+    assert parsed["payload"]["cache_hits"] == 2
+    assert parsed["payload"]["speculative_hit"] is True
+
+
+

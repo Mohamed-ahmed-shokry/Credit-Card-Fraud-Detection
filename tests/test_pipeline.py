@@ -24,12 +24,15 @@ from fraud_detection.pipeline import (
     DecisionGraphExecutor,
     EnrichmentStageProcessor,
     InferenceStageProcessor,
+    NodeCachePolicy,
+    NodeCacheStats,
     PipelineContext,
     PipelineCycleError,
     PipelineExecutionError,
     PipelineNode,
     PipelineValidationError,
     RuleStageProcessor,
+    StageExecutionCache,
     StageExecutionResult,
     StageStatus,
     StageType,
@@ -511,6 +514,38 @@ def test_create_default_fraud_pipeline_e2e() -> None:
     assert res_flagged.final_decision["matched_rule"] == "R99"
 
 
+def test_create_default_fraud_pipeline_cache_and_speculative_options() -> None:
+    dataset = validate_frame(generate_synthetic_data(rows=300, fraud_rate=0.1, random_state=42))
+    model = train_model(dataset)
+
+    graph = create_default_fraud_pipeline(
+        model=model,
+        enable_cache=True,
+        cache_rules=True,
+        cache_inference=True,
+        speculative_inference=True,
+    )
+    assert graph.metadata["speculative_inference"] is True
+    assert graph.metadata["enable_cache"] is True
+    assert graph.nodes["rules"].cache_policy is not None
+    assert graph.nodes["inference"].cache_policy is not None
+
+    executor = DecisionGraphExecutor(graph)
+    assert executor.enable_speculative is True
+
+    # Execute first time: cache miss, speculative hit
+    sample_tx = dict.fromkeys(model.feature_names, 0.2)
+    sample_tx["Amount"] = 42.0
+    res1 = executor.execute_sync(sample_tx)
+    assert res1.speculative_executed is True
+    assert res1.speculative_hit is True
+    assert res1.cache_hits == 0
+
+    # Execute second time: cache hit for rules and inference!
+    res2 = executor.execute_sync(sample_tx)
+    assert res2.cache_hits >= 1
+
+
 def test_action_aggregator_precedence_and_thresholds() -> None:
     # 1. MODEL_OVERRIDES_RULES
     proc_override = ActionAggregatorStageProcessor(
@@ -611,3 +646,360 @@ def test_pipeline_context_set_output_and_inference_none_model() -> None:
     inf_res = inf_proc(ctx)
     assert inf_res["probability"] is None
 
+
+def test_node_cache_policy_and_stats_serialization() -> None:
+    policy = NodeCachePolicy(
+        enabled=True,
+        ttl_seconds=30.0,
+        max_size=500,
+        key_fields=("card_id", "Amount"),
+    )
+    p_dict = policy.to_dict()
+    assert p_dict["enabled"] is True
+    assert p_dict["ttl_seconds"] == 30.0
+    assert p_dict["max_size"] == 500
+    assert p_dict["key_fields"] == ["card_id", "Amount"]
+    assert p_dict["has_custom_key_fn"] is False
+
+    stats = NodeCacheStats(hits=10, misses=5, evictions=2, expirations=1, size=20, max_size=500)
+    assert stats.total_lookups == 15
+    assert stats.hit_ratio == round(10 / 15, 4)
+    s_dict = stats.to_dict()
+    assert s_dict["hits"] == 10
+    assert s_dict["misses"] == 5
+    assert s_dict["hit_ratio"] == round(10 / 15, 4)
+
+
+def test_stage_execution_cache_get_put_eviction_and_expiry() -> None:
+    cache = StageExecutionCache()
+    policy = NodeCachePolicy(ttl_seconds=10.0, max_size=2)
+    cache.register_policy("rules", policy)
+    assert cache.get_policy("rules") == policy
+
+    # Miss
+    hit, val = cache.get("rules", "key1", now=100.0)
+    assert hit is False
+    assert val is None
+
+    # Put key1 and key2
+    cache.put("rules", "key1", {"decision": "ALLOW"}, now=100.0)
+    cache.put("rules", "key2", {"decision": "DENY"}, now=101.0)
+
+    # Hit key1 (moves key1 to end)
+    hit, val = cache.get("rules", "key1", now=102.0)
+    assert hit is True
+    assert val == {"decision": "ALLOW"}
+
+    # Put key3 -> evicts oldest (key2, since key1 was accessed more recently)
+    cache.put("rules", "key3", {"decision": "CHALLENGE"}, now=103.0)
+
+    hit_k2, val_k2 = cache.get("rules", "key2", now=104.0)
+    assert hit_k2 is False
+    assert val_k2 is None
+
+    hit_k1, val_k1 = cache.get("rules", "key1", now=105.0)
+    assert hit_k1 is True
+    assert val_k1 == {"decision": "ALLOW"}
+
+    # Expiry test at now=120.0 (TTL 10.0 from 100.0/103.0)
+    hit_expired, _ = cache.get("rules", "key1", now=120.0)
+    assert hit_expired is False
+
+    st = cache.get_stats("rules")
+    assert st.hits == 2
+    assert st.misses == 3
+    assert st.evictions == 1
+    assert st.expirations == 1
+
+
+def test_stage_execution_cache_key_generation_and_clear() -> None:
+    cache = StageExecutionCache()
+
+    # Default key generation (all tx keys)
+    ctx1 = PipelineContext(transaction={"b": 2, "a": 1})
+    ctx2 = PipelineContext(transaction={"a": 1, "b": 2})
+    k1 = cache.compute_key("stage", ctx1)
+    k2 = cache.compute_key("stage", ctx2)
+    assert k1 == k2  # Canonical sorted keys produce deterministic hash
+
+    # Specific key fields
+    policy_fields = NodeCachePolicy(key_fields=("card_id",))
+    cache.register_policy("stage_fields", policy_fields)
+    ctx_f1 = PipelineContext(transaction={"card_id": "c1", "Amount": 100.0})
+    ctx_f2 = PipelineContext(transaction={"card_id": "c1", "Amount": 500.0})
+    kf1 = cache.compute_key("stage_fields", ctx_f1)
+    kf2 = cache.compute_key("stage_fields", ctx_f2)
+    assert kf1 == kf2  # Ignores Amount since key_fields is only ('card_id',)
+
+    # Custom key function
+    policy_custom = NodeCachePolicy(key_fn=lambda c: f"custom_{c.transaction.get('user_id')}")
+    cache.register_policy("stage_custom", policy_custom)
+    ctx_c = PipelineContext(transaction={"user_id": "u42"})
+    assert cache.compute_key("stage_custom", ctx_c) == "custom_u42"
+
+    # Put and clear
+    cache.put("stage", k1, "val1")
+    cache.put("stage_fields", kf1, "val2")
+    stats = cache.stats_dict()
+    assert stats["total_size"] == 2
+
+    cache.clear("stage")
+    assert cache.get_stats("stage").size == 0
+    assert cache.get_stats("stage_fields").size == 1
+
+    cache.clear()
+    assert cache.stats_dict()["total_size"] == 0
+
+
+def test_decision_graph_executor_node_caching_hit_and_miss() -> None:
+    call_count = 0
+
+    def expensive_rules(ctx: PipelineContext) -> dict[str, Any]:
+        nonlocal call_count
+        call_count += 1
+        amt = ctx.transaction.get("Amount", 0.0)
+        return {"decision": "DENY" if amt > 1000.0 else "ALLOW"}
+
+    graph = DecisionGraph("cached_graph")
+    graph.add_node(
+        PipelineNode(
+            name="rules",
+            stage_type=StageType.RULES,
+            processor=expensive_rules,
+            cache_policy=NodeCachePolicy(enabled=True, ttl_seconds=60.0),
+        )
+    )
+    graph.add_node(
+        PipelineNode(
+            name="action",
+            stage_type=StageType.ACTION,
+            processor=lambda ctx: ctx.get_output("rules"),
+            dependencies=["rules"],
+        )
+    )
+
+    executor = DecisionGraphExecutor(graph, enable_cache=True)
+
+    # First run: Cache miss
+    res1 = executor.execute_sync({"Amount": 50.0, "card_id": "c1"})
+    assert call_count == 1
+    assert res1.stage_results["rules"].cached is False
+    assert res1.cache_hits == 0
+    assert res1.cache_misses == 1
+    assert res1.final_decision == {"decision": "ALLOW"}
+
+    # Second run with same input: Cache hit!
+    res2 = executor.execute_sync({"Amount": 50.0, "card_id": "c1"})
+    assert call_count == 1  # Processor was NOT called again!
+    assert res2.stage_results["rules"].cached is True
+    assert res2.cache_hits == 1
+    assert res2.cache_misses == 0
+    assert res2.final_decision == {"decision": "ALLOW"}
+
+    # Third run with different input: Cache miss
+    res3 = executor.execute_sync({"Amount": 2000.0, "card_id": "c2"})
+    assert call_count == 2
+    assert res3.stage_results["rules"].cached is False
+    assert res3.cache_hits == 0
+    assert res3.cache_misses == 1
+    assert res3.final_decision == {"decision": "DENY"}
+
+    # Check stats dict
+    stats = executor.cache.stats_dict()
+    assert stats["total_hits"] == 1
+    assert stats["total_misses"] == 2
+    assert stats["nodes"]["rules"]["hits"] == 1
+    assert stats["nodes"]["rules"]["misses"] == 2
+
+    # Disable cache
+    executor_no_cache = DecisionGraphExecutor(graph, enable_cache=False)
+    res4 = executor_no_cache.execute_sync({"Amount": 50.0, "card_id": "c1"})
+    assert call_count == 3
+    assert res4.stage_results["rules"].cached is False
+    assert res4.cache_hits == 0
+
+
+def test_speculative_execution_hit_when_features_unchanged() -> None:
+    dataset = validate_frame(generate_synthetic_data(rows=300, fraud_rate=0.1, random_state=42))
+    model = train_model(dataset)
+
+    def dummy_enrich(ctx: PipelineContext) -> dict[str, Any]:
+        # Modifies only a metadata column not in model.feature_names
+        ctx.transaction["unrelated_tag"] = "enrich_ok"
+        return {"enriched": True}
+
+    graph = DecisionGraph("spec_graph")
+    graph.add_node(
+        PipelineNode(
+            name="enrichment",
+            stage_type=StageType.ENRICHMENT,
+            processor=dummy_enrich,
+        )
+    )
+    graph.add_node(
+        PipelineNode(
+            name="inference",
+            stage_type=StageType.INFERENCE,
+            processor=InferenceStageProcessor(model),
+            dependencies=["enrichment"],
+        )
+    )
+    graph.add_node(
+        PipelineNode(
+            name="action",
+            stage_type=StageType.ACTION,
+            processor=lambda ctx: ctx.get_output("inference"),
+            dependencies=["inference"],
+            required=True,
+        )
+    )
+
+    executor = DecisionGraphExecutor(graph, enable_speculative=True)
+    sample_tx = dict.fromkeys(model.feature_names, 0.1)
+    res = executor.execute_sync(sample_tx)
+
+    assert res.speculative_executed is True
+    assert res.speculative_hit is True
+    assert res.stage_results["inference"].speculative is True
+    assert res.stage_results["inference"].output["probability"] is not None
+
+
+def test_speculative_execution_discard_when_features_modified() -> None:
+    dataset = validate_frame(generate_synthetic_data(rows=300, fraud_rate=0.1, random_state=42))
+    model = train_model(dataset)
+
+    def modifying_enrich(ctx: PipelineContext) -> dict[str, Any]:
+        # Modifies Amount which IS in model.feature_names
+        ctx.transaction["Amount"] = 99999.0
+        return {"modified": True}
+
+    graph = DecisionGraph("spec_mod_graph")
+    graph.add_node(
+        PipelineNode(
+            name="enrichment",
+            stage_type=StageType.ENRICHMENT,
+            processor=modifying_enrich,
+        )
+    )
+    graph.add_node(
+        PipelineNode(
+            name="inference",
+            stage_type=StageType.INFERENCE,
+            processor=InferenceStageProcessor(model),
+            dependencies=["enrichment"],
+        )
+    )
+    graph.add_node(
+        PipelineNode(
+            name="action",
+            stage_type=StageType.ACTION,
+            processor=lambda ctx: ctx.get_output("inference"),
+            dependencies=["inference"],
+            required=True,
+        )
+    )
+
+    executor = DecisionGraphExecutor(graph, enable_speculative=True)
+    sample_tx = dict.fromkeys(model.feature_names, 0.1)
+    sample_tx["Amount"] = 1.0
+    res = executor.execute_sync(sample_tx)
+
+    assert res.speculative_executed is True
+    assert res.speculative_hit is False
+    assert res.stage_results["inference"].speculative is False
+    assert res.stage_results["inference"].output["probability"] is not None
+
+
+def test_speculative_execution_discard_on_short_circuit() -> None:
+    dataset = validate_frame(generate_synthetic_data(rows=300, fraud_rate=0.1, random_state=42))
+    model = train_model(dataset)
+
+    rule = DecisionRule(
+        rule_id="r1",
+        name="Deny All",
+        conditions=[RuleCondition(field="Amount", operator=RuleOperator.GREATER_THAN, value=0.0)],
+        action=RuleAction.DENY,
+    )
+    rule_set = RuleSet(rules=(rule,))
+
+    graph = DecisionGraph("spec_short_circuit_graph")
+    graph.add_node(
+        PipelineNode(
+            name="rules",
+            stage_type=StageType.RULES,
+            processor=RuleStageProcessor(rules=rule_set),
+        )
+    )
+    graph.add_node(
+        PipelineNode(
+            name="inference",
+            stage_type=StageType.INFERENCE,
+            processor=InferenceStageProcessor(model),
+            dependencies=["rules"],
+        )
+    )
+    graph.add_node(
+        PipelineNode(
+            name="action",
+            stage_type=StageType.ACTION,
+            processor=lambda ctx: ctx.get_output("rules"),
+            dependencies=["inference"],
+        )
+    )
+
+    executor = DecisionGraphExecutor(graph, enable_speculative=True)
+
+    sample_tx = dict.fromkeys(model.feature_names, 0.1)
+    sample_tx["Amount"] = 100.0
+    res = executor.execute_sync(sample_tx)
+
+    assert res.speculative_executed is True
+    # Rule short-circuited: inference should be skipped, speculative output discarded
+    assert res.speculative_hit is False
+    assert res.stage_results["inference"].output["skipped"] is True
+
+
+
+
+
+
+def test_speculative_custom_node_and_global_timeout() -> None:
+    graph = DecisionGraph("spec_custom_graph")
+    graph.add_node(
+        PipelineNode(
+            name="enrichment",
+            stage_type=StageType.ENRICHMENT,
+            processor=lambda _ctx: {"enriched": True},
+        )
+    )
+    graph.add_node(
+        PipelineNode(
+            name="scoring",
+            stage_type=StageType.INFERENCE,
+            processor=lambda _ctx: {"probability": 0.2},
+            dependencies=["enrichment"],
+        )
+    )
+    graph.add_node(
+        PipelineNode(
+            name="action",
+            stage_type=StageType.ACTION,
+            processor=lambda ctx: {
+                "decision": "ALLOW",
+                "is_fraud": False,
+                "fraud_probability": ctx.get_output("scoring")["probability"],
+            },
+            dependencies=["scoring"],
+            required=True,
+        )
+    )
+
+    executor = DecisionGraphExecutor(
+        graph, enable_speculative=True, speculative_nodes=["scoring"]
+    )
+    res = asyncio.run(executor.execute({"Amount": 1.0}, global_timeout_seconds=5.0))
+
+    assert res.speculative_executed is True
+    assert res.speculative_hit is True
+    assert res.stage_results["scoring"].speculative is True
+    assert res.decision == "ALLOW"

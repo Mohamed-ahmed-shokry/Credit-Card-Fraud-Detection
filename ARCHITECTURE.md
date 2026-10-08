@@ -254,6 +254,8 @@ the request and response, while the tuned artifact threshold remains visible as
 - Decision graph DAG execution organizes stage dependencies into topologically ordered parallel execution waves, executing concurrent non-interdependent stages (e.g. feature store lookups and heuristic rules) via `asyncio.gather()`.
 - Per-stage latency budgets and fail-soft degradation guarantee pipeline resilience; when non-required stages (enrichment, recalibration, explainability) time out or fail, they fall back to pre-configured safe outputs and flag `degraded=True`, allowing final action arbitration to complete within SLA.
 - Full execution tracing records complete pipeline DAG lineage, stage durations, and degraded node lists in structured audit events and Prometheus telemetry (`fraud_pipeline_stage_duration_seconds`, `fraud_pipeline_executions_total`).
+- Stage node caching keeps a bounded in-memory LRU per node with TTL expiry; cache keys are derived deterministically from the transaction (or configured key columns), so a hit returns exactly what the processor would have produced for identical inputs. Only pure stages are cached by default (rules); model inference caching is opt-in.
+- Speculative model inference starts the inference stage concurrently with upstream enrichment on the pre-enrichment transaction. The speculative result is adopted only when the model's feature values are unchanged after enrichment and no rule short-circuit occurred; otherwise it is cancelled and the stage is recomputed, so speculation never changes the decision, only latency. Outcomes are recorded as `speculative_executed` / `speculative_hit` in results, audit events, and Prometheus counters.
 
 ## Extension guidance
 

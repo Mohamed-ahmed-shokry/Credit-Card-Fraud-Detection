@@ -566,6 +566,14 @@ fraud-detect pipeline-eval \
   --fail-on-degraded \
   --json
 
+# Enable node caching and speculative model inference, reporting cache hit ratio
+fraud-detect pipeline-eval \
+  --model artifacts/model \
+  --input Dataset/eval.csv \
+  --enable-cache --cache-size 2000 --cache-ttl 120 \
+  --speculative \
+  --json
+
 # Serve API with real-time decision graph pipeline enabled
 fraud-detect serve artifacts/model \
   --rules rules/fraud_rules.json \
@@ -588,12 +596,18 @@ export FRAUD_PIPELINE_ENABLED="true"
   - `InferenceStageProcessor`: Model risk scoring and SHAP/Tree feature contributions.
   - `CalibrationStageProcessor`: Post-hoc probability recalibration (Platt scaling, isotonic regression, temperature scaling).
   - `ActionAggregatorStageProcessor`: Precedence arbitration and tiered thresholding (`ALLOW`, `REVIEW`, `DENY`).
+- **Node Caching**: Opt-in (`enable_pipeline_cache`, `FRAUD_PIPELINE_CACHE_ENABLED`) deterministic in-memory cache for pure stages with per-stage TTL (`FRAUD_PIPELINE_CACHE_TTL_SECONDS`) and LRU bounds (`FRAUD_PIPELINE_CACHE_MAX_SIZE`).
+- **Speculative Inference**: Opt-in (`enable_speculative_pipeline`, `FRAUD_PIPELINE_SPECULATIVE_ENABLED`) model inference that runs concurrently with enrichment; the result is adopted only if the model's features are unchanged after enrichment, and discarded and recomputed on feature changes or rule short-circuits.
 - **Operational Endpoints**:
   - `GET /v1/pipeline/topology`: Inspect registered graph DAG topology, node dependencies, stage types, and parallel execution wave plans.
   - `POST /v1/pipeline/score`: Execute real-time decision graph for an incoming transaction with full stage-by-stage latency breakdowns and lineage traces.
+  - `GET /v1/pipeline/cache/stats`: Aggregate and per-node cache hits, misses, hit ratio, evictions, and size (404 when caching is disabled).
+  - `POST /v1/pipeline/cache/clear`: Drop all cached stage outputs.
 - **Prometheus Telemetry**:
   - `fraud_pipeline_stage_duration_seconds{stage="...", status="..."}`: Histogram monitoring per-stage execution durations.
   - `fraud_pipeline_executions_total{status="...", degraded="true|false"}`: Counter tracking total and degraded graph executions.
+  - `fraud_pipeline_cache_hits_total{stage="..."}` / `fraud_pipeline_cache_misses_total{stage="..."}`: Per-stage cache outcomes.
+  - `fraud_pipeline_speculative_executions_total` / `fraud_pipeline_speculative_hits_total`: Speculative launches and adopted results.
 
 ## Train on the anonymized dataset
 
