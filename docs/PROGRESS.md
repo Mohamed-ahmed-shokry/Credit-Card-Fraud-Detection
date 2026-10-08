@@ -9,7 +9,7 @@
 - [x] Task 1: Fix baseline mypy unreachable code in `InferenceStageProcessor` and tighten batch evaluation timeout robustness.
 - [x] Task 2: Implement `NodeCachePolicy`, `NodeCacheStats`, and `StageExecutionCache` in `pipeline.py`.
 - [x] Task 3: Integrate node caching into `DecisionGraphExecutor` and `StageExecutionResult`.
-- [ ] Task 4: Implement speculative asynchronous model inference execution in `DecisionGraphExecutor`.
+- [x] Task 4: Implement speculative asynchronous model inference execution in `DecisionGraphExecutor`.
 - [ ] Task 5: Enhance `create_default_fraud_pipeline` with cache and speculative evaluation options.
 - [ ] Task 6: Update audit event export in `audit.py` with cache and speculative execution metadata.
 - [ ] Task 7: Integrate cache endpoints (`/v1/pipeline/cache/stats`, `/v1/pipeline/cache/clear`) and Prometheus metrics in `api.py`.
@@ -22,7 +22,7 @@
 |-----------|--------|----------|
 | AC-1 (Baseline resilience) | Met | Strict mypy passes with 0 unreachable statement errors; `pipeline-eval` tests execute reliably without spurious threadpool timeout degradation (5/5 passed). |
 | AC-2 (Node cache semantics) | Met | `StageExecutionCache` verified with TTL expiration, LRU eviction, deterministic key generation, and telemetry counters in `tests/test_pipeline.py`. |
-| AC-3 (Speculative inference correctness) | Pending | Implementation pending |
+| AC-3 (Speculative inference correctness) | Met | Speculative inference hit verified when features unchanged; safe discard and re-computation verified on feature delta or rule short-circuit in `tests/test_pipeline.py`. |
 | AC-4 (Audit & telemetry fidelity) | Pending | Implementation pending |
 | AC-5 (API serving integration) | Pending | Implementation pending |
 | AC-6 (CLI workflow) | Pending | Implementation pending |

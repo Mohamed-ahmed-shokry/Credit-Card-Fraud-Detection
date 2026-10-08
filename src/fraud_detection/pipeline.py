@@ -940,12 +940,26 @@ class DecisionGraphExecutor:
         *,
         cache: StageExecutionCache | None = None,
         enable_cache: bool = True,
+        enable_speculative: bool = False,
+        speculative_nodes: Sequence[str] | None = None,
     ) -> None:
         self.graph = graph
         self.graph.validate()
         self.plan = self.graph.build_execution_plan()
         self.cache = cache or StageExecutionCache()
         self.enable_cache = enable_cache
+        self.enable_speculative = enable_speculative
+
+        if speculative_nodes is not None:
+            self.speculative_nodes = tuple(speculative_nodes)
+        elif self.enable_speculative:
+            self.speculative_nodes = tuple(
+                name
+                for name, node in self.graph.nodes.items()
+                if node.stage_type == StageType.INFERENCE and len(node.dependencies) > 0
+            )
+        else:
+            self.speculative_nodes = ()
 
         for name, node in self.graph.nodes.items():
             if node.cache_policy is not None:
@@ -1068,10 +1082,93 @@ class DecisionGraphExecutor:
             metadata=dict(metadata or {}),
         )
 
+        initial_tx = dict(context.transaction)
+        speculative_tasks: dict[str, tuple[asyncio.Task[None], PipelineContext]] = {}
+
+        if self.enable_speculative and self.speculative_nodes:
+            for s_name in self.speculative_nodes:
+                if s_name in self.graph.nodes:
+                    s_ctx = PipelineContext(
+                        transaction=dict(initial_tx),
+                        metadata=dict(context.metadata),
+                    )
+                    s_task = asyncio.create_task(self._execute_node(s_name, s_ctx))
+                    speculative_tasks[s_name] = (s_task, s_ctx)
+            if speculative_tasks:
+                context.metadata["speculative_executed"] = True
+
+        async def _execute_step(node_name: str) -> None:
+            if node_name in speculative_tasks:
+                s_task, s_ctx = speculative_tasks[node_name]
+                node = self.graph.nodes[node_name]
+                short_circuited = bool(context.metadata.get("short_circuit"))
+
+                if (
+                    isinstance(node.processor, InferenceStageProcessor)
+                    and node.processor.model is not None
+                ):
+                    relevant_features = node.processor.model.feature_names
+                else:
+                    relevant_features = None
+
+                features_changed = False
+                if relevant_features is not None:
+                    for f in relevant_features:
+                        if initial_tx.get(f) != context.transaction.get(f):
+                            features_changed = True
+                            break
+                else:
+                    features_changed = initial_tx != context.transaction
+
+                if not short_circuited and not features_changed:
+                    try:
+                        await s_task
+                        s_res = s_ctx.results.get(node_name)
+                        if s_res is not None and s_res.status == StageStatus.SUCCESS:
+                            context.results[node_name] = StageExecutionResult(
+                                node_name=s_res.node_name,
+                                stage_type=s_res.stage_type,
+                                status=s_res.status,
+                                latency_ms=s_res.latency_ms,
+                                output=s_res.output,
+                                error=s_res.error,
+                                degraded=s_res.degraded,
+                                cached=s_res.cached,
+                                speculative=True,
+                            )
+                            context.metadata["speculative_hit"] = True
+                            return
+                    except (
+                        PipelineError,
+                        ValueError,
+                        TypeError,
+                        KeyError,
+                        AttributeError,
+                        RuntimeError,
+                        TimeoutError,
+                        OSError,
+                    ) as s_exc:
+                        logger.debug(
+                            "Speculative task for '%s' raised %s; falling back",
+                            node_name,
+                            s_exc,
+                        )
+
+                if not s_task.done():
+                    s_task.cancel()
+                context.metadata["speculative_discarded"] = True
+
+            await self._execute_node(node_name, context)
+
         async def _run_waves() -> None:
-            for wave in self.plan.waves:
-                tasks = [self._execute_node(node_name, context) for node_name in wave]
-                await asyncio.gather(*tasks)
+            try:
+                for wave in self.plan.waves:
+                    tasks = [_execute_step(node_name) for node_name in wave]
+                    await asyncio.gather(*tasks)
+            finally:
+                for s_task, _ in speculative_tasks.values():
+                    if not s_task.done():
+                        s_task.cancel()
 
         if global_timeout_seconds is not None:
             await asyncio.wait_for(_run_waves(), timeout=global_timeout_seconds)

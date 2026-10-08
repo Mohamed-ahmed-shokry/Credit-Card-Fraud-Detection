@@ -787,4 +787,145 @@ def test_decision_graph_executor_node_caching_hit_and_miss() -> None:
     assert res4.cache_hits == 0
 
 
+def test_speculative_execution_hit_when_features_unchanged() -> None:
+    dataset = validate_frame(generate_synthetic_data(rows=300, fraud_rate=0.1, random_state=42))
+    model = train_model(dataset)
+
+    def dummy_enrich(ctx: PipelineContext) -> dict[str, Any]:
+        # Modifies only a metadata column not in model.feature_names
+        ctx.transaction["unrelated_tag"] = "enrich_ok"
+        return {"enriched": True}
+
+    graph = DecisionGraph("spec_graph")
+    graph.add_node(
+        PipelineNode(
+            name="enrichment",
+            stage_type=StageType.ENRICHMENT,
+            processor=dummy_enrich,
+        )
+    )
+    graph.add_node(
+        PipelineNode(
+            name="inference",
+            stage_type=StageType.INFERENCE,
+            processor=InferenceStageProcessor(model),
+            dependencies=["enrichment"],
+        )
+    )
+    graph.add_node(
+        PipelineNode(
+            name="action",
+            stage_type=StageType.ACTION,
+            processor=lambda ctx: ctx.get_output("inference"),
+            dependencies=["inference"],
+            required=True,
+        )
+    )
+
+    executor = DecisionGraphExecutor(graph, enable_speculative=True)
+    sample_tx = dict.fromkeys(model.feature_names, 0.1)
+    res = executor.execute_sync(sample_tx)
+
+    assert res.speculative_executed is True
+    assert res.speculative_hit is True
+    assert res.stage_results["inference"].speculative is True
+    assert res.stage_results["inference"].output["probability"] is not None
+
+
+def test_speculative_execution_discard_when_features_modified() -> None:
+    dataset = validate_frame(generate_synthetic_data(rows=300, fraud_rate=0.1, random_state=42))
+    model = train_model(dataset)
+
+    def modifying_enrich(ctx: PipelineContext) -> dict[str, Any]:
+        # Modifies Amount which IS in model.feature_names
+        ctx.transaction["Amount"] = 99999.0
+        return {"modified": True}
+
+    graph = DecisionGraph("spec_mod_graph")
+    graph.add_node(
+        PipelineNode(
+            name="enrichment",
+            stage_type=StageType.ENRICHMENT,
+            processor=modifying_enrich,
+        )
+    )
+    graph.add_node(
+        PipelineNode(
+            name="inference",
+            stage_type=StageType.INFERENCE,
+            processor=InferenceStageProcessor(model),
+            dependencies=["enrichment"],
+        )
+    )
+    graph.add_node(
+        PipelineNode(
+            name="action",
+            stage_type=StageType.ACTION,
+            processor=lambda ctx: ctx.get_output("inference"),
+            dependencies=["inference"],
+            required=True,
+        )
+    )
+
+    executor = DecisionGraphExecutor(graph, enable_speculative=True)
+    sample_tx = dict.fromkeys(model.feature_names, 0.1)
+    sample_tx["Amount"] = 1.0
+    res = executor.execute_sync(sample_tx)
+
+    assert res.speculative_executed is True
+    assert res.speculative_hit is False
+    assert res.stage_results["inference"].speculative is False
+    assert res.stage_results["inference"].output["probability"] is not None
+
+
+def test_speculative_execution_discard_on_short_circuit() -> None:
+    dataset = validate_frame(generate_synthetic_data(rows=300, fraud_rate=0.1, random_state=42))
+    model = train_model(dataset)
+
+    rule = DecisionRule(
+        rule_id="r1",
+        name="Deny All",
+        conditions=[RuleCondition(field="Amount", operator=RuleOperator.GREATER_THAN, value=0.0)],
+        action=RuleAction.DENY,
+    )
+    rule_set = RuleSet(rules=(rule,))
+
+    graph = DecisionGraph("spec_short_circuit_graph")
+    graph.add_node(
+        PipelineNode(
+            name="rules",
+            stage_type=StageType.RULES,
+            processor=RuleStageProcessor(rules=rule_set),
+        )
+    )
+    graph.add_node(
+        PipelineNode(
+            name="inference",
+            stage_type=StageType.INFERENCE,
+            processor=InferenceStageProcessor(model),
+            dependencies=["rules"],
+        )
+    )
+    graph.add_node(
+        PipelineNode(
+            name="action",
+            stage_type=StageType.ACTION,
+            processor=lambda ctx: ctx.get_output("rules"),
+            dependencies=["inference"],
+        )
+    )
+
+    executor = DecisionGraphExecutor(graph, enable_speculative=True)
+
+    sample_tx = dict.fromkeys(model.feature_names, 0.1)
+    sample_tx["Amount"] = 100.0
+    res = executor.execute_sync(sample_tx)
+
+    assert res.speculative_executed is True
+    # Rule short-circuited: inference should be skipped, speculative output discarded
+    assert res.speculative_hit is False
+    assert res.stage_results["inference"].output["skipped"] is True
+
+
+
 
