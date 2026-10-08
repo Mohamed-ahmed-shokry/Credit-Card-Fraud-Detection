@@ -3,7 +3,7 @@
 ## Overview
 - **Phase**: Phase 33 — Real-Time Graph Node Cache & Speculative Model Evaluation
 - **Branch**: `phase/node-cache-speculation`
-- **Status**: In progress
+- **Status**: Complete
 
 ## Task Status
 - [x] Task 1: Fix baseline mypy unreachable code in `InferenceStageProcessor` and tighten batch evaluation timeout robustness.
@@ -15,7 +15,7 @@
 - [x] Task 7: Integrate cache endpoints (`/v1/pipeline/cache/stats`, `/v1/pipeline/cache/clear`) and Prometheus metrics in `api.py`.
 - [x] Task 8: Add cache and speculative evaluation options to `pipeline-eval` CLI command in `cli.py`.
 - [x] Task 9: Implement comprehensive unit and integration tests across pipeline, audit, API, and CLI.
-- [ ] Task 10: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`).
+- [x] Task 10: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`).
 
 ## Acceptance Criteria Status
 | Criterion | Status | Evidence |
