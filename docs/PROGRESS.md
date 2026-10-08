@@ -10,7 +10,7 @@
 - [x] Task 2: Implement `NodeCachePolicy`, `NodeCacheStats`, and `StageExecutionCache` in `pipeline.py`.
 - [x] Task 3: Integrate node caching into `DecisionGraphExecutor` and `StageExecutionResult`.
 - [x] Task 4: Implement speculative asynchronous model inference execution in `DecisionGraphExecutor`.
-- [ ] Task 5: Enhance `create_default_fraud_pipeline` with cache and speculative evaluation options.
+- [x] Task 5: Enhance `create_default_fraud_pipeline` with cache and speculative evaluation options.
 - [ ] Task 6: Update audit event export in `audit.py` with cache and speculative execution metadata.
 - [ ] Task 7: Integrate cache endpoints (`/v1/pipeline/cache/stats`, `/v1/pipeline/cache/clear`) and Prometheus metrics in `api.py`.
 - [ ] Task 8: Add cache and speculative evaluation options to `pipeline-eval` CLI command in `cli.py`.

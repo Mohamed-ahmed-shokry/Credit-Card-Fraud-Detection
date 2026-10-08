@@ -514,6 +514,38 @@ def test_create_default_fraud_pipeline_e2e() -> None:
     assert res_flagged.final_decision["matched_rule"] == "R99"
 
 
+def test_create_default_fraud_pipeline_cache_and_speculative_options() -> None:
+    dataset = validate_frame(generate_synthetic_data(rows=300, fraud_rate=0.1, random_state=42))
+    model = train_model(dataset)
+
+    graph = create_default_fraud_pipeline(
+        model=model,
+        enable_cache=True,
+        cache_rules=True,
+        cache_inference=True,
+        speculative_inference=True,
+    )
+    assert graph.metadata["speculative_inference"] is True
+    assert graph.metadata["enable_cache"] is True
+    assert graph.nodes["rules"].cache_policy is not None
+    assert graph.nodes["inference"].cache_policy is not None
+
+    executor = DecisionGraphExecutor(graph)
+    assert executor.enable_speculative is True
+
+    # Execute first time: cache miss, speculative hit
+    sample_tx = dict.fromkeys(model.feature_names, 0.2)
+    sample_tx["Amount"] = 42.0
+    res1 = executor.execute_sync(sample_tx)
+    assert res1.speculative_executed is True
+    assert res1.speculative_hit is True
+    assert res1.cache_hits == 0
+
+    # Execute second time: cache hit for rules and inference!
+    res2 = executor.execute_sync(sample_tx)
+    assert res2.cache_hits >= 1
+
+
 def test_action_aggregator_precedence_and_thresholds() -> None:
     # 1. MODEL_OVERRIDES_RULES
     proc_override = ActionAggregatorStageProcessor(

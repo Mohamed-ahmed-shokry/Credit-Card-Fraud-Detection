@@ -421,6 +421,7 @@ class DecisionGraph:
         self.name = name
         self.nodes: dict[str, PipelineNode] = {}
         self.edges: list[PipelineEdge] = []
+        self.metadata: dict[str, Any] = {}
 
     def add_node(self, node: PipelineNode) -> DecisionGraph:
         """Register a pipeline node with the decision graph."""
@@ -545,6 +546,7 @@ class DecisionGraph:
             "nodes": {k: v.to_dict() for k, v in self.nodes.items()},
             "edges": [e.to_dict() for e in self.edges],
             "execution_plan": plan.to_dict(),
+            "metadata": dict(self.metadata),
         }
 
 
@@ -940,7 +942,7 @@ class DecisionGraphExecutor:
         *,
         cache: StageExecutionCache | None = None,
         enable_cache: bool = True,
-        enable_speculative: bool = False,
+        enable_speculative: bool | None = None,
         speculative_nodes: Sequence[str] | None = None,
     ) -> None:
         self.graph = graph
@@ -948,7 +950,11 @@ class DecisionGraphExecutor:
         self.plan = self.graph.build_execution_plan()
         self.cache = cache or StageExecutionCache()
         self.enable_cache = enable_cache
-        self.enable_speculative = enable_speculative
+        self.enable_speculative = (
+            enable_speculative
+            if enable_speculative is not None
+            else bool(self.graph.metadata.get("speculative_inference", False))
+        )
 
         if speculative_nodes is not None:
             self.speculative_nodes = tuple(speculative_nodes)
@@ -1290,10 +1296,35 @@ def create_default_fraud_pipeline(
     rules_timeout_seconds: float | None = 0.25,
     action_timeout_seconds: float | None = 0.25,
     explain: bool = False,
+    enable_cache: bool = False,
+    cache_rules: bool = True,
+    cache_inference: bool = False,
+    cache_ttl_seconds: float = 60.0,
+    cache_max_size: int = 1000,
+    speculative_inference: bool = False,
 ) -> DecisionGraph:
     """Build a standard, production-ready fraud decision execution graph."""
     applied_threshold = model.threshold if threshold is None else threshold
     graph = DecisionGraph("production_fraud_pipeline")
+    graph.metadata["speculative_inference"] = speculative_inference
+    graph.metadata["enable_cache"] = enable_cache
+
+    rules_cache_policy: NodeCachePolicy | None = None
+    if enable_cache and cache_rules:
+        rules_cache_policy = NodeCachePolicy(
+            enabled=True,
+            ttl_seconds=cache_ttl_seconds,
+            max_size=cache_max_size,
+        )
+
+    inference_cache_policy: NodeCachePolicy | None = None
+    if enable_cache and cache_inference:
+        inference_cache_policy = NodeCachePolicy(
+            enabled=True,
+            ttl_seconds=cache_ttl_seconds,
+            max_size=cache_max_size,
+            key_fields=tuple(model.feature_names),
+        )
 
     enrich_proc = EnrichmentStageProcessor(
         feature_store=feature_store,
@@ -1322,6 +1353,7 @@ def create_default_fraud_pipeline(
             timeout_seconds=rules_timeout_seconds,
             fallback_value={"matched": False, "short_circuited": False},
             required=False,
+            cache_policy=rules_cache_policy,
         )
     )
 
@@ -1340,6 +1372,7 @@ def create_default_fraud_pipeline(
                 "contributions": None,
             },
             required=False,
+            cache_policy=inference_cache_policy,
         )
     )
 
