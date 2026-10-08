@@ -7,7 +7,7 @@
 
 ## Task Status
 - [x] Task 1: Fix baseline mypy unreachable code in `InferenceStageProcessor` and tighten batch evaluation timeout robustness.
-- [ ] Task 2: Implement `NodeCachePolicy`, `NodeCacheStats`, and `StageExecutionCache` in `pipeline.py`.
+- [x] Task 2: Implement `NodeCachePolicy`, `NodeCacheStats`, and `StageExecutionCache` in `pipeline.py`.
 - [ ] Task 3: Integrate node caching into `DecisionGraphExecutor` and `StageExecutionResult`.
 - [ ] Task 4: Implement speculative asynchronous model inference execution in `DecisionGraphExecutor`.
 - [ ] Task 5: Enhance `create_default_fraud_pipeline` with cache and speculative evaluation options.
@@ -21,7 +21,7 @@
 | Criterion | Status | Evidence |
 |-----------|--------|----------|
 | AC-1 (Baseline resilience) | Met | Strict mypy passes with 0 unreachable statement errors; `pipeline-eval` tests execute reliably without spurious threadpool timeout degradation (5/5 passed). |
-| AC-2 (Node cache semantics) | Pending | Implementation pending |
+| AC-2 (Node cache semantics) | Met | `StageExecutionCache` verified with TTL expiration, LRU eviction, deterministic key generation, and telemetry counters in `tests/test_pipeline.py`. |
 | AC-3 (Speculative inference correctness) | Pending | Implementation pending |
 | AC-4 (Audit & telemetry fidelity) | Pending | Implementation pending |
 | AC-5 (API serving integration) | Pending | Implementation pending |

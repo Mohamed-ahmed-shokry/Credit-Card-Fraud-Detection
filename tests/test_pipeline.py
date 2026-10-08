@@ -24,12 +24,15 @@ from fraud_detection.pipeline import (
     DecisionGraphExecutor,
     EnrichmentStageProcessor,
     InferenceStageProcessor,
+    NodeCachePolicy,
+    NodeCacheStats,
     PipelineContext,
     PipelineCycleError,
     PipelineExecutionError,
     PipelineNode,
     PipelineValidationError,
     RuleStageProcessor,
+    StageExecutionCache,
     StageExecutionResult,
     StageStatus,
     StageType,
@@ -610,4 +613,109 @@ def test_pipeline_context_set_output_and_inference_none_model() -> None:
     inf_proc = InferenceStageProcessor(model=None)
     inf_res = inf_proc(ctx)
     assert inf_res["probability"] is None
+
+
+def test_node_cache_policy_and_stats_serialization() -> None:
+    policy = NodeCachePolicy(
+        enabled=True,
+        ttl_seconds=30.0,
+        max_size=500,
+        key_fields=("card_id", "Amount"),
+    )
+    p_dict = policy.to_dict()
+    assert p_dict["enabled"] is True
+    assert p_dict["ttl_seconds"] == 30.0
+    assert p_dict["max_size"] == 500
+    assert p_dict["key_fields"] == ["card_id", "Amount"]
+    assert p_dict["has_custom_key_fn"] is False
+
+    stats = NodeCacheStats(hits=10, misses=5, evictions=2, expirations=1, size=20, max_size=500)
+    assert stats.total_lookups == 15
+    assert stats.hit_ratio == round(10 / 15, 4)
+    s_dict = stats.to_dict()
+    assert s_dict["hits"] == 10
+    assert s_dict["misses"] == 5
+    assert s_dict["hit_ratio"] == round(10 / 15, 4)
+
+
+def test_stage_execution_cache_get_put_eviction_and_expiry() -> None:
+    cache = StageExecutionCache()
+    policy = NodeCachePolicy(ttl_seconds=10.0, max_size=2)
+    cache.register_policy("rules", policy)
+    assert cache.get_policy("rules") == policy
+
+    # Miss
+    hit, val = cache.get("rules", "key1", now=100.0)
+    assert hit is False
+    assert val is None
+
+    # Put key1 and key2
+    cache.put("rules", "key1", {"decision": "ALLOW"}, now=100.0)
+    cache.put("rules", "key2", {"decision": "DENY"}, now=101.0)
+
+    # Hit key1 (moves key1 to end)
+    hit, val = cache.get("rules", "key1", now=102.0)
+    assert hit is True
+    assert val == {"decision": "ALLOW"}
+
+    # Put key3 -> evicts oldest (key2, since key1 was accessed more recently)
+    cache.put("rules", "key3", {"decision": "CHALLENGE"}, now=103.0)
+
+    hit_k2, val_k2 = cache.get("rules", "key2", now=104.0)
+    assert hit_k2 is False
+    assert val_k2 is None
+
+    hit_k1, val_k1 = cache.get("rules", "key1", now=105.0)
+    assert hit_k1 is True
+    assert val_k1 == {"decision": "ALLOW"}
+
+    # Expiry test at now=120.0 (TTL 10.0 from 100.0/103.0)
+    hit_expired, _ = cache.get("rules", "key1", now=120.0)
+    assert hit_expired is False
+
+    st = cache.get_stats("rules")
+    assert st.hits == 2
+    assert st.misses == 3
+    assert st.evictions == 1
+    assert st.expirations == 1
+
+
+def test_stage_execution_cache_key_generation_and_clear() -> None:
+    cache = StageExecutionCache()
+
+    # Default key generation (all tx keys)
+    ctx1 = PipelineContext(transaction={"b": 2, "a": 1})
+    ctx2 = PipelineContext(transaction={"a": 1, "b": 2})
+    k1 = cache.compute_key("stage", ctx1)
+    k2 = cache.compute_key("stage", ctx2)
+    assert k1 == k2  # Canonical sorted keys produce deterministic hash
+
+    # Specific key fields
+    policy_fields = NodeCachePolicy(key_fields=("card_id",))
+    cache.register_policy("stage_fields", policy_fields)
+    ctx_f1 = PipelineContext(transaction={"card_id": "c1", "Amount": 100.0})
+    ctx_f2 = PipelineContext(transaction={"card_id": "c1", "Amount": 500.0})
+    kf1 = cache.compute_key("stage_fields", ctx_f1)
+    kf2 = cache.compute_key("stage_fields", ctx_f2)
+    assert kf1 == kf2  # Ignores Amount since key_fields is only ('card_id',)
+
+    # Custom key function
+    policy_custom = NodeCachePolicy(key_fn=lambda c: f"custom_{c.transaction.get('user_id')}")
+    cache.register_policy("stage_custom", policy_custom)
+    ctx_c = PipelineContext(transaction={"user_id": "u42"})
+    assert cache.compute_key("stage_custom", ctx_c) == "custom_u42"
+
+    # Put and clear
+    cache.put("stage", k1, "val1")
+    cache.put("stage_fields", kf1, "val2")
+    stats = cache.stats_dict()
+    assert stats["total_size"] == 2
+
+    cache.clear("stage")
+    assert cache.get_stats("stage").size == 0
+    assert cache.get_stats("stage_fields").size == 1
+
+    cache.clear()
+    assert cache.stats_dict()["total_size"] == 0
+
 

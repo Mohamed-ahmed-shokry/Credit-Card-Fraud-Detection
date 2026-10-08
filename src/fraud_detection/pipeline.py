@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import copy
+import hashlib
 import inspect
+import json
 import logging
-from collections import defaultdict, deque
+import threading
+from collections import OrderedDict, defaultdict, deque
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
-from time import perf_counter
+from time import monotonic, perf_counter
 from typing import Any, Protocol, runtime_checkable
 from uuid import uuid4
 
@@ -95,6 +99,8 @@ class StageExecutionResult:
     output: Any = None
     error: str | None = None
     degraded: bool = False
+    cached: bool = False
+    speculative: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         """Convert stage telemetry to a serializable dictionary."""
@@ -108,6 +114,8 @@ class StageExecutionResult:
             "output": safe_output,
             "error": self.error,
             "degraded": self.degraded,
+            "cached": self.cached,
+            "speculative": self.speculative,
         }
 
 
@@ -140,6 +148,226 @@ class StageProcessorProtocol(Protocol):
     def __call__(self, context: PipelineContext) -> Any: ...
 
 
+@dataclass(frozen=True)
+class NodeCachePolicy:
+    """Configures deterministic memoization for a graph node."""
+
+    enabled: bool = True
+    ttl_seconds: float | None = 60.0
+    max_size: int = 1000
+    key_fields: tuple[str, ...] | None = None
+    key_fn: Callable[[PipelineContext], str] | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "ttl_seconds": self.ttl_seconds,
+            "max_size": self.max_size,
+            "key_fields": list(self.key_fields) if self.key_fields is not None else None,
+            "has_custom_key_fn": self.key_fn is not None,
+        }
+
+
+@dataclass
+class NodeCacheEntry:
+    """Cached output entry with creation timestamp."""
+
+    created_at: float
+    output: Any
+    key: str
+
+    def is_expired(self, now: float, ttl_seconds: float | None) -> bool:
+        if ttl_seconds is None or ttl_seconds <= 0:
+            return False
+        return (now - self.created_at) >= ttl_seconds
+
+
+@dataclass
+class NodeCacheStats:
+    """Operational telemetry counters for stage node cache."""
+
+    hits: int = 0
+    misses: int = 0
+    evictions: int = 0
+    expirations: int = 0
+    size: int = 0
+    max_size: int = 0
+
+    @property
+    def total_lookups(self) -> int:
+        return self.hits + self.misses
+
+    @property
+    def hit_ratio(self) -> float:
+        total = self.total_lookups
+        return round(self.hits / total, 4) if total > 0 else 0.0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "hits": self.hits,
+            "misses": self.misses,
+            "total_lookups": self.total_lookups,
+            "hit_ratio": self.hit_ratio,
+            "evictions": self.evictions,
+            "expirations": self.expirations,
+            "size": self.size,
+            "max_size": self.max_size,
+        }
+
+
+class StageExecutionCache:
+    """Thread-safe, TTL/LRU bounded in-memory cache for decision graph nodes."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._caches: dict[str, OrderedDict[str, NodeCacheEntry]] = defaultdict(OrderedDict)
+        self._policies: dict[str, NodeCachePolicy] = {}
+        self._stats: dict[str, NodeCacheStats] = defaultdict(NodeCacheStats)
+
+    def register_policy(self, node_name: str, policy: NodeCachePolicy) -> None:
+        """Register or update caching policy for a specific node."""
+        with self._lock:
+            self._policies[node_name] = policy
+            self._stats[node_name].max_size = policy.max_size
+
+    def get_policy(self, node_name: str) -> NodeCachePolicy | None:
+        with self._lock:
+            return self._policies.get(node_name)
+
+    def compute_key(self, node_name: str, context: PipelineContext) -> str:
+        """Deterministically derive string cache key for the node and context."""
+        policy = self._policies.get(node_name)
+        if policy is not None and policy.key_fn is not None:
+            return policy.key_fn(context)
+
+        tx = context.transaction
+        if policy is not None and policy.key_fields is not None:
+            extracted = {k: tx.get(k) for k in policy.key_fields}
+        else:
+            extracted = tx
+
+        canonical_json = json.dumps(extracted, sort_keys=True, default=str)
+        return hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
+
+    def get(self, node_name: str, key: str, now: float | None = None) -> tuple[bool, Any]:
+        """Look up cached node output. Returns (hit, output)."""
+        current_time = monotonic() if now is None else now
+        with self._lock:
+            policy = self._policies.get(node_name)
+            ttl = policy.ttl_seconds if policy is not None else 60.0
+
+            cache = self._caches[node_name]
+            stats = self._stats[node_name]
+
+            if key not in cache:
+                stats.misses += 1
+                return False, None
+
+            entry = cache[key]
+            if entry.is_expired(current_time, ttl):
+                del cache[key]
+                stats.expirations += 1
+                stats.misses += 1
+                stats.size = len(cache)
+                return False, None
+
+            cache.move_to_end(key)
+            stats.hits += 1
+            out = (
+                copy.deepcopy(entry.output)
+                if isinstance(entry.output, (dict, list))
+                else entry.output
+            )
+            return True, out
+
+    def put(self, node_name: str, key: str, output: Any, now: float | None = None) -> None:
+        """Store node output in cache, evicting oldest item if exceeding max_size."""
+        current_time = monotonic() if now is None else now
+        with self._lock:
+            policy = self._policies.get(node_name)
+            max_size = policy.max_size if policy is not None else 1000
+
+            cache = self._caches[node_name]
+            stats = self._stats[node_name]
+            stats.max_size = max_size
+
+            if key in cache:
+                del cache[key]
+            elif len(cache) >= max_size and len(cache) > 0:
+                cache.popitem(last=False)
+                stats.evictions += 1
+
+            stored_output = (
+                copy.deepcopy(output) if isinstance(output, (dict, list)) else output
+            )
+            cache[key] = NodeCacheEntry(
+                created_at=current_time,
+                output=stored_output,
+                key=key,
+            )
+            stats.size = len(cache)
+
+    def clear(self, node_name: str | None = None) -> None:
+        """Clear cache for a specific node or all nodes."""
+        with self._lock:
+            if node_name is not None:
+                self._caches[node_name].clear()
+                self._stats[node_name].size = 0
+            else:
+                for c in self._caches.values():
+                    c.clear()
+                for s in self._stats.values():
+                    s.size = 0
+
+    def get_stats(self, node_name: str) -> NodeCacheStats:
+        """Retrieve copy of telemetry stats for a node."""
+        with self._lock:
+            st = self._stats[node_name]
+            return NodeCacheStats(
+                hits=st.hits,
+                misses=st.misses,
+                evictions=st.evictions,
+                expirations=st.expirations,
+                size=len(self._caches[node_name]),
+                max_size=st.max_size,
+            )
+
+    def stats_dict(self) -> dict[str, Any]:
+        """Aggregate summary of cache performance."""
+        with self._lock:
+            total_hits = sum(s.hits for s in self._stats.values())
+            total_misses = sum(s.misses for s in self._stats.values())
+            total_lookups = total_hits + total_misses
+            total_evictions = sum(s.evictions for s in self._stats.values())
+            total_expirations = sum(s.expirations for s in self._stats.values())
+            total_size = sum(len(c) for c in self._caches.values())
+            ratio = round(total_hits / total_lookups, 4) if total_lookups > 0 else 0.0
+
+            node_details = {}
+            for name, st in self._stats.items():
+                node_details[name] = {
+                    "hits": st.hits,
+                    "misses": st.misses,
+                    "total_lookups": st.total_lookups,
+                    "hit_ratio": st.hit_ratio,
+                    "evictions": st.evictions,
+                    "expirations": st.expirations,
+                    "size": len(self._caches[name]),
+                    "max_size": st.max_size,
+                }
+
+            return {
+                "total_hits": total_hits,
+                "total_misses": total_misses,
+                "total_lookups": total_lookups,
+                "hit_ratio": ratio,
+                "total_evictions": total_evictions,
+                "total_expirations": total_expirations,
+                "total_size": total_size,
+                "nodes": node_details,
+            }
+
+
 @dataclass
 class PipelineNode:
     """Configured execution node in the decision graph."""
@@ -152,6 +380,7 @@ class PipelineNode:
     fallback_value: Any = None
     required: bool = False
     condition: Callable[[PipelineContext], bool] | None = None
+    cache_policy: NodeCachePolicy | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Convert node definition to a serializable dictionary."""
@@ -167,6 +396,7 @@ class PipelineNode:
             "fallback_value": safe_fallback,
             "required": self.required,
             "has_condition": self.condition is not None,
+            "cache_policy": self.cache_policy.to_dict() if self.cache_policy is not None else None,
         }
 
 
