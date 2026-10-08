@@ -5776,5 +5776,63 @@ def test_cli_pipeline_eval_corrupt_configs(tmp_path: Path, trained_artifact: Pat
     assert "Failed to load velocity config" in res_vc.output
 
 
+def test_cli_pipeline_eval_with_cache_and_speculation(
+    tmp_path: Path, trained_artifact: Path
+) -> None:
+    data_path = tmp_path / "data.csv"
+    generate_synthetic_data(rows=250, random_state=42).to_csv(data_path, index=False)
+
+    # 1. JSON report with cache and speculative evaluation enabled
+    res_json = runner.invoke(
+        app,
+        [
+            "pipeline-eval",
+            "--model",
+            str(trained_artifact),
+            "--input",
+            str(data_path),
+            "--enable-cache",
+            "--cache-size",
+            "200",
+            "--cache-ttl",
+            "120.0",
+            "--speculative",
+            "--json",
+        ],
+    )
+    assert res_json.exit_code == 0, res_json.output
+    report = json.loads(res_json.stdout)
+    assert report["total_evaluated"] == 250
+    assert "cache" in report
+    assert report["cache"]["enabled"] is True
+    assert report["cache"]["max_size"] == 200
+    assert report["cache"]["misses"] >= 1
+    assert "hit_ratio" in report["cache"]
+    assert "speculative" in report
+    assert report["speculative"]["enabled"] is True
+    assert "executed" in report["speculative"]
+    assert "hits" in report["speculative"]
+
+    # 2. Text table report displaying cache and speculative telemetry
+    res_text = runner.invoke(
+        app,
+        [
+            "pipeline-eval",
+            "--model",
+            str(trained_artifact),
+            "--input",
+            str(data_path),
+            "--max-records",
+            "20",
+            "--enable-cache",
+            "--speculative",
+        ],
+    )
+    assert res_text.exit_code == 0, res_text.output
+    assert "Cache: Hits=" in res_text.output
+    assert "Speculative Inference: Executed=" in res_text.output
+
+
+
 
 

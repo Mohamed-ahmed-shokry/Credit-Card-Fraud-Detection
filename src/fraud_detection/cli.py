@@ -4890,6 +4890,36 @@ def pipeline_eval(
             help="Exit with code 1 if any transaction executed in degraded mode.",
         ),
     ] = False,
+    enable_cache: Annotated[
+        bool,
+        typer.Option(
+            "--enable-cache/--no-enable-cache",
+            help="Enable deterministic in-memory node caching across pipeline stages.",
+        ),
+    ] = False,
+    cache_size: Annotated[
+        int,
+        typer.Option(
+            "--cache-size",
+            help="Maximum LRU cache entries per pipeline stage.",
+            min=1,
+        ),
+    ] = 1000,
+    cache_ttl: Annotated[
+        float,
+        typer.Option(
+            "--cache-ttl",
+            help="TTL in seconds for cached stage outputs.",
+            min=0.001,
+        ),
+    ] = 60.0,
+    speculative: Annotated[
+        bool,
+        typer.Option(
+            "--speculative/--no-speculative",
+            help="Enable speculative asynchronous model inference execution.",
+        ),
+    ] = False,
     output: Annotated[
         Path | None,
         typer.Option(
@@ -4956,8 +4986,16 @@ def pipeline_eval(
         velocity_buffer=loaded_vb,
         velocity_config=loaded_vc,
         recalibrator=getattr(loaded_model, "recalibrator", None),
+        enable_cache=enable_cache,
+        cache_ttl_seconds=cache_ttl,
+        cache_max_size=cache_size,
+        speculative_inference=speculative,
     )
-    executor = DecisionGraphExecutor(pipeline_graph)
+    executor = DecisionGraphExecutor(
+        pipeline_graph,
+        enable_cache=enable_cache,
+        enable_speculative=speculative,
+    )
 
     total = len(df)
     decisions_count: dict[str, int] = {"ALLOW": 0, "REVIEW": 0, "DENY": 0}
@@ -4968,6 +5006,10 @@ def pipeline_eval(
     stage_latencies: dict[str, list[float]] = {
         node_name: [] for node_name in pipeline_graph.nodes
     }
+    total_cache_hits = 0
+    total_cache_misses = 0
+    speculative_executed_count = 0
+    speculative_hit_count = 0
 
     records = cast(list[dict[str, Any]], df.to_dict(orient="records"))
     for rec in records:
@@ -4986,11 +5028,22 @@ def pipeline_eval(
         for stage_name, s_res in res.stage_results.items():
             if stage_name in stage_latencies:
                 stage_latencies[stage_name].append(s_res.latency_ms)
+        total_cache_hits += res.cache_hits
+        total_cache_misses += res.cache_misses
+        if res.speculative_executed:
+            speculative_executed_count += 1
+        if res.speculative_hit:
+            speculative_hit_count += 1
 
     mean_lat = statistics.fmean(latencies) if latencies else 0.0
     p50_lat = float(np.percentile(latencies, 50)) if latencies else 0.0
     p95_lat = float(np.percentile(latencies, 95)) if latencies else 0.0
     p99_lat = float(np.percentile(latencies, 99)) if latencies else 0.0
+
+    cache_lookups = total_cache_hits + total_cache_misses
+    cache_hit_ratio = (
+        round(total_cache_hits / cache_lookups, 4) if cache_lookups > 0 else 0.0
+    )
 
     stage_stats: dict[str, dict[str, float]] = {}
     for stage_name, slist in stage_latencies.items():
@@ -5009,6 +5062,19 @@ def pipeline_eval(
         "degraded_count": degraded_count,
         "degraded_rate": round(degraded_count / total, 4) if total > 0 else 0.0,
         "degraded_nodes": degraded_node_counts,
+        "cache": {
+            "enabled": enable_cache,
+            "hits": total_cache_hits,
+            "misses": total_cache_misses,
+            "hit_ratio": cache_hit_ratio,
+            "size": executor.cache.stats_dict()["total_size"] if enable_cache else 0,
+            "max_size": cache_size if enable_cache else 0,
+        },
+        "speculative": {
+            "enabled": speculative,
+            "executed": speculative_executed_count,
+            "hits": speculative_hit_count,
+        },
         "latency_ms": {
             "mean": round(mean_lat, 3),
             "p50": round(p50_lat, 3),
@@ -5034,6 +5100,17 @@ def pipeline_eval(
         typer.echo(f"  Fraud Count: {fraud_count} ({fraud_pct:.2f}%)")
         deg_pct = (degraded_count / total * 100.0) if total > 0 else 0.0
         typer.echo(f"  Degraded Executions: {degraded_count} ({deg_pct:.2f}%)")
+        if enable_cache:
+            cache_pct = cache_hit_ratio * 100.0
+            typer.echo(
+                f"  Cache: Hits={total_cache_hits}, Misses={total_cache_misses}, "
+                f"Hit Ratio={cache_pct:.1f}%"
+            )
+        if speculative:
+            typer.echo(
+                f"  Speculative Inference: Executed={speculative_executed_count}, "
+                f"Hits={speculative_hit_count}"
+            )
         typer.echo(
             f"  Latency (ms): Mean={mean_lat:.2f}ms, P50={p50_lat:.2f}ms, "
             f"P95={p95_lat:.2f}ms, P99={p99_lat:.2f}ms"
