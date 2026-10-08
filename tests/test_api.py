@@ -3477,3 +3477,22 @@ def test_pipeline_cache_audit_event_emission(
 
 
 
+
+
+def test_pipeline_cache_configured_via_environment(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, model, dataset = api_context
+    monkeypatch.setenv("FRAUD_PIPELINE_ENABLED", "1")
+    monkeypatch.setenv("FRAUD_PIPELINE_CACHE_ENABLED", "true")
+    monkeypatch.setenv("FRAUD_PIPELINE_SPECULATIVE_ENABLED", "yes")
+    monkeypatch.setenv("FRAUD_PIPELINE_CACHE_TTL_SECONDS", "90")
+    monkeypatch.setenv("FRAUD_PIPELINE_CACHE_MAX_SIZE", "321")
+    app = create_app(model=model)
+    with TestClient(app) as client:
+        rec = dataset.features.iloc[0].to_dict()
+        assert client.post("/v1/pipeline/score", json={"transaction": rec}).status_code == 200
+        stats = client.get("/v1/pipeline/cache/stats")
+        assert stats.status_code == 200
+        assert stats.json()["nodes"]["rules"]["max_size"] == 321
