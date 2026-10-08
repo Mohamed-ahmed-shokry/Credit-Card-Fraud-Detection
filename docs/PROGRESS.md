@@ -14,7 +14,7 @@
 - [x] Task 6: Update audit event export in `audit.py` with cache and speculative execution metadata.
 - [x] Task 7: Integrate cache endpoints (`/v1/pipeline/cache/stats`, `/v1/pipeline/cache/clear`) and Prometheus metrics in `api.py`.
 - [x] Task 8: Add cache and speculative evaluation options to `pipeline-eval` CLI command in `cli.py`.
-- [ ] Task 9: Implement comprehensive unit and integration tests across pipeline, audit, API, and CLI.
+- [x] Task 9: Implement comprehensive unit and integration tests across pipeline, audit, API, and CLI.
 - [ ] Task 10: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`).
 
 ## Acceptance Criteria Status
@@ -26,7 +26,7 @@
 | AC-4 (Audit & telemetry fidelity) | Met | Scoring audit events serialize and redact cache hits/misses, speculative executed, and speculative hit flags in `tests/test_audit.py`. |
 | AC-5 (API serving integration) | Met | Operational endpoints `/v1/pipeline/cache/stats` and `/v1/pipeline/cache/clear` verified, Prometheus cache & speculative metrics exposed, and audit payload verified in `tests/test_api.py`. |
 | AC-6 (CLI workflow) | Met | CLI options `--enable-cache`, `--cache-size`, `--cache-ttl`, and `--speculative` verified with JSON and tabular reports in `tests/test_cli.py`. |
-| AC-7 (Quality & coverage standards) | Pending | Full suite pending |
+| AC-7 (Quality & coverage standards) | Met | 790 tests passed; branch coverage 97.04% (gate 97%); `ruff check .` and strict `mypy` clean. |
 
 ## Decision Log
 | Date | Decision | Alternatives Considered | Rationale |
