@@ -3343,4 +3343,137 @@ def test_pipeline_custom_graph_and_env_var(
         assert res["fraud_probability"] == 0.99
 
 
+def test_pipeline_cache_endpoints_disabled(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, model, _ = api_context
+
+    # Case 1: Pipeline disabled entirely
+    app_no_pipe = create_app(model=model, enable_pipeline=False)
+    with TestClient(app_no_pipe) as client:
+        stats_resp = client.get("/v1/pipeline/cache/stats")
+        assert stats_resp.status_code == 404
+        assert "not enabled" in stats_resp.json()["detail"]
+
+        clear_resp = client.post("/v1/pipeline/cache/clear")
+        assert clear_resp.status_code == 404
+        assert "not enabled" in clear_resp.json()["detail"]
+
+    # Case 2: Pipeline enabled, but cache disabled
+    app_no_cache = create_app(model=model, enable_pipeline=True, enable_pipeline_cache=False)
+    with TestClient(app_no_cache) as client:
+        stats_resp = client.get("/v1/pipeline/cache/stats")
+        assert stats_resp.status_code == 404
+        assert "Pipeline caching is not enabled" in stats_resp.json()["detail"]
+
+        clear_resp = client.post("/v1/pipeline/cache/clear")
+        assert clear_resp.status_code == 404
+        assert "Pipeline caching is not enabled" in clear_resp.json()["detail"]
+
+
+def test_pipeline_cache_endpoints_lifecycle_and_prometheus_metrics(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, model, dataset = api_context
+    app = create_app(
+        model=model,
+        enable_pipeline=True,
+        enable_pipeline_cache=True,
+        enable_speculative_pipeline=True,
+        pipeline_cache_ttl_seconds=120.0,
+        pipeline_cache_max_size=500,
+    )
+    with TestClient(app) as client:
+        # Initial stats
+        init_stats = client.get("/v1/pipeline/cache/stats")
+        assert init_stats.status_code == 200
+        stats_data = init_stats.json()
+        assert stats_data["hits"] == 0
+        assert stats_data["misses"] == 0
+        assert stats_data["size"] == 0
+        assert stats_data["nodes"]["rules"]["max_size"] == 500
+        assert stats_data["hit_ratio"] == 0.0
+
+        rec = dataset.features.iloc[0].to_dict()
+
+        # First score: fills cache
+        score1 = client.post("/v1/pipeline/score", json={"transaction": rec})
+        assert score1.status_code == 200
+
+        after1_stats = client.get("/v1/pipeline/cache/stats").json()
+        assert after1_stats["misses"] >= 1
+        assert after1_stats["size"] >= 1
+
+        # Second score: identical transaction hits cache
+        score2 = client.post("/v1/pipeline/score", json={"transaction": rec})
+        assert score2.status_code == 200
+
+        after2_stats = client.get("/v1/pipeline/cache/stats").json()
+        assert after2_stats["hits"] >= 1
+        assert after2_stats["hit_ratio"] > 0.0
+
+        # Clear cache
+        clear_resp = client.post("/v1/pipeline/cache/clear")
+        assert clear_resp.status_code == 200
+        assert clear_resp.json()["status"] == "cleared"
+
+        after_clear_stats = client.get("/v1/pipeline/cache/stats").json()
+        assert after_clear_stats["size"] == 0
+
+        # Prometheus metrics
+        metrics_resp = client.get("/metrics")
+        assert metrics_resp.status_code == 200
+        metrics_text = metrics_resp.text
+        assert "fraud_pipeline_cache_hits_total" in metrics_text
+        assert "fraud_pipeline_cache_misses_total" in metrics_text
+        assert "fraud_pipeline_speculative_executions_total" in metrics_text
+
+
+def test_pipeline_cache_audit_event_emission(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    from fraud_detection.audit import AuditEvent, AuditSink
+
+    _, model, dataset = api_context
+
+    class TestAuditSink(AuditSink):
+        def __init__(self) -> None:
+            self.events: list[AuditEvent] = []
+
+        def emit(self, event: AuditEvent) -> None:
+            self.events.append(event)
+
+        def close(self) -> None:
+            pass
+
+    sink = TestAuditSink()
+    app = create_app(
+        model=model,
+        enable_pipeline=True,
+        enable_pipeline_cache=True,
+        enable_speculative_pipeline=True,
+        audit_sink=sink,
+    )
+    with TestClient(app) as client:
+        rec = dataset.features.iloc[0].to_dict()
+        client.post("/v1/pipeline/score", json={"transaction": rec})
+        client.post("/v1/pipeline/score", json={"transaction": rec})
+
+    assert len(sink.events) == 2
+    ev1, ev2 = sink.events[0], sink.events[1]
+
+    assert "cache_hits" in ev1.payload
+    assert "cache_misses" in ev1.payload
+    assert "speculative_executed" in ev1.payload
+    assert "speculative_hit" in ev1.payload
+
+    assert ev1.payload["cache_hits"] == 0
+    assert ev1.payload["cache_misses"] >= 1
+
+    assert ev2.payload["cache_hits"] >= 1
+    assert isinstance(ev2.payload["speculative_executed"], bool)
+    assert isinstance(ev2.payload["speculative_hit"], bool)
+
+
+
 

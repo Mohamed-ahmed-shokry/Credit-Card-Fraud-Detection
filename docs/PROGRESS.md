@@ -12,7 +12,7 @@
 - [x] Task 4: Implement speculative asynchronous model inference execution in `DecisionGraphExecutor`.
 - [x] Task 5: Enhance `create_default_fraud_pipeline` with cache and speculative evaluation options.
 - [x] Task 6: Update audit event export in `audit.py` with cache and speculative execution metadata.
-- [ ] Task 7: Integrate cache endpoints (`/v1/pipeline/cache/stats`, `/v1/pipeline/cache/clear`) and Prometheus metrics in `api.py`.
+- [x] Task 7: Integrate cache endpoints (`/v1/pipeline/cache/stats`, `/v1/pipeline/cache/clear`) and Prometheus metrics in `api.py`.
 - [ ] Task 8: Add cache and speculative evaluation options to `pipeline-eval` CLI command in `cli.py`.
 - [ ] Task 9: Implement comprehensive unit and integration tests across pipeline, audit, API, and CLI.
 - [ ] Task 10: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`).
@@ -24,7 +24,7 @@
 | AC-2 (Node cache semantics) | Met | `StageExecutionCache` verified with TTL expiration, LRU eviction, deterministic key generation, and telemetry counters in `tests/test_pipeline.py`. |
 | AC-3 (Speculative inference correctness) | Met | Speculative inference hit verified when features unchanged; safe discard and re-computation verified on feature delta or rule short-circuit in `tests/test_pipeline.py`. |
 | AC-4 (Audit & telemetry fidelity) | Met | Scoring audit events serialize and redact cache hits/misses, speculative executed, and speculative hit flags in `tests/test_audit.py`. |
-| AC-5 (API serving integration) | Pending | Implementation pending |
+| AC-5 (API serving integration) | Met | Operational endpoints `/v1/pipeline/cache/stats` and `/v1/pipeline/cache/clear` verified, Prometheus cache & speculative metrics exposed, and audit payload verified in `tests/test_api.py`. |
 | AC-6 (CLI workflow) | Pending | Implementation pending |
 | AC-7 (Quality & coverage standards) | Pending | Full suite pending |
 
