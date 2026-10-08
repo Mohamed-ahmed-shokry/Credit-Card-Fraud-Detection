@@ -454,7 +454,7 @@ class InferenceStageProcessor:
 
     def __init__(
         self,
-        model: FraudModel,
+        model: FraudModel | None = None,
         explain: bool = False,
         skip_if_short_circuited: bool = True,
     ) -> None:
@@ -900,11 +900,11 @@ def create_default_fraud_pipeline(
     threshold: float | None = None,
     review_threshold: float | None = None,
     deny_threshold: float | None = None,
-    enrichment_timeout_seconds: float | None = 0.05,
-    inference_timeout_seconds: float | None = 0.05,
-    calibration_timeout_seconds: float | None = 0.02,
-    rules_timeout_seconds: float | None = 0.02,
-    action_timeout_seconds: float | None = 0.02,
+    enrichment_timeout_seconds: float | None = 0.25,
+    inference_timeout_seconds: float | None = 0.25,
+    calibration_timeout_seconds: float | None = 0.25,
+    rules_timeout_seconds: float | None = 0.25,
+    action_timeout_seconds: float | None = 0.25,
     explain: bool = False,
 ) -> DecisionGraph:
     """Build a standard, production-ready fraud decision execution graph."""
