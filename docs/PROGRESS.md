@@ -8,7 +8,7 @@
 ## Task Status
 - [x] Task 1: Fix baseline mypy unreachable code in `InferenceStageProcessor` and tighten batch evaluation timeout robustness.
 - [x] Task 2: Implement `NodeCachePolicy`, `NodeCacheStats`, and `StageExecutionCache` in `pipeline.py`.
-- [ ] Task 3: Integrate node caching into `DecisionGraphExecutor` and `StageExecutionResult`.
+- [x] Task 3: Integrate node caching into `DecisionGraphExecutor` and `StageExecutionResult`.
 - [ ] Task 4: Implement speculative asynchronous model inference execution in `DecisionGraphExecutor`.
 - [ ] Task 5: Enhance `create_default_fraud_pipeline` with cache and speculative evaluation options.
 - [ ] Task 6: Update audit event export in `audit.py` with cache and speculative execution metadata.

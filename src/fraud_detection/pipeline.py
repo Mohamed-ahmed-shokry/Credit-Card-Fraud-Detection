@@ -871,6 +871,10 @@ class PipelineExecutionResult:
     final_decision: dict[str, Any]
     degraded: bool = False
     degraded_nodes: list[str] = field(default_factory=list)
+    cache_hits: int = 0
+    cache_misses: int = 0
+    speculative_executed: bool = False
+    speculative_hit: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         """Convert pipeline execution result to a serializable dictionary."""
@@ -883,6 +887,10 @@ class PipelineExecutionResult:
             "final_decision": self.final_decision,
             "degraded": self.degraded,
             "degraded_nodes": self.degraded_nodes,
+            "cache_hits": self.cache_hits,
+            "cache_misses": self.cache_misses,
+            "speculative_executed": self.speculative_executed,
+            "speculative_hit": self.speculative_hit,
         }
 
     @property
@@ -926,10 +934,22 @@ class PipelineExecutionResult:
 class DecisionGraphExecutor:
     """Executes a DecisionGraph with concurrent waves, timeouts, and fail-soft fallback."""
 
-    def __init__(self, graph: DecisionGraph) -> None:
+    def __init__(
+        self,
+        graph: DecisionGraph,
+        *,
+        cache: StageExecutionCache | None = None,
+        enable_cache: bool = True,
+    ) -> None:
         self.graph = graph
         self.graph.validate()
         self.plan = self.graph.build_execution_plan()
+        self.cache = cache or StageExecutionCache()
+        self.enable_cache = enable_cache
+
+        for name, node in self.graph.nodes.items():
+            if node.cache_policy is not None:
+                self.cache.register_policy(name, node.cache_policy)
 
     async def _execute_node(self, node_name: str, context: PipelineContext) -> None:
         node = self.graph.nodes[node_name]
@@ -946,6 +966,24 @@ class DecisionGraphExecutor:
                     return
             except (ValueError, TypeError, KeyError, AttributeError, RuntimeError) as cond_exc:
                 logger.warning("Condition for node '%s' raised: %s", node_name, cond_exc)
+
+        cache_key: str | None = None
+        if self.enable_cache:
+            policy = self.cache.get_policy(node_name) or node.cache_policy
+            if policy is not None and policy.enabled:
+                cache_key = self.cache.compute_key(node_name, context)
+                hit, cached_output = self.cache.get(node_name, cache_key)
+                if hit:
+                    context.results[node_name] = StageExecutionResult(
+                        node_name=node.name,
+                        stage_type=node.stage_type,
+                        status=StageStatus.SUCCESS,
+                        latency_ms=0.0,
+                        output=cached_output,
+                        degraded=False,
+                        cached=True,
+                    )
+                    return
 
         start = perf_counter()
         try:
@@ -969,7 +1007,11 @@ class DecisionGraphExecutor:
                 latency_ms=elapsed,
                 output=output,
                 degraded=False,
+                cached=False,
             )
+
+            if self.enable_cache and cache_key is not None:
+                self.cache.put(node_name, cache_key, output)
 
         except TimeoutError:
             elapsed = (perf_counter() - start) * 1000.0
@@ -1074,6 +1116,17 @@ class DecisionGraphExecutor:
             node_name for node_name, res in context.results.items() if res.degraded
         ]
 
+        cache_hits = sum(1 for res in context.results.values() if res.cached)
+        cache_misses = sum(
+            1
+            for name, res in context.results.items()
+            if not res.cached
+            and (
+                self.cache.get_policy(name) is not None
+                or getattr(self.graph.nodes.get(name), "cache_policy", None) is not None
+            )
+        )
+
         return PipelineExecutionResult(
             execution_id=execution_id,
             success=True,
@@ -1083,6 +1136,10 @@ class DecisionGraphExecutor:
             final_decision=final_decision,
             degraded=len(degraded_nodes) > 0,
             degraded_nodes=degraded_nodes,
+            cache_hits=cache_hits,
+            cache_misses=cache_misses,
+            speculative_executed=bool(context.metadata.get("speculative_executed", False)),
+            speculative_hit=bool(context.metadata.get("speculative_hit", False)),
         )
 
     def execute_sync(

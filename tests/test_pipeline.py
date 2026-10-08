@@ -719,3 +719,72 @@ def test_stage_execution_cache_key_generation_and_clear() -> None:
     assert cache.stats_dict()["total_size"] == 0
 
 
+def test_decision_graph_executor_node_caching_hit_and_miss() -> None:
+    call_count = 0
+
+    def expensive_rules(ctx: PipelineContext) -> dict[str, Any]:
+        nonlocal call_count
+        call_count += 1
+        amt = ctx.transaction.get("Amount", 0.0)
+        return {"decision": "DENY" if amt > 1000.0 else "ALLOW"}
+
+    graph = DecisionGraph("cached_graph")
+    graph.add_node(
+        PipelineNode(
+            name="rules",
+            stage_type=StageType.RULES,
+            processor=expensive_rules,
+            cache_policy=NodeCachePolicy(enabled=True, ttl_seconds=60.0),
+        )
+    )
+    graph.add_node(
+        PipelineNode(
+            name="action",
+            stage_type=StageType.ACTION,
+            processor=lambda ctx: ctx.get_output("rules"),
+            dependencies=["rules"],
+        )
+    )
+
+    executor = DecisionGraphExecutor(graph, enable_cache=True)
+
+    # First run: Cache miss
+    res1 = executor.execute_sync({"Amount": 50.0, "card_id": "c1"})
+    assert call_count == 1
+    assert res1.stage_results["rules"].cached is False
+    assert res1.cache_hits == 0
+    assert res1.cache_misses == 1
+    assert res1.final_decision == {"decision": "ALLOW"}
+
+    # Second run with same input: Cache hit!
+    res2 = executor.execute_sync({"Amount": 50.0, "card_id": "c1"})
+    assert call_count == 1  # Processor was NOT called again!
+    assert res2.stage_results["rules"].cached is True
+    assert res2.cache_hits == 1
+    assert res2.cache_misses == 0
+    assert res2.final_decision == {"decision": "ALLOW"}
+
+    # Third run with different input: Cache miss
+    res3 = executor.execute_sync({"Amount": 2000.0, "card_id": "c2"})
+    assert call_count == 2
+    assert res3.stage_results["rules"].cached is False
+    assert res3.cache_hits == 0
+    assert res3.cache_misses == 1
+    assert res3.final_decision == {"decision": "DENY"}
+
+    # Check stats dict
+    stats = executor.cache.stats_dict()
+    assert stats["total_hits"] == 1
+    assert stats["total_misses"] == 2
+    assert stats["nodes"]["rules"]["hits"] == 1
+    assert stats["nodes"]["rules"]["misses"] == 2
+
+    # Disable cache
+    executor_no_cache = DecisionGraphExecutor(graph, enable_cache=False)
+    res4 = executor_no_cache.execute_sync({"Amount": 50.0, "card_id": "c1"})
+    assert call_count == 3
+    assert res4.stage_results["rules"].cached is False
+    assert res4.cache_hits == 0
+
+
+
