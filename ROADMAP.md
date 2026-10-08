@@ -1335,7 +1335,7 @@ This phase does not implement heavy distributed workflow engines (Airflow, Celer
 - `c73631a`: feat(cli): add pipeline-eval command for decision graph evaluation
 - `c984ea4`: test(pipeline): expand branch coverage for precedence, edge cases, and CLI configs
 
-## Phase 33 — Real-Time Graph Node Cache & Speculative Model Evaluation (In progress)
+## Phase 33 — Real-Time Graph Node Cache & Speculative Model Evaluation (Done)
 
 ### Objective
 
@@ -1390,17 +1390,35 @@ This phase does not implement external distributed cache brokers (Redis, Memcach
 
 ### Task list
 
-- [ ] Task 1: Fix baseline mypy unreachable code in `InferenceStageProcessor` and tighten batch evaluation timeout robustness.
-- [ ] Task 2: Implement `NodeCachePolicy`, `NodeCacheStats`, and `StageExecutionCache` in `pipeline.py`.
-- [ ] Task 3: Integrate node caching into `DecisionGraphExecutor` and `StageExecutionResult`.
-- [ ] Task 4: Implement speculative asynchronous model inference execution in `DecisionGraphExecutor`.
-- [ ] Task 5: Enhance `create_default_fraud_pipeline` with cache and speculative evaluation options.
-- [ ] Task 6: Update audit event export in `audit.py` with cache and speculative execution metadata.
-- [ ] Task 7: Integrate cache endpoints (`/v1/pipeline/cache/stats`, `/v1/pipeline/cache/clear`) and Prometheus metrics in `api.py`.
-- [ ] Task 8: Add cache and speculative evaluation options to `pipeline-eval` CLI command in `cli.py`.
-- [ ] Task 9: Implement comprehensive unit and integration tests across pipeline, audit, API, and CLI.
-- [ ] Task 10: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`).
+- [x] Task 1: Fix baseline mypy unreachable code in `InferenceStageProcessor` and tighten batch evaluation timeout robustness.
+- [x] Task 2: Implement `NodeCachePolicy`, `NodeCacheStats`, and `StageExecutionCache` in `pipeline.py`.
+- [x] Task 3: Integrate node caching into `DecisionGraphExecutor` and `StageExecutionResult`.
+- [x] Task 4: Implement speculative asynchronous model inference execution in `DecisionGraphExecutor`.
+- [x] Task 5: Enhance `create_default_fraud_pipeline` with cache and speculative evaluation options.
+- [x] Task 6: Update audit event export in `audit.py` with cache and speculative execution metadata.
+- [x] Task 7: Integrate cache endpoints (`/v1/pipeline/cache/stats`, `/v1/pipeline/cache/clear`) and Prometheus metrics in `api.py`.
+- [x] Task 8: Add cache and speculative evaluation options to `pipeline-eval` CLI command in `cli.py`.
+- [x] Task 9: Implement comprehensive unit and integration tests across pipeline, audit, API, and CLI.
+- [x] Task 10: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`).
 
+### Outcome
+
+- `StageExecutionCache` with TTL and LRU bounds, integrated into `DecisionGraphExecutor`; speculative inference with feature-delta verification and short-circuit discard.
+- Cache and speculative flags surfaced in audit events, `/v1/pipeline/cache/stats`, `/v1/pipeline/cache/clear`, Prometheus counters, and `fraud-detect pipeline-eval`.
+- Verified: 790 tests passing, branch coverage 97.04%, `ruff check .` and strict `mypy` clean.
+
+### Commits
+
+- `b2f68b7`: docs(roadmap): set Phase 33 in progress and define scope and validation plan
+- `daded34`: fix(pipeline): resolve unreachable model check under strict typing and stabilize stage timeouts
+- `62a1837`: feat(pipeline): implement StageExecutionCache, NodeCachePolicy, and NodeCacheStats
+- `0da18ec`: feat(pipeline): integrate node caching and hit/miss telemetry into DecisionGraphExecutor
+- `bcc780e`: feat(pipeline): implement speculative asynchronous model inference execution
+- `5bde938`: feat(pipeline): expose cache and speculative evaluation options in create_default_fraud_pipeline
+- `cc7897f`: feat(audit): record node cache hits and speculative inference metadata in scoring audit events
+- `7a0b926`: feat(api): expose pipeline cache endpoints and Prometheus telemetry
+- `33c179d`: feat(cli): add node cache and speculative inference flags to pipeline-eval
+- `6e5f381`, `90b750e`, `77080f3`: coverage tests for CLI error paths, API env config, and speculative paths
 ## Phase 34 — Dynamic Decision Graph Replay & Counterfactual Policy Optimization (Planned)
 
 ### Objective
