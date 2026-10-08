@@ -961,3 +961,45 @@ def test_speculative_execution_discard_on_short_circuit() -> None:
 
 
 
+
+
+def test_speculative_custom_node_and_global_timeout() -> None:
+    graph = DecisionGraph("spec_custom_graph")
+    graph.add_node(
+        PipelineNode(
+            name="enrichment",
+            stage_type=StageType.ENRICHMENT,
+            processor=lambda _ctx: {"enriched": True},
+        )
+    )
+    graph.add_node(
+        PipelineNode(
+            name="scoring",
+            stage_type=StageType.INFERENCE,
+            processor=lambda _ctx: {"probability": 0.2},
+            dependencies=["enrichment"],
+        )
+    )
+    graph.add_node(
+        PipelineNode(
+            name="action",
+            stage_type=StageType.ACTION,
+            processor=lambda ctx: {
+                "decision": "ALLOW",
+                "is_fraud": False,
+                "fraud_probability": ctx.get_output("scoring")["probability"],
+            },
+            dependencies=["scoring"],
+            required=True,
+        )
+    )
+
+    executor = DecisionGraphExecutor(
+        graph, enable_speculative=True, speculative_nodes=["scoring"]
+    )
+    res = asyncio.run(executor.execute({"Amount": 1.0}, global_timeout_seconds=5.0))
+
+    assert res.speculative_executed is True
+    assert res.speculative_hit is True
+    assert res.stage_results["scoring"].speculative is True
+    assert res.decision == "ALLOW"
