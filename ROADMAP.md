@@ -1335,11 +1335,95 @@ This phase does not implement heavy distributed workflow engines (Airflow, Celer
 - `c73631a`: feat(cli): add pipeline-eval command for decision graph evaluation
 - `c984ea4`: test(pipeline): expand branch coverage for precedence, edge cases, and CLI configs
 
-## Phase 33 — Real-Time Graph Node Cache & Speculative Model Evaluation (Planned)
+## Phase 33 — Real-Time Graph Node Cache & Speculative Model Evaluation (Done)
 
 ### Objective
 
-Accelerate decision pipeline throughput by introducing deterministic in-memory node caching for pure stage computations and speculative asynchronous model inference execution during upstream enrichment phases.
+Accelerate decision pipeline throughput and reduce P99 evaluation latencies by introducing deterministic in-memory node caching for pure stage computations and speculative asynchronous model inference execution during upstream enrichment phases.
+
+### Scope
+
+1. **Baseline defect fixes & resilience**:
+   - Correct typing in `InferenceStageProcessor.__init__` (`model: FraudModel | None = None`) to eliminate unreachable statement errors under strict mypy.
+   - Adjust default stage timeouts in `create_default_fraud_pipeline` and `pipeline-eval` to eliminate thread-pool scheduling jitter under concurrent evaluation.
+2. **Deterministic graph node caching engine** (`pipeline.py`):
+   - Define `NodeCachePolicy`, `NodeCacheKeyBuilder`, and thread-safe, asyncio-safe `StageExecutionCache` with TTL-based expiration and LRU capacity bounds.
+   - Support custom or automatic cache keys derived from transaction subsets, explicit key columns, or whole record inputs.
+   - Integrate caching directly into `DecisionGraphExecutor._execute_node`, bypassing processor invocation on cache hits while maintaining trace telemetry.
+3. **Speculative asynchronous model inference**:
+   - Provide opt-in speculative inference execution running model prediction concurrently alongside upstream stages (e.g., `enrichment`).
+   - Validate speculative feature consistency against actual post-enrichment feature deltas: reuse speculative output on feature consistency (speculative hit), or safely discard and re-evaluate on feature mutations or rule short-circuits.
+   - Track speculative outcomes (`speculative_executed`, `speculative_hit`, `speculative_discarded`) in `StageExecutionResult` and `PipelineExecutionResult`.
+4. **Structured audit logging** (`audit.py`):
+   - Export node-level cache hits/misses, cache hit ratios, and speculative inference flags in scoring audit events.
+5. **API serving & operational telemetry** (`api.py`):
+   - Expose cache statistics and management via `GET /v1/pipeline/cache/stats` and `POST /v1/pipeline/cache/clear`.
+   - Export Prometheus metrics: `fraud_pipeline_cache_hits_total`, `fraud_pipeline_cache_misses_total`, `fraud_pipeline_speculative_executions_total`, and `fraud_pipeline_speculative_hits_total`.
+6. **CLI evaluation suite** (`cli.py`):
+   - Add `--enable-cache`, `--cache-size`, `--cache-ttl`, and `--speculative/--no-speculative` flags to `fraud-detect pipeline-eval`.
+   - Surface cache efficiency and speculative acceleration in tabular and JSON reports.
+
+### Acceptance criteria
+
+1. **AC-1 (Baseline resilience)**: Strict mypy passes with 0 unreachable statement errors; `pipeline-eval` tests execute reliably without spurious threadpool timeout degradation. (Verified via `mypy` and `pytest tests/test_cli.py -k pipeline_eval`).
+2. **AC-2 (Node cache semantics)**: Pure stage executions hit cache on identical cache keys within TTL, avoid stale hits after TTL expiration, and respect max LRU capacity limits. (Verified via `tests/test_pipeline.py`).
+3. **AC-3 (Speculative inference correctness)**: When enrichment does not alter required model features, speculative inference output is adopted without re-computation; when enrichment modifies features or rules short-circuit, speculative output is safely discarded and re-computed or skipped. (Verified via `tests/test_pipeline.py`).
+4. **AC-4 (Audit & telemetry fidelity)**: Scoring audit events and pipeline results accurately annotate `cached`, `speculative`, and `speculative_hit` flags without leaking un-redacted PANs or modifying existing audit schemas. (Verified via `tests/test_audit.py`).
+5. **AC-5 (API serving integration)**: `/v1/pipeline/cache/stats` and `/v1/pipeline/cache/clear` endpoints return accurate operational metrics and clear cache safely; Prometheus counters record cache hits/misses and speculative invocations. (Verified via `tests/test_api.py`).
+6. **AC-6 (CLI workflow)**: `fraud-detect pipeline-eval` supports `--enable-cache` and `--speculative` flags in both text and JSON outputs, reporting cache hits, hit ratio, and speculative hits. (Verified via `tests/test_cli.py`).
+7. **AC-7 (Quality & coverage standards)**: 100% test pass rate across entire test suite, branch coverage $\ge 97.0\%$, Ruff lint clean, and strict mypy clean. (Verified via `pytest --cov`, `ruff check`, and `mypy`).
+
+### Explicit exclusions
+
+This phase does not implement external distributed cache brokers (Redis, Memcached, Dragonfly); it provides a robust, high-performance in-memory cache and async speculative scheduler suitable for low-latency scoring processes.
+
+### Validation plan
+
+- Unit tests for `StageExecutionCache` (hits, misses, TTL expiry, LRU eviction, concurrency).
+- Graph execution tests for node caching with pure processors.
+- Speculative inference tests comparing execution paths and results with and without speculation.
+- Audit event structure and redaction verification for cache and speculative fields.
+- FastAPI endpoint tests for `/v1/pipeline/cache/stats` and `/v1/pipeline/cache/clear` with authentication and error handling.
+- Prometheus metric increment tests.
+- CLI end-to-end tests evaluating CSV inputs with cache and speculative options.
+- Full test suite, Ruff check, and strict mypy verification.
+
+### Task list
+
+- [x] Task 1: Fix baseline mypy unreachable code in `InferenceStageProcessor` and tighten batch evaluation timeout robustness.
+- [x] Task 2: Implement `NodeCachePolicy`, `NodeCacheStats`, and `StageExecutionCache` in `pipeline.py`.
+- [x] Task 3: Integrate node caching into `DecisionGraphExecutor` and `StageExecutionResult`.
+- [x] Task 4: Implement speculative asynchronous model inference execution in `DecisionGraphExecutor`.
+- [x] Task 5: Enhance `create_default_fraud_pipeline` with cache and speculative evaluation options.
+- [x] Task 6: Update audit event export in `audit.py` with cache and speculative execution metadata.
+- [x] Task 7: Integrate cache endpoints (`/v1/pipeline/cache/stats`, `/v1/pipeline/cache/clear`) and Prometheus metrics in `api.py`.
+- [x] Task 8: Add cache and speculative evaluation options to `pipeline-eval` CLI command in `cli.py`.
+- [x] Task 9: Implement comprehensive unit and integration tests across pipeline, audit, API, and CLI.
+- [x] Task 10: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`).
+
+### Outcome
+
+- `StageExecutionCache` with TTL and LRU bounds, integrated into `DecisionGraphExecutor`; speculative inference with feature-delta verification and short-circuit discard.
+- Cache and speculative flags surfaced in audit events, `/v1/pipeline/cache/stats`, `/v1/pipeline/cache/clear`, Prometheus counters, and `fraud-detect pipeline-eval`.
+- Verified: 790 tests passing, branch coverage 97.04%, `ruff check .` and strict `mypy` clean.
+
+### Commits
+
+- `b2f68b7`: docs(roadmap): set Phase 33 in progress and define scope and validation plan
+- `daded34`: fix(pipeline): resolve unreachable model check under strict typing and stabilize stage timeouts
+- `62a1837`: feat(pipeline): implement StageExecutionCache, NodeCachePolicy, and NodeCacheStats
+- `0da18ec`: feat(pipeline): integrate node caching and hit/miss telemetry into DecisionGraphExecutor
+- `bcc780e`: feat(pipeline): implement speculative asynchronous model inference execution
+- `5bde938`: feat(pipeline): expose cache and speculative evaluation options in create_default_fraud_pipeline
+- `cc7897f`: feat(audit): record node cache hits and speculative inference metadata in scoring audit events
+- `7a0b926`: feat(api): expose pipeline cache endpoints and Prometheus telemetry
+- `33c179d`: feat(cli): add node cache and speculative inference flags to pipeline-eval
+- `6e5f381`, `90b750e`, `77080f3`: coverage tests for CLI error paths, API env config, and speculative paths
+## Phase 34 — Dynamic Decision Graph Replay & Counterfactual Policy Optimization (Planned)
+
+### Objective
+
+Enable offline replay of historical streaming audit events through alternative decision graph configurations to benchmark latency, cost, and accuracy trade-offs prior to production deployment.
 
 ## Contributing to the roadmap
 

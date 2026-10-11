@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import copy
+import hashlib
 import inspect
+import json
 import logging
-from collections import defaultdict, deque
+import threading
+from collections import OrderedDict, defaultdict, deque
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
-from time import perf_counter
+from time import monotonic, perf_counter
 from typing import Any, Protocol, runtime_checkable
 from uuid import uuid4
 
@@ -95,6 +99,8 @@ class StageExecutionResult:
     output: Any = None
     error: str | None = None
     degraded: bool = False
+    cached: bool = False
+    speculative: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         """Convert stage telemetry to a serializable dictionary."""
@@ -108,6 +114,8 @@ class StageExecutionResult:
             "output": safe_output,
             "error": self.error,
             "degraded": self.degraded,
+            "cached": self.cached,
+            "speculative": self.speculative,
         }
 
 
@@ -140,6 +148,226 @@ class StageProcessorProtocol(Protocol):
     def __call__(self, context: PipelineContext) -> Any: ...
 
 
+@dataclass(frozen=True)
+class NodeCachePolicy:
+    """Configures deterministic memoization for a graph node."""
+
+    enabled: bool = True
+    ttl_seconds: float | None = 60.0
+    max_size: int = 1000
+    key_fields: tuple[str, ...] | None = None
+    key_fn: Callable[[PipelineContext], str] | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "ttl_seconds": self.ttl_seconds,
+            "max_size": self.max_size,
+            "key_fields": list(self.key_fields) if self.key_fields is not None else None,
+            "has_custom_key_fn": self.key_fn is not None,
+        }
+
+
+@dataclass
+class NodeCacheEntry:
+    """Cached output entry with creation timestamp."""
+
+    created_at: float
+    output: Any
+    key: str
+
+    def is_expired(self, now: float, ttl_seconds: float | None) -> bool:
+        if ttl_seconds is None or ttl_seconds <= 0:
+            return False
+        return (now - self.created_at) >= ttl_seconds
+
+
+@dataclass
+class NodeCacheStats:
+    """Operational telemetry counters for stage node cache."""
+
+    hits: int = 0
+    misses: int = 0
+    evictions: int = 0
+    expirations: int = 0
+    size: int = 0
+    max_size: int = 0
+
+    @property
+    def total_lookups(self) -> int:
+        return self.hits + self.misses
+
+    @property
+    def hit_ratio(self) -> float:
+        total = self.total_lookups
+        return round(self.hits / total, 4) if total > 0 else 0.0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "hits": self.hits,
+            "misses": self.misses,
+            "total_lookups": self.total_lookups,
+            "hit_ratio": self.hit_ratio,
+            "evictions": self.evictions,
+            "expirations": self.expirations,
+            "size": self.size,
+            "max_size": self.max_size,
+        }
+
+
+class StageExecutionCache:
+    """Thread-safe, TTL/LRU bounded in-memory cache for decision graph nodes."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._caches: dict[str, OrderedDict[str, NodeCacheEntry]] = defaultdict(OrderedDict)
+        self._policies: dict[str, NodeCachePolicy] = {}
+        self._stats: dict[str, NodeCacheStats] = defaultdict(NodeCacheStats)
+
+    def register_policy(self, node_name: str, policy: NodeCachePolicy) -> None:
+        """Register or update caching policy for a specific node."""
+        with self._lock:
+            self._policies[node_name] = policy
+            self._stats[node_name].max_size = policy.max_size
+
+    def get_policy(self, node_name: str) -> NodeCachePolicy | None:
+        with self._lock:
+            return self._policies.get(node_name)
+
+    def compute_key(self, node_name: str, context: PipelineContext) -> str:
+        """Deterministically derive string cache key for the node and context."""
+        policy = self._policies.get(node_name)
+        if policy is not None and policy.key_fn is not None:
+            return policy.key_fn(context)
+
+        tx = context.transaction
+        if policy is not None and policy.key_fields is not None:
+            extracted = {k: tx.get(k) for k in policy.key_fields}
+        else:
+            extracted = tx
+
+        canonical_json = json.dumps(extracted, sort_keys=True, default=str)
+        return hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
+
+    def get(self, node_name: str, key: str, now: float | None = None) -> tuple[bool, Any]:
+        """Look up cached node output. Returns (hit, output)."""
+        current_time = monotonic() if now is None else now
+        with self._lock:
+            policy = self._policies.get(node_name)
+            ttl = policy.ttl_seconds if policy is not None else 60.0
+
+            cache = self._caches[node_name]
+            stats = self._stats[node_name]
+
+            if key not in cache:
+                stats.misses += 1
+                return False, None
+
+            entry = cache[key]
+            if entry.is_expired(current_time, ttl):
+                del cache[key]
+                stats.expirations += 1
+                stats.misses += 1
+                stats.size = len(cache)
+                return False, None
+
+            cache.move_to_end(key)
+            stats.hits += 1
+            out = (
+                copy.deepcopy(entry.output)
+                if isinstance(entry.output, (dict, list))
+                else entry.output
+            )
+            return True, out
+
+    def put(self, node_name: str, key: str, output: Any, now: float | None = None) -> None:
+        """Store node output in cache, evicting oldest item if exceeding max_size."""
+        current_time = monotonic() if now is None else now
+        with self._lock:
+            policy = self._policies.get(node_name)
+            max_size = policy.max_size if policy is not None else 1000
+
+            cache = self._caches[node_name]
+            stats = self._stats[node_name]
+            stats.max_size = max_size
+
+            if key in cache:
+                del cache[key]
+            elif len(cache) >= max_size and len(cache) > 0:
+                cache.popitem(last=False)
+                stats.evictions += 1
+
+            stored_output = (
+                copy.deepcopy(output) if isinstance(output, (dict, list)) else output
+            )
+            cache[key] = NodeCacheEntry(
+                created_at=current_time,
+                output=stored_output,
+                key=key,
+            )
+            stats.size = len(cache)
+
+    def clear(self, node_name: str | None = None) -> None:
+        """Clear cache for a specific node or all nodes."""
+        with self._lock:
+            if node_name is not None:
+                self._caches[node_name].clear()
+                self._stats[node_name].size = 0
+            else:
+                for c in self._caches.values():
+                    c.clear()
+                for s in self._stats.values():
+                    s.size = 0
+
+    def get_stats(self, node_name: str) -> NodeCacheStats:
+        """Retrieve copy of telemetry stats for a node."""
+        with self._lock:
+            st = self._stats[node_name]
+            return NodeCacheStats(
+                hits=st.hits,
+                misses=st.misses,
+                evictions=st.evictions,
+                expirations=st.expirations,
+                size=len(self._caches[node_name]),
+                max_size=st.max_size,
+            )
+
+    def stats_dict(self) -> dict[str, Any]:
+        """Aggregate summary of cache performance."""
+        with self._lock:
+            total_hits = sum(s.hits for s in self._stats.values())
+            total_misses = sum(s.misses for s in self._stats.values())
+            total_lookups = total_hits + total_misses
+            total_evictions = sum(s.evictions for s in self._stats.values())
+            total_expirations = sum(s.expirations for s in self._stats.values())
+            total_size = sum(len(c) for c in self._caches.values())
+            ratio = round(total_hits / total_lookups, 4) if total_lookups > 0 else 0.0
+
+            node_details = {}
+            for name, st in self._stats.items():
+                node_details[name] = {
+                    "hits": st.hits,
+                    "misses": st.misses,
+                    "total_lookups": st.total_lookups,
+                    "hit_ratio": st.hit_ratio,
+                    "evictions": st.evictions,
+                    "expirations": st.expirations,
+                    "size": len(self._caches[name]),
+                    "max_size": st.max_size,
+                }
+
+            return {
+                "total_hits": total_hits,
+                "total_misses": total_misses,
+                "total_lookups": total_lookups,
+                "hit_ratio": ratio,
+                "total_evictions": total_evictions,
+                "total_expirations": total_expirations,
+                "total_size": total_size,
+                "nodes": node_details,
+            }
+
+
 @dataclass
 class PipelineNode:
     """Configured execution node in the decision graph."""
@@ -152,6 +380,7 @@ class PipelineNode:
     fallback_value: Any = None
     required: bool = False
     condition: Callable[[PipelineContext], bool] | None = None
+    cache_policy: NodeCachePolicy | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Convert node definition to a serializable dictionary."""
@@ -167,6 +396,7 @@ class PipelineNode:
             "fallback_value": safe_fallback,
             "required": self.required,
             "has_condition": self.condition is not None,
+            "cache_policy": self.cache_policy.to_dict() if self.cache_policy is not None else None,
         }
 
 
@@ -191,6 +421,7 @@ class DecisionGraph:
         self.name = name
         self.nodes: dict[str, PipelineNode] = {}
         self.edges: list[PipelineEdge] = []
+        self.metadata: dict[str, Any] = {}
 
     def add_node(self, node: PipelineNode) -> DecisionGraph:
         """Register a pipeline node with the decision graph."""
@@ -315,6 +546,7 @@ class DecisionGraph:
             "nodes": {k: v.to_dict() for k, v in self.nodes.items()},
             "edges": [e.to_dict() for e in self.edges],
             "execution_plan": plan.to_dict(),
+            "metadata": dict(self.metadata),
         }
 
 
@@ -454,7 +686,7 @@ class InferenceStageProcessor:
 
     def __init__(
         self,
-        model: FraudModel,
+        model: FraudModel | None = None,
         explain: bool = False,
         skip_if_short_circuited: bool = True,
     ) -> None:
@@ -641,6 +873,10 @@ class PipelineExecutionResult:
     final_decision: dict[str, Any]
     degraded: bool = False
     degraded_nodes: list[str] = field(default_factory=list)
+    cache_hits: int = 0
+    cache_misses: int = 0
+    speculative_executed: bool = False
+    speculative_hit: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         """Convert pipeline execution result to a serializable dictionary."""
@@ -653,6 +889,10 @@ class PipelineExecutionResult:
             "final_decision": self.final_decision,
             "degraded": self.degraded,
             "degraded_nodes": self.degraded_nodes,
+            "cache_hits": self.cache_hits,
+            "cache_misses": self.cache_misses,
+            "speculative_executed": self.speculative_executed,
+            "speculative_hit": self.speculative_hit,
         }
 
     @property
@@ -696,10 +936,40 @@ class PipelineExecutionResult:
 class DecisionGraphExecutor:
     """Executes a DecisionGraph with concurrent waves, timeouts, and fail-soft fallback."""
 
-    def __init__(self, graph: DecisionGraph) -> None:
+    def __init__(
+        self,
+        graph: DecisionGraph,
+        *,
+        cache: StageExecutionCache | None = None,
+        enable_cache: bool = True,
+        enable_speculative: bool | None = None,
+        speculative_nodes: Sequence[str] | None = None,
+    ) -> None:
         self.graph = graph
         self.graph.validate()
         self.plan = self.graph.build_execution_plan()
+        self.cache = cache or StageExecutionCache()
+        self.enable_cache = enable_cache
+        self.enable_speculative = (
+            enable_speculative
+            if enable_speculative is not None
+            else bool(self.graph.metadata.get("speculative_inference", False))
+        )
+
+        if speculative_nodes is not None:
+            self.speculative_nodes = tuple(speculative_nodes)
+        elif self.enable_speculative:
+            self.speculative_nodes = tuple(
+                name
+                for name, node in self.graph.nodes.items()
+                if node.stage_type == StageType.INFERENCE and len(node.dependencies) > 0
+            )
+        else:
+            self.speculative_nodes = ()
+
+        for name, node in self.graph.nodes.items():
+            if node.cache_policy is not None:
+                self.cache.register_policy(name, node.cache_policy)
 
     async def _execute_node(self, node_name: str, context: PipelineContext) -> None:
         node = self.graph.nodes[node_name]
@@ -716,6 +986,24 @@ class DecisionGraphExecutor:
                     return
             except (ValueError, TypeError, KeyError, AttributeError, RuntimeError) as cond_exc:
                 logger.warning("Condition for node '%s' raised: %s", node_name, cond_exc)
+
+        cache_key: str | None = None
+        if self.enable_cache:
+            policy = self.cache.get_policy(node_name) or node.cache_policy
+            if policy is not None and policy.enabled:
+                cache_key = self.cache.compute_key(node_name, context)
+                hit, cached_output = self.cache.get(node_name, cache_key)
+                if hit:
+                    context.results[node_name] = StageExecutionResult(
+                        node_name=node.name,
+                        stage_type=node.stage_type,
+                        status=StageStatus.SUCCESS,
+                        latency_ms=0.0,
+                        output=cached_output,
+                        degraded=False,
+                        cached=True,
+                    )
+                    return
 
         start = perf_counter()
         try:
@@ -739,7 +1027,11 @@ class DecisionGraphExecutor:
                 latency_ms=elapsed,
                 output=output,
                 degraded=False,
+                cached=False,
             )
+
+            if self.enable_cache and cache_key is not None:
+                self.cache.put(node_name, cache_key, output)
 
         except TimeoutError:
             elapsed = (perf_counter() - start) * 1000.0
@@ -796,10 +1088,93 @@ class DecisionGraphExecutor:
             metadata=dict(metadata or {}),
         )
 
+        initial_tx = dict(context.transaction)
+        speculative_tasks: dict[str, tuple[asyncio.Task[None], PipelineContext]] = {}
+
+        if self.enable_speculative and self.speculative_nodes:
+            for s_name in self.speculative_nodes:
+                if s_name in self.graph.nodes:
+                    s_ctx = PipelineContext(
+                        transaction=dict(initial_tx),
+                        metadata=dict(context.metadata),
+                    )
+                    s_task = asyncio.create_task(self._execute_node(s_name, s_ctx))
+                    speculative_tasks[s_name] = (s_task, s_ctx)
+            if speculative_tasks:
+                context.metadata["speculative_executed"] = True
+
+        async def _execute_step(node_name: str) -> None:
+            if node_name in speculative_tasks:
+                s_task, s_ctx = speculative_tasks[node_name]
+                node = self.graph.nodes[node_name]
+                short_circuited = bool(context.metadata.get("short_circuit"))
+
+                if (
+                    isinstance(node.processor, InferenceStageProcessor)
+                    and node.processor.model is not None
+                ):
+                    relevant_features = node.processor.model.feature_names
+                else:
+                    relevant_features = None
+
+                features_changed = False
+                if relevant_features is not None:
+                    for f in relevant_features:
+                        if initial_tx.get(f) != context.transaction.get(f):
+                            features_changed = True
+                            break
+                else:
+                    features_changed = initial_tx != context.transaction
+
+                if not short_circuited and not features_changed:
+                    try:
+                        await s_task
+                        s_res = s_ctx.results.get(node_name)
+                        if s_res is not None and s_res.status == StageStatus.SUCCESS:
+                            context.results[node_name] = StageExecutionResult(
+                                node_name=s_res.node_name,
+                                stage_type=s_res.stage_type,
+                                status=s_res.status,
+                                latency_ms=s_res.latency_ms,
+                                output=s_res.output,
+                                error=s_res.error,
+                                degraded=s_res.degraded,
+                                cached=s_res.cached,
+                                speculative=True,
+                            )
+                            context.metadata["speculative_hit"] = True
+                            return
+                    except (
+                        PipelineError,
+                        ValueError,
+                        TypeError,
+                        KeyError,
+                        AttributeError,
+                        RuntimeError,
+                        TimeoutError,
+                        OSError,
+                    ) as s_exc:
+                        logger.debug(
+                            "Speculative task for '%s' raised %s; falling back",
+                            node_name,
+                            s_exc,
+                        )
+
+                if not s_task.done():
+                    s_task.cancel()
+                context.metadata["speculative_discarded"] = True
+
+            await self._execute_node(node_name, context)
+
         async def _run_waves() -> None:
-            for wave in self.plan.waves:
-                tasks = [self._execute_node(node_name, context) for node_name in wave]
-                await asyncio.gather(*tasks)
+            try:
+                for wave in self.plan.waves:
+                    tasks = [_execute_step(node_name) for node_name in wave]
+                    await asyncio.gather(*tasks)
+            finally:
+                for s_task, _ in speculative_tasks.values():
+                    if not s_task.done():
+                        s_task.cancel()
 
         if global_timeout_seconds is not None:
             await asyncio.wait_for(_run_waves(), timeout=global_timeout_seconds)
@@ -844,6 +1219,17 @@ class DecisionGraphExecutor:
             node_name for node_name, res in context.results.items() if res.degraded
         ]
 
+        cache_hits = sum(1 for res in context.results.values() if res.cached)
+        cache_misses = sum(
+            1
+            for name, res in context.results.items()
+            if not res.cached
+            and (
+                self.cache.get_policy(name) is not None
+                or getattr(self.graph.nodes.get(name), "cache_policy", None) is not None
+            )
+        )
+
         return PipelineExecutionResult(
             execution_id=execution_id,
             success=True,
@@ -853,6 +1239,10 @@ class DecisionGraphExecutor:
             final_decision=final_decision,
             degraded=len(degraded_nodes) > 0,
             degraded_nodes=degraded_nodes,
+            cache_hits=cache_hits,
+            cache_misses=cache_misses,
+            speculative_executed=bool(context.metadata.get("speculative_executed", False)),
+            speculative_hit=bool(context.metadata.get("speculative_hit", False)),
         )
 
     def execute_sync(
@@ -900,16 +1290,41 @@ def create_default_fraud_pipeline(
     threshold: float | None = None,
     review_threshold: float | None = None,
     deny_threshold: float | None = None,
-    enrichment_timeout_seconds: float | None = 0.05,
-    inference_timeout_seconds: float | None = 0.05,
-    calibration_timeout_seconds: float | None = 0.02,
-    rules_timeout_seconds: float | None = 0.02,
-    action_timeout_seconds: float | None = 0.02,
+    enrichment_timeout_seconds: float | None = 0.25,
+    inference_timeout_seconds: float | None = 0.25,
+    calibration_timeout_seconds: float | None = 0.25,
+    rules_timeout_seconds: float | None = 0.25,
+    action_timeout_seconds: float | None = 0.25,
     explain: bool = False,
+    enable_cache: bool = False,
+    cache_rules: bool = True,
+    cache_inference: bool = False,
+    cache_ttl_seconds: float = 60.0,
+    cache_max_size: int = 1000,
+    speculative_inference: bool = False,
 ) -> DecisionGraph:
     """Build a standard, production-ready fraud decision execution graph."""
     applied_threshold = model.threshold if threshold is None else threshold
     graph = DecisionGraph("production_fraud_pipeline")
+    graph.metadata["speculative_inference"] = speculative_inference
+    graph.metadata["enable_cache"] = enable_cache
+
+    rules_cache_policy: NodeCachePolicy | None = None
+    if enable_cache and cache_rules:
+        rules_cache_policy = NodeCachePolicy(
+            enabled=True,
+            ttl_seconds=cache_ttl_seconds,
+            max_size=cache_max_size,
+        )
+
+    inference_cache_policy: NodeCachePolicy | None = None
+    if enable_cache and cache_inference:
+        inference_cache_policy = NodeCachePolicy(
+            enabled=True,
+            ttl_seconds=cache_ttl_seconds,
+            max_size=cache_max_size,
+            key_fields=tuple(model.feature_names),
+        )
 
     enrich_proc = EnrichmentStageProcessor(
         feature_store=feature_store,
@@ -938,6 +1353,7 @@ def create_default_fraud_pipeline(
             timeout_seconds=rules_timeout_seconds,
             fallback_value={"matched": False, "short_circuited": False},
             required=False,
+            cache_policy=rules_cache_policy,
         )
     )
 
@@ -956,6 +1372,7 @@ def create_default_fraud_pipeline(
                 "contributions": None,
             },
             required=False,
+            cache_policy=inference_cache_policy,
         )
     )
 

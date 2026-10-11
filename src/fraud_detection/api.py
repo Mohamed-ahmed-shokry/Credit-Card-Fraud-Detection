@@ -31,7 +31,7 @@ from prometheus_client import (
     Histogram,
     generate_latest,
 )
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
 from starlette.concurrency import run_in_threadpool
 from starlette.middleware.base import RequestResponseEndpoint
 from starlette.responses import Response
@@ -113,6 +113,10 @@ CANARY_MAX_DISCREPANCY_ENVIRONMENT_VARIABLE = "FRAUD_CANARY_MAX_DISCREPANCY"
 CANARY_MAX_DIVERGENCE_ENVIRONMENT_VARIABLE = "FRAUD_CANARY_MAX_DIVERGENCE"
 CANARY_AUTO_ROLLBACK_ENVIRONMENT_VARIABLE = "FRAUD_CANARY_AUTO_ROLLBACK"
 PIPELINE_ENABLED_ENVIRONMENT_VARIABLE = "FRAUD_PIPELINE_ENABLED"
+PIPELINE_CACHE_ENABLED_ENVIRONMENT_VARIABLE = "FRAUD_PIPELINE_CACHE_ENABLED"
+PIPELINE_SPECULATIVE_ENVIRONMENT_VARIABLE = "FRAUD_PIPELINE_SPECULATIVE_ENABLED"
+PIPELINE_CACHE_TTL_ENVIRONMENT_VARIABLE = "FRAUD_PIPELINE_CACHE_TTL_SECONDS"
+PIPELINE_CACHE_SIZE_ENVIRONMENT_VARIABLE = "FRAUD_PIPELINE_CACHE_MAX_SIZE"
 REQUEST_ID_HEADER = "X-Request-ID"
 PROCESS_TIME_HEADER = "X-Process-Time-Ms"
 MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024
@@ -129,6 +133,8 @@ OPERATIONAL_PATHS = frozenset(
         "/v1/routing/reset",
         "/v1/features/stats",
         "/v1/pipeline/topology",
+        "/v1/pipeline/cache/stats",
+        "/v1/pipeline/cache/clear",
     }
 )
 UNMATCHED_ROUTE_LABEL = "unmatched"
@@ -725,6 +731,41 @@ class PipelineTopologyResponse(BaseModel):
     execution_plan: dict[str, Any]
 
 
+class PipelineCacheStatsResponse(BaseModel):
+    """Runtime cache statistics for decision graph pipeline stages."""
+
+    total_hits: int
+    total_misses: int
+    total_lookups: int
+    hit_ratio: float
+    total_evictions: int
+    total_expirations: int
+    total_size: int
+    nodes: dict[str, Any]
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def hits(self) -> int:
+        return self.total_hits
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def misses(self) -> int:
+        return self.total_misses
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def size(self) -> int:
+        return self.total_size
+
+
+class PipelineCacheClearResponse(BaseModel):
+    """Result of clearing the pipeline stage execution cache."""
+
+    status: str
+    message: str | None = None
+
+
 def create_app(
     *,
     model: FraudModel | None = None,
@@ -773,6 +814,10 @@ def create_app(
     pipeline: DecisionGraph | None = None,
     enable_pipeline: bool = False,
     pipeline_executor: DecisionGraphExecutor | None = None,
+    enable_pipeline_cache: bool = False,
+    enable_speculative_pipeline: bool = False,
+    pipeline_cache_ttl_seconds: float = 60.0,
+    pipeline_cache_max_size: int = 1000,
 ) -> FastAPI:
     """Create an application using an injected model or a trusted artifact path.
 
@@ -969,6 +1014,34 @@ def create_app(
         else False
     ) or (pipeline is not None)
 
+    raw_cache_env = os.getenv(PIPELINE_CACHE_ENABLED_ENVIRONMENT_VARIABLE)
+    resolved_pipeline_cache_enabled = enable_pipeline_cache or (
+        raw_cache_env.lower() in ("true", "1", "yes")
+        if raw_cache_env is not None
+        else False
+    )
+
+    raw_spec_env = os.getenv(PIPELINE_SPECULATIVE_ENVIRONMENT_VARIABLE)
+    resolved_pipeline_speculative_enabled = enable_speculative_pipeline or (
+        raw_spec_env.lower() in ("true", "1", "yes")
+        if raw_spec_env is not None
+        else False
+    )
+
+    raw_ttl_env = os.getenv(PIPELINE_CACHE_TTL_ENVIRONMENT_VARIABLE)
+    resolved_pipeline_cache_ttl = (
+        float(raw_ttl_env)
+        if raw_ttl_env is not None
+        else pipeline_cache_ttl_seconds
+    )
+
+    raw_size_env = os.getenv(PIPELINE_CACHE_SIZE_ENVIRONMENT_VARIABLE)
+    resolved_pipeline_cache_max_size = (
+        int(raw_size_env)
+        if raw_size_env is not None
+        else pipeline_cache_max_size
+    )
+
     metrics_registry = CollectorRegistry()
     request_counter = Counter(
         "http_requests_total",
@@ -1090,6 +1163,28 @@ def create_app(
         "fraud_pipeline_executions_total",
         "Total decision graph pipeline executions.",
         ["status", "degraded"],
+        registry=metrics_registry,
+    )
+    pipeline_cache_hits_counter = Counter(
+        "fraud_pipeline_cache_hits_total",
+        "Total pipeline stage cache hits.",
+        ["stage"],
+        registry=metrics_registry,
+    )
+    pipeline_cache_misses_counter = Counter(
+        "fraud_pipeline_cache_misses_total",
+        "Total pipeline stage cache misses.",
+        ["stage"],
+        registry=metrics_registry,
+    )
+    pipeline_speculative_executions_counter = Counter(
+        "fraud_pipeline_speculative_executions_total",
+        "Total speculative pipeline evaluations launched.",
+        registry=metrics_registry,
+    )
+    pipeline_speculative_hits_counter = Counter(
+        "fraud_pipeline_speculative_hits_total",
+        "Total speculative pipeline evaluation hits adopted.",
         registry=metrics_registry,
     )
 
@@ -1276,11 +1371,21 @@ def create_app(
                 velocity_buffer=resolved_velocity_buffer,
                 velocity_config=resolved_velocity_config,
                 recalibrator=getattr(loaded_model, "recalibrator", None),
+                enable_cache=resolved_pipeline_cache_enabled,
+                cache_ttl_seconds=resolved_pipeline_cache_ttl,
+                cache_max_size=resolved_pipeline_cache_max_size,
+                speculative_inference=resolved_pipeline_speculative_enabled,
             )
 
         resolved_pipeline_exec = pipeline_executor
         if resolved_pipeline_exec is None and resolved_pipeline_graph is not None:
-            resolved_pipeline_exec = DecisionGraphExecutor(resolved_pipeline_graph)
+            resolved_pipeline_exec = DecisionGraphExecutor(
+                resolved_pipeline_graph,
+                enable_cache=resolved_pipeline_cache_enabled,
+                enable_speculative=resolved_pipeline_speculative_enabled,
+            )
+        elif resolved_pipeline_exec is not None and resolved_pipeline_graph is None:
+            resolved_pipeline_graph = resolved_pipeline_exec.graph
 
         application.state.model = loaded_model
         application.state.shadow_model = loaded_challenger
@@ -1317,6 +1422,14 @@ def create_app(
         application.state.pipeline_executor = resolved_pipeline_exec
         application.state.pipeline_stage_duration_histogram = pipeline_stage_duration_histogram
         application.state.pipeline_executions_counter = pipeline_executions_counter
+        application.state.pipeline_cache_hits_counter = pipeline_cache_hits_counter
+        application.state.pipeline_cache_misses_counter = pipeline_cache_misses_counter
+        application.state.pipeline_speculative_executions_counter = (
+            pipeline_speculative_executions_counter
+        )
+        application.state.pipeline_speculative_hits_counter = (
+            pipeline_speculative_hits_counter
+        )
         shadow_tasks: set[asyncio.Task[None]] = set()
         application.state.shadow_tasks = shadow_tasks
         yield
@@ -2582,6 +2695,38 @@ def create_app(
                 degraded=str(result.degraded).lower(),
             ).inc()
 
+        cache_hits_counter: Counter | None = getattr(
+            request.app.state, "pipeline_cache_hits_counter", None
+        )
+        if cache_hits_counter is not None:
+            for stage_name, stage_res in result.stage_results.items():
+                if stage_res.cached:
+                    cache_hits_counter.labels(stage=stage_name).inc()
+
+        cache_misses_counter: Counter | None = getattr(
+            request.app.state, "pipeline_cache_misses_counter", None
+        )
+        if cache_misses_counter is not None:
+            for stage_name, stage_res in result.stage_results.items():
+                node_obj = executor.graph.nodes.get(stage_name)
+                if not stage_res.cached and (
+                    executor.cache.get_policy(stage_name) is not None
+                    or getattr(node_obj, "cache_policy", None) is not None
+                ):
+                    cache_misses_counter.labels(stage=stage_name).inc()
+
+        spec_exec_counter: Counter | None = getattr(
+            request.app.state, "pipeline_speculative_executions_counter", None
+        )
+        if spec_exec_counter is not None and result.speculative_executed:
+            spec_exec_counter.inc()
+
+        spec_hit_counter: Counter | None = getattr(
+            request.app.state, "pipeline_speculative_hits_counter", None
+        )
+        if spec_hit_counter is not None and result.speculative_hit:
+            spec_hit_counter.inc()
+
         sink: AuditSink = getattr(request.app.state, "audit_sink", resolved_audit_sink)
         loaded_model_for_audit: FraudModel | None = getattr(request.app.state, "model", None)
         try:
@@ -2620,6 +2765,10 @@ def create_app(
                 execution_trace=result.to_dict(),
                 pipeline_stages=[s.to_dict() for s in result.stage_results.values()],
                 degraded_nodes=result.degraded_nodes,
+                cache_hits=result.cache_hits,
+                cache_misses=result.cache_misses,
+                speculative_executed=result.speculative_executed,
+                speculative_hit=result.speculative_hit,
             )
             await run_in_threadpool(sink.emit, audit_event)
         except Exception:
@@ -2639,6 +2788,64 @@ def create_app(
             degraded_nodes=result.degraded_nodes,
             execution_path=result.execution_path,
             stage_results={k: v.to_dict() for k, v in result.stage_results.items()},
+        )
+
+    @application.get(
+        "/v1/pipeline/cache/stats",
+        response_model=PipelineCacheStatsResponse,
+        responses={
+            404: {"description": "Decision graph pipeline or cache is not enabled."},
+        },
+        tags=["pipeline"],
+    )
+    async def pipeline_cache_stats(
+        request: Request,
+    ) -> PipelineCacheStatsResponse | JSONResponse:
+        """Retrieve operational statistics for pipeline node caching."""
+        executor: DecisionGraphExecutor | None = getattr(
+            request.app.state, "pipeline_executor", None
+        )
+        if executor is None:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": "Decision graph pipeline is not enabled on this service."},
+            )
+        if not executor.enable_cache:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": "Pipeline caching is not enabled."},
+            )
+        return PipelineCacheStatsResponse(**executor.cache.stats_dict())
+
+    @application.post(
+        "/v1/pipeline/cache/clear",
+        response_model=PipelineCacheClearResponse,
+        responses={
+            404: {"description": "Decision graph pipeline or cache is not enabled."},
+        },
+        tags=["pipeline"],
+    )
+    async def pipeline_cache_clear(
+        request: Request,
+    ) -> PipelineCacheClearResponse | JSONResponse:
+        """Clear all cached entries across all pipeline stages."""
+        executor: DecisionGraphExecutor | None = getattr(
+            request.app.state, "pipeline_executor", None
+        )
+        if executor is None:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": "Decision graph pipeline is not enabled on this service."},
+            )
+        if not executor.enable_cache:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": "Pipeline caching is not enabled."},
+            )
+        executor.cache.clear()
+        return PipelineCacheClearResponse(
+            status="cleared",
+            message="Pipeline cache cleared successfully.",
         )
 
     @application.get("/metrics", tags=["operations"])

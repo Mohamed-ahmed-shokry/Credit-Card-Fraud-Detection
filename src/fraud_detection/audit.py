@@ -231,6 +231,10 @@ def build_scoring_audit_event(
     execution_trace: Mapping[str, Any] | None = None,
     pipeline_stages: Sequence[Mapping[str, Any]] | None = None,
     degraded_nodes: Sequence[str] | None = None,
+    cache_hits: int | None = None,
+    cache_misses: int | None = None,
+    speculative_executed: bool | None = None,
+    speculative_hit: bool | None = None,
 ) -> AuditEvent:
     """Construct a structured scoring audit event."""
     fraud_count = sum(1 for p in predictions if p.get("is_fraud"))
@@ -250,6 +254,14 @@ def build_scoring_audit_event(
         payload["pipeline_stages"] = [dict(s) for s in pipeline_stages]
     if degraded_nodes is not None:
         payload["degraded_nodes"] = list(degraded_nodes)
+    if cache_hits is not None:
+        payload["cache_hits"] = cache_hits
+    if cache_misses is not None:
+        payload["cache_misses"] = cache_misses
+    if speculative_executed is not None:
+        payload["speculative_executed"] = speculative_executed
+    if speculative_hit is not None:
+        payload["speculative_hit"] = speculative_hit
     if model_role is not None:
         payload["model_role"] = model_role
     if routed_model_version is not None:
