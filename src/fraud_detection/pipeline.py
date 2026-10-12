@@ -571,6 +571,97 @@ class StageCircuitBreaker:
             )
 
 
+class StageCircuitRegistry:
+    """Thread-safe registry managing per-node circuit breakers across a decision graph."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._breakers: dict[str, StageCircuitBreaker] = {}
+
+    def register_policy(
+        self,
+        node_name: str,
+        policy: StageCircuitPolicy,
+    ) -> StageCircuitBreaker:
+        """Register or replace a circuit breaker policy for a graph node."""
+        with self._lock:
+            breaker = StageCircuitBreaker(policy)
+            self._breakers[node_name] = breaker
+            return breaker
+
+    def get_breaker(self, node_name: str) -> StageCircuitBreaker | None:
+        """Retrieve registered circuit breaker for a node, if any."""
+        with self._lock:
+            return self._breakers.get(node_name)
+
+    def allow_execution(self, node_name: str, now: float | None = None) -> bool:
+        """Check whether a stage node is permitted to execute."""
+        breaker = self.get_breaker(node_name)
+        if breaker is None:
+            return True
+        return breaker.allow_execution(now=now)
+
+    def record_success(self, node_name: str) -> None:
+        """Record successful stage completion for a node."""
+        breaker = self.get_breaker(node_name)
+        if breaker is not None:
+            breaker.record_success()
+
+    def record_failure(
+        self,
+        node_name: str,
+        *,
+        reason: str = "error",
+        is_timeout: bool = False,
+        now: float | None = None,
+    ) -> bool:
+        """Record stage failure/timeout for a node. Returns True if circuit is OPEN."""
+        breaker = self.get_breaker(node_name)
+        if breaker is None:
+            return False
+        return breaker.record_failure(reason=reason, is_timeout=is_timeout, now=now)
+
+    def reset(self, node_name: str | None = None) -> list[str]:
+        """Reset one or all registered stage circuit breakers. Returns reset node names."""
+        with self._lock:
+            if node_name is not None:
+                if node_name in self._breakers:
+                    self._breakers[node_name].reset()
+                    return [node_name]
+                return []
+            for b in self._breakers.values():
+                b.reset()
+            return sorted(self._breakers.keys())
+
+    def stats_dict(self, now: float | None = None) -> dict[str, Any]:
+        """Return aggregate and per-node circuit breaker telemetry."""
+        with self._lock:
+            items = list(self._breakers.items())
+        total_trips = 0
+        total_short_circuits = 0
+        open_nodes: list[str] = []
+        half_open_nodes: list[str] = []
+        nodes_map: dict[str, dict[str, Any]] = {}
+        for name, breaker in items:
+            st = breaker.get_stats(now=now)
+            total_trips += st.total_trips
+            total_short_circuits += st.short_circuited_count
+            if st.state == StageCircuitState.OPEN:
+                open_nodes.append(name)
+            elif st.state == StageCircuitState.HALF_OPEN:
+                half_open_nodes.append(name)
+            node_entry = st.to_dict()
+            node_entry["policy"] = breaker.policy.to_dict()
+            nodes_map[name] = node_entry
+        return {
+            "total_trips": total_trips,
+            "total_short_circuits": total_short_circuits,
+            "open_nodes": sorted(open_nodes),
+            "half_open_nodes": sorted(half_open_nodes),
+            "nodes": nodes_map,
+        }
+
+
 @dataclass
 class PipelineNode:
     """Configured execution node in the decision graph."""
