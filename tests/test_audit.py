@@ -853,3 +853,18 @@ def test_build_pipeline_replay_audit_event() -> None:
     assert parsed["payload"]["metadata"]["api_key"] == "[REDACTED]"
     assert parsed["payload"]["metadata"]["env"] == "staging"
 
+    minimal_event = build_pipeline_replay_audit_event(
+        pipeline_name="min_graph",
+        audit_source="/path/to/min.jsonl",
+        replayed_events=10,
+        total_transactions=10,
+        score_discrepancies=0,
+        decision_flips=0,
+        flip_rate=0.0,
+        status="MATCH",
+    )
+    assert "transition_matrix" not in minimal_event.payload
+    assert "mean_latency_ms" not in minimal_event.payload
+    assert "p95_latency_ms" not in minimal_event.payload
+    assert "metadata" not in minimal_event.payload
+
