@@ -29,6 +29,7 @@ from fraud_detection.pipeline import (
     InferenceStageProcessor,
     NodeCachePolicy,
     NodeCacheStats,
+    PipelineCircuitOpenError,
     PipelineContext,
     PipelineCounterfactualEvaluation,
     PipelineCycleError,
@@ -1310,3 +1311,25 @@ def test_optimize_counterfactual_pipeline_metrics_and_validation() -> None:
 
     with pytest.raises(ValueError, match="Length of y_true"):
         optimize_counterfactual_pipeline(probs, cand_thresh, y_true=[0, 1])
+
+
+def test_stage_execution_result_circuit_open_serialization() -> None:
+    err = PipelineCircuitOpenError("stage circuit is open")
+    assert isinstance(err, PipelineExecutionError)
+
+    res = StageExecutionResult(
+        node_name="enrichment",
+        stage_type=StageType.ENRICHMENT,
+        status=StageStatus.CIRCUIT_OPEN,
+        latency_ms=0.0,
+        output={"fallback": True},
+        error="Stage circuit breaker is open",
+        degraded=True,
+        short_circuited_by_breaker=True,
+    )
+    payload = res.to_dict()
+    assert payload["status"] == "circuit_open"
+    assert payload["degraded"] is True
+    assert payload["short_circuited_by_breaker"] is True
+    assert payload["output"] == {"fallback": True}
+
