@@ -39,6 +39,9 @@ from fraud_detection.pipeline import (
     PipelineReplayReport,
     PipelineValidationError,
     RuleStageProcessor,
+    StageCircuitPolicy,
+    StageCircuitState,
+    StageCircuitStats,
     StageExecutionCache,
     StageExecutionResult,
     StageStatus,
@@ -1332,4 +1335,60 @@ def test_stage_execution_result_circuit_open_serialization() -> None:
     assert payload["degraded"] is True
     assert payload["short_circuited_by_breaker"] is True
     assert payload["output"] == {"fallback": True}
+
+
+def test_stage_circuit_policy_and_stats_validation() -> None:
+    policy = StageCircuitPolicy(
+        enabled=True,
+        failure_threshold=3,
+        recovery_timeout_seconds=15.0,
+        half_open_max_calls=2,
+        count_timeouts=True,
+        count_exceptions=False,
+    )
+    assert policy.to_dict() == {
+        "enabled": True,
+        "failure_threshold": 3,
+        "recovery_timeout_seconds": 15.0,
+        "half_open_max_calls": 2,
+        "count_timeouts": True,
+        "count_exceptions": False,
+    }
+
+    with pytest.raises(ValueError, match="failure_threshold"):
+        StageCircuitPolicy(failure_threshold=0)
+    with pytest.raises(ValueError, match="failure_threshold"):
+        StageCircuitPolicy(failure_threshold=True)  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="recovery_timeout_seconds"):
+        StageCircuitPolicy(recovery_timeout_seconds=0.0)
+    with pytest.raises(ValueError, match="recovery_timeout_seconds"):
+        StageCircuitPolicy(recovery_timeout_seconds=float("inf"))
+    with pytest.raises(ValueError, match="recovery_timeout_seconds"):
+        StageCircuitPolicy(recovery_timeout_seconds=True)  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="half_open_max_calls"):
+        StageCircuitPolicy(half_open_max_calls=0)
+    with pytest.raises(ValueError, match="half_open_max_calls"):
+        StageCircuitPolicy(half_open_max_calls=False)  # type: ignore[arg-type]
+
+    stats = StageCircuitStats(
+        state=StageCircuitState.OPEN,
+        consecutive_failures=3,
+        total_failures=5,
+        total_successes=10,
+        total_trips=2,
+        short_circuited_count=4,
+        last_failure_reason="timeout",
+    )
+    assert stats.to_dict() == {
+        "state": "open",
+        "consecutive_failures": 3,
+        "total_failures": 5,
+        "total_successes": 10,
+        "total_trips": 2,
+        "short_circuited_count": 4,
+        "last_failure_reason": "timeout",
+    }
+
 
