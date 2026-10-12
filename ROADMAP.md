@@ -1562,7 +1562,7 @@ This phase does not implement external service-mesh circuit breaking (Istio/Envo
 
 ### Task list
 
-- [ ] Task 1: Define stage circuit breaker primitives (`PipelineCircuitOpenError`, `StageCircuitState`, `StageCircuitPolicy`, `StageCircuitStats`, `StageCircuitBreaker`, `StageCircuitRegistry`) in `pipeline.py`.
+- [x] Task 1: Define stage circuit breaker primitives (`PipelineCircuitOpenError`, `StageCircuitState`, `StageCircuitPolicy`, `StageCircuitStats`, `StageCircuitBreaker`, `StageCircuitRegistry`) in `pipeline.py`.
 - [ ] Task 2: Integrate stage circuit breaking into `StageStatus`, `StageExecutionResult`, `PipelineNode`, `PipelineExecutionResult`, `DecisionGraphExecutor`, and `create_default_fraud_pipeline` in `pipeline.py`.
 - [ ] Task 3: Implement stage chaos fault-injection primitives (`StageFaultType`, `StageFaultSpec`, `StageChaosMetrics`, `PipelineChaosReport`) and `simulate_pipeline_chaos` in `pipeline.py`.
 - [ ] Task 4: Add `circuit_short_circuits` to `build_scoring_audit_event` and implement `build_pipeline_chaos_audit_event` in `audit.py` with unit tests in `tests/test_audit.py`.
