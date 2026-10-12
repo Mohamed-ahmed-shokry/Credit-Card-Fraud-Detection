@@ -385,6 +385,72 @@ class StageExecutionCache:
             }
 
 
+class StageCircuitState(StrEnum):
+    """Operational state of a pipeline stage circuit breaker."""
+
+    CLOSED = "closed"
+    OPEN = "open"
+    HALF_OPEN = "half_open"
+
+
+@dataclass(frozen=True)
+class StageCircuitPolicy:
+    """Configuration for per-stage circuit breaker protection."""
+
+    enabled: bool = True
+    failure_threshold: int = 5
+    recovery_timeout_seconds: float = 30.0
+    half_open_max_calls: int = 1
+    count_timeouts: bool = True
+    count_exceptions: bool = True
+
+    def __post_init__(self) -> None:
+        if isinstance(self.failure_threshold, bool) or self.failure_threshold < 1:
+            raise ValueError("failure_threshold must be an integer >= 1")
+        if (
+            isinstance(self.recovery_timeout_seconds, bool)
+            or not math.isfinite(self.recovery_timeout_seconds)
+            or self.recovery_timeout_seconds <= 0.0
+        ):
+            raise ValueError("recovery_timeout_seconds must be a positive finite number")
+        if isinstance(self.half_open_max_calls, bool) or self.half_open_max_calls < 1:
+            raise ValueError("half_open_max_calls must be an integer >= 1")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "failure_threshold": self.failure_threshold,
+            "recovery_timeout_seconds": self.recovery_timeout_seconds,
+            "half_open_max_calls": self.half_open_max_calls,
+            "count_timeouts": self.count_timeouts,
+            "count_exceptions": self.count_exceptions,
+        }
+
+
+@dataclass
+class StageCircuitStats:
+    """Runtime telemetry counters for a single stage circuit breaker."""
+
+    state: StageCircuitState = StageCircuitState.CLOSED
+    consecutive_failures: int = 0
+    total_failures: int = 0
+    total_successes: int = 0
+    total_trips: int = 0
+    short_circuited_count: int = 0
+    last_failure_reason: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "state": self.state.value,
+            "consecutive_failures": self.consecutive_failures,
+            "total_failures": self.total_failures,
+            "total_successes": self.total_successes,
+            "total_trips": self.total_trips,
+            "short_circuited_count": self.short_circuited_count,
+            "last_failure_reason": self.last_failure_reason,
+        }
+
+
 @dataclass
 class PipelineNode:
     """Configured execution node in the decision graph."""
