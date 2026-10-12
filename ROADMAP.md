@@ -1419,11 +1419,66 @@ This phase does not implement external distributed cache brokers (Redis, Memcach
 - `7a0b926`: feat(api): expose pipeline cache endpoints and Prometheus telemetry
 - `33c179d`: feat(cli): add node cache and speculative inference flags to pipeline-eval
 - `6e5f381`, `90b750e`, `77080f3`: coverage tests for CLI error paths, API env config, and speculative paths
-## Phase 34 — Dynamic Decision Graph Replay & Counterfactual Policy Optimization (Planned)
+## Phase 34 — Dynamic Decision Graph Replay & Counterfactual Policy Optimization (In progress)
 
 ### Objective
 
 Enable offline replay of historical streaming audit events through alternative decision graph configurations to benchmark latency, cost, and accuracy trade-offs prior to production deployment.
+
+### Scope
+
+1. **Graph Replay Engine Core (`pipeline.py`)**:
+   - `replay_audit_log_through_pipeline(audit_log_path, candidate_pipeline, ...)`: Replay historical scoring events through candidate decision graph configurations.
+   - Support both inline recorded features and external observations DataFrame join.
+   - Capture per-transaction decision shifts (`ALLOW` / `CHALLENGE` / `DENY`), score discrepancies, latency comparisons, and degraded execution flags.
+   - Return structured `PipelineReplayReport` with turnover counts, flip rates, stage latency distributions, and discrepancy details.
+2. **Counterfactual Policy Optimization (`pipeline.py` & `evaluation.py`)**:
+   - `optimize_counterfactual_pipeline(events_or_records, candidate_thresholds, candidate_rules, cost_policy, ...)`: Evaluate counterfactual configurations against baseline decisions and ground truth labels.
+   - Calculate transition matrices (`PolicyTransitionMatrix`), workload shifts (review count/rate delta, deny count/rate delta), and expected cost per transaction.
+   - Support automated threshold tuning across candidate graph configurations with capacity constraints.
+3. **Audit Event Fidelity (`audit.py`)**:
+   - `build_pipeline_replay_audit_event(...)`: Structured audit event recording pipeline replay runs, divergence metrics, and counterfactual policy outcomes.
+4. **Operational API Serving (`api.py`)**:
+   - `POST /v1/pipeline/replay`: Endpoint to execute replay against historical audit logs or recorded batches.
+   - `POST /v1/pipeline/counterfactual`: Endpoint to simulate policy shifts and cost impacts on candidate thresholds.
+   - Expose Prometheus metrics for replay evaluations (`fraud_pipeline_replay_evaluations_total`, `fraud_pipeline_replay_discrepancies_total`).
+5. **CLI Evaluation Suite (`cli.py`)**:
+   - Add `pipeline-replay` command supporting audit log replay, `--candidate-rules`, `--candidate-threshold`, `--fail-on-divergence`, and tabular/JSON reporting.
+   - Add `pipeline-counterfactual` command calculating decision migrations and cost tradeoffs against baseline logs.
+6. **Integration, Test Coverage & Documentation**:
+   - Unit and integration tests covering pipeline replay, counterfactual optimization, API endpoints, and CLI commands.
+   - Documentation updates in `ARCHITECTURE.md`, `README.md`, and `ROADMAP.md`.
+
+### Acceptance criteria
+
+1. **AC-1 (Audit Replay Fidelity)**: `replay_audit_log_through_pipeline` accurately replays historical scoring audit logs through candidate decision graphs, reporting score difference distributions, decision flips, and latency comparison without data leakage or PAN exposure.
+2. **AC-2 (Counterfactual Transition & Cost Evaluation)**: Replay against ground truth computes accurate 3x3 transition matrices (`ALLOW`, `CHALLENGE`, `DENY`), turnover rates, review/deny workload deltas, and net financial cost impact under configurable business cost policies.
+3. **AC-3 (Audit Trail Tracing)**: Replay runs emit structured audit events via `build_pipeline_replay_audit_event` with SHA-256 fingerprinting, parameter tracking, and redacted payloads.
+4. **AC-4 (API Serving Contract)**: `/v1/pipeline/replay` and `/v1/pipeline/counterfactual` endpoints return complete schemas with latency benchmarks, decision shift summaries, and Prometheus telemetry.
+5. **AC-5 (CLI Evaluation Suite)**: `fraud-detect pipeline-replay` and `fraud-detect pipeline-counterfactual` execute cleanly, support `--json` and text summaries, and enforce `--fail-on-divergence` exit codes.
+6. **AC-6 (Quality Standards & Zero Regressions)**: Full test suite passes 100%, branch coverage remains $\ge 97.0\%$, Ruff clean, and strict mypy clean with zero errors.
+
+### Validation plan
+
+- Unit tests for `PipelineReplayReport`, `replay_audit_log_through_pipeline`, and `optimize_counterfactual_pipeline` in `tests/test_pipeline.py`.
+- Audit event generation and redaction tests in `tests/test_audit.py`.
+- API endpoint integration tests in `tests/test_api.py`.
+- CLI end-to-end tests for `pipeline-replay` and `pipeline-counterfactual` in `tests/test_cli.py`.
+- Full regression test run with coverage, lint, and type checking.
+
+### Task list
+
+- [ ] Task 1: Define `PipelineReplayReport`, `PipelineDiscrepancyDetail`, and `replay_audit_log_through_pipeline` in `pipeline.py`.
+- [ ] Task 2: Implement counterfactual policy evaluation and threshold optimization helpers in `pipeline.py`.
+- [ ] Task 3: Add `build_pipeline_replay_audit_event` in `audit.py`.
+- [ ] Task 4: Expose `/v1/pipeline/replay` and `/v1/pipeline/counterfactual` endpoints with Prometheus telemetry in `api.py`.
+- [ ] Task 5: Implement `pipeline-replay` and `pipeline-counterfactual` CLI commands in `cli.py`.
+- [ ] Task 6: Add comprehensive unit and integration tests across pipeline, audit, API, and CLI suites.
+- [ ] Task 7: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`) and verify Completion Gate.
+
+### Explicit exclusions
+
+This phase does not implement multi-cluster distributed event replay systems or streaming message brokers (Kafka/Flink); it provides high-throughput, repeatable, asynchronous in-process graph replay and counterfactual simulation.
 
 ## Contributing to the roadmap
 
