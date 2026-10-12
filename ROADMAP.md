@@ -20,7 +20,7 @@ Status legend: `Proposed` (not started), `In progress`, `Done`.
 ## Current state
 
 The project is a production-grade reference implementation with the implementation work in
-Phases 2 through 31 complete. Phase 1's workflows are in place, but the first
+Phases 2 through 34 complete. Phase 1's workflows are in place, but the first
 real PyPI release still requires maintainer-side trusted-publisher setup. The
 shipped system covers leakage-safe training, multiple calibrated estimators,
 threshold and calibration analysis, label-delay temporal gaps, drift surveillance,
@@ -37,8 +37,11 @@ bounded operational metrics, declarative rule sets with priority overrides,
 sliding-window velocity behavioral profiles, post-hoc probability recalibration
 (Platt, isotonic, temperature scaling) with calibration drift surveillance,
 champion/challenger multi-model routing with deterministic entity stickiness and
-automated canary divergence safeguards, and feature store integration with
-point-in-time time-travel as-of joins and training-serving skew surveillance.
+automated canary divergence safeguards, feature store integration with
+point-in-time time-travel as-of joins and training-serving skew surveillance,
+real-time streaming decision graph DAG pipelines with topological wave scheduling,
+deterministic stage node caching with speculative asynchronous model inference,
+and dynamic decision graph replay with counterfactual policy optimization.
 
 ## Phase 1 — Distribution
 
