@@ -603,11 +603,17 @@ export FRAUD_PIPELINE_ENABLED="true"
   - `POST /v1/pipeline/score`: Execute real-time decision graph for an incoming transaction with full stage-by-stage latency breakdowns and lineage traces.
   - `GET /v1/pipeline/cache/stats`: Aggregate and per-node cache hits, misses, hit ratio, evictions, and size (404 when caching is disabled).
   - `POST /v1/pipeline/cache/clear`: Drop all cached stage outputs.
+  - `POST /v1/pipeline/replay`: Replay historical scoring audit logs (`JSONL`) through the active decision graph, returning probability discrepancies, 3×3 decision turnover matrices (`ALLOW`, `CHALLENGE`, `DENY`), and stage-by-stage latency distributions.
+  - `POST /v1/pipeline/counterfactual`: Evaluate candidate tiered decision thresholds against baseline decisions or thresholds with optional ground-truth cost modeling.
 - **Prometheus Telemetry**:
   - `fraud_pipeline_stage_duration_seconds{stage="...", status="..."}`: Histogram monitoring per-stage execution durations.
   - `fraud_pipeline_executions_total{status="...", degraded="true|false"}`: Counter tracking total and degraded graph executions.
   - `fraud_pipeline_cache_hits_total{stage="..."}` / `fraud_pipeline_cache_misses_total{stage="..."}`: Per-stage cache outcomes.
   - `fraud_pipeline_speculative_executions_total` / `fraud_pipeline_speculative_hits_total`: Speculative launches and adopted results.
+  - `fraud_pipeline_replay_evaluations_total{status="..."}` / `fraud_pipeline_replay_discrepancies_total`: Pipeline replay evaluations and detected score discrepancies.
+- **Offline CLI Replay & Counterfactual Analysis**:
+  - `fraud-detect pipeline-replay <audit_log.jsonl> --model <artifact> [--rules <rules.json>] [--tolerance 1e-4] [--fail-on-divergence] [--json]`
+  - `fraud-detect pipeline-counterfactual <audit_log.jsonl> --candidate-review 0.3 --candidate-deny 0.75 [--baseline-review 0.5 --baseline-deny 0.8] [--json]`
 
 ## Train on the anonymized dataset
 
