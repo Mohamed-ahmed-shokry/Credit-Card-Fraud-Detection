@@ -6064,3 +6064,83 @@ def test_cli_pipeline_replay_and_counterfactual(
     assert bad_cf_4.exit_code == 2
     assert "No valid scoring transactions" in bad_cf_4.output
 
+    # 6. Additional branches: text output with --output, corrupt model, and noisy log
+    text_rep_out = tmp_path / "text_rep.json"
+    res_text_out = runner.invoke(
+        app,
+        [
+            "pipeline-replay",
+            str(audit_log),
+            "--model",
+            str(trained_artifact),
+            "--output",
+            str(text_rep_out),
+        ],
+    )
+    assert res_text_out.exit_code == 0, res_text_out.output
+    assert "Report written to:" in res_text_out.output
+
+    corrupt_dir = tmp_path / "corrupt_m"
+    corrupt_dir.mkdir()
+    res_corrupt = runner.invoke(
+        app,
+        ["pipeline-replay", str(audit_log), "--model", str(corrupt_dir)],
+    )
+    assert res_corrupt.exit_code == 2
+    assert "Failed to load model" in res_corrupt.output
+
+    noisy_log = tmp_path / "noisy.jsonl"
+    noisy_lines = [
+        "",
+        "{invalid json",
+        "[]",
+        json.dumps({"event_type": "other"}),
+        json.dumps({"event_type": "scoring", "payload": "not_a_dict"}),
+        json.dumps(
+            {
+                "event_type": "scoring",
+                "payload": {
+                    "review_threshold": "bad",
+                    "deny_threshold": "bad",
+                    "predictions": "bad",
+                },
+            }
+        ),
+        json.dumps(
+            {
+                "event_type": "scoring",
+                "payload": {
+                    "review_threshold": 0.4,
+                    "deny_threshold": 0.8,
+                    "predictions": [
+                        "not_a_dict",
+                        {"fraud_probability": None},
+                        {"fraud_probability": "bad_float"},
+                        {"fraud_probability": 1.5},
+                        {"fraud_probability": 0.75, "is_fraud": True},
+                        {"fraud_probability": 0.15, "is_fraud": False},
+                    ],
+                },
+            }
+        ),
+    ]
+    noisy_log.write_text("\n".join(noisy_lines) + "\n", encoding="utf-8")
+
+    cf_text_out = tmp_path / "cf_text_out.json"
+    res_noisy_cf = runner.invoke(
+        app,
+        [
+            "pipeline-counterfactual",
+            str(noisy_log),
+            "--candidate-review",
+            "0.3",
+            "--candidate-deny",
+            "0.7",
+            "--output",
+            str(cf_text_out),
+        ],
+    )
+    assert res_noisy_cf.exit_code == 0, res_noisy_cf.output
+    assert "Report written to:" in res_noisy_cf.output
+
+
