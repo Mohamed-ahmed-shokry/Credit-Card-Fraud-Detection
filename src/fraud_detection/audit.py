@@ -367,6 +367,48 @@ def build_shadow_scoring_audit_event(
     )
 
 
+def build_pipeline_replay_audit_event(
+    *,
+    pipeline_name: str,
+    audit_source: str,
+    replayed_events: int,
+    total_transactions: int,
+    score_discrepancies: int,
+    decision_flips: int,
+    flip_rate: float,
+    status: str,
+    transition_matrix: Mapping[str, Any] | None = None,
+    mean_latency_ms: float | None = None,
+    p95_latency_ms: float | None = None,
+    metadata: Mapping[str, Any] | None = None,
+) -> AuditEvent:
+    """Construct a structured pipeline replay audit event."""
+    payload: dict[str, Any] = {
+        "pipeline_name": pipeline_name,
+        "audit_source": audit_source,
+        "replayed_events": replayed_events,
+        "total_transactions": total_transactions,
+        "score_discrepancies": score_discrepancies,
+        "decision_flips": decision_flips,
+        "flip_rate": flip_rate,
+        "status": status,
+    }
+    if transition_matrix is not None:
+        payload["transition_matrix"] = dict(transition_matrix)
+    if mean_latency_ms is not None:
+        payload["mean_latency_ms"] = mean_latency_ms
+    if p95_latency_ms is not None:
+        payload["p95_latency_ms"] = p95_latency_ms
+    if metadata is not None:
+        payload["metadata"] = dict(metadata)
+
+    return AuditEvent(
+        event_type="pipeline_replay",
+        model_version=pipeline_name,
+        payload=payload,
+    )
+
+
 @dataclass(frozen=True)
 class DiscrepancyDetail:
     """Record of a single replayed transaction discrepancy."""
