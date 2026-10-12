@@ -65,6 +65,10 @@ class PipelineTimeoutError(PipelineExecutionError):
     """Raised when a required pipeline stage exceeds its latency budget."""
 
 
+class PipelineCircuitOpenError(PipelineExecutionError):
+    """Raised when a required pipeline stage is blocked by an open circuit breaker."""
+
+
 class StageType(StrEnum):
     """Functional categorization for pipeline stages."""
 
@@ -85,6 +89,7 @@ class StageStatus(StrEnum):
     TIMEOUT = "timeout"
     SKIPPED = "skipped"
     FAILED = "failed"
+    CIRCUIT_OPEN = "circuit_open"
 
 
 @dataclass(frozen=True)
@@ -111,6 +116,7 @@ class StageExecutionResult:
     degraded: bool = False
     cached: bool = False
     speculative: bool = False
+    short_circuited_by_breaker: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         """Convert stage telemetry to a serializable dictionary."""
@@ -126,6 +132,7 @@ class StageExecutionResult:
             "degraded": self.degraded,
             "cached": self.cached,
             "speculative": self.speculative,
+            "short_circuited_by_breaker": self.short_circuited_by_breaker,
         }
 
 
