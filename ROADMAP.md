@@ -1419,7 +1419,7 @@ This phase does not implement external distributed cache brokers (Redis, Memcach
 - `7a0b926`: feat(api): expose pipeline cache endpoints and Prometheus telemetry
 - `33c179d`: feat(cli): add node cache and speculative inference flags to pipeline-eval
 - `6e5f381`, `90b750e`, `77080f3`: coverage tests for CLI error paths, API env config, and speculative paths
-## Phase 34 — Dynamic Decision Graph Replay & Counterfactual Policy Optimization (In progress)
+## Phase 34 — Dynamic Decision Graph Replay & Counterfactual Policy Optimization (Done)
 
 ### Objective
 
@@ -1468,17 +1468,39 @@ Enable offline replay of historical streaming audit events through alternative d
 
 ### Task list
 
-- [ ] Task 1: Define `PipelineReplayReport`, `PipelineDiscrepancyDetail`, and `replay_audit_log_through_pipeline` in `pipeline.py`.
-- [ ] Task 2: Implement counterfactual policy evaluation and threshold optimization helpers in `pipeline.py`.
-- [ ] Task 3: Add `build_pipeline_replay_audit_event` in `audit.py`.
-- [ ] Task 4: Expose `/v1/pipeline/replay` and `/v1/pipeline/counterfactual` endpoints with Prometheus telemetry in `api.py`.
-- [ ] Task 5: Implement `pipeline-replay` and `pipeline-counterfactual` CLI commands in `cli.py`.
-- [ ] Task 6: Add comprehensive unit and integration tests across pipeline, audit, API, and CLI suites.
-- [ ] Task 7: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`) and verify Completion Gate.
+- [x] Task 1: Define `PipelineReplayReport`, `PipelineDiscrepancyDetail`, and `replay_audit_log_through_pipeline` in `pipeline.py`.
+- [x] Task 2: Implement counterfactual policy evaluation and threshold optimization helpers in `pipeline.py`.
+- [x] Task 3: Add `build_pipeline_replay_audit_event` in `audit.py`.
+- [x] Task 4: Expose `/v1/pipeline/replay` and `/v1/pipeline/counterfactual` endpoints with Prometheus telemetry in `api.py`.
+- [x] Task 5: Implement `pipeline-replay` and `pipeline-counterfactual` CLI commands in `cli.py`.
+- [x] Task 6: Add comprehensive unit and integration tests across pipeline, audit, API, and CLI suites.
+- [x] Task 7: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`) and verify Completion Gate.
 
 ### Explicit exclusions
 
 This phase does not implement multi-cluster distributed event replay systems or streaming message brokers (Kafka/Flink); it provides high-throughput, repeatable, asynchronous in-process graph replay and counterfactual simulation.
+
+### Outcome
+
+- Implemented `PipelineDiscrepancyDetail`, `PipelineReplayReport`, `replay_audit_log_through_pipeline`, `PipelineCounterfactualEvaluation`, and `optimize_counterfactual_pipeline` in `src/fraud_detection/pipeline.py`.
+- Added structured audit event builder `build_pipeline_replay_audit_event` in `src/fraud_detection/audit.py`.
+- Exposed `POST /v1/pipeline/replay` and `POST /v1/pipeline/counterfactual` endpoints with `fraud_pipeline_replay_evaluations_total` and `fraud_pipeline_replay_discrepancies_total` Prometheus counters in `src/fraud_detection/api.py`.
+- Added `fraud-detect pipeline-replay` and `fraud-detect pipeline-counterfactual` CLI commands in `src/fraud_detection/cli.py`.
+- Verified: 798 tests passing (100%), branch coverage 97.05%, `ruff check .` clean, and strict `mypy` clean across 20 source files.
+
+### Commits
+
+- `2611edf`: docs(roadmap): set Phase 34 dynamic graph replay in progress and initialize progress record
+- `e75a1fd`: feat(pipeline): implement dynamic pipeline replay engine and counterfactual policy optimization
+- `a290ad8`: feat(audit): add pipeline replay structured audit event builder
+- `26ff43b`: feat(api): expose pipeline replay and counterfactual endpoints with Prometheus telemetry
+- `3f3f35d`: feat(cli): add pipeline-replay and pipeline-counterfactual commands
+- `dbecd08`, `7b207a3`: test(audit): unit tests for pipeline replay audit event builder and redaction
+- `e8e717f`: test(pipeline): add unit tests for pipeline replay engine and counterfactual optimization
+- `98ed5aa`: test(api): add endpoint and telemetry tests for pipeline replay and counterfactual routes
+- `d19832f`, `1e6517c`: test(cli): end-to-end and edge-case tests for pipeline-replay and pipeline-counterfactual
+- `a358934`, `8e0cd7d`: docs: document pipeline replay and counterfactual capabilities in ARCHITECTURE.md and README.md
+
 
 ## Contributing to the roadmap
 
