@@ -9,11 +9,14 @@ import hashlib
 import inspect
 import json
 import logging
+import math
+import statistics
 import threading
 from collections import OrderedDict, defaultdict, deque
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
+from pathlib import Path
 from time import monotonic, perf_counter
 from typing import Any, Protocol, runtime_checkable
 from uuid import uuid4
@@ -21,7 +24,14 @@ from uuid import uuid4
 import numpy as np
 import pandas as pd
 
-from fraud_detection.evaluation import DecisionAction
+from fraud_detection.evaluation import (
+    DecisionAction,
+    PolicyTransitionMatrix,
+    TieredMetrics,
+    TieredThresholds,
+    assign_tiered_decisions,
+    evaluate_tiered_policy,
+)
 from fraud_detection.features import FeatureStoreProtocol
 from fraud_detection.model import FraudModel
 from fraud_detection.recalibration import BaseRecalibrator
@@ -1417,3 +1427,630 @@ def create_default_fraud_pipeline(
     )
 
     return graph
+
+
+# ============================================================================
+# Dynamic Decision Graph Replay & Counterfactual Policy Optimization
+# ============================================================================
+
+
+@dataclass(frozen=True)
+class PipelineDiscrepancyDetail:
+    """Detailed discrepancy record between original audit log and replayed decision graph."""
+
+    event_id: str
+    transaction_index: int
+    logged_probability: float
+    replayed_probability: float
+    score_difference: float
+    logged_decision: str
+    replayed_decision: str
+    decision_flipped: bool
+    replayed_rule: str | None = None
+    degraded: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert discrepancy detail to a serializable dictionary."""
+        return {
+            "event_id": self.event_id,
+            "transaction_index": self.transaction_index,
+            "logged_probability": self.logged_probability,
+            "replayed_probability": self.replayed_probability,
+            "score_difference": self.score_difference,
+            "logged_decision": self.logged_decision,
+            "replayed_decision": self.replayed_decision,
+            "decision_flipped": self.decision_flipped,
+            "replayed_rule": self.replayed_rule,
+            "degraded": self.degraded,
+        }
+
+
+@dataclass(frozen=True)
+class PipelineReplayReport:
+    """Outcome and telemetry from replaying historical audit events through a decision graph."""
+
+    total_events: int
+    scoring_events: int
+    replayed_events: int
+    skipped_events: int
+    total_transactions: int
+    score_discrepancies: int
+    decision_flips: int
+    flip_rate: float
+    max_absolute_difference: float
+    mean_absolute_difference: float
+    tolerance: float
+    status: str  # "MATCH", "DIVERGENT", or "EMPTY"
+    transition_matrix: PolicyTransitionMatrix
+    baseline_decision_counts: dict[str, int]
+    replayed_decision_counts: dict[str, int]
+    mean_latency_ms: float
+    p95_latency_ms: float
+    degraded_executions: int
+    stage_latencies: dict[str, dict[str, float]]
+    discrepancies: tuple[PipelineDiscrepancyDetail, ...] = field(default_factory=tuple)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert replay report to a serializable dictionary."""
+        return {
+            "total_events": self.total_events,
+            "scoring_events": self.scoring_events,
+            "replayed_events": self.replayed_events,
+            "skipped_events": self.skipped_events,
+            "total_transactions": self.total_transactions,
+            "score_discrepancies": self.score_discrepancies,
+            "decision_flips": self.decision_flips,
+            "flip_rate": self.flip_rate,
+            "max_absolute_difference": self.max_absolute_difference,
+            "mean_absolute_difference": self.mean_absolute_difference,
+            "tolerance": self.tolerance,
+            "status": self.status,
+            "transition_matrix": self.transition_matrix.to_dict(),
+            "baseline_decision_counts": dict(self.baseline_decision_counts),
+            "replayed_decision_counts": dict(self.replayed_decision_counts),
+            "mean_latency_ms": self.mean_latency_ms,
+            "p95_latency_ms": self.p95_latency_ms,
+            "degraded_executions": self.degraded_executions,
+            "stage_latencies": self.stage_latencies,
+            "discrepancies": [d.to_dict() for d in self.discrepancies],
+        }
+
+
+def replay_audit_log_through_pipeline(
+    audit_log_path: Path | str,
+    pipeline: DecisionGraph | DecisionGraphExecutor,
+    *,
+    data_path: Path | str | None = None,
+    tolerance: float = 1e-4,
+    max_discrepancies_to_record: int = 100,
+) -> PipelineReplayReport:
+    """Replay historical scoring events from a JSONL audit log through a candidate decision graph.
+
+    Compares logged predictions and decisions against replayed pipeline outcomes,
+    computing probability discrepancies, decision turnover matrices, and stage-by-stage latencies.
+    """
+    if (
+        isinstance(tolerance, bool)
+        or not isinstance(tolerance, (int, float))
+        or not math.isfinite(tolerance)
+        or tolerance < 0.0
+    ):
+        raise ValueError("tolerance must be a finite, non-negative float.")
+
+    if (
+        isinstance(max_discrepancies_to_record, bool)
+        or not isinstance(max_discrepancies_to_record, int)
+        or max_discrepancies_to_record < 0
+    ):
+        raise ValueError("max_discrepancies_to_record must be a non-negative integer.")
+
+    audit_path = Path(audit_log_path)
+    if not audit_path.is_file():
+        raise FileNotFoundError(f"Audit log file not found: {audit_path}")
+
+    external_df: pd.DataFrame | None = None
+    if data_path is not None:
+        data_p = Path(data_path)
+        if not data_p.is_file():
+            raise FileNotFoundError(f"External observations file not found: {data_p}")
+        external_df = pd.read_csv(data_p)
+
+    executor = (
+        pipeline
+        if isinstance(pipeline, DecisionGraphExecutor)
+        else DecisionGraphExecutor(pipeline)
+    )
+
+    total_events = 0
+    scoring_events = 0
+    replayed_events = 0
+    skipped_events = 0
+    total_transactions = 0
+    score_discrepancies = 0
+    decision_flips = 0
+    degraded_executions = 0
+
+    max_abs_diff = 0.0
+    sum_abs_diff = 0.0
+    latencies: list[float] = []
+    stage_latencies_collector: dict[str, list[float]] = {
+        name: [] for name in executor.graph.nodes
+    }
+
+    b_actions_list: list[str] = []
+    r_actions_list: list[str] = []
+    discrepancies_list: list[PipelineDiscrepancyDetail] = []
+
+    external_offset = 0
+
+    with audit_path.open("r", encoding="utf-8") as f:
+        for line_num, line in enumerate(f, start=1):
+            stripped = line.strip()
+            if not stripped:
+                continue
+
+            total_events += 1
+            try:
+                event_dict = json.loads(stripped)
+            except json.JSONDecodeError:
+                continue
+
+            if not isinstance(event_dict, dict) or event_dict.get("event_type") != "scoring":
+                continue
+
+            scoring_events += 1
+            payload = event_dict.get("payload")
+            if not isinstance(payload, dict):
+                skipped_events += 1
+                continue
+
+            logged_predictions = payload.get("predictions")
+            if not isinstance(logged_predictions, list) or not logged_predictions:
+                skipped_events += 1
+                continue
+
+            inline_features = payload.get("features")
+            records_to_score: list[dict[str, Any]] = []
+
+            if isinstance(inline_features, list) and inline_features:
+                if len(inline_features) != len(logged_predictions):
+                    skipped_events += 1
+                    continue
+                records_to_score = [dict(f) for f in inline_features if isinstance(f, dict)]
+                if len(records_to_score) != len(logged_predictions):
+                    skipped_events += 1
+                    continue
+            elif external_df is not None:
+                n_rows = len(logged_predictions)
+                if external_offset + n_rows > len(external_df):
+                    skipped_events += 1
+                    continue
+                chunk = external_df.iloc[external_offset : external_offset + n_rows]
+                external_offset += n_rows
+                records_to_score = [
+                    {str(k): v for k, v in r.items()}
+                    for r in chunk.to_dict(orient="records")
+                ]
+            else:
+                skipped_events += 1
+                continue
+
+            event_id = str(event_dict.get("event_id", f"event_{line_num}"))
+            event_has_valid_tx = False
+
+            for idx, (pred_dict, tx_record) in enumerate(
+                zip(logged_predictions, records_to_score, strict=True)
+            ):
+                if not isinstance(pred_dict, dict):
+                    continue
+
+                raw_prob = pred_dict.get("fraud_probability")
+                if raw_prob is None or isinstance(raw_prob, bool):
+                    continue
+
+                try:
+                    logged_prob = float(raw_prob)
+                    if not math.isfinite(logged_prob) or not (0.0 <= logged_prob <= 1.0):
+                        continue
+                except (TypeError, ValueError):
+                    continue
+
+                logged_dec = pred_dict.get("decision")
+                if logged_dec is None:
+                    is_f = bool(pred_dict.get("is_fraud", False))
+                    logged_dec = DecisionAction.DENY.value if is_f else DecisionAction.ALLOW.value
+                else:
+                    logged_dec = str(logged_dec)
+
+                try:
+                    result = executor.execute_sync(tx_record)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Pipeline replay execution failed for event %s: %s",
+                        event_id,
+                        exc,
+                    )
+                    continue
+
+                event_has_valid_tx = True
+                total_transactions += 1
+                replayed_prob = result.fraud_probability
+                replayed_dec = result.decision
+
+                latencies.append(result.total_latency_ms)
+                if result.degraded:
+                    degraded_executions += 1
+
+                for s_name, s_res in result.stage_results.items():
+                    if s_name in stage_latencies_collector:
+                        stage_latencies_collector[s_name].append(s_res.latency_ms)
+
+                diff = abs(replayed_prob - logged_prob)
+                if diff > max_abs_diff:
+                    max_abs_diff = diff
+                sum_abs_diff += diff
+
+                is_score_disc = diff > tolerance
+                if is_score_disc:
+                    score_discrepancies += 1
+
+                flipped = replayed_dec != logged_dec
+                if flipped:
+                    decision_flips += 1
+
+                b_actions_list.append(logged_dec)
+                r_actions_list.append(replayed_dec)
+
+                can_rec = (
+                    (is_score_disc or flipped)
+                    and len(discrepancies_list) < max_discrepancies_to_record
+                )
+                if can_rec:
+                    discrepancies_list.append(
+                        PipelineDiscrepancyDetail(
+                            event_id=event_id,
+                            transaction_index=idx,
+                            logged_probability=logged_prob,
+                            replayed_probability=replayed_prob,
+                            score_difference=round(diff, 6),
+                            logged_decision=logged_dec,
+                            replayed_decision=replayed_dec,
+                            decision_flipped=flipped,
+                            replayed_rule=result.matched_rule,
+                            degraded=result.degraded,
+                        )
+                    )
+
+            if event_has_valid_tx:
+                replayed_events += 1
+            else:
+                skipped_events += 1
+
+    mean_abs_diff = (sum_abs_diff / total_transactions) if total_transactions > 0 else 0.0
+    flip_rate = (decision_flips / total_transactions) if total_transactions > 0 else 0.0
+    mean_lat = statistics.fmean(latencies) if latencies else 0.0
+    p95_lat = float(np.percentile(latencies, 95)) if latencies else 0.0
+
+    stage_summary: dict[str, dict[str, float]] = {}
+    for s_name, s_list in stage_latencies_collector.items():
+        if s_list:
+            stage_summary[s_name] = {
+                "mean_ms": round(statistics.fmean(s_list), 3),
+                "p95_ms": round(float(np.percentile(s_list, 95)), 3),
+            }
+        else:
+            stage_summary[s_name] = {"mean_ms": 0.0, "p95_ms": 0.0}
+
+    # Construct 3x3 PolicyTransitionMatrix
+    def _to_action_code(a: str) -> str:
+        upper = a.upper()
+        if "DENY" in upper:
+            return DecisionAction.DENY.value
+        if "CHALLENGE" in upper or "REVIEW" in upper:
+            return DecisionAction.CHALLENGE.value
+        return DecisionAction.ALLOW.value
+
+    norm_b = [_to_action_code(a) for a in b_actions_list]
+    norm_r = [_to_action_code(a) for a in r_actions_list]
+
+    b_arr = np.array(norm_b, dtype=object)
+    r_arr = np.array(norm_r, dtype=object)
+
+    b_allow = b_arr == DecisionAction.ALLOW.value
+    b_review = b_arr == DecisionAction.CHALLENGE.value
+    b_deny = b_arr == DecisionAction.DENY.value
+
+    r_allow = r_arr == DecisionAction.ALLOW.value
+    r_review = r_arr == DecisionAction.CHALLENGE.value
+    r_deny = r_arr == DecisionAction.DENY.value
+
+    turnover = int(np.sum(b_arr != r_arr)) if len(b_arr) > 0 else 0
+    turnover_rate = float(turnover / total_transactions) if total_transactions > 0 else 0.0
+
+    transition_matrix = PolicyTransitionMatrix(
+        allow_to_allow=int(np.sum(b_allow & r_allow)),
+        allow_to_challenge=int(np.sum(b_allow & r_review)),
+        allow_to_deny=int(np.sum(b_allow & r_deny)),
+        challenge_to_allow=int(np.sum(b_review & r_allow)),
+        challenge_to_challenge=int(np.sum(b_review & r_review)),
+        challenge_to_deny=int(np.sum(b_review & r_deny)),
+        deny_to_allow=int(np.sum(b_deny & r_allow)),
+        deny_to_challenge=int(np.sum(b_deny & r_review)),
+        deny_to_deny=int(np.sum(b_deny & r_deny)),
+        total_records=total_transactions,
+        turnover_count=turnover,
+        turnover_rate=turnover_rate,
+    )
+
+    baseline_counts = {
+        "ALLOW": int(np.sum(b_allow)),
+        "CHALLENGE": int(np.sum(b_review)),
+        "DENY": int(np.sum(b_deny)),
+    }
+    replayed_counts = {
+        "ALLOW": int(np.sum(r_allow)),
+        "CHALLENGE": int(np.sum(r_review)),
+        "DENY": int(np.sum(r_deny)),
+    }
+
+    if replayed_events == 0 or total_transactions == 0:
+        status = "EMPTY"
+    elif score_discrepancies > 0 or decision_flips > 0:
+        status = "DIVERGENT"
+    else:
+        status = "MATCH"
+
+    return PipelineReplayReport(
+        total_events=total_events,
+        scoring_events=scoring_events,
+        replayed_events=replayed_events,
+        skipped_events=skipped_events,
+        total_transactions=total_transactions,
+        score_discrepancies=score_discrepancies,
+        decision_flips=decision_flips,
+        flip_rate=round(flip_rate, 4),
+        max_absolute_difference=round(max_abs_diff, 6),
+        mean_absolute_difference=round(mean_abs_diff, 6),
+        tolerance=tolerance,
+        status=status,
+        transition_matrix=transition_matrix,
+        baseline_decision_counts=baseline_counts,
+        replayed_decision_counts=replayed_counts,
+        mean_latency_ms=round(mean_lat, 3),
+        p95_latency_ms=round(p95_lat, 3),
+        degraded_executions=degraded_executions,
+        stage_latencies=stage_summary,
+        discrepancies=tuple(discrepancies_list),
+    )
+
+
+@dataclass(frozen=True)
+class PipelineCounterfactualEvaluation:
+    """Counterfactual policy evaluation metrics and cost trade-offs for candidate graph settings."""
+
+    rows: int
+    baseline_thresholds: TieredThresholds
+    candidate_thresholds: TieredThresholds
+    transition_matrix: PolicyTransitionMatrix
+    baseline_decision_counts: dict[str, int]
+    candidate_decision_counts: dict[str, int]
+    review_count_delta: int
+    review_rate_delta: float
+    deny_count_delta: int
+    deny_rate_delta: float
+    turnover_count: int
+    turnover_rate: float
+    baseline_metrics: TieredMetrics | None = None
+    candidate_metrics: TieredMetrics | None = None
+    cost_delta: float | None = None
+    fraud_catch_delta: int | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert counterfactual evaluation result to a serializable dictionary."""
+        return {
+            "rows": self.rows,
+            "baseline_thresholds": self.baseline_thresholds.to_dict(),
+            "candidate_thresholds": self.candidate_thresholds.to_dict(),
+            "transition_matrix": self.transition_matrix.to_dict(),
+            "baseline_decision_counts": dict(self.baseline_decision_counts),
+            "candidate_decision_counts": dict(self.candidate_decision_counts),
+            "review_count_delta": self.review_count_delta,
+            "review_rate_delta": self.review_rate_delta,
+            "deny_count_delta": self.deny_count_delta,
+            "deny_rate_delta": self.deny_rate_delta,
+            "turnover_count": self.turnover_count,
+            "turnover_rate": self.turnover_rate,
+            "baseline_metrics": self.baseline_metrics.to_dict() if self.baseline_metrics else None,
+            "candidate_metrics": (
+                self.candidate_metrics.to_dict() if self.candidate_metrics else None
+            ),
+            "cost_delta": self.cost_delta,
+            "fraud_catch_delta": self.fraud_catch_delta,
+        }
+
+
+def optimize_counterfactual_pipeline(
+    probabilities: np.ndarray | Sequence[float],
+    candidate_thresholds: TieredThresholds,
+    *,
+    baseline_thresholds: TieredThresholds | None = None,
+    baseline_decisions: Sequence[str] | None = None,
+    y_true: np.ndarray | Sequence[int] | None = None,
+    manual_review_cost: float = 5.0,
+    false_deny_cost: float = 50.0,
+    missed_fraud_cost: float = 200.0,
+) -> PipelineCounterfactualEvaluation:
+    """Evaluate counterfactual policy shifts, decision turnover, and workload/cost impact.
+
+    Parameters
+    ----------
+    probabilities:
+        Scored transaction probabilities (from baseline model or replayed graph).
+    candidate_thresholds:
+        Target candidate tiered thresholds to evaluate.
+    baseline_thresholds:
+        Baseline tiered thresholds. Defaults to (0.5, 0.5) if not provided.
+    baseline_decisions:
+        Optional historical decision labels (e.g. from audit log). If omitted,
+        inferred from baseline_thresholds.
+    y_true:
+        Optional ground truth binary labels matching the transactions.
+    manual_review_cost:
+        Unit friction cost for transactions routed to CHALLENGE.
+    false_deny_cost:
+        Unit loss cost for legitimate transactions routed to DENY.
+    missed_fraud_cost:
+        Unit loss cost for fraudulent transactions routed to ALLOW.
+    """
+    if not isinstance(candidate_thresholds, TieredThresholds):
+        raise TypeError("candidate_thresholds must be a TieredThresholds instance")
+    if baseline_thresholds is not None and not isinstance(baseline_thresholds, TieredThresholds):
+        raise TypeError("baseline_thresholds must be a TieredThresholds instance")
+
+    for cost_name, cost_val in [
+        ("manual_review_cost", manual_review_cost),
+        ("false_deny_cost", false_deny_cost),
+        ("missed_fraud_cost", missed_fraud_cost),
+    ]:
+        if (
+            isinstance(cost_val, bool)
+            or not isinstance(cost_val, (int, float))
+            or not math.isfinite(cost_val)
+            or cost_val < 0.0
+        ):
+            raise ValueError(f"{cost_name} must be a non-negative finite number")
+
+    probs = np.asarray(probabilities, dtype=float)
+    if probs.ndim != 1 or probs.size == 0:
+        raise ValueError("probabilities must be a non-empty one-dimensional array")
+    if not np.isfinite(probs).all() or np.any((probs < 0.0) | (probs > 1.0)):
+        raise ValueError("probabilities must be finite numbers between 0 and 1")
+
+    effective_baseline = baseline_thresholds or TieredThresholds(0.5, 0.5)
+    n_rows = len(probs)
+
+    def _normalize_action(a: str) -> str:
+        upper = a.upper()
+        if "DENY" in upper:
+            return DecisionAction.DENY.value
+        if "CHALLENGE" in upper or "REVIEW" in upper:
+            return DecisionAction.CHALLENGE.value
+        return DecisionAction.ALLOW.value
+
+    if baseline_decisions is not None:
+        if len(baseline_decisions) != n_rows:
+            raise ValueError("Length of baseline_decisions must match probabilities")
+        b_actions = np.array([_normalize_action(str(d)) for d in baseline_decisions], dtype=object)
+    else:
+        b_actions = assign_tiered_decisions(
+            probs,
+            review_threshold=effective_baseline.review_threshold,
+            deny_threshold=effective_baseline.deny_threshold,
+        )
+
+    c_actions = assign_tiered_decisions(
+        probs,
+        review_threshold=candidate_thresholds.review_threshold,
+        deny_threshold=candidate_thresholds.deny_threshold,
+    )
+
+    b_allow = b_actions == DecisionAction.ALLOW.value
+    b_review = b_actions == DecisionAction.CHALLENGE.value
+    b_deny = b_actions == DecisionAction.DENY.value
+
+    c_allow = c_actions == DecisionAction.ALLOW.value
+    c_review = c_actions == DecisionAction.CHALLENGE.value
+    c_deny = c_actions == DecisionAction.DENY.value
+
+    turnover = int(np.sum(b_actions != c_actions))
+    turnover_rate = float(turnover / n_rows) if n_rows > 0 else 0.0
+
+    matrix = PolicyTransitionMatrix(
+        allow_to_allow=int(np.sum(b_allow & c_allow)),
+        allow_to_challenge=int(np.sum(b_allow & c_review)),
+        allow_to_deny=int(np.sum(b_allow & c_deny)),
+        challenge_to_allow=int(np.sum(b_review & c_allow)),
+        challenge_to_challenge=int(np.sum(b_review & c_review)),
+        challenge_to_deny=int(np.sum(b_review & c_deny)),
+        deny_to_allow=int(np.sum(b_deny & c_allow)),
+        deny_to_challenge=int(np.sum(b_deny & c_review)),
+        deny_to_deny=int(np.sum(b_deny & c_deny)),
+        total_records=n_rows,
+        turnover_count=turnover,
+        turnover_rate=turnover_rate,
+    )
+
+    b_counts = {
+        DecisionAction.ALLOW.value: int(np.sum(b_allow)),
+        DecisionAction.CHALLENGE.value: int(np.sum(b_review)),
+        DecisionAction.DENY.value: int(np.sum(b_deny)),
+    }
+    c_counts = {
+        DecisionAction.ALLOW.value: int(np.sum(c_allow)),
+        DecisionAction.CHALLENGE.value: int(np.sum(c_review)),
+        DecisionAction.DENY.value: int(np.sum(c_deny)),
+    }
+
+    review_delta = (
+        c_counts[DecisionAction.CHALLENGE.value] - b_counts[DecisionAction.CHALLENGE.value]
+    )
+    review_rate_delta = float(review_delta / n_rows) if n_rows > 0 else 0.0
+    deny_delta = c_counts[DecisionAction.DENY.value] - b_counts[DecisionAction.DENY.value]
+    deny_rate_delta = float(deny_delta / n_rows) if n_rows > 0 else 0.0
+
+    b_metrics: TieredMetrics | None = None
+    c_metrics: TieredMetrics | None = None
+    cost_delta: float | None = None
+    fraud_catch_delta: int | None = None
+
+    if y_true is not None:
+        y_arr = np.asarray(y_true, dtype=int)
+        if len(y_arr) != n_rows:
+            raise ValueError(
+                f"Length of y_true ({len(y_arr)}) does not match probabilities ({n_rows})"
+            )
+        b_metrics = evaluate_tiered_policy(
+            y_arr,
+            probs,
+            review_threshold=effective_baseline.review_threshold,
+            deny_threshold=effective_baseline.deny_threshold,
+            manual_review_cost=manual_review_cost,
+            false_deny_cost=false_deny_cost,
+            missed_fraud_cost=missed_fraud_cost,
+        )
+        c_metrics = evaluate_tiered_policy(
+            y_arr,
+            probs,
+            review_threshold=candidate_thresholds.review_threshold,
+            deny_threshold=candidate_thresholds.deny_threshold,
+            manual_review_cost=manual_review_cost,
+            false_deny_cost=false_deny_cost,
+            missed_fraud_cost=missed_fraud_cost,
+        )
+        cost_delta = float(
+            c_metrics.expected_cost_per_transaction - b_metrics.expected_cost_per_transaction
+        )
+        b_caught = b_metrics.caught_fraud_review + b_metrics.caught_fraud_deny
+        c_caught = c_metrics.caught_fraud_review + c_metrics.caught_fraud_deny
+        fraud_catch_delta = int(c_caught - b_caught)
+
+    return PipelineCounterfactualEvaluation(
+        rows=n_rows,
+        baseline_thresholds=effective_baseline,
+        candidate_thresholds=candidate_thresholds,
+        transition_matrix=matrix,
+        baseline_decision_counts=b_counts,
+        candidate_decision_counts=c_counts,
+        review_count_delta=review_delta,
+        review_rate_delta=round(review_rate_delta, 4),
+        deny_count_delta=deny_delta,
+        deny_rate_delta=round(deny_rate_delta, 4),
+        turnover_count=turnover,
+        turnover_rate=round(turnover_rate, 4),
+        baseline_metrics=b_metrics,
+        candidate_metrics=c_metrics,
+        cost_delta=round(cost_delta, 4) if cost_delta is not None else None,
+        fraud_catch_delta=fraud_catch_delta,
+    )
+
+
