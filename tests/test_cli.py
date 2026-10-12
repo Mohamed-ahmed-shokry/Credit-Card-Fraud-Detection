@@ -5861,3 +5861,206 @@ def test_cli_pipeline_eval_rejects_corrupt_model_and_empty_input(
     )
     assert res_csv.exit_code == 2
     assert "Failed to read input dataset" in res_csv.output
+
+
+def test_cli_pipeline_replay_and_counterfactual(
+    tmp_path: Path, trained_artifact: Path
+) -> None:
+    df = generate_synthetic_data(rows=250, random_state=42)
+    feature_cols = [c for c in df.columns if c != "Class"]
+    rec1 = {str(k): float(v) for k, v in df[feature_cols].iloc[0].to_dict().items()}
+    rec2 = {str(k): float(v) for k, v in df[feature_cols].iloc[1].to_dict().items()}
+
+    audit_log = tmp_path / "audit_replay.jsonl"
+    ev = {
+        "event_id": "cli_ev_1",
+        "event_type": "scoring",
+        "payload": {
+            "review_threshold": 0.3,
+            "deny_threshold": 0.7,
+            "predictions": [
+                {"fraud_probability": 0.95, "decision": "DENY", "is_fraud": True},
+                {"fraud_probability": 0.05, "decision": "ALLOW", "is_fraud": False},
+            ],
+            "features": [rec1, rec2],
+        },
+    }
+    audit_log.write_text(json.dumps(ev) + "\n", encoding="utf-8")
+
+    report_out = tmp_path / "replay_report.json"
+    audit_sink_out = tmp_path / "replay_events.jsonl"
+
+    # 1. pipeline-replay JSON output + file output + audit sink output
+    res_json = runner.invoke(
+        app,
+        [
+            "pipeline-replay",
+            str(audit_log),
+            "--model",
+            str(trained_artifact),
+            "--output",
+            str(report_out),
+            "--audit-log",
+            str(audit_sink_out),
+            "--json",
+        ],
+    )
+    assert res_json.exit_code == 0, res_json.output
+    rep_data = json.loads(res_json.stdout)
+    assert rep_data["total_transactions"] == 2
+    assert report_out.is_file()
+    assert audit_sink_out.is_file()
+
+    # 2. pipeline-replay text output + fail-on-divergence
+    res_text = runner.invoke(
+        app,
+        [
+            "pipeline-replay",
+            str(audit_log),
+            "--model",
+            str(trained_artifact),
+            "--tolerance",
+            "0.0",
+            "--fail-on-divergence",
+        ],
+    )
+    assert res_text.exit_code == 1
+    assert "Decision Graph Pipeline Replay Report:" in res_text.output
+    assert "Transition Matrix (Logged -> Replayed):" in res_text.output
+
+    # 3. pipeline-replay validation errors
+    bad_prec = runner.invoke(
+        app,
+        [
+            "pipeline-replay",
+            str(audit_log),
+            "--model",
+            str(trained_artifact),
+            "--rule-precedence",
+            "invalid_prec",
+        ],
+    )
+    assert bad_prec.exit_code == 2
+    assert "Invalid --rule-precedence" in bad_prec.output
+
+    bad_rules = tmp_path / "corrupt_rules.json"
+    bad_rules.write_text("{bad", encoding="utf-8")
+    res_bad_rules = runner.invoke(
+        app,
+        [
+            "pipeline-replay",
+            str(audit_log),
+            "--model",
+            str(trained_artifact),
+            "--rules",
+            str(bad_rules),
+        ],
+    )
+    assert res_bad_rules.exit_code == 2
+    assert "Failed to load rules" in res_bad_rules.output
+
+    # 4. pipeline-counterfactual JSON and text output
+    cf_out = tmp_path / "cf_report.json"
+    res_cf_json = runner.invoke(
+        app,
+        [
+            "pipeline-counterfactual",
+            str(audit_log),
+            "--candidate-review",
+            "0.25",
+            "--candidate-deny",
+            "0.65",
+            "--output",
+            str(cf_out),
+            "--json",
+        ],
+    )
+    assert res_cf_json.exit_code == 0, res_cf_json.output
+    cf_data = json.loads(res_cf_json.stdout)
+    assert cf_data["rows"] == 2
+    assert cf_out.is_file()
+
+    res_cf_text = runner.invoke(
+        app,
+        [
+            "pipeline-counterfactual",
+            str(audit_log),
+            "--candidate-review",
+            "0.25",
+            "--candidate-deny",
+            "0.65",
+            "--baseline-review",
+            "0.4",
+            "--baseline-deny",
+            "0.8",
+        ],
+    )
+    assert res_cf_text.exit_code == 0, res_cf_text.output
+    assert "Pipeline Counterfactual Evaluation:" in res_cf_text.output
+    assert "Transition Matrix (Baseline -> Candidate):" in res_cf_text.output
+
+    # 5. pipeline-counterfactual validation errors
+    bad_cf_1 = runner.invoke(
+        app,
+        [
+            "pipeline-counterfactual",
+            str(audit_log),
+            "--candidate-review",
+            "0.8",
+            "--candidate-deny",
+            "0.4",
+        ],
+    )
+    assert bad_cf_1.exit_code == 2
+    assert "--candidate-review cannot exceed --candidate-deny" in bad_cf_1.output
+
+    bad_cf_2 = runner.invoke(
+        app,
+        [
+            "pipeline-counterfactual",
+            str(audit_log),
+            "--candidate-review",
+            "0.3",
+            "--candidate-deny",
+            "0.7",
+            "--baseline-review",
+            "0.4",
+        ],
+    )
+    assert bad_cf_2.exit_code == 2
+    assert "Both --baseline-review and --baseline-deny" in bad_cf_2.output
+
+    bad_cf_3 = runner.invoke(
+        app,
+        [
+            "pipeline-counterfactual",
+            str(audit_log),
+            "--candidate-review",
+            "0.3",
+            "--candidate-deny",
+            "0.7",
+            "--baseline-review",
+            "0.9",
+            "--baseline-deny",
+            "0.4",
+        ],
+    )
+    assert bad_cf_3.exit_code == 2
+    assert "--baseline-review cannot exceed --baseline-deny" in bad_cf_3.output
+
+    empty_log = tmp_path / "empty_log.jsonl"
+    empty_log.write_text("", encoding="utf-8")
+    bad_cf_4 = runner.invoke(
+        app,
+        [
+            "pipeline-counterfactual",
+            str(empty_log),
+            "--candidate-review",
+            "0.3",
+            "--candidate-deny",
+            "0.7",
+        ],
+    )
+    assert bad_cf_4.exit_code == 2
+    assert "No valid scoring transactions" in bad_cf_4.output
+
