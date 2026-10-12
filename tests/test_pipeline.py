@@ -39,7 +39,9 @@ from fraud_detection.pipeline import (
     PipelineReplayReport,
     PipelineValidationError,
     RuleStageProcessor,
+    StageCircuitBreaker,
     StageCircuitPolicy,
+    StageCircuitRegistry,
     StageCircuitState,
     StageCircuitStats,
     StageExecutionCache,
@@ -1358,19 +1360,19 @@ def test_stage_circuit_policy_and_stats_validation() -> None:
     with pytest.raises(ValueError, match="failure_threshold"):
         StageCircuitPolicy(failure_threshold=0)
     with pytest.raises(ValueError, match="failure_threshold"):
-        StageCircuitPolicy(failure_threshold=True)  # type: ignore[arg-type]
+        StageCircuitPolicy(failure_threshold=True)
 
     with pytest.raises(ValueError, match="recovery_timeout_seconds"):
         StageCircuitPolicy(recovery_timeout_seconds=0.0)
     with pytest.raises(ValueError, match="recovery_timeout_seconds"):
         StageCircuitPolicy(recovery_timeout_seconds=float("inf"))
     with pytest.raises(ValueError, match="recovery_timeout_seconds"):
-        StageCircuitPolicy(recovery_timeout_seconds=True)  # type: ignore[arg-type]
+        StageCircuitPolicy(recovery_timeout_seconds=True)
 
     with pytest.raises(ValueError, match="half_open_max_calls"):
         StageCircuitPolicy(half_open_max_calls=0)
     with pytest.raises(ValueError, match="half_open_max_calls"):
-        StageCircuitPolicy(half_open_max_calls=False)  # type: ignore[arg-type]
+        StageCircuitPolicy(half_open_max_calls=False)
 
     stats = StageCircuitStats(
         state=StageCircuitState.OPEN,
@@ -1390,5 +1392,111 @@ def test_stage_circuit_policy_and_stats_validation() -> None:
         "short_circuited_count": 4,
         "last_failure_reason": "timeout",
     }
+
+
+def test_stage_circuit_breaker_state_machine() -> None:
+    policy = StageCircuitPolicy(
+        enabled=True,
+        failure_threshold=2,
+        recovery_timeout_seconds=10.0,
+        half_open_max_calls=2,
+    )
+    breaker = StageCircuitBreaker(policy)
+    assert breaker.allow_execution(now=100.0) is True
+    breaker.record_success()
+    assert breaker.get_stats(now=100.0).total_successes == 1
+
+    # First failure stays CLOSED
+    assert breaker.record_failure(reason="boom1", now=101.0) is False
+    assert breaker.get_stats(now=101.0).state == StageCircuitState.CLOSED
+
+    # Second consecutive failure trips to OPEN
+    assert breaker.record_failure(reason="boom2", now=102.0) is True
+    st_open = breaker.get_stats(now=102.0)
+    assert st_open.state == StageCircuitState.OPEN
+    assert st_open.total_trips == 1
+    assert st_open.last_failure_reason == "boom2"
+
+    # Additional failure while already OPEN stays OPEN
+    assert breaker.record_failure(reason="boom3", now=103.0) is True
+
+    # Before recovery timeout: short-circuited
+    assert breaker.allow_execution(now=105.0) is False
+    assert breaker.get_stats(now=105.0).short_circuited_count == 1
+
+    # After recovery timeout: get_stats reports HALF_OPEN
+    assert breaker.get_stats(now=113.0).state == StageCircuitState.HALF_OPEN
+
+    # Half-open allows up to half_open_max_calls (2)
+    assert breaker.allow_execution(now=113.0) is True
+    assert breaker.allow_execution(now=113.1) is True
+    assert breaker.allow_execution(now=113.2) is False
+    assert breaker.get_stats(now=113.2).short_circuited_count == 2
+
+    # First half-open success keeps HALF_OPEN until 2nd success
+    breaker.record_success()
+    assert breaker.get_stats(now=113.5).state == StageCircuitState.HALF_OPEN
+    breaker.record_success()
+    assert breaker.get_stats(now=114.0).state == StageCircuitState.CLOSED
+
+    # Trip again, move to HALF_OPEN, then fail during probe -> re-trips to OPEN
+    breaker.record_failure(reason="err1", now=200.0)
+    breaker.record_failure(reason="err2", now=201.0)
+    assert breaker.allow_execution(now=215.0) is True
+    assert breaker.record_failure(reason="probe_fail", now=215.5) is True
+    assert breaker.get_stats(now=216.0).state == StageCircuitState.OPEN
+    assert breaker.get_stats(now=216.0).total_trips == 3
+
+    # Manual reset returns to CLOSED
+    breaker.reset()
+    assert breaker.get_stats(now=216.0).state == StageCircuitState.CLOSED
+
+    # Test disabled policy and selective counting
+    disabled = StageCircuitBreaker(StageCircuitPolicy(enabled=False, failure_threshold=1))
+    assert disabled.allow_execution() is True
+    disabled.record_success()
+    assert disabled.record_failure(reason="ignored") is False
+
+    selective = StageCircuitBreaker(
+        StageCircuitPolicy(
+            failure_threshold=1,
+            count_timeouts=False,
+            count_exceptions=False,
+        )
+    )
+    assert selective.record_failure(reason="timeout", is_timeout=True) is False
+    assert selective.record_failure(reason="exc", is_timeout=False) is False
+
+
+def test_stage_circuit_registry_operations() -> None:
+    registry = StageCircuitRegistry()
+    # Unregistered nodes always allow and no-op
+    assert registry.allow_execution("unregistered") is True
+    registry.record_success("unregistered")
+    assert registry.record_failure("unregistered") is False
+    assert registry.reset("unregistered") == []
+
+    policy_a = StageCircuitPolicy(failure_threshold=1, recovery_timeout_seconds=10.0)
+    policy_b = StageCircuitPolicy(failure_threshold=1, recovery_timeout_seconds=5.0)
+    registry.register_policy("node_a", policy_a)
+    registry.register_policy("node_b", policy_b)
+
+    assert registry.allow_execution("node_a", now=10.0) is True
+    registry.record_success("node_a")
+    assert registry.record_failure("node_a", reason="err_a", now=11.0) is True
+    assert registry.record_failure("node_b", reason="err_b", now=11.0) is True
+    assert registry.allow_execution("node_a", now=12.0) is False
+
+    # At now=17.0, node_a is still OPEN (10s timeout), node_b is HALF_OPEN (5s timeout)
+    stats = registry.stats_dict(now=17.0)
+    assert stats["total_trips"] == 2
+    assert stats["total_short_circuits"] == 1
+    assert stats["open_nodes"] == ["node_a"]
+    assert stats["half_open_nodes"] == ["node_b"]
+    assert stats["nodes"]["node_a"]["policy"]["failure_threshold"] == 1
+
+    assert registry.reset("node_a") == ["node_a"]
+    assert registry.get_breaker("node_a") is not None
+    assert registry.reset() == ["node_a", "node_b"]
 
 
