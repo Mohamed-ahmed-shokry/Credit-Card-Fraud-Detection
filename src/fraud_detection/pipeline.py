@@ -451,6 +451,126 @@ class StageCircuitStats:
         }
 
 
+class StageCircuitBreaker:
+    """Thread-safe per-stage circuit breaker tracking consecutive failures and recovery."""
+
+    def __init__(self, policy: StageCircuitPolicy | None = None) -> None:
+        self.policy = policy or StageCircuitPolicy()
+        self._lock = threading.Lock()
+        self._state: StageCircuitState = StageCircuitState.CLOSED
+        self._consecutive_failures: int = 0
+        self._total_failures: int = 0
+        self._total_successes: int = 0
+        self._total_trips: int = 0
+        self._short_circuited_count: int = 0
+        self._last_failure_reason: str | None = None
+        self._opened_at: float | None = None
+        self._half_open_in_flight: int = 0
+        self._half_open_successes: int = 0
+
+    def allow_execution(self, now: float | None = None) -> bool:
+        """Return True if the stage is allowed to execute, False if short-circuited."""
+        if not self.policy.enabled:
+            return True
+        current_time = monotonic() if now is None else now
+        with self._lock:
+            if self._state == StageCircuitState.CLOSED:
+                return True
+            if self._state == StageCircuitState.OPEN:
+                if (
+                    self._opened_at is not None
+                    and (current_time - self._opened_at) >= self.policy.recovery_timeout_seconds
+                ):
+                    self._state = StageCircuitState.HALF_OPEN
+                    self._half_open_in_flight = 1
+                    self._half_open_successes = 0
+                    return True
+                self._short_circuited_count += 1
+                return False
+            if self._half_open_in_flight < self.policy.half_open_max_calls:
+                self._half_open_in_flight += 1
+                return True
+            self._short_circuited_count += 1
+            return False
+
+    def record_success(self) -> None:
+        """Record a successful stage execution and advance half-open recovery."""
+        if not self.policy.enabled:
+            return
+        with self._lock:
+            self._total_successes += 1
+            self._consecutive_failures = 0
+            if self._state == StageCircuitState.HALF_OPEN:
+                self._half_open_in_flight = max(0, self._half_open_in_flight - 1)
+                self._half_open_successes += 1
+                if self._half_open_successes >= self.policy.half_open_max_calls:
+                    self._state = StageCircuitState.CLOSED
+                    self._opened_at = None
+                    self._half_open_in_flight = 0
+                    self._half_open_successes = 0
+
+    def record_failure(
+        self,
+        *,
+        reason: str = "error",
+        is_timeout: bool = False,
+        now: float | None = None,
+    ) -> bool:
+        """Record a stage failure or timeout. Returns True if circuit is now OPEN."""
+        if not self.policy.enabled:
+            return False
+        if is_timeout and not self.policy.count_timeouts:
+            return False
+        if not is_timeout and not self.policy.count_exceptions:
+            return False
+        current_time = monotonic() if now is None else now
+        with self._lock:
+            self._total_failures += 1
+            self._consecutive_failures += 1
+            self._last_failure_reason = reason
+            if self._state == StageCircuitState.HALF_OPEN or (
+                self._state == StageCircuitState.CLOSED
+                and self._consecutive_failures >= self.policy.failure_threshold
+            ):
+                self._state = StageCircuitState.OPEN
+                self._opened_at = current_time
+                self._total_trips += 1
+                self._half_open_in_flight = 0
+                self._half_open_successes = 0
+                return True
+            return self._state == StageCircuitState.OPEN
+
+    def reset(self) -> None:
+        """Manually reset the circuit breaker state back to CLOSED."""
+        with self._lock:
+            self._state = StageCircuitState.CLOSED
+            self._consecutive_failures = 0
+            self._opened_at = None
+            self._half_open_in_flight = 0
+            self._half_open_successes = 0
+
+    def get_stats(self, now: float | None = None) -> StageCircuitStats:
+        """Return a snapshot of current circuit breaker statistics."""
+        current_time = monotonic() if now is None else now
+        with self._lock:
+            effective_state = self._state
+            if (
+                effective_state == StageCircuitState.OPEN
+                and self._opened_at is not None
+                and (current_time - self._opened_at) >= self.policy.recovery_timeout_seconds
+            ):
+                effective_state = StageCircuitState.HALF_OPEN
+            return StageCircuitStats(
+                state=effective_state,
+                consecutive_failures=self._consecutive_failures,
+                total_failures=self._total_failures,
+                total_successes=self._total_successes,
+                total_trips=self._total_trips,
+                short_circuited_count=self._short_circuited_count,
+                last_failure_reason=self._last_failure_reason,
+            )
+
+
 @dataclass
 class PipelineNode:
     """Configured execution node in the decision graph."""
