@@ -21,6 +21,7 @@ from fraud_detection import __version__
 from fraud_detection.audit import (
     JsonlAuditSink,
     backtest_audit_policy,
+    build_pipeline_replay_audit_event,
     build_promotion_audit_event,
     build_scoring_audit_event,
     replay_audit_log,
@@ -85,6 +86,8 @@ from fraud_detection.model import (
 from fraud_detection.pipeline import (
     DecisionGraphExecutor,
     create_default_fraud_pipeline,
+    optimize_counterfactual_pipeline,
+    replay_audit_log_through_pipeline,
 )
 from fraud_detection.recalibration import (
     CalibrationDiagnostics,
@@ -5123,6 +5126,505 @@ def pipeline_eval(
 
     if fail_on_degraded and degraded_count > 0:
         raise typer.Exit(code=1)
+
+
+@app.command("pipeline-replay")
+def pipeline_replay_command(
+    audit_log: Annotated[
+        Path,
+        typer.Argument(
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="JSONL audit log file containing historical scoring events.",
+        ),
+    ],
+    model: Annotated[
+        Path,
+        typer.Option(
+            "--model",
+            "-m",
+            exists=True,
+            readable=True,
+            help="Model artifact directory or file to evaluate in the decision graph.",
+        ),
+    ],
+    rules: Annotated[
+        Path | None,
+        typer.Option(
+            "--rules",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="Optional declarative JSON rules file for graph rules stage.",
+        ),
+    ] = None,
+    rule_precedence: Annotated[
+        str,
+        typer.Option(
+            "--rule-precedence",
+            help="Precedence: 'rules_override_model' or 'model_overrides_rules'.",
+        ),
+    ] = "rules_override_model",
+    data: Annotated[
+        Path | None,
+        typer.Option(
+            "--data",
+            "-d",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="Optional CSV of transactions if features are not logged inline in the audit log.",
+        ),
+    ] = None,
+    threshold: Annotated[
+        float | None,
+        typer.Option(
+            "--threshold",
+            "-t",
+            min=0.0,
+            max=1.0,
+            help="Operational threshold override for binary decision.",
+        ),
+    ] = None,
+    review_threshold: Annotated[
+        float | None,
+        typer.Option(
+            "--review-threshold",
+            min=0.0,
+            max=1.0,
+            help="Review boundary for tiered decision policy.",
+        ),
+    ] = None,
+    deny_threshold: Annotated[
+        float | None,
+        typer.Option(
+            "--deny-threshold",
+            min=0.0,
+            max=1.0,
+            help="Deny boundary for tiered decision policy.",
+        ),
+    ] = None,
+    tolerance: Annotated[
+        float,
+        typer.Option(
+            "--tolerance",
+            min=0.0,
+            help="Maximum acceptable difference between logged and replayed probability.",
+        ),
+    ] = 1e-4,
+    enable_cache: Annotated[
+        bool,
+        typer.Option(
+            "--enable-cache/--no-cache",
+            help="Enable stage execution memoization during replay.",
+        ),
+    ] = False,
+    speculative: Annotated[
+        bool,
+        typer.Option(
+            "--speculative/--no-speculative",
+            help="Enable speculative asynchronous inference during replay.",
+        ),
+    ] = False,
+    fail_on_divergence: Annotated[
+        bool,
+        typer.Option(
+            "--fail-on-divergence",
+            help="Exit with code 1 if status reaches DIVERGENT.",
+        ),
+    ] = False,
+    output: Annotated[
+        Path | None,
+        typer.Option(
+            "--output",
+            "-o",
+            help="Optional path to write JSON replay report.",
+        ),
+    ] = None,
+    audit_output: Annotated[
+        Path | None,
+        typer.Option(
+            "--audit-log",
+            "-a",
+            help="Optional destination JSONL file to record pipeline replay audit event.",
+        ),
+    ] = None,
+    as_json: Annotated[
+        bool,
+        typer.Option(
+            "--json",
+            help="Print report in JSON format.",
+        ),
+    ] = False,
+    overwrite: Annotated[
+        bool,
+        typer.Option(
+            "--overwrite/--no-overwrite",
+            help="Allow overwriting output file.",
+        ),
+    ] = False,
+) -> None:
+    """Replay historical audit events through a candidate decision graph pipeline."""
+    _guard_output(output, overwrite)
+
+    try:
+        from fraud_detection.rules import RulePrecedence, RuleSet
+
+        resolved_prec = RulePrecedence(rule_precedence.strip().lower())
+    except ValueError:
+        _abort(
+            f"Invalid --rule-precedence '{rule_precedence}'. "
+            "Must be 'rules_override_model' or 'model_overrides_rules'."
+        )
+
+    try:
+        loaded_model = load_model(model)
+    except (ModelArtifactError, OSError, ValueError) as exc:
+        _abort(f"Failed to load model from '{model}': {exc}")
+
+    loaded_rules: RuleSet | None = None
+    if rules is not None:
+        try:
+            loaded_rules = RuleSet.load_file(rules)
+        except (OSError, ValueError, TypeError, KeyError, RuntimeError) as exc:
+            _abort(f"Failed to load rules from '{rules}': {exc}")
+
+    graph = create_default_fraud_pipeline(
+        model=loaded_model,
+        rules=loaded_rules,
+        rule_precedence=resolved_prec,
+        threshold=threshold,
+        review_threshold=review_threshold,
+        deny_threshold=deny_threshold,
+        enable_cache=enable_cache,
+        speculative_inference=speculative,
+    )
+    executor = DecisionGraphExecutor(
+        graph,
+        enable_cache=enable_cache,
+        enable_speculative=speculative,
+    )
+
+    try:
+        report = replay_audit_log_through_pipeline(
+            audit_log_path=audit_log,
+            pipeline=executor,
+            data_path=data,
+            tolerance=tolerance,
+        )
+    except (OSError, ValueError, TypeError, FileNotFoundError) as exc:
+        _abort(str(exc))
+
+    if audit_output is not None:
+        sink = JsonlAuditSink(audit_output)
+        try:
+            audit_ev = build_pipeline_replay_audit_event(
+                pipeline_name=graph.name,
+                audit_source=str(audit_log),
+                replayed_events=report.replayed_events,
+                total_transactions=report.total_transactions,
+                score_discrepancies=report.score_discrepancies,
+                decision_flips=report.decision_flips,
+                flip_rate=report.flip_rate,
+                status=report.status,
+                transition_matrix=report.transition_matrix.to_dict(),
+                mean_latency_ms=report.mean_latency_ms,
+                p95_latency_ms=report.p95_latency_ms,
+                metadata={"tolerance": tolerance},
+            )
+            sink.emit(audit_ev)
+        finally:
+            sink.close()
+
+    report_dict = report.to_dict()
+    report_json = json.dumps(report_dict, indent=2)
+
+    if output is not None:
+        _atomic_write_text(report_json + "\n", output)
+
+    if as_json:
+        typer.echo(report_json)
+    else:
+        matrix = report.transition_matrix
+        typer.echo("Decision Graph Pipeline Replay Report:")
+        typer.echo(f"  Status: {report.status}")
+        typer.echo(f"  Scoring Events: {report.replayed_events}/{report.scoring_events}")
+        typer.echo(f"  Transactions Replayed: {report.total_transactions}")
+        typer.echo(
+            f"  Score Discrepancies: {report.score_discrepancies} "
+            f"(tolerance={report.tolerance})"
+        )
+        typer.echo(f"  Decision Flips: {report.decision_flips} ({report.flip_rate:.2%})")
+        typer.echo(
+            f"  Probability Diff: Max={report.max_absolute_difference:.6f}, "
+            f"Mean={report.mean_absolute_difference:.6f}"
+        )
+        typer.echo(
+            f"  Latency: Mean={report.mean_latency_ms:.2f}ms, P95={report.p95_latency_ms:.2f}ms"
+        )
+        typer.echo(f"  Degraded Executions: {report.degraded_executions}")
+        typer.echo("  Transition Matrix (Logged -> Replayed):")
+        typer.echo(
+            f"    ALLOW     -> ALLOW: {matrix.allow_to_allow:<5} "
+            f"CHALLENGE: {matrix.allow_to_challenge:<5} DENY: {matrix.allow_to_deny:<5}"
+        )
+        typer.echo(
+            f"    CHALLENGE -> ALLOW: {matrix.challenge_to_allow:<5} "
+            f"CHALLENGE: {matrix.challenge_to_challenge:<5} DENY: {matrix.challenge_to_deny:<5}"
+        )
+        typer.echo(
+            f"    DENY      -> ALLOW: {matrix.deny_to_allow:<5} "
+            f"CHALLENGE: {matrix.deny_to_challenge:<5} DENY: {matrix.deny_to_deny:<5}"
+        )
+        if output is not None:
+            typer.echo(f"Report written to: {output}")
+
+    if fail_on_divergence and report.status == "DIVERGENT":
+        raise typer.Exit(code=1)
+
+
+@app.command("pipeline-counterfactual")
+def pipeline_counterfactual_command(
+    audit_log: Annotated[
+        Path,
+        typer.Argument(
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="JSONL audit log file containing historical scored probabilities.",
+        ),
+    ],
+    candidate_review: Annotated[
+        float,
+        typer.Option(
+            "--candidate-review",
+            "-r",
+            min=0.0,
+            max=1.0,
+            help="Candidate review threshold for CHALLENGE decision.",
+        ),
+    ],
+    candidate_deny: Annotated[
+        float,
+        typer.Option(
+            "--candidate-deny",
+            "-d",
+            min=0.0,
+            max=1.0,
+            help="Candidate deny threshold for DENY decision.",
+        ),
+    ],
+    baseline_review: Annotated[
+        float | None,
+        typer.Option(
+            "--baseline-review",
+            min=0.0,
+            max=1.0,
+            help="Optional baseline review threshold override.",
+        ),
+    ] = None,
+    baseline_deny: Annotated[
+        float | None,
+        typer.Option(
+            "--baseline-deny",
+            min=0.0,
+            max=1.0,
+            help="Optional baseline deny threshold override.",
+        ),
+    ] = None,
+    manual_review_cost: Annotated[
+        float,
+        typer.Option(
+            "--manual-review-cost",
+            min=0.0,
+            help="Operational friction cost per challenged transaction.",
+        ),
+    ] = 5.0,
+    false_deny_cost: Annotated[
+        float,
+        typer.Option(
+            "--false-deny-cost",
+            min=0.0,
+            help="Friction/support loss cost per legitimate transaction denied.",
+        ),
+    ] = 50.0,
+    missed_fraud_cost: Annotated[
+        float,
+        typer.Option(
+            "--missed-fraud-cost",
+            min=0.0,
+            help="Loss cost per undetected fraud transaction allowed.",
+        ),
+    ] = 200.0,
+    output: Annotated[
+        Path | None,
+        typer.Option(
+            "--output",
+            "-o",
+            help="Optional JSON report output destination.",
+        ),
+    ] = None,
+    as_json: Annotated[
+        bool,
+        typer.Option(
+            "--json",
+            help="Print report in JSON format.",
+        ),
+    ] = False,
+    overwrite: Annotated[
+        bool,
+        typer.Option(
+            "--overwrite/--no-overwrite",
+            help="Allow overwriting output file.",
+        ),
+    ] = False,
+) -> None:
+    """Evaluate counterfactual policy shifts, decision turnover, and workload/cost impact."""
+    _guard_output(output, overwrite)
+
+    if candidate_review > candidate_deny:
+        _abort("--candidate-review cannot exceed --candidate-deny.")
+    if (baseline_review is None) ^ (baseline_deny is None):
+        _abort("Both --baseline-review and --baseline-deny must be provided or omitted.")
+    if (
+        baseline_review is not None
+        and baseline_deny is not None
+        and baseline_review > baseline_deny
+    ):
+        _abort("--baseline-review cannot exceed --baseline-deny.")
+
+    probs_list: list[float] = []
+    logged_decisions: list[str] = []
+    inferred_baseline_review: float | None = None
+    inferred_baseline_deny: float | None = None
+
+    try:
+        with audit_log.open("r", encoding="utf-8") as f:
+            for line in f:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    event = json.loads(stripped)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(event, dict) or event.get("event_type") != "scoring":
+                    continue
+                payload = event.get("payload")
+                if not isinstance(payload, dict):
+                    continue
+
+                if inferred_baseline_review is None and baseline_review is None:
+                    r_th = payload.get("review_threshold")
+                    d_th = payload.get("deny_threshold")
+                    if r_th is not None and d_th is not None:
+                        try:
+                            rf = float(r_th)
+                            df = float(d_th)
+                            if 0.0 <= rf <= df <= 1.0:
+                                inferred_baseline_review = rf
+                                inferred_baseline_deny = df
+                        except (TypeError, ValueError):
+                            pass
+
+                predictions = payload.get("predictions")
+                if not isinstance(predictions, list):
+                    continue
+                for pred in predictions:
+                    if not isinstance(pred, dict):
+                        continue
+                    raw_prob = pred.get("fraud_probability")
+                    if raw_prob is None or isinstance(raw_prob, bool):
+                        continue
+                    try:
+                        p_val = float(raw_prob)
+                        if 0.0 <= p_val <= 1.0:
+                            probs_list.append(p_val)
+                            dec = pred.get("decision")
+                            if dec is not None:
+                                logged_decisions.append(str(dec))
+                            else:
+                                is_f = bool(pred.get("is_fraud", False))
+                                logged_decisions.append("DENY" if is_f else "ALLOW")
+                    except (TypeError, ValueError):
+                        continue
+    except OSError as exc:
+        _abort(f"Failed to read audit log '{audit_log}': {exc}")
+
+    if not probs_list:
+        _abort(f"No valid scoring transactions found in audit log '{audit_log}'.")
+
+    candidate_th = TieredThresholds(candidate_review, candidate_deny)
+    baseline_th: TieredThresholds | None = None
+    if baseline_review is not None and baseline_deny is not None:
+        baseline_th = TieredThresholds(baseline_review, baseline_deny)
+    elif inferred_baseline_review is not None and inferred_baseline_deny is not None:
+        baseline_th = TieredThresholds(inferred_baseline_review, inferred_baseline_deny)
+
+    try:
+        base_decs = (
+            logged_decisions if len(logged_decisions) == len(probs_list) else None
+        )
+        cf_eval = optimize_counterfactual_pipeline(
+            probabilities=probs_list,
+            candidate_thresholds=candidate_th,
+            baseline_thresholds=baseline_th,
+            baseline_decisions=base_decs,
+            manual_review_cost=manual_review_cost,
+            false_deny_cost=false_deny_cost,
+            missed_fraud_cost=missed_fraud_cost,
+        )
+    except (ValueError, TypeError) as exc:
+        _abort(str(exc))
+
+    report_dict = cf_eval.to_dict()
+    report_json = json.dumps(report_dict, indent=2)
+
+    if output is not None:
+        _atomic_write_text(report_json + "\n", output)
+
+    if as_json:
+        typer.echo(report_json)
+    else:
+        matrix = cf_eval.transition_matrix
+        typer.echo(f"Pipeline Counterfactual Evaluation: {cf_eval.rows} records evaluated")
+        typer.echo(
+            f"Baseline: review={cf_eval.baseline_thresholds.review_threshold:.4f}, "
+            f"deny={cf_eval.baseline_thresholds.deny_threshold:.4f}"
+        )
+        typer.echo(
+            f"Candidate: review={cf_eval.candidate_thresholds.review_threshold:.4f}, "
+            f"deny={cf_eval.candidate_thresholds.deny_threshold:.4f}"
+        )
+        typer.echo(
+            f"Turnover: {matrix.turnover_count} / {matrix.total_records} "
+            f"({matrix.turnover_rate:.1%})"
+        )
+        typer.echo(
+            f"Review Workload Delta: {cf_eval.review_count_delta:+d} "
+            f"({cf_eval.review_rate_delta:+.1%})"
+        )
+        typer.echo(
+            f"Deny Volume Delta: {cf_eval.deny_count_delta:+d} "
+            f"({cf_eval.deny_rate_delta:+.1%})"
+        )
+        typer.echo("Transition Matrix (Baseline -> Candidate):")
+        typer.echo(
+            f"  ALLOW     -> ALLOW: {matrix.allow_to_allow:<5} "
+            f"CHALLENGE: {matrix.allow_to_challenge:<5} DENY: {matrix.allow_to_deny:<5}"
+        )
+        typer.echo(
+            f"  CHALLENGE -> ALLOW: {matrix.challenge_to_allow:<5} "
+            f"CHALLENGE: {matrix.challenge_to_challenge:<5} DENY: {matrix.challenge_to_deny:<5}"
+        )
+        typer.echo(
+            f"  DENY      -> ALLOW: {matrix.deny_to_allow:<5} "
+            f"CHALLENGE: {matrix.deny_to_challenge:<5} DENY: {matrix.deny_to_deny:<5}"
+        )
+        if output is not None:
+            typer.echo(f"Report written to: {output}")
+
 
 
 def _abort(message: str) -> NoReturn:
