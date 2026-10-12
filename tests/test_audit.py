@@ -19,6 +19,7 @@ from fraud_detection.audit import (
     _is_luhn_valid,
     _mask_pans_in_string,
     backtest_audit_policy,
+    build_pipeline_replay_audit_event,
     build_promotion_audit_event,
     build_scoring_audit_event,
     build_shadow_scoring_audit_event,
@@ -824,4 +825,31 @@ def test_build_scoring_audit_event_cache_and_speculative() -> None:
     assert parsed["payload"]["speculative_hit"] is True
 
 
+def test_build_pipeline_replay_audit_event() -> None:
+    event = build_pipeline_replay_audit_event(
+        pipeline_name="custom_graph",
+        audit_source="/path/to/audit.jsonl",
+        replayed_events=100,
+        total_transactions=100,
+        score_discrepancies=5,
+        decision_flips=2,
+        flip_rate=0.02,
+        status="diverged",
+        transition_matrix={"approve_to_review": 2},
+        mean_latency_ms=1.45,
+        p95_latency_ms=3.12,
+        metadata={"env": "staging", "api_key": "secret_key_12345"},
+    )
+    assert event.event_type == "pipeline_replay"
+    assert event.model_version == "custom_graph"
+    assert event.payload["replayed_events"] == 100
+    assert event.payload["flip_rate"] == 0.02
+    assert event.payload["status"] == "diverged"
+    assert event.payload["transition_matrix"] == {"approve_to_review": 2}
+
+    # Verify redaction of sensitive metadata
+    serialized = event.to_json(redact=True)
+    parsed = json.loads(serialized)
+    assert parsed["payload"]["metadata"]["api_key"] == "[REDACTED]"
+    assert parsed["payload"]["metadata"]["env"] == "staging"
 
