@@ -3496,3 +3496,167 @@ def test_pipeline_cache_configured_via_environment(
         stats = client.get("/v1/pipeline/cache/stats")
         assert stats.status_code == 200
         assert stats.json()["nodes"]["rules"]["max_size"] == 321
+
+
+def test_pipeline_replay_endpoint_and_metrics(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+    tmp_path: Path,
+) -> None:
+    from fraud_detection.audit import AuditEvent, AuditSink
+
+    _, model, dataset = api_context
+
+    class CaptureSink(AuditSink):
+        def __init__(self) -> None:
+            self.events: list[AuditEvent] = []
+
+        def emit(self, event: AuditEvent) -> None:
+            self.events.append(event)
+
+        def close(self) -> None:
+            pass
+
+    # Disabled pipeline returns 404
+    app_disabled = create_app(model=model, enable_pipeline=False)
+    with TestClient(app_disabled) as disabled_client:
+        res_404 = disabled_client.post(
+            "/v1/pipeline/replay",
+            json={"audit_log_path": str(tmp_path / "nonexistent.jsonl")},
+        )
+        assert res_404.status_code == 404
+        assert "not enabled" in res_404.json()["detail"]
+
+    sink = CaptureSink()
+    app = create_app(model=model, enable_pipeline=True, audit_sink=sink)
+
+    rec1 = {str(k): float(v) for k, v in dataset.features.iloc[0].to_dict().items()}
+    rec2 = {str(k): float(v) for k, v in dataset.features.iloc[1].to_dict().items()}
+
+    audit_log_path = tmp_path / "replay_test.jsonl"
+    events = [
+        {
+            "event_id": "api_rep_1",
+            "event_type": "scoring",
+            "payload": {
+                "predictions": [
+                    {"fraud_probability": 0.9999, "decision": "DENY"},
+                    {"fraud_probability": 0.0001, "decision": "ALLOW"},
+                ],
+                "features": [rec1, rec2],
+            },
+        }
+    ]
+    with audit_log_path.open("w", encoding="utf-8") as f:
+        for ev in events:
+            f.write(json.dumps(ev) + "\n")
+
+    with TestClient(app) as client:
+        # Missing audit log -> 404
+        missing_res = client.post(
+            "/v1/pipeline/replay",
+            json={"audit_log_path": str(tmp_path / "does_not_exist.jsonl")},
+        )
+        assert missing_res.status_code == 404
+        assert "Audit log file not found" in missing_res.json()["detail"]
+
+        # Missing external data path -> 404
+        missing_data_res = client.post(
+            "/v1/pipeline/replay",
+            json={
+                "audit_log_path": str(audit_log_path),
+                "data_path": str(tmp_path / "missing_data.csv"),
+            },
+        )
+        assert missing_data_res.status_code == 404
+        assert "External data file not found" in missing_data_res.json()["detail"]
+
+        # Valid replay request
+        ok_res = client.post(
+            "/v1/pipeline/replay",
+            json={
+                "audit_log_path": str(audit_log_path),
+                "tolerance": 1e-6,
+                "max_discrepancies": 50,
+            },
+        )
+        assert ok_res.status_code == 200
+        body = ok_res.json()
+        assert body["replayed_events"] == 1
+        assert body["total_transactions"] == 2
+        assert body["status"] in ("MATCH", "DIVERGENT")
+        assert "transition_matrix" in body
+        assert "stage_latencies" in body
+
+        # Check Prometheus metrics
+        m_res = client.get("/metrics")
+        assert m_res.status_code == 200
+        assert "fraud_pipeline_replay_evaluations_total" in m_res.text
+        assert "fraud_pipeline_replay_discrepancies_total" in m_res.text
+
+    assert any(ev.event_type == "pipeline_replay" for ev in sink.events)
+
+
+def test_pipeline_counterfactual_endpoint(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    client, _, _ = api_context
+
+    # Valid counterfactual evaluation with ground truth
+    res = client.post(
+        "/v1/pipeline/counterfactual",
+        json={
+            "probabilities": [0.1, 0.35, 0.65, 0.9],
+            "candidate_review_threshold": 0.3,
+            "candidate_deny_threshold": 0.75,
+            "baseline_review_threshold": 0.5,
+            "baseline_deny_threshold": 0.8,
+            "y_true": [0, 0, 1, 1],
+            "manual_review_cost": 5.0,
+            "false_deny_cost": 50.0,
+            "missed_fraud_cost": 200.0,
+        },
+    )
+    assert res.status_code == 200
+    data = res.json()
+    assert data["rows"] == 4
+    assert data["baseline_metrics"] is not None
+    assert data["candidate_metrics"] is not None
+    assert data["cost_delta"] is not None
+    assert data["fraud_catch_delta"] is not None
+
+    # Invalid candidate thresholds (review > deny) -> 422 Pydantic validation error
+    bad_thresh = client.post(
+        "/v1/pipeline/counterfactual",
+        json={
+            "probabilities": [0.1, 0.5],
+            "candidate_review_threshold": 0.8,
+            "candidate_deny_threshold": 0.4,
+        },
+    )
+    assert bad_thresh.status_code == 422
+
+    # Partial baseline threshold -> 422
+    partial_base = client.post(
+        "/v1/pipeline/counterfactual",
+        json={
+            "probabilities": [0.1, 0.5],
+            "candidate_review_threshold": 0.3,
+            "candidate_deny_threshold": 0.7,
+            "baseline_review_threshold": 0.4,
+        },
+    )
+    assert partial_base.status_code == 422
+
+    # Mismatched y_true length -> 400
+    bad_y = client.post(
+        "/v1/pipeline/counterfactual",
+        json={
+            "probabilities": [0.1, 0.5, 0.9],
+            "candidate_review_threshold": 0.3,
+            "candidate_deny_threshold": 0.7,
+            "y_true": [0, 1],
+        },
+    )
+    assert bad_y.status_code == 400
+    assert "Length of y_true" in bad_y.json()["detail"]
+
