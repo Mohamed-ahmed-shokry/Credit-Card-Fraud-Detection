@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
+from pathlib import Path
 from typing import Any
 
 import pytest
 
 from fraud_detection.data import generate_synthetic_data, validate_frame
+from fraud_detection.evaluation import TieredThresholds
 from fraud_detection.features import (
     FeatureDefinition,
     FeatureSnapshot,
@@ -27,9 +30,12 @@ from fraud_detection.pipeline import (
     NodeCachePolicy,
     NodeCacheStats,
     PipelineContext,
+    PipelineCounterfactualEvaluation,
     PipelineCycleError,
+    PipelineDiscrepancyDetail,
     PipelineExecutionError,
     PipelineNode,
+    PipelineReplayReport,
     PipelineValidationError,
     RuleStageProcessor,
     StageExecutionCache,
@@ -37,6 +43,8 @@ from fraud_detection.pipeline import (
     StageStatus,
     StageType,
     create_default_fraud_pipeline,
+    optimize_counterfactual_pipeline,
+    replay_audit_log_through_pipeline,
 )
 from fraud_detection.recalibration import PlattRecalibrator
 from fraud_detection.rules import (
@@ -1003,3 +1011,302 @@ def test_speculative_custom_node_and_global_timeout() -> None:
     assert res.speculative_hit is True
     assert res.stage_results["scoring"].speculative is True
     assert res.decision == "ALLOW"
+
+
+def _create_simple_replay_graph(prob_fn: Any = None, decision_fn: Any = None) -> DecisionGraph:
+    graph = DecisionGraph("replay_test_graph")
+    graph.add_node(
+        PipelineNode(
+            name="enrichment",
+            stage_type=StageType.ENRICHMENT,
+            processor=lambda ctx: dict(ctx.transaction),
+        )
+    )
+    graph.add_node(
+        PipelineNode(
+            name="inference",
+            stage_type=StageType.INFERENCE,
+            processor=lambda ctx: {
+                "probability": (
+                    prob_fn(ctx.transaction)
+                    if prob_fn is not None
+                    else float(ctx.transaction.get("prob", 0.1))
+                )
+            },
+            dependencies=["enrichment"],
+        )
+    )
+    graph.add_node(
+        PipelineNode(
+            name="action",
+            stage_type=StageType.ACTION,
+            processor=lambda ctx: {
+                "decision": (
+                    decision_fn(ctx.get_output("inference")["probability"])
+                    if decision_fn is not None
+                    else ("DENY" if ctx.get_output("inference")["probability"] >= 0.5 else "ALLOW")
+                ),
+                "is_fraud": ctx.get_output("inference")["probability"] >= 0.5,
+                "fraud_probability": ctx.get_output("inference")["probability"],
+                "matched_rule": ctx.transaction.get("rule"),
+            },
+            dependencies=["inference"],
+            required=True,
+        )
+    )
+    return graph
+
+
+def test_replay_audit_log_through_pipeline_inline_and_divergent(tmp_path: Path) -> None:
+    audit_path = tmp_path / "audit.jsonl"
+    events = [
+        {
+            "event_id": "evt_1",
+            "event_type": "scoring",
+            "payload": {
+                "predictions": [
+                    {"fraud_probability": 0.1, "decision": "ALLOW", "is_fraud": False},
+                    {"fraud_probability": 0.8, "decision": "DENY", "is_fraud": True},
+                ],
+                "features": [
+                    {"prob": 0.1, "Amount": 10.0},
+                    {"prob": 0.8, "Amount": 500.0},
+                ],
+            },
+        },
+        {
+            "event_id": "evt_2",
+            "event_type": "scoring",
+            "payload": {
+                "predictions": [
+                    {"fraud_probability": 0.2, "is_fraud": False},
+                    {"fraud_probability": 0.4, "decision": "CHALLENGE"},
+                ],
+                "features": [
+                    {"prob": 0.9, "rule": "high_risk"},
+                    {"prob": 0.4, "Amount": 100.0},
+                ],
+            },
+        },
+        {"event_id": "evt_promote", "event_type": "promotion", "payload": {}},
+        {"event_id": "evt_no_payload", "event_type": "scoring", "payload": "invalid"},
+        {"event_id": "evt_no_preds", "event_type": "scoring", "payload": {"predictions": []}},
+        {
+            "event_id": "evt_mismatch_len",
+            "event_type": "scoring",
+            "payload": {
+                "predictions": [{"fraud_probability": 0.1}],
+                "features": [{"prob": 0.1}, {"prob": 0.2}],
+            },
+        },
+        {
+            "event_id": "evt_bad_feature_item",
+            "event_type": "scoring",
+            "payload": {
+                "predictions": [{"fraud_probability": 0.1}],
+                "features": ["not_a_dict"],
+            },
+        },
+        {
+            "event_id": "evt_no_features_no_csv",
+            "event_type": "scoring",
+            "payload": {"predictions": [{"fraud_probability": 0.1}]},
+        },
+    ]
+
+    with audit_path.open("w", encoding="utf-8") as f:
+        f.write("\n")
+        f.write("{invalid json\n")
+        f.write("[]\n")
+        for ev in events:
+            f.write(json.dumps(ev) + "\n")
+
+    graph = _create_simple_replay_graph()
+    report = replay_audit_log_through_pipeline(
+        audit_path,
+        graph,
+        tolerance=1e-4,
+        max_discrepancies_to_record=10,
+    )
+
+    assert isinstance(report, PipelineReplayReport)
+    assert report.scoring_events == 7
+    assert report.replayed_events == 2
+    assert report.skipped_events == 5
+    assert report.total_transactions == 4
+    assert report.score_discrepancies == 1
+    assert report.decision_flips == 2
+    assert report.status == "DIVERGENT"
+    assert len(report.discrepancies) == 2
+    assert isinstance(report.discrepancies[0], PipelineDiscrepancyDetail)
+
+    d_dict = report.to_dict()
+    assert d_dict["status"] == "DIVERGENT"
+    assert d_dict["transition_matrix"]["turnover_count"] == 2
+    assert len(d_dict["discrepancies"]) == 2
+    assert "enrichment" in d_dict["stage_latencies"]
+
+
+def test_replay_audit_log_through_pipeline_external_csv_and_match(tmp_path: Path) -> None:
+    audit_path = tmp_path / "audit_ext.jsonl"
+    csv_path = tmp_path / "obs.csv"
+    csv_path.write_text("prob,Amount\n0.15,20.0\n0.85,200.0\n", encoding="utf-8")
+
+    ev1 = {
+        "event_id": "ext_1",
+        "event_type": "scoring",
+        "payload": {
+            "predictions": [
+                {"fraud_probability": 0.15, "decision": "ALLOW"},
+                {"fraud_probability": 0.85, "decision": "DENY"},
+            ]
+        },
+    }
+    ev2 = {
+        "event_id": "ext_2",
+        "event_type": "scoring",
+        "payload": {
+            "predictions": [
+                {"fraud_probability": 0.5, "decision": "DENY"},
+            ]
+        },
+    }
+    audit_path.write_text(json.dumps(ev1) + "\n" + json.dumps(ev2) + "\n", encoding="utf-8")
+
+    executor = DecisionGraphExecutor(_create_simple_replay_graph())
+    report = replay_audit_log_through_pipeline(
+        audit_path,
+        executor,
+        data_path=csv_path,
+        tolerance=1e-4,
+    )
+
+    assert report.status == "MATCH"
+    assert report.replayed_events == 1
+    assert report.skipped_events == 1
+    assert report.total_transactions == 2
+    assert report.score_discrepancies == 0
+    assert report.decision_flips == 0
+
+
+def test_replay_audit_log_edge_cases_and_validation(tmp_path: Path) -> None:
+    graph = _create_simple_replay_graph()
+    audit_path = tmp_path / "empty.jsonl"
+    audit_path.write_text("", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="tolerance"):
+        replay_audit_log_through_pipeline(audit_path, graph, tolerance=-0.1)
+
+    with pytest.raises(ValueError, match="tolerance"):
+        replay_audit_log_through_pipeline(audit_path, graph, tolerance=True)
+
+    with pytest.raises(ValueError, match="max_discrepancies_to_record"):
+        replay_audit_log_through_pipeline(audit_path, graph, max_discrepancies_to_record=-1)
+
+    with pytest.raises(FileNotFoundError, match="Audit log file not found"):
+        replay_audit_log_through_pipeline(tmp_path / "missing.jsonl", graph)
+
+    with pytest.raises(FileNotFoundError, match="External observations file not found"):
+        replay_audit_log_through_pipeline(
+            audit_path, graph, data_path=tmp_path / "missing.csv"
+        )
+
+    empty_rep = replay_audit_log_through_pipeline(audit_path, graph)
+    assert empty_rep.status == "EMPTY"
+    assert empty_rep.total_transactions == 0
+
+    bad_ev = {
+        "event_id": "bad_tx",
+        "event_type": "scoring",
+        "payload": {
+            "predictions": [
+                "not_a_dict",
+                {"fraud_probability": None},
+                {"fraud_probability": True},
+                {"fraud_probability": "not_a_float"},
+                {"fraud_probability": 1.5},
+                {"fraud_probability": 0.5, "decision": "DENY"},
+            ],
+            "features": [
+                {"prob": 0.1},
+                {"prob": 0.1},
+                {"prob": 0.1},
+                {"prob": 0.1},
+                {"prob": 0.1},
+                {"raise_err": True},
+            ],
+        },
+    }
+    audit_path.write_text(json.dumps(bad_ev) + "\n", encoding="utf-8")
+
+    def _err_prob(tx: dict[str, Any]) -> float:
+        if tx.get("raise_err"):
+            raise RuntimeError("boom")
+        return 0.1
+
+    err_graph = _create_simple_replay_graph(prob_fn=_err_prob)
+    err_graph.nodes["inference"].required = True
+    rep2 = replay_audit_log_through_pipeline(audit_path, err_graph)
+    assert rep2.status == "EMPTY"
+    assert rep2.skipped_events == 1
+
+
+def test_optimize_counterfactual_pipeline_metrics_and_validation() -> None:
+    probs = [0.1, 0.35, 0.6, 0.85]
+    y_true = [0, 0, 1, 1]
+    base_thresh = TieredThresholds(review_threshold=0.5, deny_threshold=0.8)
+    cand_thresh = TieredThresholds(review_threshold=0.3, deny_threshold=0.7)
+
+    eval_res = optimize_counterfactual_pipeline(
+        probabilities=probs,
+        candidate_thresholds=cand_thresh,
+        baseline_thresholds=base_thresh,
+        y_true=y_true,
+        manual_review_cost=5.0,
+        false_deny_cost=50.0,
+        missed_fraud_cost=200.0,
+    )
+    assert isinstance(eval_res, PipelineCounterfactualEvaluation)
+    assert eval_res.rows == 4
+    assert eval_res.turnover_count > 0
+    assert eval_res.baseline_metrics is not None
+    assert eval_res.candidate_metrics is not None
+    assert eval_res.cost_delta is not None
+    assert eval_res.fraud_catch_delta is not None
+
+    d = eval_res.to_dict()
+    assert d["rows"] == 4
+    assert d["baseline_metrics"] is not None
+
+    eval_with_dec = optimize_counterfactual_pipeline(
+        probabilities=probs,
+        candidate_thresholds=cand_thresh,
+        baseline_decisions=["ALLOW", "REVIEW", "DENY", "DENY"],
+    )
+    assert eval_with_dec.baseline_decision_counts["ALLOW"] == 1
+    assert eval_with_dec.baseline_decision_counts["CHALLENGE"] == 1
+    assert eval_with_dec.baseline_decision_counts["DENY"] == 2
+    assert eval_with_dec.baseline_metrics is None
+
+    with pytest.raises(TypeError, match="candidate_thresholds"):
+        optimize_counterfactual_pipeline(probs, "invalid")  # type: ignore[arg-type]
+
+    with pytest.raises(TypeError, match="baseline_thresholds"):
+        optimize_counterfactual_pipeline(
+            probs, cand_thresh, baseline_thresholds="invalid"  # type: ignore[arg-type]
+        )
+
+    with pytest.raises(ValueError, match="manual_review_cost"):
+        optimize_counterfactual_pipeline(probs, cand_thresh, manual_review_cost=-1.0)
+
+    with pytest.raises(ValueError, match="non-empty"):
+        optimize_counterfactual_pipeline([], cand_thresh)
+
+    with pytest.raises(ValueError, match="between 0 and 1"):
+        optimize_counterfactual_pipeline([0.2, 1.5], cand_thresh)
+
+    with pytest.raises(ValueError, match="baseline_decisions"):
+        optimize_counterfactual_pipeline(probs, cand_thresh, baseline_decisions=["ALLOW"])
+
+    with pytest.raises(ValueError, match="Length of y_true"):
+        optimize_counterfactual_pipeline(probs, cand_thresh, y_true=[0, 1])
