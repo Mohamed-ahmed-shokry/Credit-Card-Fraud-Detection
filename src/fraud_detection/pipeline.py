@@ -468,6 +468,11 @@ class StageCircuitBreaker:
         self._half_open_in_flight: int = 0
         self._half_open_successes: int = 0
 
+    @property
+    def state(self) -> StageCircuitState:
+        """Effective state of the circuit breaker."""
+        return self.get_stats().state
+
     def allow_execution(self, now: float | None = None) -> bool:
         """Return True if the stage is allowed to execute, False if short-circuited."""
         if not self.policy.enabled:
@@ -632,6 +637,16 @@ class StageCircuitRegistry:
             for b in self._breakers.values():
                 b.reset()
             return sorted(self._breakers.keys())
+
+    @property
+    def breakers(self) -> dict[str, StageCircuitBreaker]:
+        """Thread-safe snapshot mapping of node names to their circuit breakers."""
+        with self._lock:
+            return dict(self._breakers)
+
+    def summary(self, now: float | None = None) -> dict[str, Any]:
+        """Return aggregate and per-node circuit breaker telemetry."""
+        return self.stats_dict(now=now)
 
     def stats_dict(self, now: float | None = None) -> dict[str, Any]:
         """Return aggregate and per-node circuit breaker telemetry."""
@@ -1291,6 +1306,11 @@ class DecisionGraphExecutor:
                         recovery_timeout_seconds=rec_sec,
                     ),
                 )
+
+    @property
+    def circuits(self) -> StageCircuitRegistry:
+        """Ergonomic accessor for the stage circuit registry."""
+        return self.circuit_registry
 
     async def _execute_node(self, node_name: str, context: PipelineContext) -> None:
         node = self.graph.nodes[node_name]
