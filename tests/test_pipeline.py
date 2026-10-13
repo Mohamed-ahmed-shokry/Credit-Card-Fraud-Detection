@@ -1876,9 +1876,27 @@ def test_simulate_pipeline_chaos_edge_cases_and_validation() -> None:
         )
     )
     async_specs = [
-        StageFaultSpec(node_name="async_step", fault_type=StageFaultType.LATENCY_SPIKE, start_index=0, end_index=1, latency_ms=1.0),
-        StageFaultSpec(node_name="async_step", fault_type=StageFaultType.TIMEOUT, start_index=1, end_index=2, error_message="Async timeout"),
-        StageFaultSpec(node_name="async_step", fault_type=StageFaultType.EXCEPTION, start_index=2, end_index=3, error_message="Async fail"),
+        StageFaultSpec(
+            node_name="async_step",
+            fault_type=StageFaultType.LATENCY_SPIKE,
+            start_index=0,
+            end_index=1,
+            latency_ms=1.0,
+        ),
+        StageFaultSpec(
+            node_name="async_step",
+            fault_type=StageFaultType.TIMEOUT,
+            start_index=1,
+            end_index=2,
+            error_message="Async timeout",
+        ),
+        StageFaultSpec(
+            node_name="async_step",
+            fault_type=StageFaultType.EXCEPTION,
+            start_index=2,
+            end_index=3,
+            error_message="Async fail",
+        ),
     ]
     rep_async = simulate_pipeline_chaos([{}, {}, {}], async_graph, async_specs, sla_budget_ms=100.0)
     assert rep_async.total_transactions == 3

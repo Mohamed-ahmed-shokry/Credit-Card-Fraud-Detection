@@ -3831,7 +3831,9 @@ def test_pipeline_chaos_endpoint_and_audit(
     assert ch_ev.payload["circuit_trips"] >= 1
 
 
-def test_pipeline_circuits_and_chaos_error_handling(api_context: tuple[Any, FraudModel, Any]) -> None:
+def test_pipeline_circuits_and_chaos_error_handling(
+    api_context: tuple[Any, FraudModel, Any],
+) -> None:
     _, model, _ = api_context
     # Standard app without pipeline enabled
     app_no_pipe = create_app(model=model)
