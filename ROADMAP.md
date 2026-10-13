@@ -1565,7 +1565,7 @@ This phase does not implement external service-mesh circuit breaking (Istio/Envo
 - [x] Task 1: Define stage circuit breaker primitives (`PipelineCircuitOpenError`, `StageCircuitState`, `StageCircuitPolicy`, `StageCircuitStats`, `StageCircuitBreaker`, `StageCircuitRegistry`) in `pipeline.py`.
 - [x] Task 2: Integrate stage circuit breaking into `StageStatus`, `StageExecutionResult`, `PipelineNode`, `PipelineExecutionResult`, `DecisionGraphExecutor`, and `create_default_fraud_pipeline` in `pipeline.py`.
 - [x] Task 3: Implement stage chaos fault-injection primitives (`StageFaultType`, `StageFaultSpec`, `StageChaosMetrics`, `PipelineChaosReport`) and `simulate_pipeline_chaos` in `pipeline.py`.
-- [ ] Task 4: Add `circuit_short_circuits` to `build_scoring_audit_event` and implement `build_pipeline_chaos_audit_event` in `audit.py` with unit tests in `tests/test_audit.py`.
+- [x] Task 4: Add `circuit_short_circuits` to `build_scoring_audit_event` and implement `build_pipeline_chaos_audit_event` in `audit.py` with unit tests in `tests/test_audit.py`.
 - [ ] Task 5: Expose `/v1/pipeline/circuits`, `/v1/pipeline/circuits/reset`, and `/v1/pipeline/chaos` endpoints and Prometheus metrics in `api.py` with tests in `tests/test_api.py`.
 - [ ] Task 6: Add circuit breaker flags to `pipeline-eval` and implement `pipeline-chaos` CLI command in `cli.py` with tests in `tests/test_cli.py`.
 - [ ] Task 7: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate.
