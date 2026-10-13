@@ -17,7 +17,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
-from time import monotonic, perf_counter
+from time import monotonic, perf_counter, sleep
 from typing import Any, Protocol, runtime_checkable
 from uuid import uuid4
 
@@ -2547,7 +2547,7 @@ class PipelineChaosReport:
 def simulate_pipeline_chaos(
     records: Sequence[dict[str, Any]],
     pipeline: DecisionGraph | DecisionGraphExecutor,
-    fault_specs: Sequence[StageFaultSpec],
+    fault_specs: Sequence[StageFaultSpec | dict[str, Any]],
     *,
     sla_budget_ms: float = 100.0,
     enable_circuit_breaker: bool = True,
@@ -2665,31 +2665,31 @@ def simulate_pipeline_chaos(
                 return await orig_proc(ctx)
 
             return async_chaos_wrapper
-        else:
-            def sync_chaos_wrapper(ctx: PipelineContext) -> Any:
-                for spec in node_specs:
-                    is_active = (
-                        spec.start_index <= current_tx_index
-                        and (spec.end_index is None or current_tx_index < spec.end_index)
-                    )
-                    if is_active:
-                        m = stage_chaos_metrics[node_name]
-                        m.injected_count += 1
-                        ft = (
-                            spec.fault_type
-                            if isinstance(spec.fault_type, StageFaultType)
-                            else StageFaultType(spec.fault_type)
-                        )
-                        if ft == StageFaultType.EXCEPTION:
-                            raise RuntimeError(spec.error_message)
-                        if ft == StageFaultType.TIMEOUT:
-                            time.sleep(0.005)
-                            raise TimeoutError(spec.error_message)
-                        if ft == StageFaultType.LATENCY_SPIKE and spec.latency_ms > 0:
-                            time.sleep(spec.latency_ms / 1000.0)
-                return orig_proc(ctx)
 
-            return sync_chaos_wrapper
+        def sync_chaos_wrapper(ctx: PipelineContext) -> Any:
+            for spec in node_specs:
+                is_active = (
+                    spec.start_index <= current_tx_index
+                    and (spec.end_index is None or current_tx_index < spec.end_index)
+                )
+                if is_active:
+                    m = stage_chaos_metrics[node_name]
+                    m.injected_count += 1
+                    ft = (
+                        spec.fault_type
+                        if isinstance(spec.fault_type, StageFaultType)
+                        else StageFaultType(spec.fault_type)
+                    )
+                    if ft == StageFaultType.EXCEPTION:
+                        raise RuntimeError(spec.error_message)
+                    if ft == StageFaultType.TIMEOUT:
+                        sleep(0.005)
+                        raise TimeoutError(spec.error_message)
+                    if ft == StageFaultType.LATENCY_SPIKE and spec.latency_ms > 0:
+                        sleep(spec.latency_ms / 1000.0)
+            return orig_proc(ctx)
+
+        return sync_chaos_wrapper
 
     for name, orig_proc in original_processors.items():
         graph.nodes[name].processor = make_chaos_processor(name, orig_proc)
@@ -2718,7 +2718,7 @@ def simulate_pipeline_chaos(
                         and res.stage_results[node_name].degraded
                     ):
                         stage_chaos_metrics[node_name].handled_count += 1
-            except Exception as exc:
+            except (PipelineExecutionError, RuntimeError, TimeoutError, ValueError, KeyError) as exc:
                 logger.warning("Unhandled error during chaos execution on tx %d: %s", idx, exc)
                 unhandled_errors += 1
                 latencies.append(sla_budget_ms * 2.0)
