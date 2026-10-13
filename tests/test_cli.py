@@ -6319,3 +6319,101 @@ def test_pipeline_chaos_cli_workflow(tmp_path: Path, trained_artifact: Path) -> 
         ],
     )
     assert res_unrec_fail.exit_code == 1
+
+    # Text output check with --output option
+    res_text_out = runner.invoke(
+        app,
+        [
+            "pipeline-chaos",
+            "--input",
+            str(data_path),
+            "--faults",
+            str(faults_path),
+            "--model",
+            str(trained_artifact),
+            "--output",
+            str(tmp_path / "text_chaos_out.json"),
+        ],
+    )
+    assert res_text_out.exit_code == 0
+    assert "Report written to:" in res_text_out.output
+
+    # Error handling: non-existent model
+    res_bad_model = runner.invoke(
+        app,
+        [
+            "pipeline-chaos",
+            "--input",
+            str(data_path),
+            "--faults",
+            str(faults_path),
+            "--model",
+            str(tmp_path / "non_existent_model_dir"),
+        ],
+    )
+    assert res_bad_model.exit_code == 2
+    assert "Failed to load model" in res_bad_model.output
+
+    # Error handling: non-existent rules
+    res_bad_rules = runner.invoke(
+        app,
+        [
+            "pipeline-chaos",
+            "--input",
+            str(data_path),
+            "--faults",
+            str(faults_path),
+            "--rules",
+            str(tmp_path / "non_existent_rules.json"),
+        ],
+    )
+    # Error handling: empty input dataset triggering pd.read_csv EmptyDataError
+    empty_csv = tmp_path / "empty_input.csv"
+    empty_csv.write_text("", encoding="utf-8")
+    res_bad_input = runner.invoke(
+        app,
+        [
+            "pipeline-chaos",
+            "--input",
+            str(empty_csv),
+            "--faults",
+            str(faults_path),
+        ],
+    )
+    assert res_bad_input.exit_code == 2
+    assert "Failed to read input dataset" in res_bad_input.output
+
+    # Error handling: malformed JSON faults file
+    corrupt_faults = tmp_path / "corrupt_faults.json"
+    corrupt_faults.write_text("{malformed json", encoding="utf-8")
+    res_corrupt_faults = runner.invoke(
+        app,
+        [
+            "pipeline-chaos",
+            "--input",
+            str(data_path),
+            "--faults",
+            str(corrupt_faults),
+        ],
+    )
+    assert res_corrupt_faults.exit_code == 2
+    assert "Failed to read/parse fault specifications" in res_corrupt_faults.output
+
+    # Error handling: simulation failure from unknown target node
+    bad_node_faults = tmp_path / "bad_node_faults.json"
+    bad_node_faults.write_text(
+        json.dumps([{"node_name": "unknown_node", "fault_type": "exception"}]),
+        encoding="utf-8",
+    )
+    res_sim_fail = runner.invoke(
+        app,
+        [
+            "pipeline-chaos",
+            "--input",
+            str(data_path),
+            "--faults",
+            str(bad_node_faults),
+        ],
+    )
+    assert res_sim_fail.exit_code == 2
+    assert "Chaos simulation failed" in res_sim_fail.output
