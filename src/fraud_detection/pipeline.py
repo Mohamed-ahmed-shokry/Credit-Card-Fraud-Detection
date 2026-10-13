@@ -1657,12 +1657,26 @@ def create_default_fraud_pipeline(
     cache_ttl_seconds: float = 60.0,
     cache_max_size: int = 1000,
     speculative_inference: bool = False,
+    enable_circuit_breaker: bool = False,
+    circuit_failure_threshold: int = 5,
+    circuit_recovery_timeout_seconds: float = 30.0,
 ) -> DecisionGraph:
     """Build a standard, production-ready fraud decision execution graph."""
     applied_threshold = model.threshold if threshold is None else threshold
     graph = DecisionGraph("production_fraud_pipeline")
     graph.metadata["speculative_inference"] = speculative_inference
     graph.metadata["enable_cache"] = enable_cache
+    graph.metadata["enable_circuit_breaker"] = enable_circuit_breaker
+    graph.metadata["circuit_failure_threshold"] = circuit_failure_threshold
+    graph.metadata["circuit_recovery_timeout_seconds"] = circuit_recovery_timeout_seconds
+
+    circuit_policy: StageCircuitPolicy | None = None
+    if enable_circuit_breaker:
+        circuit_policy = StageCircuitPolicy(
+            enabled=True,
+            failure_threshold=circuit_failure_threshold,
+            recovery_timeout_seconds=circuit_recovery_timeout_seconds,
+        )
 
     rules_cache_policy: NodeCachePolicy | None = None
     if enable_cache and cache_rules:
@@ -1695,6 +1709,7 @@ def create_default_fraud_pipeline(
             timeout_seconds=enrichment_timeout_seconds,
             fallback_value={},
             required=False,
+            circuit_policy=circuit_policy,
         )
     )
 
@@ -1709,6 +1724,7 @@ def create_default_fraud_pipeline(
             fallback_value={"matched": False, "short_circuited": False},
             required=False,
             cache_policy=rules_cache_policy,
+            circuit_policy=circuit_policy,
         )
     )
 
@@ -1728,6 +1744,7 @@ def create_default_fraud_pipeline(
             },
             required=False,
             cache_policy=inference_cache_policy,
+            circuit_policy=circuit_policy,
         )
     )
 
@@ -1748,6 +1765,7 @@ def create_default_fraud_pipeline(
                 "method": "fallback",
             },
             required=False,
+            circuit_policy=circuit_policy,
         )
     )
 
