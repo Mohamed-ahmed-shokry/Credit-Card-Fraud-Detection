@@ -8,7 +8,7 @@
 ## Task Status
 - [x] Task 1: Define stage circuit breaker primitives (`PipelineCircuitOpenError`, `StageCircuitState`, `StageCircuitPolicy`, `StageCircuitStats`, `StageCircuitBreaker`, `StageCircuitRegistry`) in `pipeline.py`.
 - [x] Task 2: Integrate stage circuit breaking into `StageStatus`, `StageExecutionResult`, `PipelineNode`, `PipelineExecutionResult`, `DecisionGraphExecutor`, and `create_default_fraud_pipeline` in `pipeline.py`.
-- [ ] Task 3: Implement stage chaos fault-injection primitives (`StageFaultType`, `StageFaultSpec`, `StageChaosMetrics`, `PipelineChaosReport`) and `simulate_pipeline_chaos` in `pipeline.py`.
+- [x] Task 3: Implement stage chaos fault-injection primitives (`StageFaultType`, `StageFaultSpec`, `StageChaosMetrics`, `PipelineChaosReport`) and `simulate_pipeline_chaos` in `pipeline.py`.
 - [ ] Task 4: Add `circuit_short_circuits` to `build_scoring_audit_event` and implement `build_pipeline_chaos_audit_event` in `audit.py` with unit tests in `tests/test_audit.py`.
 - [ ] Task 5: Expose `/v1/pipeline/circuits`, `/v1/pipeline/circuits/reset`, and `/v1/pipeline/chaos` endpoints and Prometheus metrics in `api.py` with tests in `tests/test_api.py`.
 - [ ] Task 6: Add circuit breaker flags to `pipeline-eval` and implement `pipeline-chaos` CLI command in `cli.py` with tests in `tests/test_cli.py`.
@@ -18,7 +18,7 @@
 | Criterion | Status | Evidence |
 |-----------|--------|----------|
 | AC-1 (Stage Circuit Breaker State Machine & Fast-Fail Isolation) | **Verified** | Verified in `tests/test_pipeline.py`: state machine transitions, fast-fail 0ms short-circuit, half-open probe recovery, required node circuit open error. |
-| AC-2 (Deterministic Stage Chaos Fault Injection & SLA Verification) | **Pending** | — |
+| AC-2 (Deterministic Stage Chaos Fault Injection & SLA Verification) | **Verified** | Verified in `tests/test_pipeline.py`: exception/timeout/latency spike simulation, SLA budget breach tracking, circuit tripping and recovery detection. |
 | AC-3 (Audit Trail Fidelity & Redaction) | **Pending** | — |
 | AC-4 (API Serving & Prometheus Telemetry) | **Pending** | — |
 | AC-5 (CLI Evaluation & Chaos Workflows) | **Pending** | — |
