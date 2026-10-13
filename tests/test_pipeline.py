@@ -1500,3 +1500,130 @@ def test_stage_circuit_registry_operations() -> None:
     assert registry.reset() == ["node_a", "node_b"]
 
 
+def test_executor_stage_circuit_breaking_fast_fail() -> None:
+    fail_enrichment = True
+
+    def flakey_enrichment(_ctx: PipelineContext) -> dict[str, Any]:
+        if fail_enrichment:
+            raise RuntimeError("Enrichment service unavailable")
+        return {"account_age": 100}
+
+    graph = DecisionGraph("cb_graph")
+    graph.add_node(
+        PipelineNode(
+            name="enrichment",
+            stage_type=StageType.ENRICHMENT,
+            processor=flakey_enrichment,
+            fallback_value={"account_age": 0},
+            required=False,
+            circuit_policy=StageCircuitPolicy(
+                failure_threshold=2,
+                recovery_timeout_seconds=0.05,
+                half_open_max_calls=1,
+            ),
+        )
+    )
+    graph.add_node(
+        PipelineNode(
+            name="action",
+            stage_type=StageType.ACTION,
+            processor=lambda ctx: {
+                "decision": "ALLOW",
+                "age": ctx.get_output("enrichment").get("account_age", 0),
+            },
+            dependencies=["enrichment"],
+            required=True,
+        )
+    )
+
+    executor = DecisionGraphExecutor(graph)
+
+    # 1st run fails (fallback, degraded, breaker consecutive failures = 1, CLOSED)
+    res1 = executor.execute_sync({"tx_id": "1"})
+    assert res1.stage_results["enrichment"].status == StageStatus.FALLBACK
+    assert res1.stage_results["enrichment"].degraded is True
+    assert res1.stage_results["enrichment"].short_circuited_by_breaker is False
+    assert res1.circuit_short_circuits == []
+
+    # 2nd run fails (fallback, trips breaker to OPEN)
+    res2 = executor.execute_sync({"tx_id": "2"})
+    assert res2.stage_results["enrichment"].status == StageStatus.FALLBACK
+    assert executor.circuit_registry.get_breaker("enrichment") is not None
+    assert (
+        executor.circuit_registry.get_breaker("enrichment").get_stats().state  # type: ignore[union-attr]
+        == StageCircuitState.OPEN
+    )
+
+    # 3rd run short-circuits in O(1) immediately!
+    res3 = executor.execute_sync({"tx_id": "3"})
+    assert res3.stage_results["enrichment"].status == StageStatus.CIRCUIT_OPEN
+    assert res3.stage_results["enrichment"].short_circuited_by_breaker is True
+    assert res3.stage_results["enrichment"].degraded is True
+    assert res3.circuit_short_circuits == ["enrichment"]
+    assert res3.final_decision["age"] == 0
+    assert res3.to_dict()["circuit_short_circuits"] == ["enrichment"]
+
+    # Wait for recovery timeout, fix service, verify half-open recovery to CLOSED
+    time.sleep(0.06)
+    fail_enrichment = False
+    res4 = executor.execute_sync({"tx_id": "4"})
+    assert res4.stage_results["enrichment"].status == StageStatus.SUCCESS
+    assert res4.stage_results["enrichment"].short_circuited_by_breaker is False
+    assert res4.final_decision["age"] == 100
+    assert (
+        executor.circuit_registry.get_breaker("enrichment").get_stats().state  # type: ignore[union-attr]
+        == StageCircuitState.CLOSED
+    )
+
+
+def test_executor_required_stage_circuit_open_raises() -> None:
+    graph = DecisionGraph("req_cb_graph")
+    graph.add_node(
+        PipelineNode(
+            name="required_step",
+            stage_type=StageType.ACTION,
+            processor=lambda _ctx: (_ for _ in ()).throw(RuntimeError("action failed")),
+            required=True,
+            circuit_policy=StageCircuitPolicy(failure_threshold=1, recovery_timeout_seconds=10.0),
+        )
+    )
+    executor = DecisionGraphExecutor(graph)
+
+    # 1st run fails and raises PipelineExecutionError, tripping breaker to OPEN
+    with pytest.raises(PipelineExecutionError, match="action failed"):
+        executor.execute_sync({})
+
+    # 2nd run short-circuits and raises PipelineCircuitOpenError
+    with pytest.raises(PipelineCircuitOpenError, match="circuit breaker is open"):
+        executor.execute_sync({})
+
+
+def test_default_fraud_pipeline_circuit_breakers() -> None:
+    dataset = validate_frame(generate_synthetic_data(rows=250, fraud_rate=0.1, random_state=42))
+    model = train_model(dataset)
+
+    pipe = create_default_fraud_pipeline(
+        model,
+        enable_circuit_breaker=True,
+        circuit_failure_threshold=3,
+        circuit_recovery_timeout_seconds=15.0,
+    )
+    assert pipe.metadata["enable_circuit_breaker"] is True
+    assert pipe.metadata["circuit_failure_threshold"] == 3
+    assert pipe.metadata["circuit_recovery_timeout_seconds"] == 15.0
+
+    enrichment_node = pipe.nodes["enrichment"]
+    assert enrichment_node.circuit_policy is not None
+    assert enrichment_node.circuit_policy.failure_threshold == 3
+    assert enrichment_node.circuit_policy.recovery_timeout_seconds == 15.0
+    assert enrichment_node.to_dict()["circuit_policy"] is not None
+
+    executor = DecisionGraphExecutor(pipe)
+    stats = executor.circuit_registry.stats_dict()
+    assert "enrichment" in stats["nodes"]
+    assert "rules" in stats["nodes"]
+    assert "inference" in stats["nodes"]
+    assert "calibration" in stats["nodes"]
+
+
+
