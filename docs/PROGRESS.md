@@ -11,7 +11,7 @@
 - [x] Task 3: Implement stage chaos fault-injection primitives (`StageFaultType`, `StageFaultSpec`, `StageChaosMetrics`, `PipelineChaosReport`) and `simulate_pipeline_chaos` in `pipeline.py`.
 - [x] Task 4: Add `circuit_short_circuits` to `build_scoring_audit_event` and implement `build_pipeline_chaos_audit_event` in `audit.py` with unit tests in `tests/test_audit.py`.
 - [x] Task 5: Expose `/v1/pipeline/circuits`, `/v1/pipeline/circuits/reset`, and `/v1/pipeline/chaos` endpoints and Prometheus metrics in `api.py` with tests in `tests/test_api.py`.
-- [ ] Task 6: Add circuit breaker flags to `pipeline-eval` and implement `pipeline-chaos` CLI command in `cli.py` with tests in `tests/test_cli.py`.
+- [x] Task 6: Add circuit breaker flags to `pipeline-eval` and implement `pipeline-chaos` CLI command in `cli.py` with tests in `tests/test_cli.py`.
 - [ ] Task 7: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate.
 
 ## Acceptance Criteria Status
@@ -21,7 +21,7 @@
 | AC-2 (Deterministic Stage Chaos Fault Injection & SLA Verification) | **Verified** | Verified in `tests/test_pipeline.py`: exception/timeout/latency spike simulation, SLA budget breach tracking, circuit tripping and recovery detection. |
 | AC-3 (Audit Trail Fidelity & Redaction) | **Verified** | Verified in `tests/test_audit.py`: circuit_short_circuits in scoring event, pipeline_chaos event payload structure and sensitive metadata redaction. |
 | AC-4 (API Serving & Prometheus Telemetry) | **Verified** | Verified in `tests/test_api.py`: GET `/v1/pipeline/circuits`, POST `/v1/pipeline/circuits/reset`, POST `/v1/pipeline/chaos`, circuit_short_circuits scoring telemetry, Prometheus metrics export. |
-| AC-5 (CLI Evaluation & Chaos Workflows) | **Pending** | — |
+| AC-5 (CLI Evaluation & Chaos Workflows) | **Verified** | Verified in `tests/test_cli.py`: `pipeline-eval` circuit breaker flags & short-circuits reporting, `pipeline-chaos` execution, `--fail-on-sla-breach`, `--fail-on-unrecovered`, audit logging. |
 | AC-6 (Quality Standards & Zero Regressions) | **Pending** | — |
 
 ## Decision Log
