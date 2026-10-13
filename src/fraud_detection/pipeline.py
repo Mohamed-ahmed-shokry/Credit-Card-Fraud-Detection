@@ -1577,6 +1577,7 @@ class DecisionGraphExecutor:
                 self.cache.get_policy(name) is not None
                 or getattr(self.graph.nodes.get(name), "cache_policy", None) is not None
             )
+        )
         circuit_short_circuits = [
             node_name
             for node_name, res in context.results.items()
