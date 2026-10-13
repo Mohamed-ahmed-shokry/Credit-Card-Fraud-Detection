@@ -2444,19 +2444,21 @@ class StageFaultSpec:
     def __post_init__(self) -> None:
         if not self.node_name or not isinstance(self.node_name, str):
             raise ValueError("node_name must be a non-empty string")
-        if not isinstance(self.fault_type, StageFaultType):
+        raw_type = getattr(self, "fault_type")
+        if not isinstance(raw_type, StageFaultType):
             try:
-                object.__setattr__(self, "fault_type", StageFaultType(self.fault_type))
-            except ValueError:
+                object.__setattr__(self, "fault_type", StageFaultType(raw_type))
+            except (ValueError, TypeError):
                 raise ValueError(
-                    f"Unsupported fault_type '{self.fault_type}'. "
+                    f"Unsupported fault_type '{raw_type}'. "
                     f"Must be one of {[t.value for t in StageFaultType]}"
                 ) from None
         if isinstance(self.start_index, bool) or self.start_index < 0:
             raise ValueError("start_index must be an integer >= 0")
-        if self.end_index is not None:
-            if isinstance(self.end_index, bool) or self.end_index < self.start_index:
-                raise ValueError("end_index must be an integer >= start_index")
+        if self.end_index is not None and (
+            isinstance(self.end_index, bool) or self.end_index < self.start_index
+        ):
+            raise ValueError("end_index must be an integer >= start_index")
         if (
             isinstance(self.latency_ms, bool)
             or not math.isfinite(self.latency_ms)
