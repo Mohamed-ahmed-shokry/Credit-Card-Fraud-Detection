@@ -2467,9 +2467,14 @@ class StageFaultSpec:
 
     def to_dict(self) -> dict[str, Any]:
         """Convert fault specification to a serializable dictionary."""
+        ft_val = (
+            self.fault_type.value
+            if isinstance(self.fault_type, StageFaultType)
+            else str(self.fault_type)
+        )
         return {
             "node_name": self.node_name,
-            "fault_type": self.fault_type.value,
+            "fault_type": ft_val,
             "start_index": self.start_index,
             "end_index": self.end_index,
             "latency_ms": round(self.latency_ms, 3),
