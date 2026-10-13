@@ -3660,3 +3660,181 @@ def test_pipeline_counterfactual_endpoint(
     assert bad_y.status_code == 400
     assert "Length of y_true" in bad_y.json()["detail"]
 
+
+def test_pipeline_circuit_endpoints_and_telemetry(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, model, dataset = api_context
+
+    # 1. Pipeline disabled -> 404
+    app_disabled = create_app(model=model, enable_pipeline=False)
+    with TestClient(app_disabled) as client:
+        res = client.get("/v1/pipeline/circuits")
+        assert res.status_code == 404
+        assert "not enabled" in res.json()["detail"]
+        reset_res = client.post("/v1/pipeline/circuits/reset", json={})
+        assert reset_res.status_code == 404
+
+    # 2. Pipeline enabled, circuit breakers disabled -> 404
+    app_no_cb = create_app(
+        model=model,
+        enable_pipeline=True,
+        enable_pipeline_circuit_breaker=False,
+    )
+    with TestClient(app_no_cb) as client:
+        res = client.get("/v1/pipeline/circuits")
+        assert res.status_code == 404
+        assert "circuit breakers are not enabled" in res.json()["detail"]
+        reset_res = client.post("/v1/pipeline/circuits/reset", json={})
+        assert reset_res.status_code == 404
+
+    # 3. Pipeline enabled with circuit breakers
+    app_cb = create_app(
+        model=model,
+        enable_pipeline=True,
+        enable_pipeline_circuit_breaker=True,
+        pipeline_circuit_failure_threshold=2,
+        pipeline_circuit_recovery_timeout_seconds=10.0,
+    )
+    with TestClient(app_cb) as client:
+        status_res = client.get("/v1/pipeline/circuits")
+        assert status_res.status_code == 200
+        data = status_res.json()
+        assert data["total_trips"] == 0
+        assert data["total_short_circuits"] == 0
+        assert "rules" in data["nodes"]
+
+        # Trip the rules circuit breaker manually via executor
+        executor = app_cb.state.pipeline_executor
+        assert executor is not None
+        executor.circuits.record_failure("rules", reason="chaos_error")
+        executor.circuits.record_failure("rules", reason="chaos_error")
+
+        status_after_trip = client.get("/v1/pipeline/circuits").json()
+        assert status_after_trip["total_trips"] >= 1
+        assert "rules" in status_after_trip["open_nodes"]
+
+        # Scoring will fast-fail 'rules' node and record short circuit
+        rec = dataset.features.iloc[0].to_dict()
+        score_res = client.post("/v1/pipeline/score", json={"transaction": rec})
+        assert score_res.status_code == 200
+        score_data = score_res.json()
+        assert "rules" in score_data["circuit_short_circuits"]
+        assert score_data["degraded"] is True
+
+        # Verify Prometheus metrics sync
+        m_res = client.get("/metrics")
+        assert m_res.status_code == 200
+        assert 'fraud_pipeline_circuit_state{stage="rules"} 1.0' in m_res.text
+        assert 'fraud_pipeline_circuit_short_circuits_total{stage="rules"}' in m_res.text
+
+        # Reset specific node
+        reset_res = client.post("/v1/pipeline/circuits/reset", json={"stage_name": "rules"})
+        assert reset_res.status_code == 200
+        assert reset_res.json()["reset_nodes"] == ["rules"]
+
+        # Verify state is closed again
+        status_after_reset = client.get("/v1/pipeline/circuits").json()
+        assert "rules" not in status_after_reset["open_nodes"]
+
+        # Reset all nodes
+        reset_all = client.post("/v1/pipeline/circuits/reset", json={})
+        assert reset_all.status_code == 200
+        assert "rules" in reset_all.json()["reset_nodes"]
+
+
+def test_pipeline_chaos_endpoint_and_audit(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    from fraud_detection.audit import AuditEvent, AuditSink
+
+    class LocalCaptureSink(AuditSink):
+        def __init__(self) -> None:
+            self.events: list[AuditEvent] = []
+
+        def emit(self, event: AuditEvent) -> None:
+            self.events.append(event)
+
+        def close(self) -> None:
+            pass
+
+    _, model, dataset = api_context
+    sink = LocalCaptureSink()
+    app = create_app(
+        model=model,
+        enable_pipeline=True,
+        enable_pipeline_circuit_breaker=True,
+        audit_sink=sink,
+    )
+    records = dataset.features.iloc[:10].to_dict(orient="records")
+
+    with TestClient(app) as client:
+        # Invalid payload (unknown fault_type) -> 422
+        bad_type_res = client.post(
+            "/v1/pipeline/chaos",
+            json={
+                "records": records,
+                "fault_specs": [{"node_name": "rules", "fault_type": "unknown_fault"}],
+            },
+        )
+        assert bad_type_res.status_code == 422
+
+        # Invalid indices (end < start) -> 422
+        bad_idx_res = client.post(
+            "/v1/pipeline/chaos",
+            json={
+                "records": records,
+                "fault_specs": [
+                    {
+                        "node_name": "rules",
+                        "fault_type": "exception",
+                        "start_index": 5,
+                        "end_index": 2,
+                    }
+                ],
+            },
+        )
+        assert bad_idx_res.status_code == 422
+
+        # Valid chaos simulation with circuit breaking
+        ok_res = client.post(
+            "/v1/pipeline/chaos",
+            json={
+                "records": records,
+                "fault_specs": [
+                    {
+                        "node_name": "rules",
+                        "fault_type": "exception",
+                        "start_index": 0,
+                        "end_index": 3,
+                        "error_message": "Synthetic Chaos Error",
+                    }
+                ],
+                "sla_budget_ms": 500.0,
+                "enable_circuit_breaker": True,
+                "circuit_failure_threshold": 2,
+                "circuit_recovery_timeout_seconds": 0.01,
+            },
+        )
+        assert ok_res.status_code == 200
+        report = ok_res.json()
+        assert report["total_transactions"] == 10
+        assert report["circuit_breaker_enabled"] is True
+        assert report["circuit_trips"] >= 1
+        assert report["short_circuited_calls"] >= 1
+        assert report["recovered"] is True
+        assert "rules" in report["stage_metrics"]
+
+        # Verify Prometheus metrics
+        m_res = client.get("/metrics")
+        assert m_res.status_code == 200
+        assert "fraud_pipeline_chaos_simulations_total" in m_res.text
+
+    # Verify chaos audit event was emitted
+    chaos_events = [ev for ev in sink.events if ev.event_type == "pipeline_chaos"]
+    assert len(chaos_events) == 1
+    ch_ev = chaos_events[0]
+    assert ch_ev.payload["circuit_breaker_enabled"] is True
+    assert ch_ev.payload["circuit_trips"] >= 1
+
+
