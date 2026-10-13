@@ -10,7 +10,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 from uuid import uuid4
 
 import numpy as np
@@ -22,6 +22,9 @@ from fraud_detection.evaluation import (
     TieredThresholds,
     backtest_policy_transition,
 )
+
+if TYPE_CHECKING:
+    from fraud_detection.pipeline import PipelineChaosReport
 
 # Sensitive key keywords that must always be masked in audit payloads
 DEFAULT_SENSITIVE_KEYS: tuple[str, ...] = (
@@ -235,6 +238,7 @@ def build_scoring_audit_event(
     cache_misses: int | None = None,
     speculative_executed: bool | None = None,
     speculative_hit: bool | None = None,
+    circuit_short_circuits: Sequence[str] | None = None,
 ) -> AuditEvent:
     """Construct a structured scoring audit event."""
     fraud_count = sum(1 for p in predictions if p.get("is_fraud"))
@@ -254,6 +258,8 @@ def build_scoring_audit_event(
         payload["pipeline_stages"] = [dict(s) for s in pipeline_stages]
     if degraded_nodes is not None:
         payload["degraded_nodes"] = list(degraded_nodes)
+    if circuit_short_circuits is not None:
+        payload["circuit_short_circuits"] = list(circuit_short_circuits)
     if cache_hits is not None:
         payload["cache_hits"] = cache_hits
     if cache_misses is not None:
@@ -823,4 +829,46 @@ def backtest_audit_policy(
         manual_review_cost=manual_review_cost,
         false_deny_cost=false_deny_cost,
         missed_fraud_cost=missed_fraud_cost,
+    )
+
+
+def build_pipeline_chaos_audit_event(
+    *,
+    chaos_report: PipelineChaosReport | Mapping[str, Any],
+    model_version: str | None = None,
+    dataset_fingerprint: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> AuditEvent:
+    """Construct a structured pipeline chaos simulation audit event."""
+    report_dict = (
+        chaos_report.to_dict()
+        if hasattr(chaos_report, "to_dict")
+        else dict(chaos_report)
+    )
+    payload: dict[str, Any] = {
+        "simulation_type": "pipeline_chaos",
+        "status": str(report_dict.get("status", "UNKNOWN")),
+        "total_transactions": int(report_dict.get("total_transactions", 0)),
+        "circuit_breaker_enabled": bool(report_dict.get("circuit_breaker_enabled", False)),
+        "sla_budget_ms": float(report_dict.get("sla_budget_ms", 0.0)),
+        "sla_breaches": int(report_dict.get("sla_breaches", 0)),
+        "circuit_trips": int(report_dict.get("circuit_trips", 0)),
+        "short_circuited_calls": int(report_dict.get("short_circuited_calls", 0)),
+        "unhandled_errors": int(report_dict.get("unhandled_errors", 0)),
+        "degraded_transactions": int(report_dict.get("degraded_transactions", 0)),
+        "latencies_p50_ms": float(report_dict.get("latencies_p50_ms", 0.0)),
+        "latencies_p95_ms": float(report_dict.get("latencies_p95_ms", 0.0)),
+        "latencies_max_ms": float(report_dict.get("latencies_max_ms", 0.0)),
+        "recovered": bool(report_dict.get("recovered", False)),
+        "fault_specs": list(report_dict.get("fault_specs", [])),
+        "stage_metrics": dict(report_dict.get("stage_metrics", {})),
+    }
+    if metadata:
+        payload["metadata"] = dict(metadata)
+
+    return AuditEvent(
+        event_type="pipeline_chaos",
+        model_version=model_version,
+        dataset_fingerprint=dataset_fingerprint,
+        payload=payload,
     )
