@@ -1853,3 +1853,33 @@ def test_simulate_pipeline_chaos_edge_cases_and_validation() -> None:
     rep_dict = simulate_pipeline_chaos([{}], graph, [dict_spec])
     assert rep_dict.total_transactions == 1
     assert rep_dict.status in ("RESILIENT", "DEGRADED", "SLA_BREACHED")
+
+    # Pipeline passed as DecisionGraphExecutor
+    executor = DecisionGraphExecutor(graph)
+    rep_exec = simulate_pipeline_chaos([{}], executor, [])
+    assert rep_exec.total_transactions == 1
+
+    # Async stage processor under chaos simulation
+    async_graph = DecisionGraph()
+
+    async def async_proc(ctx: PipelineContext) -> dict[str, Any]:
+        await asyncio.sleep(0.001)
+        return {"processed": True}
+
+    async_graph.add_node(
+        PipelineNode(
+            name="async_step",
+            stage_type=StageType.CUSTOM,
+            processor=async_proc,
+            required=False,
+            fallback_value={"processed": False},
+        )
+    )
+    async_specs = [
+        StageFaultSpec(node_name="async_step", fault_type=StageFaultType.LATENCY_SPIKE, start_index=0, end_index=1, latency_ms=1.0),
+        StageFaultSpec(node_name="async_step", fault_type=StageFaultType.TIMEOUT, start_index=1, end_index=2, error_message="Async timeout"),
+        StageFaultSpec(node_name="async_step", fault_type=StageFaultType.EXCEPTION, start_index=2, end_index=3, error_message="Async fail"),
+    ]
+    rep_async = simulate_pipeline_chaos([{}, {}, {}], async_graph, async_specs, sla_budget_ms=100.0)
+    assert rep_async.total_transactions == 3
+    assert rep_async.degraded_transactions >= 2
