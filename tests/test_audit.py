@@ -19,6 +19,7 @@ from fraud_detection.audit import (
     _is_luhn_valid,
     _mask_pans_in_string,
     backtest_audit_policy,
+    build_pipeline_chaos_audit_event,
     build_pipeline_replay_audit_event,
     build_promotion_audit_event,
     build_scoring_audit_event,
@@ -867,4 +868,68 @@ def test_build_pipeline_replay_audit_event() -> None:
     assert "mean_latency_ms" not in minimal_event.payload
     assert "p95_latency_ms" not in minimal_event.payload
     assert "metadata" not in minimal_event.payload
+
+
+def test_build_scoring_audit_event_with_circuit_short_circuits() -> None:
+    event = build_scoring_audit_event(
+        model_version="v2",
+        dataset_fingerprint="fp123",
+        threshold=0.5,
+        predictions=[{"is_fraud": False, "decision": "ALLOW"}],
+        circuit_short_circuits=["enrichment", "rules"],
+    )
+    assert event.payload["circuit_short_circuits"] == ["enrichment", "rules"]
+    assert "enrichment" in event.to_dict()["payload"]["circuit_short_circuits"]
+
+
+def test_build_pipeline_chaos_audit_event() -> None:
+    raw_report = {
+        "status": "RESILIENT",
+        "total_transactions": 50,
+        "circuit_breaker_enabled": True,
+        "sla_budget_ms": 100.0,
+        "sla_breaches": 0,
+        "circuit_trips": 1,
+        "short_circuited_calls": 5,
+        "unhandled_errors": 0,
+        "degraded_transactions": 5,
+        "latencies_p50_ms": 1.2,
+        "latencies_p95_ms": 3.4,
+        "latencies_max_ms": 5.6,
+        "recovered": True,
+        "fault_specs": [{"node_name": "enrichment", "fault_type": "exception"}],
+        "stage_metrics": {
+            "enrichment": {
+                "node_name": "enrichment",
+                "fault_type": "exception",
+                "injected_count": 2,
+                "handled_count": 2,
+                "tripped_circuit": True,
+            }
+        },
+    }
+
+    event = build_pipeline_chaos_audit_event(
+        chaos_report=raw_report,
+        model_version="model_chaos_v1",
+        dataset_fingerprint="ds_chaos_fp",
+        metadata={"environment": "canary", "api_key": "dummy_key_12345"},
+    )
+
+    assert event.event_type == "pipeline_chaos"
+    assert event.model_version == "model_chaos_v1"
+    assert event.dataset_fingerprint == "ds_chaos_fp"
+    assert event.payload["simulation_type"] == "pipeline_chaos"
+    assert event.payload["status"] == "RESILIENT"
+    assert event.payload["total_transactions"] == 50
+    assert event.payload["circuit_breaker_enabled"] is True
+    assert event.payload["circuit_trips"] == 1
+    assert event.payload["short_circuited_calls"] == 5
+    assert event.payload["recovered"] is True
+
+    # Check redaction of metadata
+    d = event.to_dict(redact=True)
+    assert d["payload"]["metadata"]["environment"] == "canary"
+    assert d["payload"]["metadata"]["api_key"] == "[REDACTED]"
+
 
