@@ -5039,9 +5039,7 @@ def pipeline_eval(
     circuit_short_circuits_count = 0
     circuit_short_circuit_node_counts: dict[str, int] = {}
     latencies: list[float] = []
-    stage_latencies: dict[str, list[float]] = {
-        node_name: [] for node_name in pipeline_graph.nodes
-    }
+    stage_latencies: dict[str, list[float]] = {node_name: [] for node_name in pipeline_graph.nodes}
     total_cache_hits = 0
     total_cache_misses = 0
     speculative_executed_count = 0
@@ -5058,9 +5056,7 @@ def pipeline_eval(
         if res.degraded:
             degraded_count += 1
             for node_name in res.degraded_nodes:
-                degraded_node_counts[node_name] = (
-                    degraded_node_counts.get(node_name, 0) + 1
-                )
+                degraded_node_counts[node_name] = degraded_node_counts.get(node_name, 0) + 1
         if res.circuit_short_circuits:
             circuit_short_circuits_count += len(res.circuit_short_circuits)
             for sc_node in res.circuit_short_circuits:
@@ -5083,9 +5079,7 @@ def pipeline_eval(
     p99_lat = float(np.percentile(latencies, 99)) if latencies else 0.0
 
     cache_lookups = total_cache_hits + total_cache_misses
-    cache_hit_ratio = (
-        round(total_cache_hits / cache_lookups, 4) if cache_lookups > 0 else 0.0
-    )
+    cache_hit_ratio = round(total_cache_hits / cache_lookups, 4) if cache_lookups > 0 else 0.0
 
     stage_stats: dict[str, dict[str, float]] = {}
     for stage_name, slist in stage_latencies.items():
@@ -5402,8 +5396,7 @@ def pipeline_replay_command(
         typer.echo(f"  Scoring Events: {report.replayed_events}/{report.scoring_events}")
         typer.echo(f"  Transactions Replayed: {report.total_transactions}")
         typer.echo(
-            f"  Score Discrepancies: {report.score_discrepancies} "
-            f"(tolerance={report.tolerance})"
+            f"  Score Discrepancies: {report.score_discrepancies} (tolerance={report.tolerance})"
         )
         typer.echo(f"  Decision Flips: {report.decision_flips} ({report.flip_rate:.2%})")
         typer.echo(
@@ -5613,9 +5606,7 @@ def pipeline_counterfactual_command(
         baseline_th = TieredThresholds(inferred_baseline_review, inferred_baseline_deny)
 
     try:
-        base_decs = (
-            logged_decisions if len(logged_decisions) == len(probs_list) else None
-        )
+        base_decs = logged_decisions if len(logged_decisions) == len(probs_list) else None
         cf_eval = optimize_counterfactual_pipeline(
             probabilities=probs_list,
             candidate_thresholds=candidate_th,
@@ -5656,8 +5647,7 @@ def pipeline_counterfactual_command(
             f"({cf_eval.review_rate_delta:+.1%})"
         )
         typer.echo(
-            f"Deny Volume Delta: {cf_eval.deny_count_delta:+d} "
-            f"({cf_eval.deny_rate_delta:+.1%})"
+            f"Deny Volume Delta: {cf_eval.deny_count_delta:+d} ({cf_eval.deny_rate_delta:+.1%})"
         )
         typer.echo("Transition Matrix (Baseline -> Candidate):")
         typer.echo(
@@ -5898,10 +5888,7 @@ def pipeline_chaos_command(
         typer.echo(f"  Status: {report.status}")
         typer.echo(f"  Transactions: {report.total_transactions}")
         typer.echo(f"  Circuit Breaker Enabled: {report.circuit_breaker_enabled}")
-        typer.echo(
-            f"  SLA Budget: {report.sla_budget_ms:.2f}ms "
-            f"(Breaches: {report.sla_breaches})"
-        )
+        typer.echo(f"  SLA Budget: {report.sla_budget_ms:.2f}ms (Breaches: {report.sla_breaches})")
         typer.echo(
             f"  Circuit Trips: {report.circuit_trips}, "
             f"Short-Circuited: {report.short_circuited_calls}"
@@ -5929,7 +5916,6 @@ def pipeline_chaos_command(
 
     if fail_on_unrecovered and not report.recovered:
         raise typer.Exit(code=1)
-
 
 
 def _abort(message: str) -> NoReturn:

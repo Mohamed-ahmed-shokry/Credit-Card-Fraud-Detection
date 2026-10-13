@@ -125,12 +125,8 @@ PIPELINE_CACHE_ENABLED_ENVIRONMENT_VARIABLE = "FRAUD_PIPELINE_CACHE_ENABLED"
 PIPELINE_SPECULATIVE_ENVIRONMENT_VARIABLE = "FRAUD_PIPELINE_SPECULATIVE_ENABLED"
 PIPELINE_CACHE_TTL_ENVIRONMENT_VARIABLE = "FRAUD_PIPELINE_CACHE_TTL_SECONDS"
 PIPELINE_CACHE_SIZE_ENVIRONMENT_VARIABLE = "FRAUD_PIPELINE_CACHE_MAX_SIZE"
-PIPELINE_CIRCUIT_BREAKER_ENABLED_ENVIRONMENT_VARIABLE = (
-    "FRAUD_PIPELINE_CIRCUIT_BREAKER_ENABLED"
-)
-PIPELINE_CIRCUIT_FAILURE_THRESHOLD_ENVIRONMENT_VARIABLE = (
-    "FRAUD_PIPELINE_CIRCUIT_FAILURE_THRESHOLD"
-)
+PIPELINE_CIRCUIT_BREAKER_ENABLED_ENVIRONMENT_VARIABLE = "FRAUD_PIPELINE_CIRCUIT_BREAKER_ENABLED"
+PIPELINE_CIRCUIT_FAILURE_THRESHOLD_ENVIRONMENT_VARIABLE = "FRAUD_PIPELINE_CIRCUIT_FAILURE_THRESHOLD"
 PIPELINE_CIRCUIT_RECOVERY_TIMEOUT_ENVIRONMENT_VARIABLE = (
     "FRAUD_PIPELINE_CIRCUIT_RECOVERY_TIMEOUT_SECONDS"
 )
@@ -1201,45 +1197,39 @@ def create_app(
         resolved_feature_store = FileFeatureStore.from_file(resolved_feature_store_path)
 
     raw_pipeline_env = os.getenv(PIPELINE_ENABLED_ENVIRONMENT_VARIABLE)
-    resolved_pipeline_enabled = enable_pipeline or (
-        raw_pipeline_env.lower() in ("true", "1", "yes")
-        if raw_pipeline_env is not None
-        else False
-    ) or (pipeline is not None)
+    resolved_pipeline_enabled = (
+        enable_pipeline
+        or (
+            raw_pipeline_env.lower() in ("true", "1", "yes")
+            if raw_pipeline_env is not None
+            else False
+        )
+        or (pipeline is not None)
+    )
 
     raw_cache_env = os.getenv(PIPELINE_CACHE_ENABLED_ENVIRONMENT_VARIABLE)
     resolved_pipeline_cache_enabled = enable_pipeline_cache or (
-        raw_cache_env.lower() in ("true", "1", "yes")
-        if raw_cache_env is not None
-        else False
+        raw_cache_env.lower() in ("true", "1", "yes") if raw_cache_env is not None else False
     )
 
     raw_spec_env = os.getenv(PIPELINE_SPECULATIVE_ENVIRONMENT_VARIABLE)
     resolved_pipeline_speculative_enabled = enable_speculative_pipeline or (
-        raw_spec_env.lower() in ("true", "1", "yes")
-        if raw_spec_env is not None
-        else False
+        raw_spec_env.lower() in ("true", "1", "yes") if raw_spec_env is not None else False
     )
 
     raw_ttl_env = os.getenv(PIPELINE_CACHE_TTL_ENVIRONMENT_VARIABLE)
     resolved_pipeline_cache_ttl = (
-        float(raw_ttl_env)
-        if raw_ttl_env is not None
-        else pipeline_cache_ttl_seconds
+        float(raw_ttl_env) if raw_ttl_env is not None else pipeline_cache_ttl_seconds
     )
 
     raw_size_env = os.getenv(PIPELINE_CACHE_SIZE_ENVIRONMENT_VARIABLE)
     resolved_pipeline_cache_max_size = (
-        int(raw_size_env)
-        if raw_size_env is not None
-        else pipeline_cache_max_size
+        int(raw_size_env) if raw_size_env is not None else pipeline_cache_max_size
     )
 
     raw_pipe_cb_env = os.getenv(PIPELINE_CIRCUIT_BREAKER_ENABLED_ENVIRONMENT_VARIABLE)
     resolved_pipeline_cb_enabled = enable_pipeline_circuit_breaker or (
-        raw_pipe_cb_env.lower() in ("true", "1", "yes")
-        if raw_pipe_cb_env is not None
-        else False
+        raw_pipe_cb_env.lower() in ("true", "1", "yes") if raw_pipe_cb_env is not None else False
     )
 
     raw_pipe_thresh_env = os.getenv(PIPELINE_CIRCUIT_FAILURE_THRESHOLD_ENVIRONMENT_VARIABLE)
@@ -1575,9 +1565,7 @@ def create_app(
                 if c_auto is None:
                     raw_auto = os.getenv(CANARY_AUTO_ROLLBACK_ENVIRONMENT_VARIABLE)
                     c_auto = (
-                        raw_auto.lower() in ("true", "1", "yes")
-                        if raw_auto is not None
-                        else True
+                        raw_auto.lower() in ("true", "1", "yes") if raw_auto is not None else True
                     )
 
                 built_canary_cfg = canary_config or CanaryConfig(
@@ -1674,12 +1662,8 @@ def create_app(
         application.state.pipeline_speculative_executions_counter = (
             pipeline_speculative_executions_counter
         )
-        application.state.pipeline_speculative_hits_counter = (
-            pipeline_speculative_hits_counter
-        )
-        application.state.pipeline_replay_evaluations_counter = (
-            pipeline_replay_evaluations_counter
-        )
+        application.state.pipeline_speculative_hits_counter = pipeline_speculative_hits_counter
+        application.state.pipeline_replay_evaluations_counter = pipeline_replay_evaluations_counter
         application.state.pipeline_replay_discrepancies_counter = (
             pipeline_replay_discrepancies_counter
         )
@@ -1687,9 +1671,7 @@ def create_app(
         application.state.pipeline_circuit_failure_threshold = (
             resolved_pipeline_cb_failure_threshold
         )
-        application.state.pipeline_circuit_recovery_timeout = (
-            resolved_pipeline_cb_recovery_timeout
-        )
+        application.state.pipeline_circuit_recovery_timeout = resolved_pipeline_cb_recovery_timeout
         application.state.pipeline_circuit_short_circuits_counter = (
             pipeline_circuit_short_circuits_counter
         )
@@ -2306,9 +2288,7 @@ def create_app(
                 is_mixed = True
                 model_role = "mixed"
                 routed_version = f"{router.champion_version}+{router.challenger_version}"
-                champ_indices = [
-                    i for i, d in enumerate(decisions) if d.role == ModelRole.CHAMPION
-                ]
+                champ_indices = [i for i, d in enumerate(decisions) if d.role == ModelRole.CHAMPION]
                 chall_indices = [
                     i for i, d in enumerate(decisions) if d.role == ModelRole.CHALLENGER
                 ]
@@ -2483,9 +2463,7 @@ def create_app(
                     shadow_discrepancy_total_counter=getattr(
                         request.app.state, "shadow_discrepancy_total_counter", None
                     ),
-                    canary_status_gauge=getattr(
-                        request.app.state, "canary_status_gauge", None
-                    ),
+                    canary_status_gauge=getattr(request.app.state, "canary_status_gauge", None),
                 )
             )
             shadow_tasks.add(shadow_task)
@@ -2616,9 +2594,7 @@ def create_app(
             frame_records,
             enriched_features,
             feature_views_applied,
-        ) = _enrich_records_with_feature_store(
-            request, frame_records, set(loaded.feature_names)
-        )
+        ) = _enrich_records_with_feature_store(request, frame_records, set(loaded.feature_names))
 
         try:
             (
@@ -2702,9 +2678,7 @@ def create_app(
             frame_records,
             enriched_features,
             feature_views_applied,
-        ) = _enrich_records_with_feature_store(
-            request, frame_records, set(loaded.feature_names)
-        )
+        ) = _enrich_records_with_feature_store(request, frame_records, set(loaded.feature_names))
 
         try:
             (
@@ -2806,9 +2780,7 @@ def create_app(
         }
 
     @application.get("/v1/features/lookup/{entity_key}/{entity_id}", tags=["features"])
-    async def feature_store_lookup(
-        entity_key: str, entity_id: str, request: Request
-    ) -> Any:
+    async def feature_store_lookup(entity_key: str, entity_id: str, request: Request) -> Any:
         """Inspect online feature values for a specific entity."""
         fs: FeatureStoreProtocol | None = getattr(request.app.state, "feature_store", None)
         if fs is None:
@@ -3014,9 +2986,7 @@ def create_app(
                     else "pipeline"
                 ),
                 threshold=(
-                    loaded_model_for_audit.threshold
-                    if loaded_model_for_audit is not None
-                    else 0.5
+                    loaded_model_for_audit.threshold if loaded_model_for_audit is not None else 0.5
                 ),
                 features=[payload.transaction],
                 fallback_applied=result.degraded,
@@ -3306,9 +3276,7 @@ def create_app(
             )
 
         reset_nodes = executor.circuits.reset(payload.stage_name)
-        pipe_gauge: Gauge | None = getattr(
-            request.app.state, "pipeline_circuit_state_gauge", None
-        )
+        pipe_gauge: Gauge | None = getattr(request.app.state, "pipeline_circuit_state_gauge", None)
         if pipe_gauge is not None:
             for node_name in reset_nodes:
                 pipe_gauge.labels(stage=node_name).set(0.0)
@@ -3412,9 +3380,7 @@ def create_app(
         pipe_exec: DecisionGraphExecutor | None = getattr(
             application.state, "pipeline_executor", None
         )
-        pipe_gauge: Gauge | None = getattr(
-            application.state, "pipeline_circuit_state_gauge", None
-        )
+        pipe_gauge: Gauge | None = getattr(application.state, "pipeline_circuit_state_gauge", None)
         if pipe_exec is not None and pipe_gauge is not None:
             stage_map = {
                 StageCircuitState.CLOSED: 0.0,
@@ -3487,8 +3453,7 @@ def _evaluate_shadow_traffic(
 
         primary_probs = [p.fraud_probability for p in primary_results]
         prob_diffs = [
-            abs(p - float(s))
-            for p, s in zip(primary_probs, shadow_probabilities, strict=True)
+            abs(p - float(s)) for p, s in zip(primary_probs, shadow_probabilities, strict=True)
         ]
         mean_div = float(np.mean(prob_diffs)) if prob_diffs else 0.0
         max_div = float(np.max(prob_diffs)) if prob_diffs else 0.0

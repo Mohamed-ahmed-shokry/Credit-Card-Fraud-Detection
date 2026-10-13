@@ -931,5 +931,3 @@ def test_build_pipeline_chaos_audit_event() -> None:
     d = event.to_dict(redact=True)
     assert d["payload"]["metadata"]["environment"] == "canary"
     assert d["payload"]["metadata"]["api_key"] == "[REDACTED]"
-
-

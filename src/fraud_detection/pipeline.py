@@ -314,9 +314,7 @@ class StageExecutionCache:
                 cache.popitem(last=False)
                 stats.evictions += 1
 
-            stored_output = (
-                copy.deepcopy(output) if isinstance(output, (dict, list)) else output
-            )
+            stored_output = copy.deepcopy(output) if isinstance(output, (dict, list)) else output
             cache[key] = NodeCacheEntry(
                 created_at=current_time,
                 output=stored_output,
@@ -1431,9 +1429,7 @@ class DecisionGraphExecutor:
             logger.exception("Pipeline stage '%s' failed: %s", node_name, exc)
             self.circuit_registry.record_failure(node_name, reason=str(exc), is_timeout=False)
             if node.required:
-                raise PipelineExecutionError(
-                    f"Required stage '{node_name}' failed: {exc}"
-                ) from exc
+                raise PipelineExecutionError(f"Required stage '{node_name}' failed: {exc}") from exc
             context.results[node_name] = StageExecutionResult(
                 node_name=node.name,
                 stage_type=node.stage_type,
@@ -1586,9 +1582,7 @@ class DecisionGraphExecutor:
                 "contributions": None,
             }
 
-        degraded_nodes = [
-            node_name for node_name, res in context.results.items() if res.degraded
-        ]
+        degraded_nodes = [node_name for node_name, res in context.results.items() if res.degraded]
 
         cache_hits = sum(1 for res in context.results.values() if res.cached)
         cache_misses = sum(
@@ -1941,9 +1935,7 @@ def replay_audit_log_through_pipeline(
         external_df = pd.read_csv(data_p)
 
     executor = (
-        pipeline
-        if isinstance(pipeline, DecisionGraphExecutor)
-        else DecisionGraphExecutor(pipeline)
+        pipeline if isinstance(pipeline, DecisionGraphExecutor) else DecisionGraphExecutor(pipeline)
     )
 
     total_events = 0
@@ -1958,9 +1950,7 @@ def replay_audit_log_through_pipeline(
     max_abs_diff = 0.0
     sum_abs_diff = 0.0
     latencies: list[float] = []
-    stage_latencies_collector: dict[str, list[float]] = {
-        name: [] for name in executor.graph.nodes
-    }
+    stage_latencies_collector: dict[str, list[float]] = {name: [] for name in executor.graph.nodes}
 
     b_actions_list: list[str] = []
     r_actions_list: list[str] = []
@@ -2013,8 +2003,7 @@ def replay_audit_log_through_pipeline(
                 chunk = external_df.iloc[external_offset : external_offset + n_rows]
                 external_offset += n_rows
                 records_to_score = [
-                    {str(k): v for k, v in r.items()}
-                    for r in chunk.to_dict(orient="records")
+                    {str(k): v for k, v in r.items()} for r in chunk.to_dict(orient="records")
                 ]
             else:
                 skipped_events += 1
@@ -2086,10 +2075,9 @@ def replay_audit_log_through_pipeline(
                 b_actions_list.append(logged_dec)
                 r_actions_list.append(replayed_dec)
 
-                can_rec = (
-                    (is_score_disc or flipped)
-                    and len(discrepancies_list) < max_discrepancies_to_record
-                )
+                can_rec = (is_score_disc or flipped) and len(
+                    discrepancies_list
+                ) < max_discrepancies_to_record
                 if can_rec:
                     discrepancies_list.append(
                         PipelineDiscrepancyDetail(
@@ -2583,11 +2571,7 @@ def simulate_pipeline_chaos(
     index ranges, evaluating stage circuit breaker tripping, zero-latency fast-fail isolation,
     SLA budget compliance, and post-fault circuit recovery.
     """
-    if (
-        isinstance(sla_budget_ms, bool)
-        or not math.isfinite(sla_budget_ms)
-        or sla_budget_ms <= 0.0
-    ):
+    if isinstance(sla_budget_ms, bool) or not math.isfinite(sla_budget_ms) or sla_budget_ms <= 0.0:
         raise ValueError("sla_budget_ms must be a positive finite number")
 
     parsed_specs: list[StageFaultSpec] = []
@@ -2673,11 +2657,11 @@ def simulate_pipeline_chaos(
             return orig_proc
 
         if inspect.iscoroutinefunction(orig_proc):
+
             async def async_chaos_wrapper(ctx: PipelineContext) -> Any:
                 for spec in node_specs:
-                    is_active = (
-                        spec.start_index <= current_tx_index
-                        and (spec.end_index is None or current_tx_index < spec.end_index)
+                    is_active = spec.start_index <= current_tx_index and (
+                        spec.end_index is None or current_tx_index < spec.end_index
                     )
                     if is_active:
                         m = stage_chaos_metrics[node_name]
@@ -2700,9 +2684,8 @@ def simulate_pipeline_chaos(
 
         def sync_chaos_wrapper(ctx: PipelineContext) -> Any:
             for spec in node_specs:
-                is_active = (
-                    spec.start_index <= current_tx_index
-                    and (spec.end_index is None or current_tx_index < spec.end_index)
+                is_active = spec.start_index <= current_tx_index and (
+                    spec.end_index is None or current_tx_index < spec.end_index
                 )
                 if is_active:
                     m = stage_chaos_metrics[node_name]
@@ -2745,10 +2728,7 @@ def simulate_pipeline_chaos(
                 if res.degraded:
                     degraded_transactions += 1
                 for node_name in res.stage_results:
-                    if (
-                        node_name in stage_chaos_metrics
-                        and res.stage_results[node_name].degraded
-                    ):
+                    if node_name in stage_chaos_metrics and res.stage_results[node_name].degraded:
                         stage_chaos_metrics[node_name].handled_count += 1
             except (
                 PipelineExecutionError,
@@ -2811,7 +2791,3 @@ def simulate_pipeline_chaos(
         recovered=all_closed,
         status=overall_status,
     )
-
-
-
-

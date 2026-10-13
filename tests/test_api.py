@@ -2880,9 +2880,7 @@ def test_routing_canary_auto_rollback_on_discrepancy(
     divergent_challenger.threshold = 0.5
     divergent_challenger.feature_names = base_model.feature_names
     # Always return 1.0 (fraud), triggering high discrepancy and divergence
-    divergent_challenger.predict_probabilities.side_effect = (
-        lambda df: np.array([1.0] * len(df))
-    )
+    divergent_challenger.predict_probabilities.side_effect = lambda df: np.array([1.0] * len(df))
 
     app = create_app(
         model=base_model,
@@ -3044,8 +3042,7 @@ def test_feature_store_enrichment_predict_and_score(
         assert resp_score.status_code == 200
 
     events = [
-        json.loads(line)
-        for line in audit_path.read_text(encoding="utf-8").strip().splitlines()
+        json.loads(line) for line in audit_path.read_text(encoding="utf-8").strip().splitlines()
     ]
     assert len(events) == 2
 
@@ -3475,10 +3472,6 @@ def test_pipeline_cache_audit_event_emission(
     assert isinstance(ev2.payload["speculative_hit"], bool)
 
 
-
-
-
-
 def test_pipeline_cache_configured_via_environment(
     api_context: tuple[TestClient, FraudModel, ValidatedDataset],
     monkeypatch: pytest.MonkeyPatch,
@@ -3836,5 +3829,3 @@ def test_pipeline_chaos_endpoint_and_audit(
     ch_ev = chaos_events[0]
     assert ch_ev.payload["circuit_breaker_enabled"] is True
     assert ch_ev.payload["circuit_trips"] >= 1
-
-

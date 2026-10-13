@@ -5631,9 +5631,7 @@ def test_cli_pipeline_eval_success(tmp_path: Path, trained_artifact: Path) -> No
     assert "action" in report["stage_latency_ms"]
 
 
-def test_cli_pipeline_eval_table_output_and_file(
-    tmp_path: Path, trained_artifact: Path
-) -> None:
+def test_cli_pipeline_eval_table_output_and_file(tmp_path: Path, trained_artifact: Path) -> None:
     data_path = tmp_path / "eval_data.csv"
     generate_synthetic_data(rows=250, random_state=42).to_csv(data_path, index=False)
     out_file = tmp_path / "pipeline_report.json"
@@ -5662,9 +5660,7 @@ def test_cli_pipeline_eval_table_output_and_file(
     assert saved_data["total_evaluated"] == 50
 
 
-def test_cli_pipeline_eval_with_rules_and_velocity(
-    tmp_path: Path, trained_artifact: Path
-) -> None:
+def test_cli_pipeline_eval_with_rules_and_velocity(tmp_path: Path, trained_artifact: Path) -> None:
     data_path = tmp_path / "eval_data.csv"
     generate_synthetic_data(rows=250, random_state=42).to_csv(data_path, index=False)
 
@@ -5679,9 +5675,7 @@ def test_cli_pipeline_eval_with_rules_and_velocity(
                         "description": "Deny amounts over 5000",
                         "action": "DENY",
                         "priority": 100,
-                        "conditions": [
-                            {"field": "Amount", "operator": ">", "value": 5000.0}
-                        ],
+                        "conditions": [{"field": "Amount", "operator": ">", "value": 5000.0}],
                     }
                 ]
             }
@@ -5833,11 +5827,6 @@ def test_cli_pipeline_eval_with_cache_and_speculation(
     assert "Speculative Inference: Executed=" in res_text.output
 
 
-
-
-
-
-
 def test_cli_pipeline_eval_rejects_corrupt_model_and_empty_input(
     tmp_path: Path, trained_artifact: Path
 ) -> None:
@@ -5863,9 +5852,7 @@ def test_cli_pipeline_eval_rejects_corrupt_model_and_empty_input(
     assert "Failed to read input dataset" in res_csv.output
 
 
-def test_cli_pipeline_replay_and_counterfactual(
-    tmp_path: Path, trained_artifact: Path
-) -> None:
+def test_cli_pipeline_replay_and_counterfactual(tmp_path: Path, trained_artifact: Path) -> None:
     df = generate_synthetic_data(rows=250, random_state=42)
     feature_cols = [c for c in df.columns if c != "Class"]
     rec1 = {str(k): float(v) for k, v in df[feature_cols].iloc[0].to_dict().items()}
@@ -6144,9 +6131,7 @@ def test_cli_pipeline_replay_and_counterfactual(
     assert "Report written to:" in res_noisy_cf.output
 
 
-def test_pipeline_eval_cli_circuit_breaker_options(
-    tmp_path: Path, trained_artifact: Path
-) -> None:
+def test_pipeline_eval_cli_circuit_breaker_options(tmp_path: Path, trained_artifact: Path) -> None:
     data_path = tmp_path / "tx.csv"
     generate_synthetic_data(rows=200, random_state=42).iloc[:20].to_csv(data_path, index=False)
     out_file = tmp_path / "eval_cb.json"
@@ -6334,5 +6319,3 @@ def test_pipeline_chaos_cli_workflow(tmp_path: Path, trained_artifact: Path) -> 
         ],
     )
     assert res_unrec_fail.exit_code == 1
-
-
