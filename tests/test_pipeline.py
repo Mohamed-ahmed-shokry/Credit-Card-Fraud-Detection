@@ -29,6 +29,7 @@ from fraud_detection.pipeline import (
     InferenceStageProcessor,
     NodeCachePolicy,
     NodeCacheStats,
+    PipelineChaosReport,
     PipelineCircuitOpenError,
     PipelineContext,
     PipelineCounterfactualEvaluation,
@@ -39,6 +40,7 @@ from fraud_detection.pipeline import (
     PipelineReplayReport,
     PipelineValidationError,
     RuleStageProcessor,
+    StageChaosMetrics,
     StageCircuitBreaker,
     StageCircuitPolicy,
     StageCircuitRegistry,
@@ -46,11 +48,14 @@ from fraud_detection.pipeline import (
     StageCircuitStats,
     StageExecutionCache,
     StageExecutionResult,
+    StageFaultSpec,
+    StageFaultType,
     StageStatus,
     StageType,
     create_default_fraud_pipeline,
     optimize_counterfactual_pipeline,
     replay_audit_log_through_pipeline,
+    simulate_pipeline_chaos,
 )
 from fraud_detection.recalibration import PlattRecalibrator
 from fraud_detection.rules import (
@@ -1624,6 +1629,240 @@ def test_default_fraud_pipeline_circuit_breakers() -> None:
     assert "rules" in stats["nodes"]
     assert "inference" in stats["nodes"]
     assert "calibration" in stats["nodes"]
+
+
+def test_stage_fault_spec_and_metrics_validation() -> None:
+    spec = StageFaultSpec(
+        node_name="enrichment",
+        fault_type="exception",
+        start_index=1,
+        end_index=5,
+        latency_ms=12.5,
+    )
+    assert spec.fault_type == StageFaultType.EXCEPTION
+    d = spec.to_dict()
+    assert d["node_name"] == "enrichment"
+    assert d["fault_type"] == "exception"
+    assert d["start_index"] == 1
+    assert d["end_index"] == 5
+    assert d["latency_ms"] == 12.5
+
+    with pytest.raises(ValueError, match="node_name"):
+        StageFaultSpec(node_name="", fault_type=StageFaultType.EXCEPTION)
+
+    with pytest.raises(ValueError, match="fault_type"):
+        StageFaultSpec(node_name="test", fault_type="unsupported")
+
+    with pytest.raises(ValueError, match="start_index"):
+        StageFaultSpec(node_name="test", fault_type=StageFaultType.EXCEPTION, start_index=-1)
+
+    with pytest.raises(ValueError, match="end_index"):
+        StageFaultSpec(
+            node_name="test", fault_type=StageFaultType.EXCEPTION, start_index=5, end_index=2
+        )
+
+    with pytest.raises(ValueError, match="latency_ms"):
+        StageFaultSpec(node_name="test", fault_type=StageFaultType.LATENCY_SPIKE, latency_ms=-1.0)
+
+    with pytest.raises(ValueError, match="latency_ms"):
+        StageFaultSpec(
+            node_name="test", fault_type=StageFaultType.LATENCY_SPIKE, latency_ms=float("inf")
+        )
+
+    metrics = StageChaosMetrics(
+        node_name="inference",
+        fault_type="timeout",
+        injected_count=3,
+        handled_count=3,
+        tripped_circuit=True,
+    )
+    assert metrics.to_dict() == {
+        "node_name": "inference",
+        "fault_type": "timeout",
+        "injected_count": 3,
+        "handled_count": 3,
+        "tripped_circuit": True,
+    }
+
+
+def test_simulate_pipeline_chaos_exception_and_recovery() -> None:
+    graph = DecisionGraph("chaos_sim_graph")
+    graph.add_node(
+        PipelineNode(
+            name="enrichment",
+            stage_type=StageType.ENRICHMENT,
+            processor=lambda _ctx: {"account_tier": "gold"},
+            fallback_value={"account_tier": "basic"},
+            required=False,
+            circuit_policy=StageCircuitPolicy(
+                failure_threshold=2,
+                recovery_timeout_seconds=0.02,
+                half_open_max_calls=1,
+            ),
+        )
+    )
+    graph.add_node(
+        PipelineNode(
+            name="action",
+            stage_type=StageType.ACTION,
+            processor=lambda ctx: {
+                "decision": "ALLOW",
+                "tier": ctx.get_output("enrichment").get("account_tier", "basic"),
+            },
+            dependencies=["enrichment"],
+            required=True,
+        )
+    )
+
+    records = [{"id": i} for i in range(10)]
+    faults = [
+        StageFaultSpec(
+            node_name="enrichment",
+            fault_type=StageFaultType.EXCEPTION,
+            start_index=0,
+            end_index=3,
+        )
+    ]
+
+    report = simulate_pipeline_chaos(
+        records,
+        graph,
+        faults,
+        sla_budget_ms=500.0,
+        enable_circuit_breaker=True,
+        circuit_failure_threshold=2,
+        circuit_recovery_timeout_seconds=0.02,
+    )
+
+    assert isinstance(report, PipelineChaosReport)
+    assert report.total_transactions == 10
+    assert report.circuit_trips >= 1
+    assert report.short_circuited_calls >= 1
+    assert report.unhandled_errors == 0
+    assert report.degraded_transactions >= 3
+    assert report.stage_metrics["enrichment"].injected_count >= 2
+    assert report.stage_metrics["enrichment"].handled_count >= 2
+    assert report.stage_metrics["enrichment"].tripped_circuit is True
+    assert report.latencies_p50_ms >= 0.0
+
+    d = report.to_dict()
+    assert d["total_transactions"] == 10
+    assert d["circuit_breaker_enabled"] is True
+    assert "enrichment" in d["stage_metrics"]
+
+
+def test_simulate_pipeline_chaos_sla_breach_and_timeout() -> None:
+    graph = DecisionGraph("chaos_timeout_graph")
+    graph.add_node(
+        PipelineNode(
+            name="inference",
+            stage_type=StageType.INFERENCE,
+            processor=lambda _ctx: {"prob": 0.1},
+            fallback_value={"prob": 0.5},
+            required=False,
+            timeout_seconds=0.01,
+        )
+    )
+    graph.add_node(
+        PipelineNode(
+            name="action",
+            stage_type=StageType.ACTION,
+            processor=lambda _ctx: {"decision": "ALLOW"},
+            dependencies=["inference"],
+            required=True,
+        )
+    )
+
+    records = [{"id": 0}, {"id": 1}]
+    faults = [
+        StageFaultSpec(
+            node_name="inference",
+            fault_type=StageFaultType.TIMEOUT,
+            start_index=0,
+            end_index=2,
+        )
+    ]
+
+    report = simulate_pipeline_chaos(
+        records,
+        graph,
+        faults,
+        sla_budget_ms=0.001,  # Guaranteed breach
+        enable_circuit_breaker=False,
+    )
+    assert report.sla_breaches > 0
+    assert report.status == "SLA_BREACHED"
+
+
+def test_simulate_pipeline_chaos_unhandled_failure() -> None:
+    graph = DecisionGraph("chaos_fail_graph")
+    graph.add_node(
+        PipelineNode(
+            name="required_action",
+            stage_type=StageType.ACTION,
+            processor=lambda _ctx: {"done": True},
+            required=True,
+        )
+    )
+    records = [{"id": 0}]
+    faults = [
+        StageFaultSpec(
+            node_name="required_action",
+            fault_type=StageFaultType.EXCEPTION,
+            start_index=0,
+            end_index=1,
+            error_message="fatal action crash",
+        )
+    ]
+    report = simulate_pipeline_chaos(records, graph, faults, enable_circuit_breaker=False)
+    assert report.unhandled_errors == 1
+    assert report.status == "FAILED"
+
+
+def test_simulate_pipeline_chaos_edge_cases_and_validation() -> None:
+    graph = DecisionGraph("chaos_edge_graph")
+    graph.add_node(
+        PipelineNode(
+            name="step",
+            stage_type=StageType.ACTION,
+            processor=lambda _ctx: {"ok": True},
+            required=True,
+        )
+    )
+
+    with pytest.raises(ValueError, match="sla_budget_ms"):
+        simulate_pipeline_chaos([{}], graph, [], sla_budget_ms=-5.0)
+
+    with pytest.raises(TypeError, match="pipeline must be"):
+        simulate_pipeline_chaos([{}], "invalid", [])  # type: ignore[arg-type]
+
+    with pytest.raises(TypeError, match="fault_spec must be"):
+        simulate_pipeline_chaos([{}], graph, ["not_a_spec"])  # type: ignore[list-item]
+
+    with pytest.raises(ValueError, match="does not exist"):
+        simulate_pipeline_chaos(
+            [{}],
+            graph,
+            [StageFaultSpec(node_name="unknown", fault_type=StageFaultType.EXCEPTION)],
+        )
+
+    # Empty records
+    empty_rep = simulate_pipeline_chaos([], graph, [])
+    assert empty_rep.total_transactions == 0
+    assert empty_rep.latencies_p50_ms == 0.0
+    assert empty_rep.status == "RESILIENT"
+
+    # Dict format for fault_specs
+    dict_spec = {
+        "node_name": "step",
+        "fault_type": "latency_spike",
+        "start_index": 0,
+        "end_index": 1,
+        "latency_ms": 1.0,
+    }
+    rep_dict = simulate_pipeline_chaos([{}], graph, [dict_spec])
+    assert rep_dict.total_transactions == 1
+    assert rep_dict.status in ("RESILIENT", "DEGRADED", "SLA_BREACHED")
 
 
 
