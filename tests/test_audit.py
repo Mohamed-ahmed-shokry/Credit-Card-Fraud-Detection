@@ -19,6 +19,8 @@ from fraud_detection.audit import (
     _is_luhn_valid,
     _mask_pans_in_string,
     backtest_audit_policy,
+    build_pipeline_chaos_audit_event,
+    build_pipeline_replay_audit_event,
     build_promotion_audit_event,
     build_scoring_audit_event,
     build_shadow_scoring_audit_event,
@@ -823,5 +825,111 @@ def test_build_scoring_audit_event_cache_and_speculative() -> None:
     assert parsed["payload"]["cache_hits"] == 2
     assert parsed["payload"]["speculative_hit"] is True
 
+
+def test_build_pipeline_replay_audit_event() -> None:
+    event = build_pipeline_replay_audit_event(
+        pipeline_name="custom_graph",
+        audit_source="/path/to/audit.jsonl",
+        replayed_events=100,
+        total_transactions=100,
+        score_discrepancies=5,
+        decision_flips=2,
+        flip_rate=0.02,
+        status="diverged",
+        transition_matrix={"approve_to_review": 2},
+        mean_latency_ms=1.45,
+        p95_latency_ms=3.12,
+        metadata={"env": "staging", "api_key": "secret_key_12345"},
+    )
+    assert event.event_type == "pipeline_replay"
+    assert event.model_version == "custom_graph"
+    assert event.payload["replayed_events"] == 100
+    assert event.payload["flip_rate"] == 0.02
+    assert event.payload["status"] == "diverged"
+    assert event.payload["transition_matrix"] == {"approve_to_review": 2}
+
+    # Verify redaction of sensitive metadata
+    serialized = event.to_json(redact=True)
+    parsed = json.loads(serialized)
+    assert parsed["payload"]["metadata"]["api_key"] == "[REDACTED]"
+    assert parsed["payload"]["metadata"]["env"] == "staging"
+
+    minimal_event = build_pipeline_replay_audit_event(
+        pipeline_name="min_graph",
+        audit_source="/path/to/min.jsonl",
+        replayed_events=10,
+        total_transactions=10,
+        score_discrepancies=0,
+        decision_flips=0,
+        flip_rate=0.0,
+        status="MATCH",
+    )
+    assert "transition_matrix" not in minimal_event.payload
+    assert "mean_latency_ms" not in minimal_event.payload
+    assert "p95_latency_ms" not in minimal_event.payload
+    assert "metadata" not in minimal_event.payload
+
+
+def test_build_scoring_audit_event_with_circuit_short_circuits() -> None:
+    event = build_scoring_audit_event(
+        model_version="v2",
+        dataset_fingerprint="fp123",
+        threshold=0.5,
+        predictions=[{"is_fraud": False, "decision": "ALLOW"}],
+        circuit_short_circuits=["enrichment", "rules"],
+    )
+    assert event.payload["circuit_short_circuits"] == ["enrichment", "rules"]
+    assert "enrichment" in event.to_dict()["payload"]["circuit_short_circuits"]
+
+
+def test_build_pipeline_chaos_audit_event() -> None:
+    raw_report = {
+        "status": "RESILIENT",
+        "total_transactions": 50,
+        "circuit_breaker_enabled": True,
+        "sla_budget_ms": 100.0,
+        "sla_breaches": 0,
+        "circuit_trips": 1,
+        "short_circuited_calls": 5,
+        "unhandled_errors": 0,
+        "degraded_transactions": 5,
+        "latencies_p50_ms": 1.2,
+        "latencies_p95_ms": 3.4,
+        "latencies_max_ms": 5.6,
+        "recovered": True,
+        "fault_specs": [{"node_name": "enrichment", "fault_type": "exception"}],
+        "stage_metrics": {
+            "enrichment": {
+                "node_name": "enrichment",
+                "fault_type": "exception",
+                "injected_count": 2,
+                "handled_count": 2,
+                "tripped_circuit": True,
+            }
+        },
+    }
+
+    event = build_pipeline_chaos_audit_event(
+        chaos_report=raw_report,
+        model_version="model_chaos_v1",
+        dataset_fingerprint="ds_chaos_fp",
+        metadata={"environment": "canary", "api_key": "dummy_key_12345"},
+    )
+
+    assert event.event_type == "pipeline_chaos"
+    assert event.model_version == "model_chaos_v1"
+    assert event.dataset_fingerprint == "ds_chaos_fp"
+    assert event.payload["simulation_type"] == "pipeline_chaos"
+    assert event.payload["status"] == "RESILIENT"
+    assert event.payload["total_transactions"] == 50
+    assert event.payload["circuit_breaker_enabled"] is True
+    assert event.payload["circuit_trips"] == 1
+    assert event.payload["short_circuited_calls"] == 5
+    assert event.payload["recovered"] is True
+
+    # Check redaction of metadata
+    d = event.to_dict(redact=True)
+    assert d["payload"]["metadata"]["environment"] == "canary"
+    assert d["payload"]["metadata"]["api_key"] == "[REDACTED]"
 
 

@@ -20,7 +20,7 @@ Status legend: `Proposed` (not started), `In progress`, `Done`.
 ## Current state
 
 The project is a production-grade reference implementation with the implementation work in
-Phases 2 through 31 complete. Phase 1's workflows are in place, but the first
+Phases 2 through 34 complete. Phase 1's workflows are in place, but the first
 real PyPI release still requires maintainer-side trusted-publisher setup. The
 shipped system covers leakage-safe training, multiple calibrated estimators,
 threshold and calibration analysis, label-delay temporal gaps, drift surveillance,
@@ -37,8 +37,11 @@ bounded operational metrics, declarative rule sets with priority overrides,
 sliding-window velocity behavioral profiles, post-hoc probability recalibration
 (Platt, isotonic, temperature scaling) with calibration drift surveillance,
 champion/challenger multi-model routing with deterministic entity stickiness and
-automated canary divergence safeguards, and feature store integration with
-point-in-time time-travel as-of joins and training-serving skew surveillance.
+automated canary divergence safeguards, feature store integration with
+point-in-time time-travel as-of joins and training-serving skew surveillance,
+real-time streaming decision graph DAG pipelines with topological wave scheduling,
+deterministic stage node caching with speculative asynchronous model inference,
+and dynamic decision graph replay with counterfactual policy optimization.
 
 ## Phase 1 — Distribution
 
@@ -1419,11 +1422,154 @@ This phase does not implement external distributed cache brokers (Redis, Memcach
 - `7a0b926`: feat(api): expose pipeline cache endpoints and Prometheus telemetry
 - `33c179d`: feat(cli): add node cache and speculative inference flags to pipeline-eval
 - `6e5f381`, `90b750e`, `77080f3`: coverage tests for CLI error paths, API env config, and speculative paths
-## Phase 34 — Dynamic Decision Graph Replay & Counterfactual Policy Optimization (Planned)
+## Phase 34 — Dynamic Decision Graph Replay & Counterfactual Policy Optimization (Done)
 
 ### Objective
 
 Enable offline replay of historical streaming audit events through alternative decision graph configurations to benchmark latency, cost, and accuracy trade-offs prior to production deployment.
+
+### Scope
+
+1. **Graph Replay Engine Core (`pipeline.py`)**:
+   - `replay_audit_log_through_pipeline(audit_log_path, candidate_pipeline, ...)`: Replay historical scoring events through candidate decision graph configurations.
+   - Support both inline recorded features and external observations DataFrame join.
+   - Capture per-transaction decision shifts (`ALLOW` / `CHALLENGE` / `DENY`), score discrepancies, latency comparisons, and degraded execution flags.
+   - Return structured `PipelineReplayReport` with turnover counts, flip rates, stage latency distributions, and discrepancy details.
+2. **Counterfactual Policy Optimization (`pipeline.py` & `evaluation.py`)**:
+   - `optimize_counterfactual_pipeline(events_or_records, candidate_thresholds, candidate_rules, cost_policy, ...)`: Evaluate counterfactual configurations against baseline decisions and ground truth labels.
+   - Calculate transition matrices (`PolicyTransitionMatrix`), workload shifts (review count/rate delta, deny count/rate delta), and expected cost per transaction.
+   - Support automated threshold tuning across candidate graph configurations with capacity constraints.
+3. **Audit Event Fidelity (`audit.py`)**:
+   - `build_pipeline_replay_audit_event(...)`: Structured audit event recording pipeline replay runs, divergence metrics, and counterfactual policy outcomes.
+4. **Operational API Serving (`api.py`)**:
+   - `POST /v1/pipeline/replay`: Endpoint to execute replay against historical audit logs or recorded batches.
+   - `POST /v1/pipeline/counterfactual`: Endpoint to simulate policy shifts and cost impacts on candidate thresholds.
+   - Expose Prometheus metrics for replay evaluations (`fraud_pipeline_replay_evaluations_total`, `fraud_pipeline_replay_discrepancies_total`).
+5. **CLI Evaluation Suite (`cli.py`)**:
+   - Add `pipeline-replay` command supporting audit log replay, `--candidate-rules`, `--candidate-threshold`, `--fail-on-divergence`, and tabular/JSON reporting.
+   - Add `pipeline-counterfactual` command calculating decision migrations and cost tradeoffs against baseline logs.
+6. **Integration, Test Coverage & Documentation**:
+   - Unit and integration tests covering pipeline replay, counterfactual optimization, API endpoints, and CLI commands.
+   - Documentation updates in `ARCHITECTURE.md`, `README.md`, and `ROADMAP.md`.
+
+### Acceptance criteria
+
+1. **AC-1 (Audit Replay Fidelity)**: `replay_audit_log_through_pipeline` accurately replays historical scoring audit logs through candidate decision graphs, reporting score difference distributions, decision flips, and latency comparison without data leakage or PAN exposure.
+2. **AC-2 (Counterfactual Transition & Cost Evaluation)**: Replay against ground truth computes accurate 3x3 transition matrices (`ALLOW`, `CHALLENGE`, `DENY`), turnover rates, review/deny workload deltas, and net financial cost impact under configurable business cost policies.
+3. **AC-3 (Audit Trail Tracing)**: Replay runs emit structured audit events via `build_pipeline_replay_audit_event` with SHA-256 fingerprinting, parameter tracking, and redacted payloads.
+4. **AC-4 (API Serving Contract)**: `/v1/pipeline/replay` and `/v1/pipeline/counterfactual` endpoints return complete schemas with latency benchmarks, decision shift summaries, and Prometheus telemetry.
+5. **AC-5 (CLI Evaluation Suite)**: `fraud-detect pipeline-replay` and `fraud-detect pipeline-counterfactual` execute cleanly, support `--json` and text summaries, and enforce `--fail-on-divergence` exit codes.
+6. **AC-6 (Quality Standards & Zero Regressions)**: Full test suite passes 100%, branch coverage remains $\ge 97.0\%$, Ruff clean, and strict mypy clean with zero errors.
+
+### Validation plan
+
+- Unit tests for `PipelineReplayReport`, `replay_audit_log_through_pipeline`, and `optimize_counterfactual_pipeline` in `tests/test_pipeline.py`.
+- Audit event generation and redaction tests in `tests/test_audit.py`.
+- API endpoint integration tests in `tests/test_api.py`.
+- CLI end-to-end tests for `pipeline-replay` and `pipeline-counterfactual` in `tests/test_cli.py`.
+- Full regression test run with coverage, lint, and type checking.
+
+### Task list
+
+- [x] Task 1: Define `PipelineReplayReport`, `PipelineDiscrepancyDetail`, and `replay_audit_log_through_pipeline` in `pipeline.py`.
+- [x] Task 2: Implement counterfactual policy evaluation and threshold optimization helpers in `pipeline.py`.
+- [x] Task 3: Add `build_pipeline_replay_audit_event` in `audit.py`.
+- [x] Task 4: Expose `/v1/pipeline/replay` and `/v1/pipeline/counterfactual` endpoints with Prometheus telemetry in `api.py`.
+- [x] Task 5: Implement `pipeline-replay` and `pipeline-counterfactual` CLI commands in `cli.py`.
+- [x] Task 6: Add comprehensive unit and integration tests across pipeline, audit, API, and CLI suites.
+- [x] Task 7: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`) and verify Completion Gate.
+
+### Explicit exclusions
+
+This phase does not implement multi-cluster distributed event replay systems or streaming message brokers (Kafka/Flink); it provides high-throughput, repeatable, asynchronous in-process graph replay and counterfactual simulation.
+
+### Outcome
+
+- Implemented `PipelineDiscrepancyDetail`, `PipelineReplayReport`, `replay_audit_log_through_pipeline`, `PipelineCounterfactualEvaluation`, and `optimize_counterfactual_pipeline` in `src/fraud_detection/pipeline.py`.
+- Added structured audit event builder `build_pipeline_replay_audit_event` in `src/fraud_detection/audit.py`.
+- Exposed `POST /v1/pipeline/replay` and `POST /v1/pipeline/counterfactual` endpoints with `fraud_pipeline_replay_evaluations_total` and `fraud_pipeline_replay_discrepancies_total` Prometheus counters in `src/fraud_detection/api.py`.
+- Added `fraud-detect pipeline-replay` and `fraud-detect pipeline-counterfactual` CLI commands in `src/fraud_detection/cli.py`.
+- Verified: 798 tests passing (100%), branch coverage 97.05%, `ruff check .` clean, and strict `mypy` clean across 20 source files.
+
+### Commits
+
+- `2611edf`: docs(roadmap): set Phase 34 dynamic graph replay in progress and initialize progress record
+- `e75a1fd`: feat(pipeline): implement dynamic pipeline replay engine and counterfactual policy optimization
+- `a290ad8`: feat(audit): add pipeline replay structured audit event builder
+- `26ff43b`: feat(api): expose pipeline replay and counterfactual endpoints with Prometheus telemetry
+- `3f3f35d`: feat(cli): add pipeline-replay and pipeline-counterfactual commands
+- `dbecd08`, `7b207a3`: test(audit): unit tests for pipeline replay audit event builder and redaction
+- `e8e717f`: test(pipeline): add unit tests for pipeline replay engine and counterfactual optimization
+- `98ed5aa`: test(api): add endpoint and telemetry tests for pipeline replay and counterfactual routes
+- `d19832f`, `1e6517c`: test(cli): end-to-end and edge-case tests for pipeline-replay and pipeline-counterfactual
+- `a358934`, `8e0cd7d`: docs: document pipeline replay and counterfactual capabilities in ARCHITECTURE.md and README.md
+
+## Phase 35 — Decision Graph Stage Circuit Breakers, Fast-Fail Isolation & Chaos Fault Injection (In progress)
+
+### Objective
+
+Harden real-time decision graph execution (`DecisionGraphExecutor`) against cascading upstream latency spikes and partial subsystem outages by introducing per-stage stateful circuit breakers (`StageCircuitPolicy`, `StageCircuitState`, `StageCircuitBreaker`, `StageCircuitRegistry`), zero-latency fast-fail fallback isolation (`StageStatus.CIRCUIT_OPEN`), and a deterministic stage chaos fault-injection and resilience verification engine (`StageFaultType`, `StageFaultSpec`, `StageChaosMetrics`, `PipelineChaosReport`, `simulate_pipeline_chaos`), complete with structured audit logging, FastAPI operational endpoints, Prometheus telemetry, and CLI workflows.
+
+### Scope
+
+1. **Stage-Level Circuit Breaker Engine (`pipeline.py`)**:
+   - Define `PipelineCircuitOpenError`, `StageCircuitState` (`CLOSED`, `OPEN`, `HALF_OPEN`), `StageCircuitPolicy`, `StageCircuitStats`, `StageCircuitBreaker`, and thread-safe `StageCircuitRegistry`.
+   - Extend `StageStatus` with `CIRCUIT_OPEN = "circuit_open"` and `StageExecutionResult` with `short_circuited_by_breaker: bool = False`.
+   - Extend `PipelineNode` with `circuit_policy: StageCircuitPolicy | None = None` and serialize it in `PipelineNode.to_dict()`.
+   - Integrate `StageCircuitRegistry` into `DecisionGraphExecutor`:
+     - Check `allow_execution(node_name)` before invoking a stage processor; when blocked, short-circuit immediately in $O(1)$ zero-latency (`0.0 ms`) with `StageStatus.CIRCUIT_OPEN`, `degraded=True`, `short_circuited_by_breaker=True`, and `node.fallback_value` (or raise `PipelineCircuitOpenError` if `node.required=True`).
+     - Record stage `SUCCESS` (`HALF_OPEN -> CLOSED` after `half_open_max_calls`) and stage `TIMEOUT` / `FALLBACK` / `FAILED` (`CLOSED -> OPEN` at `failure_threshold`, or `HALF_OPEN -> OPEN` immediately).
+   - Track `circuit_short_circuits: list[str]` in `PipelineExecutionResult`.
+   - Expose `enable_circuit_breaker: bool = False`, `circuit_failure_threshold: int = 5`, and `circuit_recovery_timeout_seconds: float = 30.0` in `create_default_fraud_pipeline(...)`.
+2. **Stage Chaos Fault-Injection & Resilience Simulator (`pipeline.py`)**:
+   - Define `StageFaultType` (`EXCEPTION`, `TIMEOUT`, `LATENCY_SPIKE`), `StageFaultSpec`, `StageChaosMetrics`, and `PipelineChaosReport`.
+   - Implement `simulate_pipeline_chaos(records, graph, fault_specs, *, sla_budget_ms=..., enable_circuit_breaker=True, ...)` to execute transactions through a fault-injected `DecisionGraphExecutor`, measuring degraded executions, unhandled errors, SLA budget breaches, circuit breaker trips, fast-fail short-circuits, latency distributions, and post-fault circuit recovery (`recovered: bool`).
+3. **Structured Audit Trail Integration (`audit.py`)**:
+   - Extend `build_scoring_audit_event` with `circuit_short_circuits: Sequence[str] | None = None`.
+   - Add `build_pipeline_chaos_audit_event(...)` emitting a redacted `pipeline_chaos` audit event summarizing chaos simulation parameters, fault specs, circuit breaker trips, SLA compliance, and recovery status.
+4. **Operational API Serving & Prometheus Telemetry (`api.py`)**:
+   - Support pipeline circuit breaker configuration in `create_app` (`enable_pipeline_circuit_breaker`, `pipeline_circuit_failure_threshold`, `pipeline_circuit_recovery_timeout_seconds` and environment variables `FRAUD_PIPELINE_CIRCUIT_BREAKER_ENABLED`, `FRAUD_PIPELINE_CIRCUIT_FAILURE_THRESHOLD`, `FRAUD_PIPELINE_CIRCUIT_RECOVERY_TIMEOUT_SECONDS`).
+   - Expose `GET /v1/pipeline/circuits`, `POST /v1/pipeline/circuits/reset`, and `POST /v1/pipeline/chaos`.
+   - Export Prometheus metrics: `fraud_pipeline_circuit_short_circuits_total{stage="..."}`, `fraud_pipeline_circuit_state{stage="..."}`, and `fraud_pipeline_chaos_simulations_total{status="..."}`.
+5. **CLI Evaluation & Chaos Suite (`cli.py`)**:
+   - Add `--enable-circuit-breaker/--no-circuit-breaker`, `--cb-failure-threshold`, and `--cb-recovery-timeout` flags to `fraud-detect pipeline-eval`.
+   - Add `fraud-detect pipeline-chaos` command supporting `--model`, `--input`, `--fault-stage`, `--fault-type`, `--fault-start`, `--fault-end`, `--fault-latency-ms`, `--cb-failure-threshold`, `--cb-recovery-timeout`, `--sla-budget-ms`, `--fail-on-sla-breach`, `--fail-on-unrecovered`, `--audit-log`, `--output`, `--json`, and `--overwrite`.
+6. **Integration, Test Coverage & Documentation**:
+   - Comprehensive unit and integration tests across `tests/test_pipeline.py`, `tests/test_audit.py`, `tests/test_api.py`, and `tests/test_cli.py`.
+   - Documentation updates in `ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, and `docs/PROGRESS.md`.
+
+### Acceptance criteria
+
+1. **AC-1 (Stage Circuit Breaker State Machine & Fast-Fail Isolation)**: Consecutive stage failures or timeouts trip a node's `StageCircuitBreaker` from `CLOSED` to `OPEN` at `failure_threshold`; while `OPEN`, `DecisionGraphExecutor` short-circuits optional nodes in $O(1)$ without invoking the processor (`status=CIRCUIT_OPEN`, `degraded=True`, `short_circuited_by_breaker=True`), transitions to `HALF_OPEN` after `recovery_timeout_seconds`, and closes after `half_open_max_calls` successes (or re-opens on failure). Required nodes raise `PipelineCircuitOpenError` when open.
+2. **AC-2 (Deterministic Stage Chaos Fault Injection & SLA Verification)**: `simulate_pipeline_chaos` injects deterministic `EXCEPTION`, `TIMEOUT`, and `LATENCY_SPIKE` faults over configured transaction index windows, accurately reporting SLA budget breaches, circuit trips, fast-fail short-circuits, latency distributions, and post-fault recovery status (`RESILIENT`, `DEGRADED`, `SLA_BREACHED`).
+3. **AC-3 (Audit Trail Fidelity & Redaction)**: Scoring audit events record `circuit_short_circuits`, and `build_pipeline_chaos_audit_event` produces structured `pipeline_chaos` JSONL events with full PAN/secret redaction guarantees.
+4. **AC-4 (API Serving & Prometheus Telemetry)**: `GET /v1/pipeline/circuits`, `POST /v1/pipeline/circuits/reset`, and `POST /v1/pipeline/chaos` enforce schema contracts, return 404 when pipeline or circuit breakers are disabled, and update Prometheus metrics (`fraud_pipeline_circuit_short_circuits_total`, `fraud_pipeline_circuit_state`, `fraud_pipeline_chaos_simulations_total`).
+5. **AC-5 (CLI Evaluation & Chaos Workflows)**: `fraud-detect pipeline-eval` supports stage circuit breaker flags and `fraud-detect pipeline-chaos` runs end-to-end fault injection simulations with tabular and `--json` output, `--fail-on-sla-breach`, and `--fail-on-unrecovered` exit code gating.
+6. **AC-6 (Quality Standards & Zero Regressions)**: Full test suite passes 100%, branch coverage remains $\ge 97.0\%$, Ruff format/lint clean, and strict mypy clean with zero errors.
+
+### Validation plan
+
+- Unit tests for `StageCircuitPolicy`, `StageCircuitBreaker`, `StageCircuitRegistry`, and `DecisionGraphExecutor` fast-fail and half-open recovery in `tests/test_pipeline.py`.
+- Unit tests for `StageFaultSpec` and `simulate_pipeline_chaos` across exception, timeout, and latency spike faults in `tests/test_pipeline.py`.
+- Audit event serialization and redaction tests for `circuit_short_circuits` and `build_pipeline_chaos_audit_event` in `tests/test_audit.py`.
+- FastAPI endpoint and Prometheus telemetry tests for `/v1/pipeline/circuits`, `/v1/pipeline/circuits/reset`, and `/v1/pipeline/chaos` in `tests/test_api.py`.
+- CLI end-to-end and error-path tests for `pipeline-eval` circuit breaker flags and `pipeline-chaos` in `tests/test_cli.py`.
+- Full quality gate verification (`ruff`, `mypy`, `pytest --cov`, `build`, `twine check`).
+
+### Explicit exclusions
+
+This phase does not implement external service-mesh circuit breaking (Istio/Envoy) or kernel-level network chaos tools (tc/ebpf); it provides deterministic, in-process DAG stage circuit breaking and fault-injection verification.
+
+### Task list
+
+- [x] Task 1: Define stage circuit breaker primitives (`PipelineCircuitOpenError`, `StageCircuitState`, `StageCircuitPolicy`, `StageCircuitStats`, `StageCircuitBreaker`, `StageCircuitRegistry`) in `pipeline.py`.
+- [x] Task 2: Integrate stage circuit breaking into `StageStatus`, `StageExecutionResult`, `PipelineNode`, `PipelineExecutionResult`, `DecisionGraphExecutor`, and `create_default_fraud_pipeline` in `pipeline.py`.
+- [x] Task 3: Implement stage chaos fault-injection primitives (`StageFaultType`, `StageFaultSpec`, `StageChaosMetrics`, `PipelineChaosReport`) and `simulate_pipeline_chaos` in `pipeline.py`.
+- [ ] Task 4: Add `circuit_short_circuits` to `build_scoring_audit_event` and implement `build_pipeline_chaos_audit_event` in `audit.py` with unit tests in `tests/test_audit.py`.
+- [ ] Task 5: Expose `/v1/pipeline/circuits`, `/v1/pipeline/circuits/reset`, and `/v1/pipeline/chaos` endpoints and Prometheus metrics in `api.py` with tests in `tests/test_api.py`.
+- [ ] Task 6: Add circuit breaker flags to `pipeline-eval` and implement `pipeline-chaos` CLI command in `cli.py` with tests in `tests/test_cli.py`.
+- [ ] Task 7: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate.
+
 
 ## Contributing to the roadmap
 

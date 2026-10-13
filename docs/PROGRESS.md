@@ -1,43 +1,37 @@
-# Phase 33 Progress Record
+# Phase 35 Progress Record
 
 ## Overview
-- **Phase**: Phase 33 — Real-Time Graph Node Cache & Speculative Model Evaluation
-- **Branch**: `phase/node-cache-speculation`
-- **Status**: Complete
+- **Phase**: Phase 35 — Decision Graph Stage Circuit Breakers, Fast-Fail Isolation & Chaos Fault Injection
+- **Branch**: `phase/graph-replay-counterfactual`
+- **Status**: In progress
 
 ## Task Status
-- [x] Task 1: Fix baseline mypy unreachable code in `InferenceStageProcessor` and tighten batch evaluation timeout robustness.
-- [x] Task 2: Implement `NodeCachePolicy`, `NodeCacheStats`, and `StageExecutionCache` in `pipeline.py`.
-- [x] Task 3: Integrate node caching into `DecisionGraphExecutor` and `StageExecutionResult`.
-- [x] Task 4: Implement speculative asynchronous model inference execution in `DecisionGraphExecutor`.
-- [x] Task 5: Enhance `create_default_fraud_pipeline` with cache and speculative evaluation options.
-- [x] Task 6: Update audit event export in `audit.py` with cache and speculative execution metadata.
-- [x] Task 7: Integrate cache endpoints (`/v1/pipeline/cache/stats`, `/v1/pipeline/cache/clear`) and Prometheus metrics in `api.py`.
-- [x] Task 8: Add cache and speculative evaluation options to `pipeline-eval` CLI command in `cli.py`.
-- [x] Task 9: Implement comprehensive unit and integration tests across pipeline, audit, API, and CLI.
-- [x] Task 10: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`).
+- [x] Task 1: Define stage circuit breaker primitives (`PipelineCircuitOpenError`, `StageCircuitState`, `StageCircuitPolicy`, `StageCircuitStats`, `StageCircuitBreaker`, `StageCircuitRegistry`) in `pipeline.py`.
+- [x] Task 2: Integrate stage circuit breaking into `StageStatus`, `StageExecutionResult`, `PipelineNode`, `PipelineExecutionResult`, `DecisionGraphExecutor`, and `create_default_fraud_pipeline` in `pipeline.py`.
+- [x] Task 3: Implement stage chaos fault-injection primitives (`StageFaultType`, `StageFaultSpec`, `StageChaosMetrics`, `PipelineChaosReport`) and `simulate_pipeline_chaos` in `pipeline.py`.
+- [ ] Task 4: Add `circuit_short_circuits` to `build_scoring_audit_event` and implement `build_pipeline_chaos_audit_event` in `audit.py` with unit tests in `tests/test_audit.py`.
+- [ ] Task 5: Expose `/v1/pipeline/circuits`, `/v1/pipeline/circuits/reset`, and `/v1/pipeline/chaos` endpoints and Prometheus metrics in `api.py` with tests in `tests/test_api.py`.
+- [ ] Task 6: Add circuit breaker flags to `pipeline-eval` and implement `pipeline-chaos` CLI command in `cli.py` with tests in `tests/test_cli.py`.
+- [ ] Task 7: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate.
 
 ## Acceptance Criteria Status
 | Criterion | Status | Evidence |
 |-----------|--------|----------|
-| AC-1 (Baseline resilience) | Met | Strict mypy passes with 0 unreachable statement errors; `pipeline-eval` tests execute reliably without spurious threadpool timeout degradation (5/5 passed). |
-| AC-2 (Node cache semantics) | Met | `StageExecutionCache` verified with TTL expiration, LRU eviction, deterministic key generation, and telemetry counters in `tests/test_pipeline.py`. |
-| AC-3 (Speculative inference correctness) | Met | Speculative inference hit verified when features unchanged; safe discard and re-computation verified on feature delta or rule short-circuit in `tests/test_pipeline.py`. |
-| AC-4 (Audit & telemetry fidelity) | Met | Scoring audit events serialize and redact cache hits/misses, speculative executed, and speculative hit flags in `tests/test_audit.py`. |
-| AC-5 (API serving integration) | Met | Operational endpoints `/v1/pipeline/cache/stats` and `/v1/pipeline/cache/clear` verified, Prometheus cache & speculative metrics exposed, and audit payload verified in `tests/test_api.py`. |
-| AC-6 (CLI workflow) | Met | CLI options `--enable-cache`, `--cache-size`, `--cache-ttl`, and `--speculative` verified with JSON and tabular reports in `tests/test_cli.py`. |
-| AC-7 (Quality & coverage standards) | Met | 790 tests passed; branch coverage 97.04% (gate 97%); `ruff check .` and strict `mypy` clean. |
+| AC-1 (Stage Circuit Breaker State Machine & Fast-Fail Isolation) | **Verified** | Verified in `tests/test_pipeline.py`: state machine transitions, fast-fail 0ms short-circuit, half-open probe recovery, required node circuit open error. |
+| AC-2 (Deterministic Stage Chaos Fault Injection & SLA Verification) | **Verified** | Verified in `tests/test_pipeline.py`: exception/timeout/latency spike simulation, SLA budget breach tracking, circuit tripping and recovery detection. |
+| AC-3 (Audit Trail Fidelity & Redaction) | **Pending** | — |
+| AC-4 (API Serving & Prometheus Telemetry) | **Pending** | — |
+| AC-5 (CLI Evaluation & Chaos Workflows) | **Pending** | — |
+| AC-6 (Quality Standards & Zero Regressions) | **Pending** | — |
 
 ## Decision Log
 | Date | Decision | Alternatives Considered | Rationale |
 |------|----------|-------------------------|-----------|
-| 2026-10-08 | Use in-memory LRU+TTL cache with bounded capacity for stage caching | External cache (Redis/Memcached), unbounded dict | Keeps project zero-dependency, self-contained, microsecond-latency oriented, and safe against memory exhaustion. |
-| 2026-10-08 | Speculative inference evaluates on raw transaction features and verifies against post-enrichment delta | Blocking speculation until enrichment finishes, speculation without verification | Running inference concurrently with enrichment achieves real parallelism; validating feature delta guarantees zero accuracy divergence. |
-| 2026-10-08 | Support optional per-node cache policies rather than global caching | Blanket cache for all nodes | Not all nodes are pure or beneficial to cache; allowing per-node policy allows operators to target expensive pure stages (e.g. rules, transforms). |
+| 2026-10-13 | Continue on active feature branch `phase/graph-replay-counterfactual` with upstream and open draft PR #12 | Create a separate branch from `main` | Follows §4A rule ("if you are on a feature branch with an upstream, use it") and preserves unmerged Phase 34 commits on `HEAD`. |
+| 2026-10-13 | Implement per-stage circuit breakers (`StageCircuitBreaker`, `StageCircuitRegistry`) and deterministic chaos simulation (`simulate_pipeline_chaos`) in `pipeline.py` | Service-level circuit breaker only | Service-level `CircuitBreaker` in `api.py` fails over the entire model response, whereas stage-level circuit breakers isolate slow/failing non-critical DAG nodes (e.g., enrichment, calibration) in $O(1)$ without waiting for stage timeouts on every request. |
+| 2026-10-13 | Leave untracked `uv.lock` untouched | Stage or remove `uv.lock` | Follows §1 hard rule ("Never discard, overwrite, stage, or commit changes you did not make"). |
 
-## Validation Commands
-```bash
-.venv/Scripts/python.exe -m ruff check .
-.venv/Scripts/python.exe -m mypy
-.venv/Scripts/python.exe -m pytest -ra
-```
+## Validation Commands & Results
+- Baseline `ruff check src tests`: Passed (0 errors)
+- Baseline `mypy src`: Passed (0 issues in 20 source files)
+- Baseline `pytest --cov=fraud_detection --cov-report=term-missing -q`: Passed (798 passed, 97.05% branch coverage)

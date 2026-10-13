@@ -41,6 +41,7 @@ from fraud_detection.audit import (
     AuditSink,
     JsonlAuditSink,
     NullAuditSink,
+    build_pipeline_replay_audit_event,
     build_scoring_audit_event,
     build_shadow_scoring_audit_event,
 )
@@ -52,6 +53,8 @@ from fraud_detection.pipeline import (
     DecisionGraph,
     DecisionGraphExecutor,
     create_default_fraud_pipeline,
+    optimize_counterfactual_pipeline,
+    replay_audit_log_through_pipeline,
 )
 from fraud_detection.recalibration import BaseRecalibrator
 from fraud_detection.routing import (
@@ -766,6 +769,97 @@ class PipelineCacheClearResponse(BaseModel):
     message: str | None = None
 
 
+class PipelineReplayRequest(BaseModel):
+    """Payload to request replay of an audit log through a candidate pipeline."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    audit_log_path: str = Field(min_length=1)
+    data_path: str | None = None
+    tolerance: float = Field(default=1e-4, ge=0.0)
+    max_discrepancies: int = Field(default=100, ge=0)
+
+
+class PipelineReplayResponse(BaseModel):
+    """Execution summary and divergence telemetry from pipeline audit replay."""
+
+    total_events: int
+    scoring_events: int
+    replayed_events: int
+    skipped_events: int
+    total_transactions: int
+    score_discrepancies: int
+    decision_flips: int
+    flip_rate: float
+    max_absolute_difference: float
+    mean_absolute_difference: float
+    tolerance: float
+    status: str
+    transition_matrix: dict[str, Any]
+    baseline_decision_counts: dict[str, int]
+    replayed_decision_counts: dict[str, int]
+    mean_latency_ms: float
+    p95_latency_ms: float
+    degraded_executions: int
+    stage_latencies: dict[str, dict[str, float]]
+    discrepancies: list[dict[str, Any]]
+
+
+class PipelineCounterfactualRequest(BaseModel):
+    """Payload to evaluate counterfactual policy shifts on probabilities."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    probabilities: list[float] = Field(min_length=1)
+    candidate_review_threshold: float = Field(ge=0.0, le=1.0)
+    candidate_deny_threshold: float = Field(ge=0.0, le=1.0)
+    baseline_review_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
+    baseline_deny_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
+    baseline_decisions: list[str] | None = None
+    y_true: list[int] | None = None
+    manual_review_cost: float = Field(default=5.0, ge=0.0)
+    false_deny_cost: float = Field(default=50.0, ge=0.0)
+    missed_fraud_cost: float = Field(default=200.0, ge=0.0)
+
+    @model_validator(mode="after")
+    def validate_threshold_boundaries(self) -> Self:
+        if self.candidate_review_threshold > self.candidate_deny_threshold:
+            raise ValueError("candidate_review_threshold cannot exceed candidate_deny_threshold.")
+        if (self.baseline_review_threshold is None) ^ (self.baseline_deny_threshold is None):
+            raise ValueError(
+                "baseline_review_threshold and baseline_deny_threshold "
+                "must both be provided or omitted."
+            )
+        if (
+            self.baseline_review_threshold is not None
+            and self.baseline_deny_threshold is not None
+            and self.baseline_review_threshold > self.baseline_deny_threshold
+        ):
+            raise ValueError("baseline_review_threshold cannot exceed baseline_deny_threshold.")
+        return self
+
+
+class PipelineCounterfactualResponse(BaseModel):
+    """Simulation outcomes, transition matrices, and cost impacts of counterfactual policies."""
+
+    rows: int
+    baseline_thresholds: dict[str, float]
+    candidate_thresholds: dict[str, float]
+    transition_matrix: dict[str, Any]
+    baseline_decision_counts: dict[str, int]
+    candidate_decision_counts: dict[str, int]
+    review_count_delta: int
+    review_rate_delta: float
+    deny_count_delta: int
+    deny_rate_delta: float
+    turnover_count: int
+    turnover_rate: float
+    baseline_metrics: dict[str, Any] | None = None
+    candidate_metrics: dict[str, Any] | None = None
+    cost_delta: float | None = None
+    fraud_catch_delta: int | None = None
+
+
 def create_app(
     *,
     model: FraudModel | None = None,
@@ -1187,6 +1281,17 @@ def create_app(
         "Total speculative pipeline evaluation hits adopted.",
         registry=metrics_registry,
     )
+    pipeline_replay_evaluations_counter = Counter(
+        "fraud_pipeline_replay_evaluations_total",
+        "Total audit log replay evaluations through decision graph.",
+        ["status"],
+        registry=metrics_registry,
+    )
+    pipeline_replay_discrepancies_counter = Counter(
+        "fraud_pipeline_replay_discrepancies_total",
+        "Total discrepancies identified during pipeline replay.",
+        registry=metrics_registry,
+    )
 
     if resolved_cb is not None:
         # Keep a caller-supplied callback: the metrics counter is chained onto it
@@ -1429,6 +1534,12 @@ def create_app(
         )
         application.state.pipeline_speculative_hits_counter = (
             pipeline_speculative_hits_counter
+        )
+        application.state.pipeline_replay_evaluations_counter = (
+            pipeline_replay_evaluations_counter
+        )
+        application.state.pipeline_replay_discrepancies_counter = (
+            pipeline_replay_discrepancies_counter
         )
         shadow_tasks: set[asyncio.Task[None]] = set()
         application.state.shadow_tasks = shadow_tasks
@@ -2847,6 +2958,136 @@ def create_app(
             status="cleared",
             message="Pipeline cache cleared successfully.",
         )
+
+    @application.post(
+        "/v1/pipeline/replay",
+        response_model=PipelineReplayResponse,
+        responses={
+            400: {"description": "Invalid audit log path or parameter error."},
+            404: {"description": "Decision graph pipeline is not enabled or file not found."},
+        },
+        tags=["pipeline"],
+    )
+    async def pipeline_replay(
+        payload: PipelineReplayRequest,
+        request: Request,
+    ) -> PipelineReplayResponse | JSONResponse:
+        """Replay historical scoring events from an audit log through the active decision graph."""
+        executor: DecisionGraphExecutor | None = getattr(
+            request.app.state, "pipeline_executor", None
+        )
+        if executor is None:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": "Decision graph pipeline is not enabled on this service."},
+            )
+
+        def _check_files() -> str | None:
+            log_p = Path(payload.audit_log_path)
+            if not log_p.is_file():
+                return f"Audit log file not found: {payload.audit_log_path}"
+            if payload.data_path is not None:
+                d_p = Path(payload.data_path)
+                if not d_p.is_file():
+                    return f"External data file not found: {payload.data_path}"
+            return None
+
+        file_error = await run_in_threadpool(_check_files)
+        if file_error is not None:
+            return JSONResponse(status_code=404, content={"detail": file_error})
+
+        try:
+            report = await run_in_threadpool(
+                replay_audit_log_through_pipeline,
+                Path(payload.audit_log_path),
+                executor,
+                data_path=payload.data_path,
+                tolerance=payload.tolerance,
+                max_discrepancies_to_record=payload.max_discrepancies,
+            )
+        except ValueError as exc:
+            return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+        rep_counter: Counter | None = getattr(
+            request.app.state, "pipeline_replay_evaluations_counter", None
+        )
+        if rep_counter is not None:
+            rep_counter.labels(status=report.status.lower()).inc()
+
+        disc_counter: Counter | None = getattr(
+            request.app.state, "pipeline_replay_discrepancies_counter", None
+        )
+        if disc_counter is not None and report.score_discrepancies > 0:
+            disc_counter.inc(report.score_discrepancies)
+
+        sink: AuditSink = getattr(request.app.state, "audit_sink", resolved_audit_sink)
+        try:
+            audit_ev = build_pipeline_replay_audit_event(
+                pipeline_name=executor.graph.name,
+                audit_source=str(payload.audit_log_path),
+                replayed_events=report.replayed_events,
+                total_transactions=report.total_transactions,
+                score_discrepancies=report.score_discrepancies,
+                decision_flips=report.decision_flips,
+                flip_rate=report.flip_rate,
+                status=report.status,
+                transition_matrix=report.transition_matrix.to_dict(),
+                mean_latency_ms=report.mean_latency_ms,
+                p95_latency_ms=report.p95_latency_ms,
+                metadata={"tolerance": payload.tolerance},
+            )
+            await run_in_threadpool(sink.emit, audit_ev)
+        except Exception:
+            logger.exception("Failed to emit pipeline replay audit event.")
+
+        rep_dict = report.to_dict()
+        return PipelineReplayResponse(**rep_dict)
+
+    @application.post(
+        "/v1/pipeline/counterfactual",
+        response_model=PipelineCounterfactualResponse,
+        responses={
+            400: {"description": "Validation or cost parameter error."},
+        },
+        tags=["pipeline"],
+    )
+    async def pipeline_counterfactual(
+        payload: PipelineCounterfactualRequest,
+    ) -> PipelineCounterfactualResponse | JSONResponse:
+        """Evaluate counterfactual policy shifts, decision turnover, and workload/cost impact."""
+        candidate_th = TieredThresholds(
+            review_threshold=payload.candidate_review_threshold,
+            deny_threshold=payload.candidate_deny_threshold,
+        )
+
+        baseline_th: TieredThresholds | None = None
+        if (
+            payload.baseline_review_threshold is not None
+            and payload.baseline_deny_threshold is not None
+        ):
+            baseline_th = TieredThresholds(
+                review_threshold=payload.baseline_review_threshold,
+                deny_threshold=payload.baseline_deny_threshold,
+            )
+
+        try:
+            cf_eval = await run_in_threadpool(
+                optimize_counterfactual_pipeline,
+                probabilities=payload.probabilities,
+                candidate_thresholds=candidate_th,
+                baseline_thresholds=baseline_th,
+                baseline_decisions=payload.baseline_decisions,
+                y_true=payload.y_true,
+                manual_review_cost=payload.manual_review_cost,
+                false_deny_cost=payload.false_deny_cost,
+                missed_fraud_cost=payload.missed_fraud_cost,
+            )
+        except ValueError as exc:
+            return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+        cf_dict = cf_eval.to_dict()
+        return PipelineCounterfactualResponse(**cf_dict)
+
 
     @application.get("/metrics", tags=["operations"])
     async def metrics() -> Response:
