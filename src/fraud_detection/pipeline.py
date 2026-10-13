@@ -2544,4 +2544,236 @@ class PipelineChaosReport:
         }
 
 
+def simulate_pipeline_chaos(
+    records: Sequence[dict[str, Any]],
+    pipeline: DecisionGraph | DecisionGraphExecutor,
+    fault_specs: Sequence[StageFaultSpec],
+    *,
+    sla_budget_ms: float = 100.0,
+    enable_circuit_breaker: bool = True,
+    circuit_failure_threshold: int = 5,
+    circuit_recovery_timeout_seconds: float = 30.0,
+    global_timeout_seconds: float | None = None,
+) -> PipelineChaosReport:
+    """Execute transactions through a decision graph under deterministic chaos fault injection.
+
+    Injects stage-level exceptions, timeouts, and latency spikes across specified transaction
+    index ranges, evaluating stage circuit breaker tripping, zero-latency fast-fail isolation,
+    SLA budget compliance, and post-fault circuit recovery.
+    """
+    if (
+        isinstance(sla_budget_ms, bool)
+        or not math.isfinite(sla_budget_ms)
+        or sla_budget_ms <= 0.0
+    ):
+        raise ValueError("sla_budget_ms must be a positive finite number")
+
+    parsed_specs: list[StageFaultSpec] = []
+    for s in fault_specs:
+        if isinstance(s, StageFaultSpec):
+            parsed_specs.append(s)
+        elif isinstance(s, dict):
+            parsed_specs.append(
+                StageFaultSpec(
+                    node_name=str(s["node_name"]),
+                    fault_type=StageFaultType(s["fault_type"]),
+                    start_index=int(s.get("start_index", 0)),
+                    end_index=int(s["end_index"]) if s.get("end_index") is not None else None,
+                    latency_ms=float(s.get("latency_ms", 0.0)),
+                    error_message=str(s.get("error_message", "Injected stage chaos fault")),
+                )
+            )
+        else:
+            raise TypeError(f"fault_spec must be StageFaultSpec or dict, got {type(s)}")
+
+    if isinstance(pipeline, DecisionGraphExecutor):
+        graph = pipeline.graph
+    elif isinstance(pipeline, DecisionGraph):
+        graph = pipeline
+    else:
+        raise TypeError(
+            f"pipeline must be DecisionGraph or DecisionGraphExecutor, got {type(pipeline)}"
+        )
+
+    for spec in parsed_specs:
+        if spec.node_name not in graph.nodes:
+            raise ValueError(f"Target node '{spec.node_name}' does not exist in decision graph")
+
+    registry = StageCircuitRegistry()
+    if enable_circuit_breaker:
+        for name, node in graph.nodes.items():
+            pol = node.circuit_policy or StageCircuitPolicy(
+                enabled=True,
+                failure_threshold=circuit_failure_threshold,
+                recovery_timeout_seconds=circuit_recovery_timeout_seconds,
+            )
+            registry.register_policy(name, pol)
+
+    executor = DecisionGraphExecutor(
+        graph,
+        circuit_registry=registry,
+        enable_circuit_breaker=enable_circuit_breaker,
+        enable_cache=(
+            getattr(pipeline, "enable_cache", False)
+            if isinstance(pipeline, DecisionGraphExecutor)
+            else False
+        ),
+    )
+
+    current_tx_index = 0
+    stage_chaos_metrics: dict[str, StageChaosMetrics] = {
+        spec.node_name: StageChaosMetrics(
+            node_name=spec.node_name,
+            fault_type=(
+                spec.fault_type.value
+                if isinstance(spec.fault_type, StageFaultType)
+                else str(spec.fault_type)
+            ),
+        )
+        for spec in parsed_specs
+    }
+
+    original_processors = {name: node.processor for name, node in graph.nodes.items()}
+
+    def make_chaos_processor(node_name: str, orig_proc: Any) -> Any:
+        node_specs = [s for s in parsed_specs if s.node_name == node_name]
+        if not node_specs:
+            return orig_proc
+
+        if inspect.iscoroutinefunction(orig_proc):
+            async def async_chaos_wrapper(ctx: PipelineContext) -> Any:
+                for spec in node_specs:
+                    is_active = (
+                        spec.start_index <= current_tx_index
+                        and (spec.end_index is None or current_tx_index < spec.end_index)
+                    )
+                    if is_active:
+                        m = stage_chaos_metrics[node_name]
+                        m.injected_count += 1
+                        ft = (
+                            spec.fault_type
+                            if isinstance(spec.fault_type, StageFaultType)
+                            else StageFaultType(spec.fault_type)
+                        )
+                        if ft == StageFaultType.EXCEPTION:
+                            raise RuntimeError(spec.error_message)
+                        if ft == StageFaultType.TIMEOUT:
+                            await asyncio.sleep(0.005)
+                            raise TimeoutError(spec.error_message)
+                        if ft == StageFaultType.LATENCY_SPIKE and spec.latency_ms > 0:
+                            await asyncio.sleep(spec.latency_ms / 1000.0)
+                return await orig_proc(ctx)
+
+            return async_chaos_wrapper
+        else:
+            def sync_chaos_wrapper(ctx: PipelineContext) -> Any:
+                for spec in node_specs:
+                    is_active = (
+                        spec.start_index <= current_tx_index
+                        and (spec.end_index is None or current_tx_index < spec.end_index)
+                    )
+                    if is_active:
+                        m = stage_chaos_metrics[node_name]
+                        m.injected_count += 1
+                        ft = (
+                            spec.fault_type
+                            if isinstance(spec.fault_type, StageFaultType)
+                            else StageFaultType(spec.fault_type)
+                        )
+                        if ft == StageFaultType.EXCEPTION:
+                            raise RuntimeError(spec.error_message)
+                        if ft == StageFaultType.TIMEOUT:
+                            time.sleep(0.005)
+                            raise TimeoutError(spec.error_message)
+                        if ft == StageFaultType.LATENCY_SPIKE and spec.latency_ms > 0:
+                            time.sleep(spec.latency_ms / 1000.0)
+                return orig_proc(ctx)
+
+            return sync_chaos_wrapper
+
+    for name, orig_proc in original_processors.items():
+        graph.nodes[name].processor = make_chaos_processor(name, orig_proc)
+
+    latencies: list[float] = []
+    sla_breaches = 0
+    degraded_transactions = 0
+    unhandled_errors = 0
+
+    try:
+        for idx, record in enumerate(records):
+            current_tx_index = idx
+            try:
+                res = executor.execute_sync(
+                    record,
+                    global_timeout_seconds=global_timeout_seconds,
+                )
+                latencies.append(res.total_latency_ms)
+                if res.total_latency_ms > sla_budget_ms:
+                    sla_breaches += 1
+                if res.degraded:
+                    degraded_transactions += 1
+                for node_name in res.stage_results:
+                    if (
+                        node_name in stage_chaos_metrics
+                        and res.stage_results[node_name].degraded
+                    ):
+                        stage_chaos_metrics[node_name].handled_count += 1
+            except Exception as exc:
+                logger.warning("Unhandled error during chaos execution on tx %d: %s", idx, exc)
+                unhandled_errors += 1
+                latencies.append(sla_budget_ms * 2.0)
+                sla_breaches += 1
+    finally:
+        for name, orig_proc in original_processors.items():
+            graph.nodes[name].processor = orig_proc
+
+    cb_stats = registry.stats_dict()
+    total_trips = int(cb_stats["total_trips"])
+    short_circuited_calls = int(cb_stats["total_short_circuits"])
+
+    for node_name, m in stage_chaos_metrics.items():
+        node_st = cb_stats["nodes"].get(node_name)
+        if node_st and int(node_st.get("total_trips", 0)) > 0:
+            m.tripped_circuit = True
+
+    all_closed = len(cb_stats["open_nodes"]) == 0 and len(cb_stats["half_open_nodes"]) == 0
+
+    if latencies:
+        p50 = float(np.percentile(latencies, 50))
+        p95 = float(np.percentile(latencies, 95))
+        max_lat = float(np.max(latencies))
+    else:
+        p50 = 0.0
+        p95 = 0.0
+        max_lat = 0.0
+
+    if unhandled_errors > 0:
+        overall_status = "FAILED"
+    elif sla_breaches > 0:
+        overall_status = "SLA_BREACHED"
+    elif degraded_transactions > 0 or not all_closed:
+        overall_status = "DEGRADED"
+    else:
+        overall_status = "RESILIENT"
+
+    return PipelineChaosReport(
+        total_transactions=len(records),
+        fault_specs=parsed_specs,
+        circuit_breaker_enabled=enable_circuit_breaker,
+        sla_budget_ms=sla_budget_ms,
+        sla_breaches=sla_breaches,
+        circuit_trips=total_trips,
+        short_circuited_calls=short_circuited_calls,
+        unhandled_errors=unhandled_errors,
+        degraded_transactions=degraded_transactions,
+        latencies_p50_ms=p50,
+        latencies_p95_ms=p95,
+        latencies_max_ms=max_lat,
+        stage_metrics=stage_chaos_metrics,
+        recovered=all_closed,
+        status=overall_status,
+    )
+
+
+
 
