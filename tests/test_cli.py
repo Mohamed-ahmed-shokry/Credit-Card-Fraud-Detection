@@ -6144,3 +6144,195 @@ def test_cli_pipeline_replay_and_counterfactual(
     assert "Report written to:" in res_noisy_cf.output
 
 
+def test_pipeline_eval_cli_circuit_breaker_options(
+    tmp_path: Path, trained_artifact: Path
+) -> None:
+    data_path = tmp_path / "tx.csv"
+    generate_synthetic_data(rows=200, random_state=42).iloc[:20].to_csv(data_path, index=False)
+    out_file = tmp_path / "eval_cb.json"
+
+    res = runner.invoke(
+        app,
+        [
+            "pipeline-eval",
+            "--model",
+            str(trained_artifact),
+            "--input",
+            str(data_path),
+            "--enable-circuit-breaker",
+            "--cb-failure-threshold",
+            "3",
+            "--cb-recovery-timeout",
+            "15.0",
+            "--output",
+            str(out_file),
+            "--json",
+        ],
+    )
+    assert res.exit_code == 0, res.output
+    data = json.loads(res.stdout)
+    assert data["circuit_breaker"]["enabled"] is True
+    assert "short_circuits_count" in data["circuit_breaker"]
+    assert "summary" in data["circuit_breaker"]
+
+    # Also test text output display
+    res_text = runner.invoke(
+        app,
+        [
+            "pipeline-eval",
+            "--model",
+            str(trained_artifact),
+            "--input",
+            str(data_path),
+            "--enable-circuit-breaker",
+        ],
+    )
+    assert res_text.exit_code == 0
+    assert "Circuit Breaker: Short Circuits=" in res_text.output
+
+
+def test_pipeline_chaos_cli_workflow(tmp_path: Path, trained_artifact: Path) -> None:
+    data_path = tmp_path / "tx_chaos.csv"
+    generate_synthetic_data(rows=200, random_state=42).iloc[:25].to_csv(data_path, index=False)
+
+    faults_path = tmp_path / "faults.json"
+    faults = [
+        {
+            "node_name": "rules",
+            "fault_type": "exception",
+            "start_index": 0,
+            "end_index": 5,
+            "error_message": "CLI Test Injected Chaos",
+        }
+    ]
+    faults_path.write_text(json.dumps(faults), encoding="utf-8")
+
+    out_json = tmp_path / "chaos_out.json"
+    audit_path = tmp_path / "chaos_audit.jsonl"
+
+    # Successful run with JSON output and audit logging
+    res = runner.invoke(
+        app,
+        [
+            "pipeline-chaos",
+            "--input",
+            str(data_path),
+            "--faults",
+            str(faults_path),
+            "--model",
+            str(trained_artifact),
+            "--sla-budget-ms",
+            "500.0",
+            "--enable-circuit-breaker",
+            "--cb-failure-threshold",
+            "2",
+            "--cb-recovery-timeout",
+            "0.01",
+            "--audit-log",
+            str(audit_path),
+            "--output",
+            str(out_json),
+            "--json",
+        ],
+    )
+    assert res.exit_code == 0, res.output
+    report = json.loads(res.stdout)
+    assert report["total_transactions"] == 25
+    assert report["circuit_breaker_enabled"] is True
+    assert report["circuit_trips"] >= 1
+    assert "rules" in report["stage_metrics"]
+    assert out_json.is_file()
+
+    # Check audit log written
+    assert audit_path.is_file()
+    lines = audit_path.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 1
+    ev = json.loads(lines[0])
+    assert ev["event_type"] == "pipeline_chaos"
+    assert ev["payload"]["circuit_trips"] >= 1
+
+    # Text output check
+    res_text = runner.invoke(
+        app,
+        [
+            "pipeline-chaos",
+            "--input",
+            str(data_path),
+            "--faults",
+            str(faults_path),
+            "--model",
+            str(trained_artifact),
+        ],
+    )
+    assert res_text.exit_code == 0
+    assert "Pipeline Chaos Resilience Report:" in res_text.output
+    assert "Status:" in res_text.output
+
+    # Default model fallback when --model is omitted
+    res_default_model = runner.invoke(
+        app,
+        [
+            "pipeline-chaos",
+            "--input",
+            str(data_path),
+            "--faults",
+            str(faults_path),
+            "--max-records",
+            "5",
+            "--json",
+        ],
+    )
+    assert res_default_model.exit_code == 0, res_default_model.output
+
+    # Failure exits: invalid faults file
+    bad_faults = tmp_path / "bad_faults.json"
+    bad_faults.write_text('{"not": "a list"}', encoding="utf-8")
+    res_bad_faults = runner.invoke(
+        app,
+        ["pipeline-chaos", "--input", str(data_path), "--faults", str(bad_faults)],
+    )
+    assert res_bad_faults.exit_code == 2
+
+    # Failure exits: --fail-on-sla-breach
+    res_sla_fail = runner.invoke(
+        app,
+        [
+            "pipeline-chaos",
+            "--input",
+            str(data_path),
+            "--faults",
+            str(faults_path),
+            "--sla-budget-ms",
+            "0.001",
+            "--fail-on-sla-breach",
+        ],
+    )
+    assert res_sla_fail.exit_code == 1
+
+    # Failure exits: --fail-on-unrecovered
+    unrecovered_faults = tmp_path / "unrec_faults.json"
+    unrec = [
+        {
+            "node_name": "rules",
+            "fault_type": "exception",
+            "start_index": 0,
+            "end_index": 25,
+        }
+    ]
+    unrecovered_faults.write_text(json.dumps(unrec), encoding="utf-8")
+    res_unrec_fail = runner.invoke(
+        app,
+        [
+            "pipeline-chaos",
+            "--input",
+            str(data_path),
+            "--faults",
+            str(unrecovered_faults),
+            "--cb-recovery-timeout",
+            "60.0",
+            "--fail-on-unrecovered",
+        ],
+    )
+    assert res_unrec_fail.exit_code == 1
+
+
