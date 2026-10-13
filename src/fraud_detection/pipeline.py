@@ -1244,12 +1244,20 @@ class DecisionGraphExecutor:
         enable_cache: bool = True,
         enable_speculative: bool | None = None,
         speculative_nodes: Sequence[str] | None = None,
+        circuit_registry: StageCircuitRegistry | None = None,
+        enable_circuit_breaker: bool | None = None,
     ) -> None:
         self.graph = graph
         self.graph.validate()
         self.plan = self.graph.build_execution_plan()
         self.cache = cache or StageExecutionCache()
         self.enable_cache = enable_cache
+        self.circuit_registry = circuit_registry or StageCircuitRegistry()
+        self.enable_circuit_breaker = (
+            enable_circuit_breaker
+            if enable_circuit_breaker is not None
+            else bool(self.graph.metadata.get("enable_circuit_breaker", False))
+        )
         self.enable_speculative = (
             enable_speculative
             if enable_speculative is not None
@@ -1270,9 +1278,46 @@ class DecisionGraphExecutor:
         for name, node in self.graph.nodes.items():
             if node.cache_policy is not None:
                 self.cache.register_policy(name, node.cache_policy)
+            if node.circuit_policy is not None:
+                self.circuit_registry.register_policy(name, node.circuit_policy)
+            elif self.enable_circuit_breaker:
+                thresh = int(self.graph.metadata.get("circuit_failure_threshold", 5))
+                rec_sec = float(self.graph.metadata.get("circuit_recovery_timeout_seconds", 30.0))
+                self.circuit_registry.register_policy(
+                    name,
+                    StageCircuitPolicy(
+                        enabled=True,
+                        failure_threshold=thresh,
+                        recovery_timeout_seconds=rec_sec,
+                    ),
+                )
 
     async def _execute_node(self, node_name: str, context: PipelineContext) -> None:
         node = self.graph.nodes[node_name]
+
+        if not self.circuit_registry.allow_execution(node_name):
+            logger.warning(
+                "Pipeline stage '%s' short-circuited: circuit breaker is OPEN", node_name
+            )
+            if node.required:
+                raise PipelineCircuitOpenError(
+                    f"Required stage '{node_name}' cannot execute: circuit breaker is open."
+                )
+            context.results[node_name] = StageExecutionResult(
+                node_name=node.name,
+                stage_type=node.stage_type,
+                status=StageStatus.CIRCUIT_OPEN,
+                latency_ms=0.0,
+                output=(
+                    copy.deepcopy(node.fallback_value)
+                    if isinstance(node.fallback_value, (dict, list))
+                    else node.fallback_value
+                ),
+                error="Stage circuit breaker is open",
+                degraded=True,
+                short_circuited_by_breaker=True,
+            )
+            return
 
         if node.condition is not None:
             try:
@@ -1294,6 +1339,7 @@ class DecisionGraphExecutor:
                 cache_key = self.cache.compute_key(node_name, context)
                 hit, cached_output = self.cache.get(node_name, cache_key)
                 if hit:
+                    self.circuit_registry.record_success(node_name)
                     context.results[node_name] = StageExecutionResult(
                         node_name=node.name,
                         stage_type=node.stage_type,
@@ -1320,6 +1366,7 @@ class DecisionGraphExecutor:
                 output = await proc_coro
 
             elapsed = (perf_counter() - start) * 1000.0
+            self.circuit_registry.record_success(node_name)
             context.results[node_name] = StageExecutionResult(
                 node_name=node.name,
                 stage_type=node.stage_type,
@@ -1341,6 +1388,7 @@ class DecisionGraphExecutor:
                 elapsed,
                 node.timeout_seconds or 0.0,
             )
+            self.circuit_registry.record_failure(node_name, reason="timeout", is_timeout=True)
             if node.required:
                 raise PipelineTimeoutError(
                     f"Required stage '{node_name}' exceeded latency budget "
@@ -1359,6 +1407,7 @@ class DecisionGraphExecutor:
         except Exception as exc:
             elapsed = (perf_counter() - start) * 1000.0
             logger.exception("Pipeline stage '%s' failed: %s", node_name, exc)
+            self.circuit_registry.record_failure(node_name, reason=str(exc), is_timeout=False)
             if node.required:
                 raise PipelineExecutionError(
                     f"Required stage '{node_name}' failed: {exc}"
@@ -1528,7 +1577,11 @@ class DecisionGraphExecutor:
                 self.cache.get_policy(name) is not None
                 or getattr(self.graph.nodes.get(name), "cache_policy", None) is not None
             )
-        )
+        circuit_short_circuits = [
+            node_name
+            for node_name, res in context.results.items()
+            if res.short_circuited_by_breaker
+        ]
 
         return PipelineExecutionResult(
             execution_id=execution_id,
@@ -1543,6 +1596,7 @@ class DecisionGraphExecutor:
             cache_misses=cache_misses,
             speculative_executed=bool(context.metadata.get("speculative_executed", False)),
             speculative_hit=bool(context.metadata.get("speculative_hit", False)),
+            circuit_short_circuits=circuit_short_circuits,
         )
 
     def execute_sync(
