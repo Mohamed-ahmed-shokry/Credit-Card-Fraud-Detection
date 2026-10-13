@@ -675,6 +675,7 @@ class PipelineNode:
     required: bool = False
     condition: Callable[[PipelineContext], bool] | None = None
     cache_policy: NodeCachePolicy | None = None
+    circuit_policy: StageCircuitPolicy | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Convert node definition to a serializable dictionary."""
@@ -691,6 +692,9 @@ class PipelineNode:
             "required": self.required,
             "has_condition": self.condition is not None,
             "cache_policy": self.cache_policy.to_dict() if self.cache_policy is not None else None,
+            "circuit_policy": (
+                self.circuit_policy.to_dict() if self.circuit_policy is not None else None
+            ),
         }
 
 
@@ -1171,6 +1175,7 @@ class PipelineExecutionResult:
     cache_misses: int = 0
     speculative_executed: bool = False
     speculative_hit: bool = False
+    circuit_short_circuits: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         """Convert pipeline execution result to a serializable dictionary."""
@@ -1187,6 +1192,7 @@ class PipelineExecutionResult:
             "cache_misses": self.cache_misses,
             "speculative_executed": self.speculative_executed,
             "speculative_hit": self.speculative_hit,
+            "circuit_short_circuits": list(self.circuit_short_circuits),
         }
 
     @property
