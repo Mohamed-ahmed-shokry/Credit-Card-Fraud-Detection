@@ -41,6 +41,7 @@ from fraud_detection.audit import (
     AuditSink,
     JsonlAuditSink,
     NullAuditSink,
+    build_pipeline_chaos_audit_event,
     build_pipeline_replay_audit_event,
     build_scoring_audit_event,
     build_shadow_scoring_audit_event,
@@ -52,9 +53,13 @@ from fraud_detection.model import FraudModel, ModelArtifactError, load_model
 from fraud_detection.pipeline import (
     DecisionGraph,
     DecisionGraphExecutor,
+    StageCircuitState,
+    StageFaultSpec,
+    StageFaultType,
     create_default_fraud_pipeline,
     optimize_counterfactual_pipeline,
     replay_audit_log_through_pipeline,
+    simulate_pipeline_chaos,
 )
 from fraud_detection.recalibration import BaseRecalibrator
 from fraud_detection.routing import (
@@ -120,6 +125,15 @@ PIPELINE_CACHE_ENABLED_ENVIRONMENT_VARIABLE = "FRAUD_PIPELINE_CACHE_ENABLED"
 PIPELINE_SPECULATIVE_ENVIRONMENT_VARIABLE = "FRAUD_PIPELINE_SPECULATIVE_ENABLED"
 PIPELINE_CACHE_TTL_ENVIRONMENT_VARIABLE = "FRAUD_PIPELINE_CACHE_TTL_SECONDS"
 PIPELINE_CACHE_SIZE_ENVIRONMENT_VARIABLE = "FRAUD_PIPELINE_CACHE_MAX_SIZE"
+PIPELINE_CIRCUIT_BREAKER_ENABLED_ENVIRONMENT_VARIABLE = (
+    "FRAUD_PIPELINE_CIRCUIT_BREAKER_ENABLED"
+)
+PIPELINE_CIRCUIT_FAILURE_THRESHOLD_ENVIRONMENT_VARIABLE = (
+    "FRAUD_PIPELINE_CIRCUIT_FAILURE_THRESHOLD"
+)
+PIPELINE_CIRCUIT_RECOVERY_TIMEOUT_ENVIRONMENT_VARIABLE = (
+    "FRAUD_PIPELINE_CIRCUIT_RECOVERY_TIMEOUT_SECONDS"
+)
 REQUEST_ID_HEADER = "X-Request-ID"
 PROCESS_TIME_HEADER = "X-Process-Time-Ms"
 MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024
@@ -138,6 +152,9 @@ OPERATIONAL_PATHS = frozenset(
         "/v1/pipeline/topology",
         "/v1/pipeline/cache/stats",
         "/v1/pipeline/cache/clear",
+        "/v1/pipeline/circuits",
+        "/v1/pipeline/circuits/reset",
+        "/v1/pipeline/chaos",
     }
 )
 UNMATCHED_ROUTE_LABEL = "unmatched"
@@ -719,6 +736,7 @@ class PipelineScoreResponse(BaseModel):
     total_latency_ms: float
     degraded: bool
     degraded_nodes: list[str]
+    circuit_short_circuits: list[str] = Field(default_factory=list)
     execution_path: list[str]
     stage_results: dict[str, Any]
 
@@ -858,6 +876,84 @@ class PipelineCounterfactualResponse(BaseModel):
     candidate_metrics: dict[str, Any] | None = None
     cost_delta: float | None = None
     fraud_catch_delta: int | None = None
+
+
+class PipelineCircuitStatusResponse(BaseModel):
+    """Telemetry and operational state for pipeline stage circuit breakers."""
+
+    total_trips: int
+    total_short_circuits: int
+    open_nodes: list[str]
+    half_open_nodes: list[str]
+    nodes: dict[str, Any]
+
+
+class PipelineCircuitResetRequest(BaseModel):
+    """Optional filter to reset a single stage or all stage circuit breakers."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    stage_name: str | None = None
+
+
+class PipelineCircuitResetResponse(BaseModel):
+    """Outcome of manually resetting stage circuit breakers."""
+
+    status: str
+    reset_nodes: list[str]
+    message: str | None = None
+
+
+class StageFaultSpecModel(BaseModel):
+    """Specification for deterministic fault injection during chaos simulation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    node_name: str = Field(min_length=1)
+    fault_type: str = Field(pattern="^(exception|timeout|latency_spike)$")
+    start_index: int = Field(default=0, ge=0)
+    end_index: int | None = Field(default=None, ge=0)
+    latency_ms: float = Field(default=0.0, ge=0.0)
+    error_message: str = "Injected stage chaos fault"
+
+    @model_validator(mode="after")
+    def validate_indices(self) -> Self:
+        if self.end_index is not None and self.end_index < self.start_index:
+            raise ValueError("end_index must be >= start_index")
+        return self
+
+
+class PipelineChaosRequest(BaseModel):
+    """Payload to trigger deterministic chaos resilience verification."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    records: list[dict[str, Any]] = Field(min_length=1)
+    fault_specs: list[StageFaultSpecModel]
+    sla_budget_ms: float = Field(default=100.0, gt=0.0)
+    enable_circuit_breaker: bool = True
+    circuit_failure_threshold: int = Field(default=5, ge=1)
+    circuit_recovery_timeout_seconds: float = Field(default=30.0, gt=0.0)
+
+
+class PipelineChaosResponse(BaseModel):
+    """Telemetry report emitted by stage chaos resilience verification."""
+
+    total_transactions: int
+    fault_specs: list[dict[str, Any]]
+    circuit_breaker_enabled: bool
+    sla_budget_ms: float
+    sla_breaches: int
+    circuit_trips: int
+    short_circuited_calls: int
+    unhandled_errors: int
+    degraded_transactions: int
+    latencies_p50_ms: float
+    latencies_p95_ms: float
+    latencies_max_ms: float
+    stage_metrics: dict[str, Any]
+    recovered: bool
+    status: str
 
 
 def create_app(
