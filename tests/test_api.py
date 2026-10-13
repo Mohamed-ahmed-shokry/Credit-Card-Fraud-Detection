@@ -3829,3 +3829,52 @@ def test_pipeline_chaos_endpoint_and_audit(
     ch_ev = chaos_events[0]
     assert ch_ev.payload["circuit_breaker_enabled"] is True
     assert ch_ev.payload["circuit_trips"] >= 1
+
+
+def test_pipeline_circuits_and_chaos_error_handling(api_context: tuple[Any, FraudModel, Any]) -> None:
+    _, model, _ = api_context
+    # Standard app without pipeline enabled
+    app_no_pipe = create_app(model=model)
+    with TestClient(app_no_pipe) as client:
+        res_c = client.get("/v1/pipeline/circuits")
+        assert res_c.status_code == 404
+
+        res_r = client.post("/v1/pipeline/circuits/reset", json={})
+        assert res_r.status_code == 404
+
+        res_ch = client.post("/v1/pipeline/chaos", json={"records": [{}], "fault_specs": []})
+        assert res_ch.status_code == 404
+
+    # Pipeline enabled app
+    from fraud_detection.audit import AuditEvent, AuditSink
+
+    class ChaosTestSink(AuditSink):
+        def emit(self, event: AuditEvent) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    sink = ChaosTestSink()
+    app_pipe = create_app(model=model, enable_pipeline=True, audit_sink=sink)
+    with TestClient(app_pipe) as client:
+        # Non-existent node name
+        bad_node = client.post(
+            "/v1/pipeline/chaos",
+            json={
+                "records": [{}],
+                "fault_specs": [{"node_name": "does_not_exist", "fault_type": "exception"}],
+            },
+        )
+        assert bad_node.status_code == 400
+
+        # Audit sink failure during chaos
+        def exploding_emit(_ev: Any) -> None:
+            raise RuntimeError("Disk write failed")
+
+        sink.emit = exploding_emit  # type: ignore[assignment]
+        ok_res = client.post(
+            "/v1/pipeline/chaos",
+            json={"records": [{}], "fault_specs": []},
+        )
+        assert ok_res.status_code == 200
