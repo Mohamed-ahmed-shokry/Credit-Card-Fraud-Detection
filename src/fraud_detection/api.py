@@ -1008,6 +1008,9 @@ def create_app(
     enable_speculative_pipeline: bool = False,
     pipeline_cache_ttl_seconds: float = 60.0,
     pipeline_cache_max_size: int = 1000,
+    enable_pipeline_circuit_breaker: bool = False,
+    pipeline_circuit_failure_threshold: int = 5,
+    pipeline_circuit_recovery_timeout_seconds: float = 30.0,
 ) -> FastAPI:
     """Create an application using an injected model or a trusted artifact path.
 
@@ -1232,6 +1235,27 @@ def create_app(
         else pipeline_cache_max_size
     )
 
+    raw_pipe_cb_env = os.getenv(PIPELINE_CIRCUIT_BREAKER_ENABLED_ENVIRONMENT_VARIABLE)
+    resolved_pipeline_cb_enabled = enable_pipeline_circuit_breaker or (
+        raw_pipe_cb_env.lower() in ("true", "1", "yes")
+        if raw_pipe_cb_env is not None
+        else False
+    )
+
+    raw_pipe_thresh_env = os.getenv(PIPELINE_CIRCUIT_FAILURE_THRESHOLD_ENVIRONMENT_VARIABLE)
+    resolved_pipeline_cb_failure_threshold = (
+        int(raw_pipe_thresh_env)
+        if raw_pipe_thresh_env is not None
+        else pipeline_circuit_failure_threshold
+    )
+
+    raw_pipe_recov_env = os.getenv(PIPELINE_CIRCUIT_RECOVERY_TIMEOUT_ENVIRONMENT_VARIABLE)
+    resolved_pipeline_cb_recovery_timeout = (
+        float(raw_pipe_recov_env)
+        if raw_pipe_recov_env is not None
+        else pipeline_circuit_recovery_timeout_seconds
+    )
+
     metrics_registry = CollectorRegistry()
     request_counter = Counter(
         "http_requests_total",
@@ -1386,6 +1410,24 @@ def create_app(
     pipeline_replay_discrepancies_counter = Counter(
         "fraud_pipeline_replay_discrepancies_total",
         "Total discrepancies identified during pipeline replay.",
+        registry=metrics_registry,
+    )
+    pipeline_circuit_short_circuits_counter = Counter(
+        "fraud_pipeline_circuit_short_circuits_total",
+        "Total short-circuited executions triggered by stage circuit breaker.",
+        ["stage"],
+        registry=metrics_registry,
+    )
+    pipeline_circuit_state_gauge = Gauge(
+        "fraud_pipeline_circuit_state",
+        "Current state of pipeline stage circuit breaker (0=closed, 1=open, 2=half_open).",
+        ["stage"],
+        registry=metrics_registry,
+    )
+    pipeline_chaos_simulations_counter = Counter(
+        "fraud_pipeline_chaos_simulations_total",
+        "Total chaos resilience simulations performed.",
+        ["status"],
         registry=metrics_registry,
     )
 
@@ -1576,6 +1618,9 @@ def create_app(
                 cache_ttl_seconds=resolved_pipeline_cache_ttl,
                 cache_max_size=resolved_pipeline_cache_max_size,
                 speculative_inference=resolved_pipeline_speculative_enabled,
+                enable_circuit_breaker=resolved_pipeline_cb_enabled,
+                circuit_failure_threshold=resolved_pipeline_cb_failure_threshold,
+                circuit_recovery_timeout_seconds=resolved_pipeline_cb_recovery_timeout,
             )
 
         resolved_pipeline_exec = pipeline_executor
@@ -1584,6 +1629,7 @@ def create_app(
                 resolved_pipeline_graph,
                 enable_cache=resolved_pipeline_cache_enabled,
                 enable_speculative=resolved_pipeline_speculative_enabled,
+                enable_circuit_breaker=resolved_pipeline_cb_enabled,
             )
         elif resolved_pipeline_exec is not None and resolved_pipeline_graph is None:
             resolved_pipeline_graph = resolved_pipeline_exec.graph
@@ -1637,6 +1683,18 @@ def create_app(
         application.state.pipeline_replay_discrepancies_counter = (
             pipeline_replay_discrepancies_counter
         )
+        application.state.pipeline_circuit_breaker_enabled = resolved_pipeline_cb_enabled
+        application.state.pipeline_circuit_failure_threshold = (
+            resolved_pipeline_cb_failure_threshold
+        )
+        application.state.pipeline_circuit_recovery_timeout = (
+            resolved_pipeline_cb_recovery_timeout
+        )
+        application.state.pipeline_circuit_short_circuits_counter = (
+            pipeline_circuit_short_circuits_counter
+        )
+        application.state.pipeline_circuit_state_gauge = pipeline_circuit_state_gauge
+        application.state.pipeline_chaos_simulations_counter = pipeline_chaos_simulations_counter
         shadow_tasks: set[asyncio.Task[None]] = set()
         application.state.shadow_tasks = shadow_tasks
         yield
@@ -2934,6 +2992,13 @@ def create_app(
         if spec_hit_counter is not None and result.speculative_hit:
             spec_hit_counter.inc()
 
+        pipe_cb_counter: Counter | None = getattr(
+            request.app.state, "pipeline_circuit_short_circuits_counter", None
+        )
+        if pipe_cb_counter is not None and result.circuit_short_circuits:
+            for stage_name in result.circuit_short_circuits:
+                pipe_cb_counter.labels(stage=stage_name).inc()
+
         sink: AuditSink = getattr(request.app.state, "audit_sink", resolved_audit_sink)
         loaded_model_for_audit: FraudModel | None = getattr(request.app.state, "model", None)
         try:
@@ -2976,6 +3041,7 @@ def create_app(
                 cache_misses=result.cache_misses,
                 speculative_executed=result.speculative_executed,
                 speculative_hit=result.speculative_hit,
+                circuit_short_circuits=result.circuit_short_circuits,
             )
             await run_in_threadpool(sink.emit, audit_event)
         except Exception:
@@ -2995,6 +3061,7 @@ def create_app(
             degraded_nodes=result.degraded_nodes,
             execution_path=result.execution_path,
             stage_results={k: v.to_dict() for k, v in result.stage_results.items()},
+            circuit_short_circuits=result.circuit_short_circuits,
         )
 
     @application.get(
@@ -3184,6 +3251,154 @@ def create_app(
         cf_dict = cf_eval.to_dict()
         return PipelineCounterfactualResponse(**cf_dict)
 
+    @application.get(
+        "/v1/pipeline/circuits",
+        response_model=PipelineCircuitStatusResponse,
+        responses={
+            404: {"description": "Decision graph pipeline or circuit breakers not enabled."},
+        },
+        tags=["pipeline"],
+    )
+    async def pipeline_circuits_status(
+        request: Request,
+    ) -> PipelineCircuitStatusResponse | JSONResponse:
+        """Inspect the current health and state of all pipeline stage circuit breakers."""
+        executor: DecisionGraphExecutor | None = getattr(
+            request.app.state, "pipeline_executor", None
+        )
+        if executor is None:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": "Decision graph pipeline is not enabled on this service."},
+            )
+        if not executor.enable_circuit_breaker:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": "Pipeline stage circuit breakers are not enabled."},
+            )
+        return PipelineCircuitStatusResponse(**executor.circuits.summary())
+
+    @application.post(
+        "/v1/pipeline/circuits/reset",
+        response_model=PipelineCircuitResetResponse,
+        responses={
+            404: {"description": "Decision graph pipeline or circuit breakers not enabled."},
+        },
+        tags=["pipeline"],
+    )
+    async def pipeline_circuits_reset(
+        payload: PipelineCircuitResetRequest,
+        request: Request,
+    ) -> PipelineCircuitResetResponse | JSONResponse:
+        """Manually reset tripped stage circuit breakers back to CLOSED state."""
+        executor: DecisionGraphExecutor | None = getattr(
+            request.app.state, "pipeline_executor", None
+        )
+        if executor is None:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": "Decision graph pipeline is not enabled on this service."},
+            )
+        if not executor.enable_circuit_breaker:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": "Pipeline stage circuit breakers are not enabled."},
+            )
+
+        reset_nodes = executor.circuits.reset(payload.stage_name)
+        pipe_gauge: Gauge | None = getattr(
+            request.app.state, "pipeline_circuit_state_gauge", None
+        )
+        if pipe_gauge is not None:
+            for node_name in reset_nodes:
+                pipe_gauge.labels(stage=node_name).set(0.0)
+
+        return PipelineCircuitResetResponse(
+            status="reset",
+            reset_nodes=reset_nodes,
+            message=f"Reset circuit breaker state for {len(reset_nodes)} stage(s).",
+        )
+
+    @application.post(
+        "/v1/pipeline/chaos",
+        response_model=PipelineChaosResponse,
+        responses={
+            400: {"description": "Invalid fault specification or parameters."},
+            404: {"description": "Decision graph pipeline is not enabled."},
+        },
+        tags=["pipeline"],
+    )
+    async def pipeline_chaos(
+        payload: PipelineChaosRequest,
+        request: Request,
+    ) -> PipelineChaosResponse | JSONResponse:
+        """Inject deterministic faults into pipeline stages to evaluate fault isolation and SLAs."""
+        executor: DecisionGraphExecutor | None = getattr(
+            request.app.state, "pipeline_executor", None
+        )
+        if executor is None:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": "Decision graph pipeline is not enabled on this service."},
+            )
+
+        try:
+            converted_specs: list[StageFaultSpec] = [
+                StageFaultSpec(
+                    node_name=s.node_name,
+                    fault_type=StageFaultType(s.fault_type),
+                    start_index=s.start_index,
+                    end_index=s.end_index,
+                    latency_ms=s.latency_ms,
+                    error_message=s.error_message,
+                )
+                for s in payload.fault_specs
+            ]
+        except (ValueError, KeyError) as exc:
+            return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+        try:
+            report = await run_in_threadpool(
+                simulate_pipeline_chaos,
+                payload.records,
+                executor.graph,
+                converted_specs,
+                sla_budget_ms=payload.sla_budget_ms,
+                enable_circuit_breaker=payload.enable_circuit_breaker,
+                circuit_failure_threshold=payload.circuit_failure_threshold,
+                circuit_recovery_timeout_seconds=payload.circuit_recovery_timeout_seconds,
+            )
+        except ValueError as exc:
+            return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+        chaos_counter: Counter | None = getattr(
+            request.app.state, "pipeline_chaos_simulations_counter", None
+        )
+        if chaos_counter is not None:
+            chaos_counter.labels(status=report.status).inc()
+
+        sink: AuditSink = getattr(request.app.state, "audit_sink", resolved_audit_sink)
+        loaded_model_for_audit: FraudModel | None = getattr(request.app.state, "model", None)
+        try:
+            audit_ev = build_pipeline_chaos_audit_event(
+                chaos_report=report,
+                model_version=(
+                    _model_version(loaded_model_for_audit)
+                    if loaded_model_for_audit is not None
+                    else "pipeline"
+                ),
+                dataset_fingerprint=(
+                    str(loaded_model_for_audit.metadata.get("dataset_fingerprint", ""))
+                    if loaded_model_for_audit is not None
+                    else "pipeline"
+                ),
+            )
+            await run_in_threadpool(sink.emit, audit_ev)
+        except Exception:
+            logger.exception("Failed to emit pipeline chaos audit event.")
+
+        rep_dict = report.to_dict()
+        return PipelineChaosResponse(**rep_dict)
 
     @application.get("/metrics", tags=["operations"])
     async def metrics() -> Response:
@@ -3193,6 +3408,22 @@ def create_app(
             if gauge is not None:
                 state_map = {"closed": 0.0, "half_open": 1.0, "open": 2.0}
                 gauge.set(state_map.get(cb.state, 0.0))
+
+        pipe_exec: DecisionGraphExecutor | None = getattr(
+            application.state, "pipeline_executor", None
+        )
+        pipe_gauge: Gauge | None = getattr(
+            application.state, "pipeline_circuit_state_gauge", None
+        )
+        if pipe_exec is not None and pipe_gauge is not None:
+            stage_map = {
+                StageCircuitState.CLOSED: 0.0,
+                StageCircuitState.OPEN: 1.0,
+                StageCircuitState.HALF_OPEN: 2.0,
+            }
+            for stage_name, breaker in pipe_exec.circuits.breakers.items():
+                pipe_gauge.labels(stage=stage_name).set(stage_map.get(breaker.state, 0.0))
+
         return Response(
             content=generate_latest(metrics_registry),
             media_type=CONTENT_TYPE_LATEST,
