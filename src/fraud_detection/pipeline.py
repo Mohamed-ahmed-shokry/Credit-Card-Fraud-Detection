@@ -1293,6 +1293,8 @@ class DecisionGraphExecutor:
         for name, node in self.graph.nodes.items():
             if node.cache_policy is not None:
                 self.cache.register_policy(name, node.cache_policy)
+            if self.circuit_registry.get_breaker(name) is not None:
+                continue
             if node.circuit_policy is not None:
                 self.circuit_registry.register_policy(name, node.circuit_policy)
             elif self.enable_circuit_breaker:
@@ -2622,11 +2624,21 @@ def simulate_pipeline_chaos(
     registry = StageCircuitRegistry()
     if enable_circuit_breaker:
         for name, node in graph.nodes.items():
-            pol = node.circuit_policy or StageCircuitPolicy(
-                enabled=True,
-                failure_threshold=circuit_failure_threshold,
-                recovery_timeout_seconds=circuit_recovery_timeout_seconds,
-            )
+            if node.circuit_policy is not None:
+                pol = StageCircuitPolicy(
+                    enabled=node.circuit_policy.enabled,
+                    failure_threshold=circuit_failure_threshold,
+                    recovery_timeout_seconds=circuit_recovery_timeout_seconds,
+                    half_open_max_calls=node.circuit_policy.half_open_max_calls,
+                    count_timeouts=node.circuit_policy.count_timeouts,
+                    count_exceptions=node.circuit_policy.count_exceptions,
+                )
+            else:
+                pol = StageCircuitPolicy(
+                    enabled=True,
+                    failure_threshold=circuit_failure_threshold,
+                    recovery_timeout_seconds=circuit_recovery_timeout_seconds,
+                )
             registry.register_policy(name, pol)
 
     executor = DecisionGraphExecutor(
