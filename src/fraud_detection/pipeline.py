@@ -2417,3 +2417,125 @@ def optimize_counterfactual_pipeline(
     )
 
 
+# ============================================================================
+# Deterministic Stage Chaos Fault Injection & Resilience Simulation
+# ============================================================================
+
+
+class StageFaultType(StrEnum):
+    """Supported fault injection modes for stage resilience simulation."""
+
+    EXCEPTION = "exception"
+    TIMEOUT = "timeout"
+    LATENCY_SPIKE = "latency_spike"
+
+
+@dataclass(frozen=True)
+class StageFaultSpec:
+    """Deterministic fault injection specification targeting a stage node."""
+
+    node_name: str
+    fault_type: StageFaultType
+    start_index: int = 0
+    end_index: int | None = None
+    latency_ms: float = 0.0
+    error_message: str = "Injected stage chaos fault"
+
+    def __post_init__(self) -> None:
+        if not self.node_name or not isinstance(self.node_name, str):
+            raise ValueError("node_name must be a non-empty string")
+        if not isinstance(self.fault_type, StageFaultType):
+            try:
+                object.__setattr__(self, "fault_type", StageFaultType(self.fault_type))
+            except ValueError:
+                raise ValueError(
+                    f"Unsupported fault_type '{self.fault_type}'. "
+                    f"Must be one of {[t.value for t in StageFaultType]}"
+                ) from None
+        if isinstance(self.start_index, bool) or self.start_index < 0:
+            raise ValueError("start_index must be an integer >= 0")
+        if self.end_index is not None:
+            if isinstance(self.end_index, bool) or self.end_index < self.start_index:
+                raise ValueError("end_index must be an integer >= start_index")
+        if (
+            isinstance(self.latency_ms, bool)
+            or not math.isfinite(self.latency_ms)
+            or self.latency_ms < 0.0
+        ):
+            raise ValueError("latency_ms must be a non-negative finite number")
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert fault specification to a serializable dictionary."""
+        return {
+            "node_name": self.node_name,
+            "fault_type": self.fault_type.value,
+            "start_index": self.start_index,
+            "end_index": self.end_index,
+            "latency_ms": round(self.latency_ms, 3),
+            "error_message": self.error_message,
+        }
+
+
+@dataclass
+class StageChaosMetrics:
+    """Per-stage fault injection counters and circuit trip status."""
+
+    node_name: str
+    fault_type: str
+    injected_count: int = 0
+    handled_count: int = 0
+    tripped_circuit: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert stage chaos metrics to a serializable dictionary."""
+        return {
+            "node_name": self.node_name,
+            "fault_type": self.fault_type,
+            "injected_count": self.injected_count,
+            "handled_count": self.handled_count,
+            "tripped_circuit": self.tripped_circuit,
+        }
+
+
+@dataclass
+class PipelineChaosReport:
+    """Comprehensive telemetry report emitted by simulate_pipeline_chaos."""
+
+    total_transactions: int
+    fault_specs: list[StageFaultSpec]
+    circuit_breaker_enabled: bool
+    sla_budget_ms: float
+    sla_breaches: int
+    circuit_trips: int
+    short_circuited_calls: int
+    unhandled_errors: int
+    degraded_transactions: int
+    latencies_p50_ms: float
+    latencies_p95_ms: float
+    latencies_max_ms: float
+    stage_metrics: dict[str, StageChaosMetrics]
+    recovered: bool
+    status: str
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert chaos report to a serializable dictionary."""
+        return {
+            "total_transactions": self.total_transactions,
+            "fault_specs": [s.to_dict() for s in self.fault_specs],
+            "circuit_breaker_enabled": self.circuit_breaker_enabled,
+            "sla_budget_ms": round(self.sla_budget_ms, 3),
+            "sla_breaches": self.sla_breaches,
+            "circuit_trips": self.circuit_trips,
+            "short_circuited_calls": self.short_circuited_calls,
+            "unhandled_errors": self.unhandled_errors,
+            "degraded_transactions": self.degraded_transactions,
+            "latencies_p50_ms": round(self.latencies_p50_ms, 3),
+            "latencies_p95_ms": round(self.latencies_p95_ms, 3),
+            "latencies_max_ms": round(self.latencies_max_ms, 3),
+            "stage_metrics": {k: v.to_dict() for k, v in self.stage_metrics.items()},
+            "recovered": self.recovered,
+            "status": self.status,
+        }
+
+
+
