@@ -1504,7 +1504,7 @@ This phase does not implement multi-cluster distributed event replay systems or 
 - `d19832f`, `1e6517c`: test(cli): end-to-end and edge-case tests for pipeline-replay and pipeline-counterfactual
 - `a358934`, `8e0cd7d`: docs: document pipeline replay and counterfactual capabilities in ARCHITECTURE.md and README.md
 
-## Phase 35 — Decision Graph Stage Circuit Breakers, Fast-Fail Isolation & Chaos Fault Injection (In progress)
+## Phase 35 — Decision Graph Stage Circuit Breakers, Fast-Fail Isolation & Chaos Fault Injection (Done)
 
 ### Objective
 
@@ -1566,9 +1566,19 @@ This phase does not implement external service-mesh circuit breaking (Istio/Envo
 - [x] Task 2: Integrate stage circuit breaking into `StageStatus`, `StageExecutionResult`, `PipelineNode`, `PipelineExecutionResult`, `DecisionGraphExecutor`, and `create_default_fraud_pipeline` in `pipeline.py`.
 - [x] Task 3: Implement stage chaos fault-injection primitives (`StageFaultType`, `StageFaultSpec`, `StageChaosMetrics`, `PipelineChaosReport`) and `simulate_pipeline_chaos` in `pipeline.py`.
 - [x] Task 4: Add `circuit_short_circuits` to `build_scoring_audit_event` and implement `build_pipeline_chaos_audit_event` in `audit.py` with unit tests in `tests/test_audit.py`.
-- [ ] Task 5: Expose `/v1/pipeline/circuits`, `/v1/pipeline/circuits/reset`, and `/v1/pipeline/chaos` endpoints and Prometheus metrics in `api.py` with tests in `tests/test_api.py`.
-- [ ] Task 6: Add circuit breaker flags to `pipeline-eval` and implement `pipeline-chaos` CLI command in `cli.py` with tests in `tests/test_cli.py`.
-- [ ] Task 7: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate.
+- [x] Task 5: Expose `/v1/pipeline/circuits`, `/v1/pipeline/circuits/reset`, and `/v1/pipeline/chaos` endpoints and Prometheus metrics in `api.py` with tests in `tests/test_api.py`.
+- [x] Task 6: Add circuit breaker flags to `pipeline-eval` and implement `pipeline-chaos` CLI command in `cli.py` with tests in `tests/test_cli.py`.
+- [x] Task 7: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate.
+
+### Delivery record
+
+- Implemented per-stage circuit breakers with three-state finite state machine (`CLOSED`, `OPEN`, `HALF_OPEN`), thread-safe `StageCircuitRegistry`, failure thresholds, and recovery timeout cooldowns in `src/fraud_detection/pipeline.py`.
+- Integrated stage fast-fail isolation into `DecisionGraphExecutor` and `create_default_fraud_pipeline`, achieving zero-latency short-circuiting to fallback values (`StageStatus.CIRCUIT_OPEN`) and tracking `circuit_short_circuits`.
+- Built deterministic stage chaos fault injection engine (`simulate_pipeline_chaos`) supporting synthetic latency spikes, transient exceptions, timeouts, and SLA breach budget analysis.
+- Integrated audit logging in `src/fraud_detection/audit.py` with `build_pipeline_chaos_audit_event` and `circuit_short_circuits` in scoring audit events.
+- Wired operational endpoints (`GET /v1/pipeline/circuits`, `POST /v1/pipeline/circuits/reset`, `POST /v1/pipeline/chaos`) and Prometheus telemetry (`fraud_pipeline_circuit_state`, `fraud_pipeline_circuit_short_circuits_total`, `fraud_pipeline_chaos_simulations_total`) in `src/fraud_detection/api.py`.
+- Added circuit breaker flags to `pipeline-eval` and implemented the `fraud-detect pipeline-chaos` CLI command in `src/fraud_detection/cli.py`.
+- Final validation: 817 tests passed with 97.15% branch coverage (exceeding 97.0% gate); Ruff format and check clean; strict mypy clean (0 issues); pip-audit passed with 0 vulnerabilities; build and twine check clean.
 
 
 ## Contributing to the roadmap
