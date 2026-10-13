@@ -2435,7 +2435,7 @@ class StageFaultSpec:
     """Deterministic fault injection specification targeting a stage node."""
 
     node_name: str
-    fault_type: StageFaultType
+    fault_type: StageFaultType | str
     start_index: int = 0
     end_index: int | None = None
     latency_ms: float = 0.0
@@ -2444,13 +2444,12 @@ class StageFaultSpec:
     def __post_init__(self) -> None:
         if not self.node_name or not isinstance(self.node_name, str):
             raise ValueError("node_name must be a non-empty string")
-        raw_type = getattr(self, "fault_type")
-        if not isinstance(raw_type, StageFaultType):
+        if not isinstance(self.fault_type, StageFaultType):
             try:
-                object.__setattr__(self, "fault_type", StageFaultType(raw_type))
+                object.__setattr__(self, "fault_type", StageFaultType(self.fault_type))
             except (ValueError, TypeError):
                 raise ValueError(
-                    f"Unsupported fault_type '{raw_type}'. "
+                    f"Unsupported fault_type '{self.fault_type}'. "
                     f"Must be one of {[t.value for t in StageFaultType]}"
                 ) from None
         if isinstance(self.start_index, bool) or self.start_index < 0:
