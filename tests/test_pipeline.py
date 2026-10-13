@@ -1862,7 +1862,7 @@ def test_simulate_pipeline_chaos_edge_cases_and_validation() -> None:
     # Async stage processor under chaos simulation
     async_graph = DecisionGraph()
 
-    async def async_proc(ctx: PipelineContext) -> dict[str, Any]:
+    async def async_proc(_ctx: PipelineContext) -> dict[str, Any]:
         await asyncio.sleep(0.001)
         return {"processed": True}
 

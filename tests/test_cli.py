@@ -6367,6 +6367,9 @@ def test_pipeline_chaos_cli_workflow(tmp_path: Path, trained_artifact: Path) -> 
             str(tmp_path / "non_existent_rules.json"),
         ],
     )
+    assert res_bad_rules.exit_code == 2
+    assert "Failed to load rules" in res_bad_rules.output
+
     # Error handling: empty input dataset triggering pd.read_csv EmptyDataError
     empty_csv = tmp_path / "empty_input.csv"
     empty_csv.write_text("", encoding="utf-8")
