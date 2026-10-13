@@ -2718,7 +2718,13 @@ def simulate_pipeline_chaos(
                         and res.stage_results[node_name].degraded
                     ):
                         stage_chaos_metrics[node_name].handled_count += 1
-            except (PipelineExecutionError, RuntimeError, TimeoutError, ValueError, KeyError) as exc:
+            except (
+                PipelineExecutionError,
+                RuntimeError,
+                TimeoutError,
+                ValueError,
+                KeyError,
+            ) as exc:
                 logger.warning("Unhandled error during chaos execution on tx %d: %s", idx, exc)
                 unhandled_errors += 1
                 latencies.append(sla_budget_ms * 2.0)
