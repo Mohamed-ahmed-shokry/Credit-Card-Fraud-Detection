@@ -5814,7 +5814,7 @@ def pipeline_chaos_command(
         from fraud_detection.data import generate_synthetic_data, validate_frame
         from fraud_detection.model import train_model
 
-        syn_df = generate_synthetic_data(rows=100)
+        syn_df = generate_synthetic_data(rows=500, fraud_rate=0.05)
         syn_dataset = validate_frame(syn_df)
         loaded_model = train_model(syn_dataset)
 
