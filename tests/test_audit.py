@@ -19,15 +19,23 @@ from fraud_detection.audit import (
     _is_luhn_valid,
     _mask_pans_in_string,
     backtest_audit_policy,
+    build_delayed_label_audit_event,
     build_pipeline_chaos_audit_event,
     build_pipeline_replay_audit_event,
     build_promotion_audit_event,
+    build_retraining_trigger_audit_event,
     build_scoring_audit_event,
     build_shadow_scoring_audit_event,
     redact_data,
     replay_audit_log,
 )
 from fraud_detection.evaluation import TieredThresholds
+from fraud_detection.feedback import (
+    DelayedLabelRecord,
+    DisputeType,
+    RealizedMetricsReport,
+    RetrainingTriggerEvent,
+)
 
 
 def test_is_luhn_valid() -> None:
@@ -931,3 +939,128 @@ def test_build_pipeline_chaos_audit_event() -> None:
     d = event.to_dict(redact=True)
     assert d["payload"]["metadata"]["environment"] == "canary"
     assert d["payload"]["metadata"]["api_key"] == "[REDACTED]"
+
+
+def test_build_delayed_label_audit_event() -> None:
+    rec = DelayedLabelRecord(
+        transaction_id="tx_audit_100",
+        event_timestamp=1000.0,
+        label_timestamp=87400.0,
+        dispute_type=DisputeType.CHARGEBACK,
+        is_fraud=True,
+        amount=199.99,
+        entity_key="card_12345",
+        notes="Network report from issuer",
+    )
+
+    event = build_delayed_label_audit_event(
+        record=rec,
+        model_version="v2.1.0",
+        dataset_fingerprint="ds_fp_123",
+        metadata={"operator": "fraud_analyst", "user_id": "usr_999"},
+    )
+
+    assert event.event_type == "delayed_label_ingestion"
+    assert event.model_version == "v2.1.0"
+    assert event.dataset_fingerprint == "ds_fp_123"
+    assert event.payload["transaction_id"] == "tx_audit_100"
+    assert event.payload["event_timestamp"] == 1000.0
+    assert event.payload["label_timestamp"] == 87400.0
+    assert event.payload["delay_days"] == 1.0
+    assert event.payload["dispute_type"] == "chargeback"
+    assert event.payload["is_fraud"] is True
+    assert event.payload["amount"] == 199.99
+    assert event.payload["ingestion_status"] == "ingested"
+
+    # Redaction verification
+    d = event.to_dict(redact=True)
+    assert d["payload"]["metadata"]["operator"] == "fraud_analyst"
+    assert d["payload"]["metadata"]["user_id"] == "[REDACTED]"
+
+    # Test with dict record without metadata
+    event_dict = build_delayed_label_audit_event(
+        record={
+            "transaction_id": "tx_audit_101",
+            "event_timestamp": 2000.0,
+            "label_timestamp": 90000.0,
+            "dispute_type": "fraud_dispute",
+            "is_fraud": False,
+            "amount": 50.0,
+        }
+    )
+    assert event_dict.payload["transaction_id"] == "tx_audit_101"
+    assert event_dict.payload["is_fraud"] is False
+    assert "metadata" not in event_dict.payload
+
+
+def test_build_retraining_trigger_audit_event() -> None:
+    report = RealizedMetricsReport(
+        total_transactions=20,
+        actual_fraud_count=5,
+        actual_fraud_rate=0.25,
+        predicted_positive_count=6,
+        true_positives=3,
+        false_positives=3,
+        true_negatives=12,
+        false_negatives=2,
+        realized_precision=0.5,
+        realized_recall=0.6,
+        realized_f1=0.5455,
+        realized_fpr=0.2,
+        realized_auprc=0.48,
+        total_fraud_loss=500.0,
+        prevented_fraud_amount=300.0,
+        missed_fraud_amount=200.0,
+        false_positive_cost=45.0,
+        net_financial_savings=255.0,
+        decision_counts={"deny": 6, "allow": 14},
+        cohort_id="c_2026_w41",
+    )
+    trig = RetrainingTriggerEvent(
+        trigger_id="trig_retrain_1",
+        triggered_at=1700000000.0,
+        breached_metrics={"precision": {"observed": 0.5, "threshold": 0.7}},
+        realized_metrics=report,
+        recommended_retrain_start=1680000000.0,
+        recommended_retrain_end=1698000000.0,
+        recommended_temporal_gap_seconds=1209600.0,
+        reason="precision breached (0.5 vs threshold 0.7)",
+        cohort_id="c_2026_w41",
+    )
+
+    event = build_retraining_trigger_audit_event(
+        trigger_event=trig,
+        model_version="v2.1.0",
+        metadata={"initiator": "surveillance_cron", "token": "cron_tok_xyz"},
+    )
+
+    assert event.event_type == "retraining_trigger"
+    assert event.model_version == "v2.1.0"
+    assert event.payload["trigger_id"] == "trig_retrain_1"
+    assert event.payload["triggered_at"] == 1700000000.0
+    assert event.payload["cohort_id"] == "c_2026_w41"
+    assert event.payload["breached_metrics"]["precision"]["observed"] == 0.5
+    assert event.payload["recommended_temporal_gap_seconds"] == 1209600.0
+    assert event.payload["realized_metrics"]["total_transactions"] == 20
+
+    # Redaction verification
+    d = event.to_dict(redact=True)
+    assert d["payload"]["metadata"]["initiator"] == "surveillance_cron"
+    assert d["payload"]["metadata"]["token"] == "[REDACTED]"  # noqa: S105
+
+    # Test with dict trigger_event without metadata
+    event_dict = build_retraining_trigger_audit_event(
+        trigger_event={
+            "trigger_id": "trig_dict_2",
+            "triggered_at": 1700000000.0,
+            "cohort_id": "c_dict",
+            "reason": "fpr breached",
+            "breached_metrics": {"fpr": {"observed": 0.1, "threshold": 0.05}},
+            "recommended_retrain_start": 1600.0,
+            "recommended_retrain_end": 1700.0,
+            "recommended_temporal_gap_seconds": 100.0,
+            "realized_metrics": {"total_transactions": 15},
+        }
+    )
+    assert event_dict.payload["trigger_id"] == "trig_dict_2"
+    assert "metadata" not in event_dict.payload
