@@ -11,6 +11,8 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 
 class FeedbackError(Exception):
     """Raised when feedback ingestion or surveillance operations encounter errors."""
@@ -483,3 +485,143 @@ def partition_into_cohorts(
         cohort_idx += 1
 
     return cohorts
+
+
+@dataclass(frozen=True)
+class LabelMaturationCurve:
+    """Empirical maturation curve estimating cumulative label arrival over elapsed days."""
+
+    total_labels_observed: int
+    p50_delay_days: float
+    p75_delay_days: float
+    p90_delay_days: float
+    p95_delay_days: float
+    p99_delay_days: float
+    max_delay_days: float
+    delay_cdf_points: tuple[tuple[float, float], ...]
+
+    def maturation_fraction(self, elapsed_days: float) -> float:
+        """Estimate cumulative proportion of labels arrived by elapsed_days."""
+        if elapsed_days <= 0.0 or self.total_labels_observed == 0:
+            return 0.0
+        if not self.delay_cdf_points or elapsed_days >= self.max_delay_days:
+            return 1.0
+
+        days = [pt[0] for pt in self.delay_cdf_points]
+        fractions = [pt[1] for pt in self.delay_cdf_points]
+        return float(np.interp(elapsed_days, days, fractions))
+
+    def is_cohort_mature(
+        self,
+        cohort: FeedbackCohort,
+        current_timestamp: float,
+        *,
+        min_maturation_fraction: float = 0.90,
+        min_elapsed_days: float | None = None,
+    ) -> bool:
+        """Return True if the cohort has matured sufficiently for unbiased evaluation."""
+        elapsed_sec = max(0.0, current_timestamp - cohort.end_timestamp)
+        elapsed_days = elapsed_sec / 86400.0
+        if min_elapsed_days is not None and elapsed_days < min_elapsed_days:
+            return False
+        return self.maturation_fraction(elapsed_days) >= min_maturation_fraction
+
+    def filter_mature_cohorts(
+        self,
+        cohorts: Sequence[FeedbackCohort],
+        current_timestamp: float,
+        *,
+        min_maturation_fraction: float = 0.90,
+        min_elapsed_days: float | None = None,
+    ) -> list[FeedbackCohort]:
+        """Filter input cohorts to only include matured cohorts."""
+        return [
+            c
+            for c in cohorts
+            if self.is_cohort_mature(
+                c,
+                current_timestamp,
+                min_maturation_fraction=min_maturation_fraction,
+                min_elapsed_days=min_elapsed_days,
+            )
+        ]
+
+    @classmethod
+    def fit_from_records(
+        cls,
+        records: Iterable[DelayedLabelRecord | MatchedFeedbackRecord],
+    ) -> LabelMaturationCurve:
+        """Fit empirical maturation curve from observed delay durations."""
+        delays: list[float] = []
+        for r in records:
+            d = getattr(r, "delay_days", None)
+            if d is not None and d >= 0.0:
+                delays.append(float(d))
+
+        if not delays:
+            return cls(
+                total_labels_observed=0,
+                p50_delay_days=0.0,
+                p75_delay_days=0.0,
+                p90_delay_days=0.0,
+                p95_delay_days=0.0,
+                p99_delay_days=0.0,
+                max_delay_days=0.0,
+                delay_cdf_points=(),
+            )
+
+        delays_arr = np.sort(np.array(delays, dtype=float))
+        n = len(delays_arr)
+        p50 = float(np.percentile(delays_arr, 50))
+        p75 = float(np.percentile(delays_arr, 75))
+        p90 = float(np.percentile(delays_arr, 90))
+        p95 = float(np.percentile(delays_arr, 95))
+        p99 = float(np.percentile(delays_arr, 99))
+        max_d = float(delays_arr[-1])
+
+        # Sample up to 100 quantiles for CDF curve
+        grid = np.linspace(0.01, 1.0, min(n, 100))
+        q_days = np.quantile(delays_arr, grid)
+        cdf_points = tuple(
+            (float(round(day, 4)), float(round(q, 4))) for day, q in zip(q_days, grid, strict=True)
+        )
+
+        return cls(
+            total_labels_observed=n,
+            p50_delay_days=round(p50, 4),
+            p75_delay_days=round(p75, 4),
+            p90_delay_days=round(p90, 4),
+            p95_delay_days=round(p95, 4),
+            p99_delay_days=round(p99, 4),
+            max_delay_days=round(max_d, 4),
+            delay_cdf_points=cdf_points,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize maturation curve to dictionary."""
+        return {
+            "total_labels_observed": self.total_labels_observed,
+            "p50_delay_days": self.p50_delay_days,
+            "p75_delay_days": self.p75_delay_days,
+            "p90_delay_days": self.p90_delay_days,
+            "p95_delay_days": self.p95_delay_days,
+            "p99_delay_days": self.p99_delay_days,
+            "max_delay_days": self.max_delay_days,
+            "delay_cdf_points": [list(pt) for pt in self.delay_cdf_points],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> LabelMaturationCurve:
+        """Construct maturation curve from dictionary."""
+        raw_pts = data.get("delay_cdf_points", [])
+        pts = tuple((float(pt[0]), float(pt[1])) for pt in raw_pts)
+        return cls(
+            total_labels_observed=int(data["total_labels_observed"]),
+            p50_delay_days=float(data["p50_delay_days"]),
+            p75_delay_days=float(data["p75_delay_days"]),
+            p90_delay_days=float(data["p90_delay_days"]),
+            p95_delay_days=float(data["p95_delay_days"]),
+            p99_delay_days=float(data["p99_delay_days"]),
+            max_delay_days=float(data["max_delay_days"]),
+            delay_cdf_points=pts,
+        )
