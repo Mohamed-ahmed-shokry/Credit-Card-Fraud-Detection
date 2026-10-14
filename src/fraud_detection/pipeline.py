@@ -2673,10 +2673,10 @@ def simulate_pipeline_chaos(
                         )
                         if ft == StageFaultType.EXCEPTION:
                             raise RuntimeError(spec.error_message)
-                        elif ft == StageFaultType.TIMEOUT:
+                        if ft == StageFaultType.TIMEOUT:
                             await asyncio.sleep(0.005)
                             raise TimeoutError(spec.error_message)
-                        elif ft == StageFaultType.LATENCY_SPIKE and spec.latency_ms > 0:
+                        if ft == StageFaultType.LATENCY_SPIKE and spec.latency_ms > 0:
                             await asyncio.sleep(spec.latency_ms / 1000.0)
                 return await orig_proc(ctx)
 
@@ -2697,10 +2697,10 @@ def simulate_pipeline_chaos(
                     )
                     if ft == StageFaultType.EXCEPTION:
                         raise RuntimeError(spec.error_message)
-                    elif ft == StageFaultType.TIMEOUT:
+                    if ft == StageFaultType.TIMEOUT:
                         sleep(0.005)
                         raise TimeoutError(spec.error_message)
-                    elif ft == StageFaultType.LATENCY_SPIKE and spec.latency_ms > 0:
+                    if ft == StageFaultType.LATENCY_SPIKE and spec.latency_ms > 0:
                         sleep(spec.latency_ms / 1000.0)
             return orig_proc(ctx)
 
