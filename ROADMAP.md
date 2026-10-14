@@ -41,11 +41,11 @@ automated canary divergence safeguards, feature store integration with
 point-in-time time-travel as-of joins and training-serving skew surveillance,
 real-time streaming decision graph DAG pipelines with topological wave scheduling,
 deterministic stage node caching with speculative asynchronous model inference,
-dynamic decision graph replay with counterfactual policy optimization, and
-per-stage circuit breakers with zero-latency fast-fail isolation and deterministic
-chaos fault injection. Phase 36 is in progress to close the continuous learning
-feedback loop with delayed ground-truth label ingestion, realized performance
-surveillance, and automated retraining triggers.
+dynamic decision graph replay with counterfactual policy optimization,
+per-stage circuit breakers with zero-latency fast-fail isolation, deterministic
+chaos fault injection, and delayed feedback ingestion with empirical label maturation
+curve modeling, realized performance and financial cost surveillance, and automated
+retraining triggers.
 
 ## Phase 1 — Distribution
 
@@ -1584,7 +1584,7 @@ This phase does not implement external service-mesh circuit breaking (Istio/Envo
 - Added circuit breaker flags to `pipeline-eval` and implemented the `fraud-detect pipeline-chaos` CLI command in `src/fraud_detection/cli.py`.
 - Final validation: 817 tests passed with 97.15% branch coverage (exceeding 97.0% gate); Ruff format and check clean; strict mypy clean (0 issues); pip-audit passed with 0 vulnerabilities; build and twine check clean.
 
-## Phase 36 — Delayed Feedback Ingestion, Realized Performance Surveillance & Automated Retraining Trigger (In progress)
+## Phase 36 — Delayed Feedback Ingestion, Realized Performance Surveillance & Automated Retraining Trigger (Done)
 
 ### Objective
 
@@ -1635,13 +1635,13 @@ Close the continuous learning feedback loop in production fraud detection by imp
 
 ### Acceptance criteria
 
-1. **AC-1 (Delayed Label Ingestion & As-Of Matching)**: `LabelIngestionStore` ingests valid delayed label records, enforces deduplication and timestamp sanity ($t_{\text{label}} \ge t_{\text{event}}$), and correctly matches historical scoring audit logs by transaction/event ID, producing unified records with predictions, decisions, and actual dispute outcomes.
-2. **AC-2 (Label Maturation Curve Modeling)**: `FeedbackSurveillanceAnalyzer` calculates empirical label delay percentiles and maturation fractions, correctly filtering immature cohorts from performance calculations to prevent label-delay bias.
-3. **AC-3 (Realized Performance & Financial Cost Metrics)**: `RealizedMetricsReport` accurately computes realized precision, recall, AUPRC, FPR, and net financial cost saved on matured cohorts against actual fraud labels.
-4. **AC-4 (Automated Retraining Trigger Policy)**: When realized metrics breach configured `RetrainingTriggerPolicy` thresholds (e.g. AUPRC < 0.65 or Precision < 0.70), `FeedbackSurveillanceAnalyzer` emits a valid `RetrainingTriggerEvent` specifying recommended retraining window boundaries and holdout gaps.
-5. **AC-5 (Audit Trail & Telemetry Integration)**: `audit.py` generates redacted `delayed_label_ingested` and `retraining_trigger` audit events; `api.py` exposes `/v1/feedback/labels`, `/v1/feedback/surveillance`, and `/v1/feedback/maturation` with Prometheus gauges and counters.
-6. **AC-6 (CLI Workflows & Exit Code Gating)**: `fraud-detect ingest-labels` joins audit logs with dispute feeds, and `fraud-detect feedback-surveillance` evaluates performance with optional `--fail-on-trigger` exit gating and `--output-trigger` serialization.
-7. **AC-7 (Quality Standards & Zero Regressions)**: Full test suite passes 100%, branch coverage remains $\ge 97.0\%$, Ruff format and check pass cleanly, strict mypy reports 0 errors in 21 source files, and build/twine checks pass.
+1. **AC-1 (Delayed Label Ingestion & As-Of Matching)**: `LabelIngestionStore` ingests valid delayed label records, enforces deduplication and timestamp sanity ($t_{\text{label}} \ge t_{\text{event}}$), and correctly matches historical scoring audit logs by transaction/event ID, producing unified records with predictions, decisions, and actual dispute outcomes. (Verified)
+2. **AC-2 (Label Maturation Curve Modeling)**: `FeedbackSurveillanceAnalyzer` calculates empirical label delay percentiles and maturation fractions, correctly filtering immature cohorts from performance calculations to prevent label-delay bias. (Verified)
+3. **AC-3 (Realized Performance & Financial Cost Metrics)**: `RealizedMetricsReport` accurately computes realized precision, recall, AUPRC, FPR, and net financial cost saved on matured cohorts against actual fraud labels. (Verified)
+4. **AC-4 (Automated Retraining Trigger Policy)**: When realized metrics breach configured `RetrainingTriggerPolicy` thresholds (e.g. AUPRC < 0.65 or Precision < 0.70), `FeedbackSurveillanceAnalyzer` emits a valid `RetrainingTriggerEvent` specifying recommended retraining window boundaries and holdout gaps. (Verified)
+5. **AC-5 (Audit Trail & Telemetry Integration)**: `audit.py` generates redacted `delayed_label_ingested` and `retraining_trigger` audit events; `api.py` exposes `/v1/feedback/labels`, `/v1/feedback/surveillance`, and `/v1/feedback/maturation` with Prometheus gauges and counters. (Verified)
+6. **AC-6 (CLI Workflows & Exit Code Gating)**: `fraud-detect ingest-labels` joins audit logs with dispute feeds, and `fraud-detect feedback-surveillance` evaluates performance with optional `--fail-on-trigger` exit gating and `--output-trigger` serialization. (Verified)
+7. **AC-7 (Quality Standards & Zero Regressions)**: Full test suite passes 100%, branch coverage remains $\ge 97.0\%$, Ruff format and check pass cleanly, strict mypy reports 0 errors in 21 source files, and build/twine checks pass. (Verified)
 
 ### Explicit exclusions
 
@@ -1649,15 +1649,21 @@ This phase does not implement live webhook callbacks to external payment card ne
 
 ### Task list
 
-- [ ] Task 1: Create `src/fraud_detection/feedback.py` with domain data models (`DisputeType`, `LabelSource`, `DelayedLabelRecord`, `FeedbackError`) and `LabelIngestionStore` with unit tests in `tests/test_feedback.py`.
-- [ ] Task 2: Implement audit log matching and cohort partitioning (`match_labels_with_audit_log`, `FeedbackCohort`) in `feedback.py` with tests in `tests/test_feedback.py`.
-- [ ] Task 3: Implement `LabelMaturationCurve` empirical delay distribution and cohort maturity filtering in `feedback.py` with tests in `tests/test_feedback.py`.
-- [ ] Task 4: Implement `RealizedMetricsReport` and realized precision/recall/AUPRC/cost calculation in `feedback.py` with tests in `tests/test_feedback.py`.
-- [ ] Task 5: Implement `RetrainingTriggerPolicy`, `RetrainingTriggerEvent`, and trigger evaluation logic in `feedback.py` with tests in `tests/test_feedback.py`.
-- [ ] Task 6: Implement audit event builders (`build_delayed_label_audit_event`, `build_retraining_trigger_audit_event`) in `audit.py` with tests in `tests/test_audit.py`.
-- [ ] Task 7: Wire feedback endpoints (`POST /v1/feedback/labels`, `GET /v1/feedback/surveillance`, `GET /v1/feedback/maturation`) and Prometheus telemetry in `api.py` with tests in `tests/test_api.py`.
-- [ ] Task 8: Implement CLI commands `ingest-labels` and `feedback-surveillance` in `cli.py` with tests in `tests/test_cli.py`.
-- [ ] Task 9: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate.
+- [x] Task 1: Create `src/fraud_detection/feedback.py` with domain data models (`DisputeType`, `LabelSource`, `DelayedLabelRecord`, `FeedbackError`) and `LabelIngestionStore` with unit tests in `tests/test_feedback.py`.
+- [x] Task 2: Implement audit log matching and cohort partitioning (`match_labels_with_audit_log`, `FeedbackCohort`) in `feedback.py` with tests in `tests/test_feedback.py`.
+- [x] Task 3: Implement `LabelMaturationCurve` empirical delay distribution and cohort maturity filtering in `feedback.py` with tests in `tests/test_feedback.py`.
+- [x] Task 4: Implement `RealizedMetricsReport` and realized precision/recall/AUPRC/cost calculation in `feedback.py` with tests in `tests/test_feedback.py`.
+- [x] Task 5: Implement `RetrainingTriggerPolicy`, `RetrainingTriggerEvent`, and trigger evaluation logic in `feedback.py` with tests in `tests/test_feedback.py`.
+- [x] Task 6: Implement audit event builders (`build_delayed_label_audit_event`, `build_retraining_trigger_audit_event`) in `audit.py` with tests in `tests/test_audit.py`.
+- [x] Task 7: Wire feedback endpoints (`POST /v1/feedback/labels`, `GET /v1/feedback/surveillance`, `GET /v1/feedback/maturation`) and Prometheus telemetry in `api.py` with tests in `tests/test_api.py`.
+- [x] Task 8: Implement CLI commands `ingest-labels` and `feedback-surveillance` in `cli.py` with tests in `tests/test_cli.py`.
+- [x] Task 9: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate.
+
+### Delivery Record
+
+- **Status**: Completed across 27 micro-commits.
+- **Verification**: 100% test pass rate (848+ tests), branch coverage $\ge 97.0\%$, strict mypy 0 issues across 21 source files, Ruff format and check clean, pip-audit 0 vulnerabilities, wheel build and twine check valid.
+
 
 ## Contributing to the roadmap
 
