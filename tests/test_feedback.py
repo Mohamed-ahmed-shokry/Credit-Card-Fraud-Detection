@@ -18,6 +18,8 @@ from fraud_detection.feedback import (
     LabelMaturationCurve,
     LabelSource,
     MatchedFeedbackRecord,
+    RealizedMetricsReport,
+    compute_realized_metrics,
     match_labels_with_audit_log,
     partition_into_cohorts,
 )
@@ -480,3 +482,84 @@ def test_label_maturation_curve() -> None:
     assert recon.total_labels_observed == curve.total_labels_observed
     assert recon.max_delay_days == curve.max_delay_days
     assert len(recon.delay_cdf_points) == len(curve.delay_cdf_points)
+
+
+def test_compute_realized_metrics() -> None:
+    # Empty records
+    empty_report = compute_realized_metrics([])
+    assert empty_report.total_transactions == 0
+    assert empty_report.realized_precision == 0.0
+    assert empty_report.realized_auprc == 0.0
+
+    # Populated records
+    records = [
+        MatchedFeedbackRecord(
+            transaction_id="t1",
+            event_timestamp=100.0,
+            actual_fraud=True,
+            predicted_probability=0.9,
+            predicted_decision="deny",
+            amount=100.0,
+        ),
+        MatchedFeedbackRecord(
+            transaction_id="t2",
+            event_timestamp=105.0,
+            actual_fraud=False,
+            predicted_probability=0.6,
+            predicted_decision="review",
+            amount=50.0,
+        ),
+        MatchedFeedbackRecord(
+            transaction_id="t3",
+            event_timestamp=110.0,
+            actual_fraud=False,
+            predicted_probability=0.05,
+            predicted_decision="allow",
+            amount=20.0,
+        ),
+        MatchedFeedbackRecord(
+            transaction_id="t4",
+            event_timestamp=115.0,
+            actual_fraud=True,
+            predicted_probability=0.2,
+            predicted_decision="allow",
+            amount=80.0,
+        ),
+    ]
+
+    report = compute_realized_metrics(
+        records,
+        positive_decisions=("deny", "review"),
+        manual_review_cost=15.0,
+        cohort_id="c_test",
+    )
+    assert report.total_transactions == 4
+    assert report.actual_fraud_count == 2
+    assert report.actual_fraud_rate == 0.5
+    assert report.predicted_positive_count == 2
+    assert report.true_positives == 1
+    assert report.false_positives == 1
+    assert report.true_negatives == 1
+    assert report.false_negatives == 1
+    assert report.realized_precision == 0.5
+    assert report.realized_recall == 0.5
+    assert report.realized_f1 == 0.5
+    assert report.realized_fpr == 0.5
+    assert report.total_fraud_loss == 180.0
+    assert report.prevented_fraud_amount == 100.0
+    assert report.missed_fraud_amount == 80.0
+    assert report.false_positive_cost == 15.0
+    assert report.net_financial_savings == 85.0
+    assert report.decision_counts == {"deny": 1, "review": 1, "allow": 2}
+    assert report.realized_auprc > 0.0
+    assert report.cohort_id == "c_test"
+
+    # Serialization
+    d = report.to_dict()
+    assert d["total_transactions"] == 4
+    assert d["net_financial_savings"] == 85.0
+
+    recon = RealizedMetricsReport.from_dict(d)
+    assert recon.total_transactions == report.total_transactions
+    assert recon.realized_precision == report.realized_precision
+    assert recon.net_financial_savings == report.net_financial_savings
