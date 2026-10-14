@@ -41,14 +41,29 @@ from fraud_detection.audit import (
     AuditSink,
     JsonlAuditSink,
     NullAuditSink,
+    build_delayed_label_audit_event,
     build_pipeline_chaos_audit_event,
     build_pipeline_replay_audit_event,
+    build_retraining_trigger_audit_event,
     build_scoring_audit_event,
     build_shadow_scoring_audit_event,
 )
 from fraud_detection.evaluation import DecisionAction, TieredThresholds
 from fraud_detection.explanations import ExplanationProvider
 from fraud_detection.features import FeatureStoreProtocol, FileFeatureStore
+from fraud_detection.feedback import (
+    DelayedLabelRecord,
+    DisputeType,
+    FeedbackError,
+    FeedbackSurveillanceAnalyzer,
+    LabelIngestionStore,
+    LabelMaturationCurve,
+    LabelSource,
+    RealizedMetricsReport,
+    RetrainingTriggerPolicy,
+    match_labels_with_audit_log,
+    partition_into_cohorts,
+)
 from fraud_detection.model import FraudModel, ModelArtifactError, load_model
 from fraud_detection.pipeline import (
     DecisionGraph,
@@ -952,6 +967,61 @@ class PipelineChaosResponse(BaseModel):
     status: str
 
 
+class DelayedLabelItem(BaseModel):
+    """Ground-truth feedback label for a historical transaction."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    transaction_id: str = Field(min_length=1)
+    event_timestamp: float = Field(ge=0.0)
+    label_timestamp: float = Field(ge=0.0)
+    dispute_type: str = Field(default="chargeback")
+    is_fraud: bool = True
+    amount: float = Field(default=0.0, ge=0.0)
+    label_source: str = Field(default="network_report")
+    entity_key: str | None = None
+    notes: str | None = None
+
+
+class DelayedLabelIngestionRequest(BaseModel):
+    """Payload for asynchronous delayed label ingestion."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    labels: list[DelayedLabelItem] = Field(min_length=1)
+
+
+class DelayedLabelIngestionResponse(BaseModel):
+    """Result of delayed label batch ingestion."""
+
+    status: str
+    ingested_count: int
+    total_stored: int
+
+
+class FeedbackSurveillanceResponse(BaseModel):
+    """Realized performance surveillance report and retraining trigger event."""
+
+    realized_metrics: dict[str, Any]
+    trigger_event: dict[str, Any] | None = None
+    matured_cohort_count: int
+    total_matured_transactions: int
+    audit_log_path: str | None = None
+
+
+class FeedbackMaturationResponse(BaseModel):
+    """Summary of empirical label maturation delay curve."""
+
+    total_labels_observed: int
+    p50_delay_days: float
+    p75_delay_days: float
+    p90_delay_days: float
+    p95_delay_days: float
+    p99_delay_days: float
+    max_delay_days: float
+    delay_cdf_points: list[list[float]] = Field(default_factory=list)
+
+
 def create_app(
     *,
     model: FraudModel | None = None,
@@ -1007,6 +1077,9 @@ def create_app(
     enable_pipeline_circuit_breaker: bool = False,
     pipeline_circuit_failure_threshold: int = 5,
     pipeline_circuit_recovery_timeout_seconds: float = 30.0,
+    label_store: LabelIngestionStore | None = None,
+    feedback_surveillance_analyzer: FeedbackSurveillanceAnalyzer | None = None,
+    retraining_policy: RetrainingTriggerPolicy | None = None,
 ) -> FastAPI:
     """Create an application using an injected model or a trusted artifact path.
 
@@ -1420,6 +1493,32 @@ def create_app(
         ["status"],
         registry=metrics_registry,
     )
+    delayed_labels_counter = Counter(
+        "fraud_delayed_labels_ingested_total",
+        "Total asynchronous delayed feedback labels ingested.",
+        ["dispute_type", "is_fraud"],
+        registry=metrics_registry,
+    )
+    realized_auprc_gauge = Gauge(
+        "fraud_realized_auprc",
+        "Realized area under precision-recall curve on matured cohorts.",
+        registry=metrics_registry,
+    )
+    realized_precision_gauge = Gauge(
+        "fraud_realized_precision",
+        "Realized precision on matured cohorts.",
+        registry=metrics_registry,
+    )
+    realized_recall_gauge = Gauge(
+        "fraud_realized_recall",
+        "Realized recall on matured cohorts.",
+        registry=metrics_registry,
+    )
+    retraining_triggers_counter = Counter(
+        "fraud_retraining_triggers_total",
+        "Total automated retraining triggers generated due to policy breaches.",
+        registry=metrics_registry,
+    )
 
     if resolved_cb is not None:
         # Keep a caller-supplied callback: the metrics counter is chained onto it
@@ -1677,6 +1776,23 @@ def create_app(
         )
         application.state.pipeline_circuit_state_gauge = pipeline_circuit_state_gauge
         application.state.pipeline_chaos_simulations_counter = pipeline_chaos_simulations_counter
+        active_label_store = label_store if label_store is not None else LabelIngestionStore()
+        active_retraining_policy = (
+            retraining_policy if retraining_policy is not None else RetrainingTriggerPolicy()
+        )
+        active_feedback_analyzer = (
+            feedback_surveillance_analyzer
+            if feedback_surveillance_analyzer is not None
+            else FeedbackSurveillanceAnalyzer(default_policy=active_retraining_policy)
+        )
+        application.state.label_store = active_label_store
+        application.state.retraining_policy = active_retraining_policy
+        application.state.feedback_surveillance_analyzer = active_feedback_analyzer
+        application.state.delayed_labels_counter = delayed_labels_counter
+        application.state.realized_auprc_gauge = realized_auprc_gauge
+        application.state.realized_precision_gauge = realized_precision_gauge
+        application.state.realized_recall_gauge = realized_recall_gauge
+        application.state.retraining_triggers_counter = retraining_triggers_counter
         shadow_tasks: set[asyncio.Task[None]] = set()
         application.state.shadow_tasks = shadow_tasks
         yield
@@ -3367,6 +3483,218 @@ def create_app(
 
         rep_dict = report.to_dict()
         return PipelineChaosResponse(**rep_dict)
+
+    @application.post(
+        "/v1/feedback/labels",
+        response_model=DelayedLabelIngestionResponse,
+        responses={400: {"description": "Invalid label record format or validation error."}},
+        tags=["feedback"],
+    )
+    async def ingest_feedback_labels(
+        payload: DelayedLabelIngestionRequest,
+        request: Request,
+    ) -> DelayedLabelIngestionResponse | JSONResponse:
+        """Ingest asynchronous ground-truth feedback labels into the operational store."""
+        store: LabelIngestionStore = request.app.state.label_store
+        sink: AuditSink = getattr(request.app.state, "audit_sink", resolved_audit_sink)
+        counter: Counter | None = getattr(request.app.state, "delayed_labels_counter", None)
+
+        converted_records: list[DelayedLabelRecord] = []
+        for item in payload.labels:
+            try:
+                rec = DelayedLabelRecord(
+                    transaction_id=item.transaction_id,
+                    event_timestamp=item.event_timestamp,
+                    label_timestamp=item.label_timestamp,
+                    dispute_type=DisputeType(item.dispute_type),
+                    is_fraud=item.is_fraud,
+                    amount=item.amount,
+                    label_source=LabelSource(item.label_source),
+                    entity_key=item.entity_key,
+                    notes=item.notes,
+                )
+                converted_records.append(rec)
+            except (ValueError, FeedbackError) as exc:
+                return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+        ingested_count = 0
+        for rec in converted_records:
+            added = store.ingest_record(rec)
+            if added:
+                ingested_count += 1
+                if counter is not None:
+                    counter.labels(
+                        dispute_type=rec.dispute_type.value,
+                        is_fraud=str(rec.is_fraud).lower(),
+                    ).inc()
+
+                try:
+                    audit_ev = build_delayed_label_audit_event(
+                        record=rec,
+                        ingestion_status="ingested",
+                    )
+                    await run_in_threadpool(sink.emit, audit_ev)
+                except Exception:
+                    logger.exception("Failed to emit delayed label audit event.")
+
+        return DelayedLabelIngestionResponse(
+            status="ingested",
+            ingested_count=ingested_count,
+            total_stored=len(store),
+        )
+
+    @application.get(
+        "/v1/feedback/surveillance",
+        response_model=FeedbackSurveillanceResponse,
+        responses={400: {"description": "Surveillance parameter or calculation error."}},
+        tags=["feedback"],
+    )
+    async def feedback_surveillance(
+        request: Request,
+        audit_log_path: str | None = None,
+        target_maturity_level: float = 0.90,
+        min_precision: float | None = None,
+        min_auprc: float | None = None,
+        max_fpr: float | None = None,
+        max_missed_fraud_rate: float | None = None,
+        min_matured_transactions: int | None = None,
+    ) -> FeedbackSurveillanceResponse | JSONResponse:
+        """Surveil realized model performance on cohorts and trigger retraining."""
+        store: LabelIngestionStore = request.app.state.label_store
+        analyzer: FeedbackSurveillanceAnalyzer = request.app.state.feedback_surveillance_analyzer
+        base_policy: RetrainingTriggerPolicy = request.app.state.retraining_policy
+        sink: AuditSink = getattr(request.app.state, "audit_sink", resolved_audit_sink)
+
+        log_path_str = audit_log_path
+        if not log_path_str:
+            if isinstance(sink, JsonlAuditSink):
+                log_path_str = str(sink.path)
+            else:
+                log_path_str = os.getenv(AUDIT_LOG_ENVIRONMENT_VARIABLE)
+
+        def _log_exists(path_str: str | None) -> bool:
+            return bool(path_str and Path(path_str).is_file())
+
+        has_log = await run_in_threadpool(_log_exists, log_path_str)
+        if not has_log:
+            empty_rep = RealizedMetricsReport(
+                total_transactions=0,
+                actual_fraud_count=0,
+                actual_fraud_rate=0.0,
+                predicted_positive_count=0,
+                true_positives=0,
+                false_positives=0,
+                true_negatives=0,
+                false_negatives=0,
+                realized_precision=0.0,
+                realized_recall=0.0,
+                realized_f1=0.0,
+                realized_fpr=0.0,
+                realized_auprc=0.0,
+                total_fraud_loss=0.0,
+                prevented_fraud_amount=0.0,
+                missed_fraud_amount=0.0,
+                false_positive_cost=0.0,
+                net_financial_savings=0.0,
+                decision_counts={},
+            )
+            return FeedbackSurveillanceResponse(
+                realized_metrics=empty_rep.to_dict(),
+                trigger_event=None,
+                matured_cohort_count=0,
+                total_matured_transactions=0,
+                audit_log_path=log_path_str,
+            )
+
+        resolved_log_path = cast(str, log_path_str)
+        try:
+            matched = await run_in_threadpool(match_labels_with_audit_log, resolved_log_path, store)
+            cohorts = partition_into_cohorts(matched)
+            curve = LabelMaturationCurve.fit_from_records(matched)
+            now = time.time()
+            matured_cohorts = curve.filter_mature_cohorts(
+                cohorts, now, min_maturation_fraction=target_maturity_level
+            )
+            matured_records = [r for c in matured_cohorts for r in c.records]
+
+            active_policy = base_policy
+            if any(
+                v is not None
+                for v in (
+                    min_precision,
+                    min_auprc,
+                    max_fpr,
+                    max_missed_fraud_rate,
+                    min_matured_transactions,
+                )
+            ):
+                active_policy = RetrainingTriggerPolicy(
+                    min_precision=(
+                        min_precision if min_precision is not None else base_policy.min_precision
+                    ),
+                    min_auprc=min_auprc if min_auprc is not None else base_policy.min_auprc,
+                    max_fpr=max_fpr if max_fpr is not None else base_policy.max_fpr,
+                    max_missed_fraud_rate=(
+                        max_missed_fraud_rate
+                        if max_missed_fraud_rate is not None
+                        else base_policy.max_missed_fraud_rate
+                    ),
+                    min_matured_transactions=(
+                        min_matured_transactions
+                        if min_matured_transactions is not None
+                        else base_policy.min_matured_transactions
+                    ),
+                    recommended_retrain_window_days=base_policy.recommended_retrain_window_days,
+                    recommended_temporal_gap_days=base_policy.recommended_temporal_gap_days,
+                )
+
+            report, trigger = analyzer.evaluate_cohort(matured_records, policy=active_policy)
+        except (ValueError, FeedbackError) as exc:
+            return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+        auprc_gauge: Gauge | None = getattr(request.app.state, "realized_auprc_gauge", None)
+        prec_gauge: Gauge | None = getattr(request.app.state, "realized_precision_gauge", None)
+        rec_gauge: Gauge | None = getattr(request.app.state, "realized_recall_gauge", None)
+        trig_counter: Counter | None = getattr(
+            request.app.state, "retraining_triggers_counter", None
+        )
+
+        if auprc_gauge is not None:
+            auprc_gauge.set(report.realized_auprc)
+        if prec_gauge is not None:
+            prec_gauge.set(report.realized_precision)
+        if rec_gauge is not None:
+            rec_gauge.set(report.realized_recall)
+
+        if trigger is not None:
+            if trig_counter is not None:
+                trig_counter.inc()
+            try:
+                audit_ev = build_retraining_trigger_audit_event(trigger_event=trigger)
+                await run_in_threadpool(sink.emit, audit_ev)
+            except Exception:
+                logger.exception("Failed to emit retraining trigger audit event.")
+
+        return FeedbackSurveillanceResponse(
+            realized_metrics=report.to_dict(),
+            trigger_event=trigger.to_dict() if trigger is not None else None,
+            matured_cohort_count=len(matured_cohorts),
+            total_matured_transactions=len(matured_records),
+            audit_log_path=log_path_str,
+        )
+
+    @application.get(
+        "/v1/feedback/maturation",
+        response_model=FeedbackMaturationResponse,
+        tags=["feedback"],
+    )
+    async def feedback_maturation(
+        request: Request,
+    ) -> FeedbackMaturationResponse:
+        """Return empirical label maturation delay quantiles from ingested feedback labels."""
+        store: LabelIngestionStore = request.app.state.label_store
+        curve = LabelMaturationCurve.fit_from_records(store.all_records())
+        return FeedbackMaturationResponse(**curve.to_dict())
 
     @application.get("/metrics", tags=["operations"])
     async def metrics() -> Response:
