@@ -3,7 +3,7 @@
 ## Overview
 - **Phase**: Phase 36 — Delayed Feedback Ingestion, Realized Performance Surveillance & Automated Retraining Trigger
 - **Branch**: `phase/feedback-surveillance-retraining`
-- **Status**: In progress
+- **Status**: Complete
 
 ## Task Status
 - [x] Task 1: Create `src/fraud_detection/feedback.py` with domain data models (`DisputeType`, `LabelSource`, `DelayedLabelRecord`, `FeedbackError`) and `LabelIngestionStore` with unit tests in `tests/test_feedback.py`.
@@ -14,7 +14,7 @@
 - [x] Task 6: Implement audit event builders (`build_delayed_label_audit_event`, `build_retraining_trigger_audit_event`) in `audit.py` with tests in `tests/test_audit.py`.
 - [x] Task 7: Wire feedback endpoints (`POST /v1/feedback/labels`, `GET /v1/feedback/surveillance`, `GET /v1/feedback/maturation`) and Prometheus telemetry in `api.py` with tests in `tests/test_api.py`.
 - [x] Task 8: Implement CLI commands `ingest-labels` and `feedback-surveillance` in `cli.py` with tests in `tests/test_cli.py`.
-- [ ] Task 9: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate.
+- [x] Task 9: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate.
 
 ## Acceptance Criteria Status
 | Criterion | Status | Evidence |
@@ -25,7 +25,7 @@
 | AC-4 (Automated Retraining Trigger Policy) | **Verified** | Verified in `tests/test_feedback.py`: `RetrainingTriggerPolicy` parameterization, threshold violation detection, temporal gap and retraining window calculation, and `RetrainingTriggerEvent` generation. |
 | AC-5 (Audit Trail & Telemetry Integration) | **Verified** | Verified in `tests/test_audit.py` and `tests/test_api.py`: structured audit events (`delayed_label_ingestion`, `retraining_trigger`) with redaction, Prometheus metrics (`fraud_delayed_labels_ingested_total`, `fraud_realized_auprc`, `fraud_realized_precision`, `fraud_realized_recall`, `fraud_retraining_triggers_total`), and FastAPI endpoints. |
 | AC-6 (CLI Workflows & Exit Code Gating) | **Verified** | Verified in `tests/test_cli.py`: `fraud-detect ingest-labels` (CSV/JSONL/--json), `fraud-detect feedback-surveillance` (maturity filtering, policy thresholds, `--gate` exit code 1 on breach, exit code 2 on error). |
-| AC-7 (Quality Standards & Zero Regressions) | Pending | — |
+| AC-7 (Quality Standards & Zero Regressions) | **Verified** | Full test suite passed (838 passed, 0 failures), 97.15% branch coverage ($\ge 97.0\%$), strict mypy clean (0 issues in 21 source files), ruff format and check clean, pip-audit 0 vulnerabilities, build and twine check clean. |
 
 ## Decision Log
 | Date | Decision | Alternatives Considered | Rationale |
@@ -35,9 +35,10 @@
 | 2026-10-14 | Preserve untracked `uv.lock` untouched | Stage or remove `uv.lock` | Strictly follows §1 hard rule ("Never discard, overwrite, stage, or commit changes you did not make"). |
 
 ## Validation Commands & Results
-- Baseline `ruff format --check src tests`: PASSED (39 files cleanly formatted)
-- Baseline `ruff check src tests`: PASSED (0 errors)
-- Baseline `mypy src`: PASSED (0 issues in 20 source files)
-- Baseline `pip-audit --skip-editable`: PASSED (0 known vulnerabilities found)
-- Baseline `pytest --cov=fraud_detection --cov-report=term-missing`: PASSED (817 passed, 97.15% branch coverage)
-- Baseline `build` & `twine check dist/*`: PASSED (sdist and wheel valid)
+- `ruff format --check src tests`: PASSED (41 files cleanly formatted)
+- `ruff check src tests`: PASSED (0 errors)
+- `mypy src`: PASSED (0 issues in 21 source files)
+- `pip-audit --skip-editable`: PASSED (0 known vulnerabilities found)
+- `pytest --cov=fraud_detection --cov-report=term-missing`: PASSED (838 passed, 97.15% branch coverage)
+- `build` & `twine check dist/*`: PASSED (sdist and wheel valid)
+
