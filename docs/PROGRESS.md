@@ -11,7 +11,7 @@
 - [x] Task 3: Implement `LabelMaturationCurve` empirical delay distribution and cohort maturity filtering in `feedback.py` with tests in `tests/test_feedback.py`.
 - [x] Task 4: Implement `RealizedMetricsReport` and realized precision/recall/AUPRC/cost calculation in `feedback.py` with tests in `tests/test_feedback.py`.
 - [x] Task 5: Implement `RetrainingTriggerPolicy`, `RetrainingTriggerEvent`, and trigger evaluation logic in `feedback.py` with tests in `tests/test_feedback.py`.
-- [ ] Task 6: Implement audit event builders (`build_delayed_label_audit_event`, `build_retraining_trigger_audit_event`) in `audit.py` with tests in `tests/test_audit.py`.
+- [x] Task 6: Implement audit event builders (`build_delayed_label_audit_event`, `build_retraining_trigger_audit_event`) in `audit.py` with tests in `tests/test_audit.py`.
 - [ ] Task 7: Wire feedback endpoints (`POST /v1/feedback/labels`, `GET /v1/feedback/surveillance`, `GET /v1/feedback/maturation`) and Prometheus telemetry in `api.py` with tests in `tests/test_api.py`.
 - [ ] Task 8: Implement CLI commands `ingest-labels` and `feedback-surveillance` in `cli.py` with tests in `tests/test_cli.py`.
 - [ ] Task 9: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate.
