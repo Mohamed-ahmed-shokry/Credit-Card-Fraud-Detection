@@ -840,11 +840,7 @@ def build_pipeline_chaos_audit_event(
     metadata: dict[str, Any] | None = None,
 ) -> AuditEvent:
     """Construct a structured pipeline chaos simulation audit event."""
-    report_dict = (
-        chaos_report.to_dict()
-        if hasattr(chaos_report, "to_dict")
-        else dict(chaos_report)
-    )
+    report_dict = chaos_report.to_dict() if hasattr(chaos_report, "to_dict") else dict(chaos_report)
     payload: dict[str, Any] = {
         "simulation_type": "pipeline_chaos",
         "status": str(report_dict.get("status", "UNKNOWN")),

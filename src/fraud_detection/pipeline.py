@@ -314,9 +314,7 @@ class StageExecutionCache:
                 cache.popitem(last=False)
                 stats.evictions += 1
 
-            stored_output = (
-                copy.deepcopy(output) if isinstance(output, (dict, list)) else output
-            )
+            stored_output = copy.deepcopy(output) if isinstance(output, (dict, list)) else output
             cache[key] = NodeCacheEntry(
                 created_at=current_time,
                 output=stored_output,
@@ -467,6 +465,11 @@ class StageCircuitBreaker:
         self._opened_at: float | None = None
         self._half_open_in_flight: int = 0
         self._half_open_successes: int = 0
+
+    @property
+    def state(self) -> StageCircuitState:
+        """Effective state of the circuit breaker."""
+        return self.get_stats().state
 
     def allow_execution(self, now: float | None = None) -> bool:
         """Return True if the stage is allowed to execute, False if short-circuited."""
@@ -632,6 +635,16 @@ class StageCircuitRegistry:
             for b in self._breakers.values():
                 b.reset()
             return sorted(self._breakers.keys())
+
+    @property
+    def breakers(self) -> dict[str, StageCircuitBreaker]:
+        """Thread-safe snapshot mapping of node names to their circuit breakers."""
+        with self._lock:
+            return dict(self._breakers)
+
+    def summary(self, now: float | None = None) -> dict[str, Any]:
+        """Return aggregate and per-node circuit breaker telemetry."""
+        return self.stats_dict(now=now)
 
     def stats_dict(self, now: float | None = None) -> dict[str, Any]:
         """Return aggregate and per-node circuit breaker telemetry."""
@@ -1278,6 +1291,8 @@ class DecisionGraphExecutor:
         for name, node in self.graph.nodes.items():
             if node.cache_policy is not None:
                 self.cache.register_policy(name, node.cache_policy)
+            if self.circuit_registry.get_breaker(name) is not None:
+                continue
             if node.circuit_policy is not None:
                 self.circuit_registry.register_policy(name, node.circuit_policy)
             elif self.enable_circuit_breaker:
@@ -1291,6 +1306,11 @@ class DecisionGraphExecutor:
                         recovery_timeout_seconds=rec_sec,
                     ),
                 )
+
+    @property
+    def circuits(self) -> StageCircuitRegistry:
+        """Ergonomic accessor for the stage circuit registry."""
+        return self.circuit_registry
 
     async def _execute_node(self, node_name: str, context: PipelineContext) -> None:
         node = self.graph.nodes[node_name]
@@ -1409,9 +1429,7 @@ class DecisionGraphExecutor:
             logger.exception("Pipeline stage '%s' failed: %s", node_name, exc)
             self.circuit_registry.record_failure(node_name, reason=str(exc), is_timeout=False)
             if node.required:
-                raise PipelineExecutionError(
-                    f"Required stage '{node_name}' failed: {exc}"
-                ) from exc
+                raise PipelineExecutionError(f"Required stage '{node_name}' failed: {exc}") from exc
             context.results[node_name] = StageExecutionResult(
                 node_name=node.name,
                 stage_type=node.stage_type,
@@ -1564,9 +1582,7 @@ class DecisionGraphExecutor:
                 "contributions": None,
             }
 
-        degraded_nodes = [
-            node_name for node_name, res in context.results.items() if res.degraded
-        ]
+        degraded_nodes = [node_name for node_name, res in context.results.items() if res.degraded]
 
         cache_hits = sum(1 for res in context.results.values() if res.cached)
         cache_misses = sum(
@@ -1919,9 +1935,7 @@ def replay_audit_log_through_pipeline(
         external_df = pd.read_csv(data_p)
 
     executor = (
-        pipeline
-        if isinstance(pipeline, DecisionGraphExecutor)
-        else DecisionGraphExecutor(pipeline)
+        pipeline if isinstance(pipeline, DecisionGraphExecutor) else DecisionGraphExecutor(pipeline)
     )
 
     total_events = 0
@@ -1936,9 +1950,7 @@ def replay_audit_log_through_pipeline(
     max_abs_diff = 0.0
     sum_abs_diff = 0.0
     latencies: list[float] = []
-    stage_latencies_collector: dict[str, list[float]] = {
-        name: [] for name in executor.graph.nodes
-    }
+    stage_latencies_collector: dict[str, list[float]] = {name: [] for name in executor.graph.nodes}
 
     b_actions_list: list[str] = []
     r_actions_list: list[str] = []
@@ -1991,8 +2003,7 @@ def replay_audit_log_through_pipeline(
                 chunk = external_df.iloc[external_offset : external_offset + n_rows]
                 external_offset += n_rows
                 records_to_score = [
-                    {str(k): v for k, v in r.items()}
-                    for r in chunk.to_dict(orient="records")
+                    {str(k): v for k, v in r.items()} for r in chunk.to_dict(orient="records")
                 ]
             else:
                 skipped_events += 1
@@ -2064,10 +2075,9 @@ def replay_audit_log_through_pipeline(
                 b_actions_list.append(logged_dec)
                 r_actions_list.append(replayed_dec)
 
-                can_rec = (
-                    (is_score_disc or flipped)
-                    and len(discrepancies_list) < max_discrepancies_to_record
-                )
+                can_rec = (is_score_disc or flipped) and len(
+                    discrepancies_list
+                ) < max_discrepancies_to_record
                 if can_rec:
                     discrepancies_list.append(
                         PipelineDiscrepancyDetail(
@@ -2561,11 +2571,7 @@ def simulate_pipeline_chaos(
     index ranges, evaluating stage circuit breaker tripping, zero-latency fast-fail isolation,
     SLA budget compliance, and post-fault circuit recovery.
     """
-    if (
-        isinstance(sla_budget_ms, bool)
-        or not math.isfinite(sla_budget_ms)
-        or sla_budget_ms <= 0.0
-    ):
+    if isinstance(sla_budget_ms, bool) or not math.isfinite(sla_budget_ms) or sla_budget_ms <= 0.0:
         raise ValueError("sla_budget_ms must be a positive finite number")
 
     parsed_specs: list[StageFaultSpec] = []
@@ -2602,11 +2608,21 @@ def simulate_pipeline_chaos(
     registry = StageCircuitRegistry()
     if enable_circuit_breaker:
         for name, node in graph.nodes.items():
-            pol = node.circuit_policy or StageCircuitPolicy(
-                enabled=True,
-                failure_threshold=circuit_failure_threshold,
-                recovery_timeout_seconds=circuit_recovery_timeout_seconds,
-            )
+            if node.circuit_policy is not None:
+                pol = StageCircuitPolicy(
+                    enabled=node.circuit_policy.enabled,
+                    failure_threshold=circuit_failure_threshold,
+                    recovery_timeout_seconds=circuit_recovery_timeout_seconds,
+                    half_open_max_calls=node.circuit_policy.half_open_max_calls,
+                    count_timeouts=node.circuit_policy.count_timeouts,
+                    count_exceptions=node.circuit_policy.count_exceptions,
+                )
+            else:
+                pol = StageCircuitPolicy(
+                    enabled=True,
+                    failure_threshold=circuit_failure_threshold,
+                    recovery_timeout_seconds=circuit_recovery_timeout_seconds,
+                )
             registry.register_policy(name, pol)
 
     executor = DecisionGraphExecutor(
@@ -2641,11 +2657,11 @@ def simulate_pipeline_chaos(
             return orig_proc
 
         if inspect.iscoroutinefunction(orig_proc):
+
             async def async_chaos_wrapper(ctx: PipelineContext) -> Any:
                 for spec in node_specs:
-                    is_active = (
-                        spec.start_index <= current_tx_index
-                        and (spec.end_index is None or current_tx_index < spec.end_index)
+                    is_active = spec.start_index <= current_tx_index and (
+                        spec.end_index is None or current_tx_index < spec.end_index
                     )
                     if is_active:
                         m = stage_chaos_metrics[node_name]
@@ -2657,10 +2673,10 @@ def simulate_pipeline_chaos(
                         )
                         if ft == StageFaultType.EXCEPTION:
                             raise RuntimeError(spec.error_message)
-                        if ft == StageFaultType.TIMEOUT:
+                        elif ft == StageFaultType.TIMEOUT:
                             await asyncio.sleep(0.005)
                             raise TimeoutError(spec.error_message)
-                        if ft == StageFaultType.LATENCY_SPIKE and spec.latency_ms > 0:
+                        elif ft == StageFaultType.LATENCY_SPIKE and spec.latency_ms > 0:
                             await asyncio.sleep(spec.latency_ms / 1000.0)
                 return await orig_proc(ctx)
 
@@ -2668,9 +2684,8 @@ def simulate_pipeline_chaos(
 
         def sync_chaos_wrapper(ctx: PipelineContext) -> Any:
             for spec in node_specs:
-                is_active = (
-                    spec.start_index <= current_tx_index
-                    and (spec.end_index is None or current_tx_index < spec.end_index)
+                is_active = spec.start_index <= current_tx_index and (
+                    spec.end_index is None or current_tx_index < spec.end_index
                 )
                 if is_active:
                     m = stage_chaos_metrics[node_name]
@@ -2682,10 +2697,10 @@ def simulate_pipeline_chaos(
                     )
                     if ft == StageFaultType.EXCEPTION:
                         raise RuntimeError(spec.error_message)
-                    if ft == StageFaultType.TIMEOUT:
+                    elif ft == StageFaultType.TIMEOUT:
                         sleep(0.005)
                         raise TimeoutError(spec.error_message)
-                    if ft == StageFaultType.LATENCY_SPIKE and spec.latency_ms > 0:
+                    elif ft == StageFaultType.LATENCY_SPIKE and spec.latency_ms > 0:
                         sleep(spec.latency_ms / 1000.0)
             return orig_proc(ctx)
 
@@ -2713,10 +2728,7 @@ def simulate_pipeline_chaos(
                 if res.degraded:
                     degraded_transactions += 1
                 for node_name in res.stage_results:
-                    if (
-                        node_name in stage_chaos_metrics
-                        and res.stage_results[node_name].degraded
-                    ):
+                    if node_name in stage_chaos_metrics and res.stage_results[node_name].degraded:
                         stage_chaos_metrics[node_name].handled_count += 1
             except (
                 PipelineExecutionError,
@@ -2779,7 +2791,3 @@ def simulate_pipeline_chaos(
         recovered=all_closed,
         status=overall_status,
     )
-
-
-
-

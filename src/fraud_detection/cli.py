@@ -21,6 +21,7 @@ from fraud_detection import __version__
 from fraud_detection.audit import (
     JsonlAuditSink,
     backtest_audit_policy,
+    build_pipeline_chaos_audit_event,
     build_pipeline_replay_audit_event,
     build_promotion_audit_event,
     build_scoring_audit_event,
@@ -85,9 +86,12 @@ from fraud_detection.model import (
 )
 from fraud_detection.pipeline import (
     DecisionGraphExecutor,
+    StageFaultSpec,
+    StageFaultType,
     create_default_fraud_pipeline,
     optimize_counterfactual_pipeline,
     replay_audit_log_through_pipeline,
+    simulate_pipeline_chaos,
 )
 from fraud_detection.recalibration import (
     CalibrationDiagnostics,
@@ -4923,6 +4927,29 @@ def pipeline_eval(
             help="Enable speculative asynchronous model inference execution.",
         ),
     ] = False,
+    enable_circuit_breaker: Annotated[
+        bool,
+        typer.Option(
+            "--enable-circuit-breaker/--no-circuit-breaker",
+            help="Enable stage-level circuit breakers for fast-fail isolation.",
+        ),
+    ] = False,
+    cb_failure_threshold: Annotated[
+        int,
+        typer.Option(
+            "--cb-failure-threshold",
+            help="Consecutive failure threshold before tripping stage circuit breaker.",
+            min=1,
+        ),
+    ] = 5,
+    cb_recovery_timeout: Annotated[
+        float,
+        typer.Option(
+            "--cb-recovery-timeout",
+            help="Recovery timeout in seconds before stage circuit attempts half-open probe.",
+            min=0.001,
+        ),
+    ] = 30.0,
     output: Annotated[
         Path | None,
         typer.Option(
@@ -4993,11 +5020,15 @@ def pipeline_eval(
         cache_ttl_seconds=cache_ttl,
         cache_max_size=cache_size,
         speculative_inference=speculative,
+        enable_circuit_breaker=enable_circuit_breaker,
+        circuit_failure_threshold=cb_failure_threshold,
+        circuit_recovery_timeout_seconds=cb_recovery_timeout,
     )
     executor = DecisionGraphExecutor(
         pipeline_graph,
         enable_cache=enable_cache,
         enable_speculative=speculative,
+        enable_circuit_breaker=enable_circuit_breaker,
     )
 
     total = len(df)
@@ -5005,10 +5036,10 @@ def pipeline_eval(
     fraud_count = 0
     degraded_count = 0
     degraded_node_counts: dict[str, int] = {}
+    circuit_short_circuits_count = 0
+    circuit_short_circuit_node_counts: dict[str, int] = {}
     latencies: list[float] = []
-    stage_latencies: dict[str, list[float]] = {
-        node_name: [] for node_name in pipeline_graph.nodes
-    }
+    stage_latencies: dict[str, list[float]] = {node_name: [] for node_name in pipeline_graph.nodes}
     total_cache_hits = 0
     total_cache_misses = 0
     speculative_executed_count = 0
@@ -5025,8 +5056,12 @@ def pipeline_eval(
         if res.degraded:
             degraded_count += 1
             for node_name in res.degraded_nodes:
-                degraded_node_counts[node_name] = (
-                    degraded_node_counts.get(node_name, 0) + 1
+                degraded_node_counts[node_name] = degraded_node_counts.get(node_name, 0) + 1
+        if res.circuit_short_circuits:
+            circuit_short_circuits_count += len(res.circuit_short_circuits)
+            for sc_node in res.circuit_short_circuits:
+                circuit_short_circuit_node_counts[sc_node] = (
+                    circuit_short_circuit_node_counts.get(sc_node, 0) + 1
                 )
         for stage_name, s_res in res.stage_results.items():
             if stage_name in stage_latencies:
@@ -5044,9 +5079,7 @@ def pipeline_eval(
     p99_lat = float(np.percentile(latencies, 99)) if latencies else 0.0
 
     cache_lookups = total_cache_hits + total_cache_misses
-    cache_hit_ratio = (
-        round(total_cache_hits / cache_lookups, 4) if cache_lookups > 0 else 0.0
-    )
+    cache_hit_ratio = round(total_cache_hits / cache_lookups, 4) if cache_lookups > 0 else 0.0
 
     stage_stats: dict[str, dict[str, float]] = {}
     for stage_name, slist in stage_latencies.items():
@@ -5065,6 +5098,12 @@ def pipeline_eval(
         "degraded_count": degraded_count,
         "degraded_rate": round(degraded_count / total, 4) if total > 0 else 0.0,
         "degraded_nodes": degraded_node_counts,
+        "circuit_breaker": {
+            "enabled": enable_circuit_breaker,
+            "short_circuits_count": circuit_short_circuits_count,
+            "short_circuit_nodes": circuit_short_circuit_node_counts,
+            "summary": executor.circuits.summary() if enable_circuit_breaker else {},
+        },
         "cache": {
             "enabled": enable_cache,
             "hits": total_cache_hits,
@@ -5103,6 +5142,11 @@ def pipeline_eval(
         typer.echo(f"  Fraud Count: {fraud_count} ({fraud_pct:.2f}%)")
         deg_pct = (degraded_count / total * 100.0) if total > 0 else 0.0
         typer.echo(f"  Degraded Executions: {degraded_count} ({deg_pct:.2f}%)")
+        if enable_circuit_breaker:
+            typer.echo(
+                f"  Circuit Breaker: Short Circuits={circuit_short_circuits_count}, "
+                f"Trips={executor.circuits.summary().get('total_trips', 0)}"
+            )
         if enable_cache:
             cache_pct = cache_hit_ratio * 100.0
             typer.echo(
@@ -5352,8 +5396,7 @@ def pipeline_replay_command(
         typer.echo(f"  Scoring Events: {report.replayed_events}/{report.scoring_events}")
         typer.echo(f"  Transactions Replayed: {report.total_transactions}")
         typer.echo(
-            f"  Score Discrepancies: {report.score_discrepancies} "
-            f"(tolerance={report.tolerance})"
+            f"  Score Discrepancies: {report.score_discrepancies} (tolerance={report.tolerance})"
         )
         typer.echo(f"  Decision Flips: {report.decision_flips} ({report.flip_rate:.2%})")
         typer.echo(
@@ -5563,9 +5606,7 @@ def pipeline_counterfactual_command(
         baseline_th = TieredThresholds(inferred_baseline_review, inferred_baseline_deny)
 
     try:
-        base_decs = (
-            logged_decisions if len(logged_decisions) == len(probs_list) else None
-        )
+        base_decs = logged_decisions if len(logged_decisions) == len(probs_list) else None
         cf_eval = optimize_counterfactual_pipeline(
             probabilities=probs_list,
             candidate_thresholds=candidate_th,
@@ -5606,8 +5647,7 @@ def pipeline_counterfactual_command(
             f"({cf_eval.review_rate_delta:+.1%})"
         )
         typer.echo(
-            f"Deny Volume Delta: {cf_eval.deny_count_delta:+d} "
-            f"({cf_eval.deny_rate_delta:+.1%})"
+            f"Deny Volume Delta: {cf_eval.deny_count_delta:+d} ({cf_eval.deny_rate_delta:+.1%})"
         )
         typer.echo("Transition Matrix (Baseline -> Candidate):")
         typer.echo(
@@ -5625,6 +5665,257 @@ def pipeline_counterfactual_command(
         if output is not None:
             typer.echo(f"Report written to: {output}")
 
+
+@app.command("pipeline-chaos")
+def pipeline_chaos_command(
+    input_data: Annotated[
+        Path,
+        typer.Option(
+            "--input",
+            "-i",
+            help="Path to input transactions CSV dataset.",
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            readable=True,
+            resolve_path=True,
+        ),
+    ],
+    fault_spec_path: Annotated[
+        Path,
+        typer.Option(
+            "--faults",
+            "-f",
+            help="JSON file containing list of StageFaultSpec definitions.",
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            readable=True,
+            resolve_path=True,
+        ),
+    ],
+    model: Annotated[
+        Path | None,
+        typer.Option(
+            "--model",
+            "-m",
+            help="Optional path to FraudModel artifact. If omitted, default model is loaded.",
+        ),
+    ] = None,
+    rules: Annotated[
+        Path | None,
+        typer.Option(
+            "--rules",
+            "-r",
+            help="Optional declarative rules file (JSON or YAML).",
+        ),
+    ] = None,
+    sla_budget_ms: Annotated[
+        float,
+        typer.Option(
+            "--sla-budget-ms",
+            help="Latency SLA budget in milliseconds per transaction.",
+            min=0.001,
+        ),
+    ] = 100.0,
+    enable_circuit_breaker: Annotated[
+        bool,
+        typer.Option(
+            "--enable-circuit-breaker/--no-circuit-breaker",
+            help="Enable stage circuit breakers for fast-fail isolation during chaos.",
+        ),
+    ] = True,
+    cb_failure_threshold: Annotated[
+        int,
+        typer.Option(
+            "--cb-failure-threshold",
+            help="Consecutive failure threshold before tripping stage circuit breaker.",
+            min=1,
+        ),
+    ] = 5,
+    cb_recovery_timeout: Annotated[
+        float,
+        typer.Option(
+            "--cb-recovery-timeout",
+            help="Recovery timeout in seconds before stage circuit probes half-open.",
+            min=0.001,
+        ),
+    ] = 30.0,
+    max_records: Annotated[
+        int | None,
+        typer.Option(
+            "--max-records",
+            "-n",
+            help="Maximum transactions to evaluate.",
+            min=1,
+        ),
+    ] = None,
+    fail_on_sla_breach: Annotated[
+        bool,
+        typer.Option(
+            "--fail-on-sla-breach/--no-fail-on-sla-breach",
+            help="Exit with code 1 if any transaction breached the SLA budget.",
+        ),
+    ] = False,
+    fail_on_unrecovered: Annotated[
+        bool,
+        typer.Option(
+            "--fail-on-unrecovered/--no-fail-on-unrecovered",
+            help="Exit with code 1 if any circuit breaker remained unrecovered.",
+        ),
+    ] = False,
+    audit_log: Annotated[
+        Path | None,
+        typer.Option(
+            "--audit-log",
+            help="Optional path to append structured chaos audit event.",
+        ),
+    ] = None,
+    output: Annotated[
+        Path | None,
+        typer.Option(
+            "--output",
+            "-o",
+            help="Optional path to write JSON chaos report.",
+        ),
+    ] = None,
+    as_json: Annotated[
+        bool,
+        typer.Option(
+            "--json",
+            help="Print report in JSON format.",
+        ),
+    ] = False,
+    overwrite: Annotated[
+        bool,
+        typer.Option("--overwrite/--no-overwrite", help="Allow overwriting output file."),
+    ] = False,
+) -> None:
+    """Simulate stage-level chaos faults and evaluate circuit breaking resilience and SLAs."""
+    _guard_output(output, overwrite)
+
+    loaded_model: FraudModel
+    if model is not None:
+        try:
+            loaded_model = load_model(model)
+        except (ModelArtifactError, OSError, ValueError) as exc:
+            _abort(f"Failed to load model from '{model}': {exc}")
+    else:
+        from fraud_detection.data import generate_synthetic_data, validate_frame
+        from fraud_detection.model import train_model
+
+        syn_df = generate_synthetic_data(rows=500, fraud_rate=0.05)
+        syn_dataset = validate_frame(syn_df)
+        loaded_model = train_model(syn_dataset)
+
+    loaded_rules: RuleSet | None = None
+    if rules is not None:
+        try:
+            loaded_rules = RuleSet.load_file(rules)
+        except (OSError, ValueError, TypeError, KeyError, RuntimeError) as exc:
+            _abort(f"Failed to load rules from '{rules}': {exc}")
+
+    try:
+        raw_fault_specs = json.loads(fault_spec_path.read_text(encoding="utf-8"))
+        if not isinstance(raw_fault_specs, list):
+            _abort("Fault specifications file must contain a JSON list of objects.")
+        converted_specs: list[StageFaultSpec] = [
+            StageFaultSpec(
+                node_name=str(f["node_name"]),
+                fault_type=StageFaultType(f["fault_type"]),
+                start_index=int(f.get("start_index", 0)),
+                end_index=int(f["end_index"]) if f.get("end_index") is not None else None,
+                latency_ms=float(f.get("latency_ms", 0.0)),
+                error_message=str(f.get("error_message", "Injected stage chaos fault")),
+            )
+            for f in raw_fault_specs
+        ]
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        _abort(f"Failed to read/parse fault specifications from '{fault_spec_path}': {exc}")
+
+    try:
+        df = pd.read_csv(input_data)
+    except (OSError, ValueError, TypeError) as exc:
+        _abort(f"Failed to read input dataset '{input_data}': {exc}")
+
+    if max_records is not None:
+        df = df.iloc[:max_records]
+
+    pipeline_graph = create_default_fraud_pipeline(
+        model=loaded_model,
+        rules=loaded_rules,
+        recalibrator=getattr(loaded_model, "recalibrator", None),
+        enable_circuit_breaker=enable_circuit_breaker,
+        circuit_failure_threshold=cb_failure_threshold,
+        circuit_recovery_timeout_seconds=cb_recovery_timeout,
+    )
+
+    records = cast(list[dict[str, Any]], df.to_dict(orient="records"))
+
+    try:
+        report = simulate_pipeline_chaos(
+            records=records,
+            pipeline=pipeline_graph,
+            fault_specs=converted_specs,
+            sla_budget_ms=sla_budget_ms,
+            enable_circuit_breaker=enable_circuit_breaker,
+            circuit_failure_threshold=cb_failure_threshold,
+            circuit_recovery_timeout_seconds=cb_recovery_timeout,
+        )
+    except (ValueError, TypeError, RuntimeError) as exc:
+        _abort(f"Chaos simulation failed: {exc}")
+
+    if audit_log is not None:
+        sink = JsonlAuditSink(audit_log)
+        audit_ev = build_pipeline_chaos_audit_event(
+            chaos_report=report,
+            model_version=str(loaded_model.metadata.get("dataset_fingerprint", ""))[:12],
+            dataset_fingerprint=str(loaded_model.metadata.get("dataset_fingerprint", "")),
+        )
+        sink.emit(audit_ev)
+        sink.close()
+
+    report_dict = report.to_dict()
+    report_json = json.dumps(report_dict, indent=2)
+
+    if output is not None:
+        _atomic_write_text(report_json + "\n", output)
+
+    if as_json:
+        typer.echo(report_json)
+    else:
+        typer.echo("Pipeline Chaos Resilience Report:")
+        typer.echo(f"  Status: {report.status}")
+        typer.echo(f"  Transactions: {report.total_transactions}")
+        typer.echo(f"  Circuit Breaker Enabled: {report.circuit_breaker_enabled}")
+        typer.echo(f"  SLA Budget: {report.sla_budget_ms:.2f}ms (Breaches: {report.sla_breaches})")
+        typer.echo(
+            f"  Circuit Trips: {report.circuit_trips}, "
+            f"Short-Circuited: {report.short_circuited_calls}"
+        )
+        typer.echo(
+            f"  Degraded: {report.degraded_transactions}, "
+            f"Unhandled Errors: {report.unhandled_errors}"
+        )
+        typer.echo(
+            f"  Latency (ms): P50={report.latencies_p50_ms:.2f}ms, "
+            f"P95={report.latencies_p95_ms:.2f}ms, Max={report.latencies_max_ms:.2f}ms"
+        )
+        typer.echo(f"  Recovered: {report.recovered}")
+        typer.echo("  Stage Metrics:")
+        for node_name, sm in report.stage_metrics.items():
+            typer.echo(
+                f"    - {node_name} [{sm.fault_type}]: Injected={sm.injected_count}, "
+                f"Handled={sm.handled_count}, Tripped={sm.tripped_circuit}"
+            )
+        if output is not None:
+            typer.echo(f"Report written to: {output}")
+
+    if fail_on_sla_breach and report.sla_breaches > 0:
+        raise typer.Exit(code=1)
+
+    if fail_on_unrecovered and not report.recovered:
+        raise typer.Exit(code=1)
 
 
 def _abort(message: str) -> NoReturn:

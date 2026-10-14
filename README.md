@@ -601,17 +601,25 @@ export FRAUD_PIPELINE_ENABLED="true"
 - **Operational Endpoints**:
   - `GET /v1/pipeline/topology`: Inspect registered graph DAG topology, node dependencies, stage types, and parallel execution wave plans.
   - `POST /v1/pipeline/score`: Execute real-time decision graph for an incoming transaction with full stage-by-stage latency breakdowns and lineage traces.
+  - `GET /v1/pipeline/circuits`: Inspect status, state (`CLOSED`, `OPEN`, `HALF_OPEN`), failure counts, short-circuit counts, and breaker policies for all graph stages.
+  - `POST /v1/pipeline/circuits/reset`: Reset all stage circuit breakers to `CLOSED` state.
   - `GET /v1/pipeline/cache/stats`: Aggregate and per-node cache hits, misses, hit ratio, evictions, and size (404 when caching is disabled).
   - `POST /v1/pipeline/cache/clear`: Drop all cached stage outputs.
   - `POST /v1/pipeline/replay`: Replay historical scoring audit logs (`JSONL`) through the active decision graph, returning probability discrepancies, 3×3 decision turnover matrices (`ALLOW`, `CHALLENGE`, `DENY`), and stage-by-stage latency distributions.
   - `POST /v1/pipeline/counterfactual`: Evaluate candidate tiered decision thresholds against baseline decisions or thresholds with optional ground-truth cost modeling.
+  - `POST /v1/pipeline/chaos`: Simulate deterministic stage faults (latency spikes, exceptions, corruption, timeouts) against a transaction batch with SLA verification.
 - **Prometheus Telemetry**:
   - `fraud_pipeline_stage_duration_seconds{stage="...", status="..."}`: Histogram monitoring per-stage execution durations.
   - `fraud_pipeline_executions_total{status="...", degraded="true|false"}`: Counter tracking total and degraded graph executions.
+  - `fraud_pipeline_circuit_state{stage="...", state="CLOSED|OPEN|HALF_OPEN"}`: Gauge tracking circuit breaker state per stage.
+  - `fraud_pipeline_circuit_short_circuits_total{stage="..."}`: Counter tracking executions short-circuited by tripped circuit breakers.
+  - `fraud_pipeline_chaos_injections_total{stage="...", fault_type="..."}`: Counter tracking simulated chaos faults injected per stage.
   - `fraud_pipeline_cache_hits_total{stage="..."}` / `fraud_pipeline_cache_misses_total{stage="..."}`: Per-stage cache outcomes.
   - `fraud_pipeline_speculative_executions_total` / `fraud_pipeline_speculative_hits_total`: Speculative launches and adopted results.
   - `fraud_pipeline_replay_evaluations_total{status="..."}` / `fraud_pipeline_replay_discrepancies_total`: Pipeline replay evaluations and detected score discrepancies.
-- **Offline CLI Replay & Counterfactual Analysis**:
+- **Offline CLI Replay, Chaos & Counterfactual Analysis**:
+  - `fraud-detect pipeline-eval <input.csv> --model <artifact> [--enable-circuit-breakers] [--circuit-failure-threshold 5] [--circuit-recovery-timeout-seconds 30.0] [--fail-on-degraded] [--json]`
+  - `fraud-detect pipeline-chaos <input.csv> --model <artifact> [--fault-stage rules] [--fault-type latency_spike|transient_exception|payload_corruption|timeout] [--fault-rate 0.5] [--latency-spike-ms 50.0] [--sla-budget-ms 100.0] [--output reports/chaos.json] [--json]`
   - `fraud-detect pipeline-replay <audit_log.jsonl> --model <artifact> [--rules <rules.json>] [--tolerance 1e-4] [--fail-on-divergence] [--json]`
   - `fraud-detect pipeline-counterfactual <audit_log.jsonl> --candidate-review 0.3 --candidate-deny 0.75 [--baseline-review 0.5 --baseline-deny 0.8] [--json]`
 
@@ -1545,6 +1553,7 @@ src/fraud_detection/
 ├── explanations.py   # isolated explanation provider protocols and cost controls
 ├── features.py       # feature store contracts, point-in-time join, and skew surveillance
 ├── model.py          # training, model card, inference, and cryptographic attestation
+├── pipeline.py       # decision graph execution, stage circuit breakers, and chaos simulation
 ├── recalibration.py  # ECE diagnostics, reliability curves, and post-hoc recalibration
 ├── reporting.py      # self-contained HTML compliance report rendering
 ├── routing.py        # champion/challenger multi-model routing and canary governance

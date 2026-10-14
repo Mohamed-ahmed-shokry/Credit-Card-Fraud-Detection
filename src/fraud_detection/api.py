@@ -41,6 +41,7 @@ from fraud_detection.audit import (
     AuditSink,
     JsonlAuditSink,
     NullAuditSink,
+    build_pipeline_chaos_audit_event,
     build_pipeline_replay_audit_event,
     build_scoring_audit_event,
     build_shadow_scoring_audit_event,
@@ -52,9 +53,13 @@ from fraud_detection.model import FraudModel, ModelArtifactError, load_model
 from fraud_detection.pipeline import (
     DecisionGraph,
     DecisionGraphExecutor,
+    StageCircuitState,
+    StageFaultSpec,
+    StageFaultType,
     create_default_fraud_pipeline,
     optimize_counterfactual_pipeline,
     replay_audit_log_through_pipeline,
+    simulate_pipeline_chaos,
 )
 from fraud_detection.recalibration import BaseRecalibrator
 from fraud_detection.routing import (
@@ -120,6 +125,11 @@ PIPELINE_CACHE_ENABLED_ENVIRONMENT_VARIABLE = "FRAUD_PIPELINE_CACHE_ENABLED"
 PIPELINE_SPECULATIVE_ENVIRONMENT_VARIABLE = "FRAUD_PIPELINE_SPECULATIVE_ENABLED"
 PIPELINE_CACHE_TTL_ENVIRONMENT_VARIABLE = "FRAUD_PIPELINE_CACHE_TTL_SECONDS"
 PIPELINE_CACHE_SIZE_ENVIRONMENT_VARIABLE = "FRAUD_PIPELINE_CACHE_MAX_SIZE"
+PIPELINE_CIRCUIT_BREAKER_ENABLED_ENVIRONMENT_VARIABLE = "FRAUD_PIPELINE_CIRCUIT_BREAKER_ENABLED"
+PIPELINE_CIRCUIT_FAILURE_THRESHOLD_ENVIRONMENT_VARIABLE = "FRAUD_PIPELINE_CIRCUIT_FAILURE_THRESHOLD"
+PIPELINE_CIRCUIT_RECOVERY_TIMEOUT_ENVIRONMENT_VARIABLE = (
+    "FRAUD_PIPELINE_CIRCUIT_RECOVERY_TIMEOUT_SECONDS"
+)
 REQUEST_ID_HEADER = "X-Request-ID"
 PROCESS_TIME_HEADER = "X-Process-Time-Ms"
 MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024
@@ -138,6 +148,9 @@ OPERATIONAL_PATHS = frozenset(
         "/v1/pipeline/topology",
         "/v1/pipeline/cache/stats",
         "/v1/pipeline/cache/clear",
+        "/v1/pipeline/circuits",
+        "/v1/pipeline/circuits/reset",
+        "/v1/pipeline/chaos",
     }
 )
 UNMATCHED_ROUTE_LABEL = "unmatched"
@@ -719,6 +732,7 @@ class PipelineScoreResponse(BaseModel):
     total_latency_ms: float
     degraded: bool
     degraded_nodes: list[str]
+    circuit_short_circuits: list[str] = Field(default_factory=list)
     execution_path: list[str]
     stage_results: dict[str, Any]
 
@@ -860,6 +874,84 @@ class PipelineCounterfactualResponse(BaseModel):
     fraud_catch_delta: int | None = None
 
 
+class PipelineCircuitStatusResponse(BaseModel):
+    """Telemetry and operational state for pipeline stage circuit breakers."""
+
+    total_trips: int
+    total_short_circuits: int
+    open_nodes: list[str]
+    half_open_nodes: list[str]
+    nodes: dict[str, Any]
+
+
+class PipelineCircuitResetRequest(BaseModel):
+    """Optional filter to reset a single stage or all stage circuit breakers."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    stage_name: str | None = None
+
+
+class PipelineCircuitResetResponse(BaseModel):
+    """Outcome of manually resetting stage circuit breakers."""
+
+    status: str
+    reset_nodes: list[str]
+    message: str | None = None
+
+
+class StageFaultSpecModel(BaseModel):
+    """Specification for deterministic fault injection during chaos simulation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    node_name: str = Field(min_length=1)
+    fault_type: str = Field(pattern="^(exception|timeout|latency_spike)$")
+    start_index: int = Field(default=0, ge=0)
+    end_index: int | None = Field(default=None, ge=0)
+    latency_ms: float = Field(default=0.0, ge=0.0)
+    error_message: str = "Injected stage chaos fault"
+
+    @model_validator(mode="after")
+    def validate_indices(self) -> Self:
+        if self.end_index is not None and self.end_index < self.start_index:
+            raise ValueError("end_index must be >= start_index")
+        return self
+
+
+class PipelineChaosRequest(BaseModel):
+    """Payload to trigger deterministic chaos resilience verification."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    records: list[dict[str, Any]] = Field(min_length=1)
+    fault_specs: list[StageFaultSpecModel]
+    sla_budget_ms: float = Field(default=100.0, gt=0.0)
+    enable_circuit_breaker: bool = True
+    circuit_failure_threshold: int = Field(default=5, ge=1)
+    circuit_recovery_timeout_seconds: float = Field(default=30.0, gt=0.0)
+
+
+class PipelineChaosResponse(BaseModel):
+    """Telemetry report emitted by stage chaos resilience verification."""
+
+    total_transactions: int
+    fault_specs: list[dict[str, Any]]
+    circuit_breaker_enabled: bool
+    sla_budget_ms: float
+    sla_breaches: int
+    circuit_trips: int
+    short_circuited_calls: int
+    unhandled_errors: int
+    degraded_transactions: int
+    latencies_p50_ms: float
+    latencies_p95_ms: float
+    latencies_max_ms: float
+    stage_metrics: dict[str, Any]
+    recovered: bool
+    status: str
+
+
 def create_app(
     *,
     model: FraudModel | None = None,
@@ -912,6 +1004,9 @@ def create_app(
     enable_speculative_pipeline: bool = False,
     pipeline_cache_ttl_seconds: float = 60.0,
     pipeline_cache_max_size: int = 1000,
+    enable_pipeline_circuit_breaker: bool = False,
+    pipeline_circuit_failure_threshold: int = 5,
+    pipeline_circuit_recovery_timeout_seconds: float = 30.0,
 ) -> FastAPI:
     """Create an application using an injected model or a trusted artifact path.
 
@@ -1102,38 +1197,53 @@ def create_app(
         resolved_feature_store = FileFeatureStore.from_file(resolved_feature_store_path)
 
     raw_pipeline_env = os.getenv(PIPELINE_ENABLED_ENVIRONMENT_VARIABLE)
-    resolved_pipeline_enabled = enable_pipeline or (
-        raw_pipeline_env.lower() in ("true", "1", "yes")
-        if raw_pipeline_env is not None
-        else False
-    ) or (pipeline is not None)
+    resolved_pipeline_enabled = (
+        enable_pipeline
+        or (
+            raw_pipeline_env.lower() in ("true", "1", "yes")
+            if raw_pipeline_env is not None
+            else False
+        )
+        or (pipeline is not None)
+    )
 
     raw_cache_env = os.getenv(PIPELINE_CACHE_ENABLED_ENVIRONMENT_VARIABLE)
     resolved_pipeline_cache_enabled = enable_pipeline_cache or (
-        raw_cache_env.lower() in ("true", "1", "yes")
-        if raw_cache_env is not None
-        else False
+        raw_cache_env.lower() in ("true", "1", "yes") if raw_cache_env is not None else False
     )
 
     raw_spec_env = os.getenv(PIPELINE_SPECULATIVE_ENVIRONMENT_VARIABLE)
     resolved_pipeline_speculative_enabled = enable_speculative_pipeline or (
-        raw_spec_env.lower() in ("true", "1", "yes")
-        if raw_spec_env is not None
-        else False
+        raw_spec_env.lower() in ("true", "1", "yes") if raw_spec_env is not None else False
     )
 
     raw_ttl_env = os.getenv(PIPELINE_CACHE_TTL_ENVIRONMENT_VARIABLE)
     resolved_pipeline_cache_ttl = (
-        float(raw_ttl_env)
-        if raw_ttl_env is not None
-        else pipeline_cache_ttl_seconds
+        float(raw_ttl_env) if raw_ttl_env is not None else pipeline_cache_ttl_seconds
     )
 
     raw_size_env = os.getenv(PIPELINE_CACHE_SIZE_ENVIRONMENT_VARIABLE)
     resolved_pipeline_cache_max_size = (
-        int(raw_size_env)
-        if raw_size_env is not None
-        else pipeline_cache_max_size
+        int(raw_size_env) if raw_size_env is not None else pipeline_cache_max_size
+    )
+
+    raw_pipe_cb_env = os.getenv(PIPELINE_CIRCUIT_BREAKER_ENABLED_ENVIRONMENT_VARIABLE)
+    resolved_pipeline_cb_enabled = enable_pipeline_circuit_breaker or (
+        raw_pipe_cb_env.lower() in ("true", "1", "yes") if raw_pipe_cb_env is not None else False
+    )
+
+    raw_pipe_thresh_env = os.getenv(PIPELINE_CIRCUIT_FAILURE_THRESHOLD_ENVIRONMENT_VARIABLE)
+    resolved_pipeline_cb_failure_threshold = (
+        int(raw_pipe_thresh_env)
+        if raw_pipe_thresh_env is not None
+        else pipeline_circuit_failure_threshold
+    )
+
+    raw_pipe_recov_env = os.getenv(PIPELINE_CIRCUIT_RECOVERY_TIMEOUT_ENVIRONMENT_VARIABLE)
+    resolved_pipeline_cb_recovery_timeout = (
+        float(raw_pipe_recov_env)
+        if raw_pipe_recov_env is not None
+        else pipeline_circuit_recovery_timeout_seconds
     )
 
     metrics_registry = CollectorRegistry()
@@ -1292,6 +1402,24 @@ def create_app(
         "Total discrepancies identified during pipeline replay.",
         registry=metrics_registry,
     )
+    pipeline_circuit_short_circuits_counter = Counter(
+        "fraud_pipeline_circuit_short_circuits_total",
+        "Total short-circuited executions triggered by stage circuit breaker.",
+        ["stage"],
+        registry=metrics_registry,
+    )
+    pipeline_circuit_state_gauge = Gauge(
+        "fraud_pipeline_circuit_state",
+        "Current state of pipeline stage circuit breaker (0=closed, 1=open, 2=half_open).",
+        ["stage"],
+        registry=metrics_registry,
+    )
+    pipeline_chaos_simulations_counter = Counter(
+        "fraud_pipeline_chaos_simulations_total",
+        "Total chaos resilience simulations performed.",
+        ["status"],
+        registry=metrics_registry,
+    )
 
     if resolved_cb is not None:
         # Keep a caller-supplied callback: the metrics counter is chained onto it
@@ -1437,9 +1565,7 @@ def create_app(
                 if c_auto is None:
                     raw_auto = os.getenv(CANARY_AUTO_ROLLBACK_ENVIRONMENT_VARIABLE)
                     c_auto = (
-                        raw_auto.lower() in ("true", "1", "yes")
-                        if raw_auto is not None
-                        else True
+                        raw_auto.lower() in ("true", "1", "yes") if raw_auto is not None else True
                     )
 
                 built_canary_cfg = canary_config or CanaryConfig(
@@ -1480,6 +1606,9 @@ def create_app(
                 cache_ttl_seconds=resolved_pipeline_cache_ttl,
                 cache_max_size=resolved_pipeline_cache_max_size,
                 speculative_inference=resolved_pipeline_speculative_enabled,
+                enable_circuit_breaker=resolved_pipeline_cb_enabled,
+                circuit_failure_threshold=resolved_pipeline_cb_failure_threshold,
+                circuit_recovery_timeout_seconds=resolved_pipeline_cb_recovery_timeout,
             )
 
         resolved_pipeline_exec = pipeline_executor
@@ -1488,6 +1617,7 @@ def create_app(
                 resolved_pipeline_graph,
                 enable_cache=resolved_pipeline_cache_enabled,
                 enable_speculative=resolved_pipeline_speculative_enabled,
+                enable_circuit_breaker=resolved_pipeline_cb_enabled,
             )
         elif resolved_pipeline_exec is not None and resolved_pipeline_graph is None:
             resolved_pipeline_graph = resolved_pipeline_exec.graph
@@ -1532,15 +1662,21 @@ def create_app(
         application.state.pipeline_speculative_executions_counter = (
             pipeline_speculative_executions_counter
         )
-        application.state.pipeline_speculative_hits_counter = (
-            pipeline_speculative_hits_counter
-        )
-        application.state.pipeline_replay_evaluations_counter = (
-            pipeline_replay_evaluations_counter
-        )
+        application.state.pipeline_speculative_hits_counter = pipeline_speculative_hits_counter
+        application.state.pipeline_replay_evaluations_counter = pipeline_replay_evaluations_counter
         application.state.pipeline_replay_discrepancies_counter = (
             pipeline_replay_discrepancies_counter
         )
+        application.state.pipeline_circuit_breaker_enabled = resolved_pipeline_cb_enabled
+        application.state.pipeline_circuit_failure_threshold = (
+            resolved_pipeline_cb_failure_threshold
+        )
+        application.state.pipeline_circuit_recovery_timeout = resolved_pipeline_cb_recovery_timeout
+        application.state.pipeline_circuit_short_circuits_counter = (
+            pipeline_circuit_short_circuits_counter
+        )
+        application.state.pipeline_circuit_state_gauge = pipeline_circuit_state_gauge
+        application.state.pipeline_chaos_simulations_counter = pipeline_chaos_simulations_counter
         shadow_tasks: set[asyncio.Task[None]] = set()
         application.state.shadow_tasks = shadow_tasks
         yield
@@ -2152,9 +2288,7 @@ def create_app(
                 is_mixed = True
                 model_role = "mixed"
                 routed_version = f"{router.champion_version}+{router.challenger_version}"
-                champ_indices = [
-                    i for i, d in enumerate(decisions) if d.role == ModelRole.CHAMPION
-                ]
+                champ_indices = [i for i, d in enumerate(decisions) if d.role == ModelRole.CHAMPION]
                 chall_indices = [
                     i for i, d in enumerate(decisions) if d.role == ModelRole.CHALLENGER
                 ]
@@ -2329,9 +2463,7 @@ def create_app(
                     shadow_discrepancy_total_counter=getattr(
                         request.app.state, "shadow_discrepancy_total_counter", None
                     ),
-                    canary_status_gauge=getattr(
-                        request.app.state, "canary_status_gauge", None
-                    ),
+                    canary_status_gauge=getattr(request.app.state, "canary_status_gauge", None),
                 )
             )
             shadow_tasks.add(shadow_task)
@@ -2462,9 +2594,7 @@ def create_app(
             frame_records,
             enriched_features,
             feature_views_applied,
-        ) = _enrich_records_with_feature_store(
-            request, frame_records, set(loaded.feature_names)
-        )
+        ) = _enrich_records_with_feature_store(request, frame_records, set(loaded.feature_names))
 
         try:
             (
@@ -2548,9 +2678,7 @@ def create_app(
             frame_records,
             enriched_features,
             feature_views_applied,
-        ) = _enrich_records_with_feature_store(
-            request, frame_records, set(loaded.feature_names)
-        )
+        ) = _enrich_records_with_feature_store(request, frame_records, set(loaded.feature_names))
 
         try:
             (
@@ -2652,9 +2780,7 @@ def create_app(
         }
 
     @application.get("/v1/features/lookup/{entity_key}/{entity_id}", tags=["features"])
-    async def feature_store_lookup(
-        entity_key: str, entity_id: str, request: Request
-    ) -> Any:
+    async def feature_store_lookup(entity_key: str, entity_id: str, request: Request) -> Any:
         """Inspect online feature values for a specific entity."""
         fs: FeatureStoreProtocol | None = getattr(request.app.state, "feature_store", None)
         if fs is None:
@@ -2838,6 +2964,13 @@ def create_app(
         if spec_hit_counter is not None and result.speculative_hit:
             spec_hit_counter.inc()
 
+        pipe_cb_counter: Counter | None = getattr(
+            request.app.state, "pipeline_circuit_short_circuits_counter", None
+        )
+        if pipe_cb_counter is not None and result.circuit_short_circuits:
+            for stage_name in result.circuit_short_circuits:
+                pipe_cb_counter.labels(stage=stage_name).inc()
+
         sink: AuditSink = getattr(request.app.state, "audit_sink", resolved_audit_sink)
         loaded_model_for_audit: FraudModel | None = getattr(request.app.state, "model", None)
         try:
@@ -2853,9 +2986,7 @@ def create_app(
                     else "pipeline"
                 ),
                 threshold=(
-                    loaded_model_for_audit.threshold
-                    if loaded_model_for_audit is not None
-                    else 0.5
+                    loaded_model_for_audit.threshold if loaded_model_for_audit is not None else 0.5
                 ),
                 features=[payload.transaction],
                 fallback_applied=result.degraded,
@@ -2880,6 +3011,7 @@ def create_app(
                 cache_misses=result.cache_misses,
                 speculative_executed=result.speculative_executed,
                 speculative_hit=result.speculative_hit,
+                circuit_short_circuits=result.circuit_short_circuits,
             )
             await run_in_threadpool(sink.emit, audit_event)
         except Exception:
@@ -2899,6 +3031,7 @@ def create_app(
             degraded_nodes=result.degraded_nodes,
             execution_path=result.execution_path,
             stage_results={k: v.to_dict() for k, v in result.stage_results.items()},
+            circuit_short_circuits=result.circuit_short_circuits,
         )
 
     @application.get(
@@ -3088,6 +3221,152 @@ def create_app(
         cf_dict = cf_eval.to_dict()
         return PipelineCounterfactualResponse(**cf_dict)
 
+    @application.get(
+        "/v1/pipeline/circuits",
+        response_model=PipelineCircuitStatusResponse,
+        responses={
+            404: {"description": "Decision graph pipeline or circuit breakers not enabled."},
+        },
+        tags=["pipeline"],
+    )
+    async def pipeline_circuits_status(
+        request: Request,
+    ) -> PipelineCircuitStatusResponse | JSONResponse:
+        """Inspect the current health and state of all pipeline stage circuit breakers."""
+        executor: DecisionGraphExecutor | None = getattr(
+            request.app.state, "pipeline_executor", None
+        )
+        if executor is None:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": "Decision graph pipeline is not enabled on this service."},
+            )
+        if not executor.enable_circuit_breaker:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": "Pipeline stage circuit breakers are not enabled."},
+            )
+        return PipelineCircuitStatusResponse(**executor.circuits.summary())
+
+    @application.post(
+        "/v1/pipeline/circuits/reset",
+        response_model=PipelineCircuitResetResponse,
+        responses={
+            404: {"description": "Decision graph pipeline or circuit breakers not enabled."},
+        },
+        tags=["pipeline"],
+    )
+    async def pipeline_circuits_reset(
+        payload: PipelineCircuitResetRequest,
+        request: Request,
+    ) -> PipelineCircuitResetResponse | JSONResponse:
+        """Manually reset tripped stage circuit breakers back to CLOSED state."""
+        executor: DecisionGraphExecutor | None = getattr(
+            request.app.state, "pipeline_executor", None
+        )
+        if executor is None:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": "Decision graph pipeline is not enabled on this service."},
+            )
+        if not executor.enable_circuit_breaker:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": "Pipeline stage circuit breakers are not enabled."},
+            )
+
+        reset_nodes = executor.circuits.reset(payload.stage_name)
+        pipe_gauge: Gauge | None = getattr(request.app.state, "pipeline_circuit_state_gauge", None)
+        if pipe_gauge is not None:
+            for node_name in reset_nodes:
+                pipe_gauge.labels(stage=node_name).set(0.0)
+
+        return PipelineCircuitResetResponse(
+            status="reset",
+            reset_nodes=reset_nodes,
+            message=f"Reset circuit breaker state for {len(reset_nodes)} stage(s).",
+        )
+
+    @application.post(
+        "/v1/pipeline/chaos",
+        response_model=PipelineChaosResponse,
+        responses={
+            400: {"description": "Invalid fault specification or parameters."},
+            404: {"description": "Decision graph pipeline is not enabled."},
+        },
+        tags=["pipeline"],
+    )
+    async def pipeline_chaos(
+        payload: PipelineChaosRequest,
+        request: Request,
+    ) -> PipelineChaosResponse | JSONResponse:
+        """Inject deterministic faults into pipeline stages to evaluate fault isolation and SLAs."""
+        executor: DecisionGraphExecutor | None = getattr(
+            request.app.state, "pipeline_executor", None
+        )
+        if executor is None:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": "Decision graph pipeline is not enabled on this service."},
+            )
+
+        try:
+            converted_specs: list[StageFaultSpec] = [
+                StageFaultSpec(
+                    node_name=s.node_name,
+                    fault_type=StageFaultType(s.fault_type),
+                    start_index=s.start_index,
+                    end_index=s.end_index,
+                    latency_ms=s.latency_ms,
+                    error_message=s.error_message,
+                )
+                for s in payload.fault_specs
+            ]
+        except (ValueError, KeyError) as exc:
+            return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+        try:
+            report = await run_in_threadpool(
+                simulate_pipeline_chaos,
+                payload.records,
+                executor.graph,
+                converted_specs,
+                sla_budget_ms=payload.sla_budget_ms,
+                enable_circuit_breaker=payload.enable_circuit_breaker,
+                circuit_failure_threshold=payload.circuit_failure_threshold,
+                circuit_recovery_timeout_seconds=payload.circuit_recovery_timeout_seconds,
+            )
+        except ValueError as exc:
+            return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+        chaos_counter: Counter | None = getattr(
+            request.app.state, "pipeline_chaos_simulations_counter", None
+        )
+        if chaos_counter is not None:
+            chaos_counter.labels(status=report.status).inc()
+
+        sink: AuditSink = getattr(request.app.state, "audit_sink", resolved_audit_sink)
+        loaded_model_for_audit: FraudModel | None = getattr(request.app.state, "model", None)
+        try:
+            audit_ev = build_pipeline_chaos_audit_event(
+                chaos_report=report,
+                model_version=(
+                    _model_version(loaded_model_for_audit)
+                    if loaded_model_for_audit is not None
+                    else "pipeline"
+                ),
+                dataset_fingerprint=(
+                    str(loaded_model_for_audit.metadata.get("dataset_fingerprint", ""))
+                    if loaded_model_for_audit is not None
+                    else "pipeline"
+                ),
+            )
+            await run_in_threadpool(sink.emit, audit_ev)
+        except Exception:
+            logger.exception("Failed to emit pipeline chaos audit event.")
+
+        rep_dict = report.to_dict()
+        return PipelineChaosResponse(**rep_dict)
 
     @application.get("/metrics", tags=["operations"])
     async def metrics() -> Response:
@@ -3097,6 +3376,20 @@ def create_app(
             if gauge is not None:
                 state_map = {"closed": 0.0, "half_open": 1.0, "open": 2.0}
                 gauge.set(state_map.get(cb.state, 0.0))
+
+        pipe_exec: DecisionGraphExecutor | None = getattr(
+            application.state, "pipeline_executor", None
+        )
+        pipe_gauge: Gauge | None = getattr(application.state, "pipeline_circuit_state_gauge", None)
+        if pipe_exec is not None and pipe_gauge is not None:
+            stage_map = {
+                StageCircuitState.CLOSED: 0.0,
+                StageCircuitState.OPEN: 1.0,
+                StageCircuitState.HALF_OPEN: 2.0,
+            }
+            for stage_name, breaker in pipe_exec.circuits.breakers.items():
+                pipe_gauge.labels(stage=stage_name).set(stage_map.get(breaker.state, 0.0))
+
         return Response(
             content=generate_latest(metrics_registry),
             media_type=CONTENT_TYPE_LATEST,
@@ -3160,8 +3453,7 @@ def _evaluate_shadow_traffic(
 
         primary_probs = [p.fraud_probability for p in primary_results]
         prob_diffs = [
-            abs(p - float(s))
-            for p, s in zip(primary_probs, shadow_probabilities, strict=True)
+            abs(p - float(s)) for p, s in zip(primary_probs, shadow_probabilities, strict=True)
         ]
         mean_div = float(np.mean(prob_diffs)) if prob_diffs else 0.0
         max_div = float(np.max(prob_diffs)) if prob_diffs else 0.0

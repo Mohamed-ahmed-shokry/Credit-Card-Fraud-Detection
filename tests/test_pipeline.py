@@ -264,9 +264,7 @@ def test_enrichment_stage_processor() -> None:
         velocity_config=v_conf,
     )
 
-    ctx = PipelineContext(
-        transaction={"card_id": "card_999", "Amount": 150.0, "Time": 150.0}
-    )
+    ctx = PipelineContext(transaction={"card_id": "card_999", "Amount": 150.0, "Time": 150.0})
     result = processor(ctx)
 
     assert "card_risk_score" in result["enriched_features"]
@@ -276,9 +274,7 @@ def test_enrichment_stage_processor() -> None:
     assert ctx.transaction["velocity_count_1h"] == 0.0
 
     # Second transaction for the same entity should see count=1.0
-    ctx2 = PipelineContext(
-        transaction={"card_id": "card_999", "Amount": 200.0, "Time": 200.0}
-    )
+    ctx2 = PipelineContext(transaction={"card_id": "card_999", "Amount": 200.0, "Time": 200.0})
     processor(ctx2)
     assert ctx2.transaction["velocity_count_1h"] == 1.0
 
@@ -978,10 +974,6 @@ def test_speculative_execution_discard_on_short_circuit() -> None:
     assert res.stage_results["inference"].output["skipped"] is True
 
 
-
-
-
-
 def test_speculative_custom_node_and_global_timeout() -> None:
     graph = DecisionGraph("spec_custom_graph")
     graph.add_node(
@@ -1013,9 +1005,7 @@ def test_speculative_custom_node_and_global_timeout() -> None:
         )
     )
 
-    executor = DecisionGraphExecutor(
-        graph, enable_speculative=True, speculative_nodes=["scoring"]
-    )
+    executor = DecisionGraphExecutor(graph, enable_speculative=True, speculative_nodes=["scoring"])
     res = asyncio.run(executor.execute({"Amount": 1.0}, global_timeout_seconds=5.0))
 
     assert res.speculative_executed is True
@@ -1218,9 +1208,7 @@ def test_replay_audit_log_edge_cases_and_validation(tmp_path: Path) -> None:
         replay_audit_log_through_pipeline(tmp_path / "missing.jsonl", graph)
 
     with pytest.raises(FileNotFoundError, match="External observations file not found"):
-        replay_audit_log_through_pipeline(
-            audit_path, graph, data_path=tmp_path / "missing.csv"
-        )
+        replay_audit_log_through_pipeline(audit_path, graph, data_path=tmp_path / "missing.csv")
 
     empty_rep = replay_audit_log_through_pipeline(audit_path, graph)
     assert empty_rep.status == "EMPTY"
@@ -1304,7 +1292,9 @@ def test_optimize_counterfactual_pipeline_metrics_and_validation() -> None:
 
     with pytest.raises(TypeError, match="baseline_thresholds"):
         optimize_counterfactual_pipeline(
-            probs, cand_thresh, baseline_thresholds="invalid"  # type: ignore[arg-type]
+            probs,
+            cand_thresh,
+            baseline_thresholds="invalid",  # type: ignore[arg-type]
         )
 
     with pytest.raises(ValueError, match="manual_review_cost"):
@@ -1864,5 +1854,50 @@ def test_simulate_pipeline_chaos_edge_cases_and_validation() -> None:
     assert rep_dict.total_transactions == 1
     assert rep_dict.status in ("RESILIENT", "DEGRADED", "SLA_BREACHED")
 
+    # Pipeline passed as DecisionGraphExecutor
+    executor = DecisionGraphExecutor(graph)
+    rep_exec = simulate_pipeline_chaos([{}], executor, [])
+    assert rep_exec.total_transactions == 1
 
+    # Async stage processor under chaos simulation
+    async_graph = DecisionGraph()
 
+    async def async_proc(_ctx: PipelineContext) -> dict[str, Any]:
+        await asyncio.sleep(0.001)
+        return {"processed": True}
+
+    async_graph.add_node(
+        PipelineNode(
+            name="async_step",
+            stage_type=StageType.CUSTOM,
+            processor=async_proc,
+            required=False,
+            fallback_value={"processed": False},
+        )
+    )
+    async_specs = [
+        StageFaultSpec(
+            node_name="async_step",
+            fault_type=StageFaultType.LATENCY_SPIKE,
+            start_index=0,
+            end_index=1,
+            latency_ms=1.0,
+        ),
+        StageFaultSpec(
+            node_name="async_step",
+            fault_type=StageFaultType.TIMEOUT,
+            start_index=1,
+            end_index=2,
+            error_message="Async timeout",
+        ),
+        StageFaultSpec(
+            node_name="async_step",
+            fault_type=StageFaultType.EXCEPTION,
+            start_index=2,
+            end_index=3,
+            error_message="Async fail",
+        ),
+    ]
+    rep_async = simulate_pipeline_chaos([{}, {}, {}], async_graph, async_specs, sla_budget_ms=100.0)
+    assert rep_async.total_transactions == 3
+    assert rep_async.degraded_transactions >= 2
