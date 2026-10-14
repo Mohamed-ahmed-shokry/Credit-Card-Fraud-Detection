@@ -13,7 +13,7 @@
 - [x] Task 5: Implement `RetrainingTriggerPolicy`, `RetrainingTriggerEvent`, and trigger evaluation logic in `feedback.py` with tests in `tests/test_feedback.py`.
 - [x] Task 6: Implement audit event builders (`build_delayed_label_audit_event`, `build_retraining_trigger_audit_event`) in `audit.py` with tests in `tests/test_audit.py`.
 - [x] Task 7: Wire feedback endpoints (`POST /v1/feedback/labels`, `GET /v1/feedback/surveillance`, `GET /v1/feedback/maturation`) and Prometheus telemetry in `api.py` with tests in `tests/test_api.py`.
-- [ ] Task 8: Implement CLI commands `ingest-labels` and `feedback-surveillance` in `cli.py` with tests in `tests/test_cli.py`.
+- [x] Task 8: Implement CLI commands `ingest-labels` and `feedback-surveillance` in `cli.py` with tests in `tests/test_cli.py`.
 - [ ] Task 9: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate.
 
 ## Acceptance Criteria Status
@@ -24,7 +24,7 @@
 | AC-3 (Realized Performance & Financial Cost Metrics) | **Verified** | Verified in `tests/test_feedback.py`: `compute_realized_metrics` precision, recall, F1, FPR, AUPRC, total fraud loss, prevented amount, FP review cost, and net savings. |
 | AC-4 (Automated Retraining Trigger Policy) | **Verified** | Verified in `tests/test_feedback.py`: `RetrainingTriggerPolicy` parameterization, threshold violation detection, temporal gap and retraining window calculation, and `RetrainingTriggerEvent` generation. |
 | AC-5 (Audit Trail & Telemetry Integration) | **Verified** | Verified in `tests/test_audit.py` and `tests/test_api.py`: structured audit events (`delayed_label_ingestion`, `retraining_trigger`) with redaction, Prometheus metrics (`fraud_delayed_labels_ingested_total`, `fraud_realized_auprc`, `fraud_realized_precision`, `fraud_realized_recall`, `fraud_retraining_triggers_total`), and FastAPI endpoints. |
-| AC-6 (CLI Workflows & Exit Code Gating) | Pending | — |
+| AC-6 (CLI Workflows & Exit Code Gating) | **Verified** | Verified in `tests/test_cli.py`: `fraud-detect ingest-labels` (CSV/JSONL/--json), `fraud-detect feedback-surveillance` (maturity filtering, policy thresholds, `--gate` exit code 1 on breach, exit code 2 on error). |
 | AC-7 (Quality Standards & Zero Regressions) | Pending | — |
 
 ## Decision Log
