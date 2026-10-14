@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from sklearn.metrics import average_precision_score
 
 
 class FeedbackError(Exception):
@@ -625,3 +626,205 @@ class LabelMaturationCurve:
             max_delay_days=float(data["max_delay_days"]),
             delay_cdf_points=pts,
         )
+
+
+@dataclass(frozen=True)
+class RealizedMetricsReport:
+    """Realized performance and business impact metrics computed on matured feedback."""
+
+    total_transactions: int
+    actual_fraud_count: int
+    actual_fraud_rate: float
+    predicted_positive_count: int
+    true_positives: int
+    false_positives: int
+    true_negatives: int
+    false_negatives: int
+    realized_precision: float
+    realized_recall: float
+    realized_f1: float
+    realized_fpr: float
+    realized_auprc: float
+    total_fraud_loss: float
+    prevented_fraud_amount: float
+    missed_fraud_amount: float
+    false_positive_cost: float
+    net_financial_savings: float
+    decision_counts: dict[str, int]
+    cohort_id: str | None = None
+    start_timestamp: float | None = None
+    end_timestamp: float | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize realized metrics report to dictionary."""
+        return {
+            "total_transactions": self.total_transactions,
+            "actual_fraud_count": self.actual_fraud_count,
+            "actual_fraud_rate": round(self.actual_fraud_rate, 4),
+            "predicted_positive_count": self.predicted_positive_count,
+            "true_positives": self.true_positives,
+            "false_positives": self.false_positives,
+            "true_negatives": self.true_negatives,
+            "false_negatives": self.false_negatives,
+            "realized_precision": round(self.realized_precision, 4),
+            "realized_recall": round(self.realized_recall, 4),
+            "realized_f1": round(self.realized_f1, 4),
+            "realized_fpr": round(self.realized_fpr, 4),
+            "realized_auprc": round(self.realized_auprc, 4),
+            "total_fraud_loss": round(self.total_fraud_loss, 2),
+            "prevented_fraud_amount": round(self.prevented_fraud_amount, 2),
+            "missed_fraud_amount": round(self.missed_fraud_amount, 2),
+            "false_positive_cost": round(self.false_positive_cost, 2),
+            "net_financial_savings": round(self.net_financial_savings, 2),
+            "decision_counts": dict(self.decision_counts),
+            "cohort_id": self.cohort_id,
+            "start_timestamp": self.start_timestamp,
+            "end_timestamp": self.end_timestamp,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> RealizedMetricsReport:
+        """Construct report from dictionary."""
+        return cls(
+            total_transactions=int(data["total_transactions"]),
+            actual_fraud_count=int(data["actual_fraud_count"]),
+            actual_fraud_rate=float(data["actual_fraud_rate"]),
+            predicted_positive_count=int(data["predicted_positive_count"]),
+            true_positives=int(data["true_positives"]),
+            false_positives=int(data["false_positives"]),
+            true_negatives=int(data["true_negatives"]),
+            false_negatives=int(data["false_negatives"]),
+            realized_precision=float(data["realized_precision"]),
+            realized_recall=float(data["realized_recall"]),
+            realized_f1=float(data["realized_f1"]),
+            realized_fpr=float(data["realized_fpr"]),
+            realized_auprc=float(data["realized_auprc"]),
+            total_fraud_loss=float(data["total_fraud_loss"]),
+            prevented_fraud_amount=float(data["prevented_fraud_amount"]),
+            missed_fraud_amount=float(data["missed_fraud_amount"]),
+            false_positive_cost=float(data["false_positive_cost"]),
+            net_financial_savings=float(data["net_financial_savings"]),
+            decision_counts=dict(data.get("decision_counts", {})),
+            cohort_id=data.get("cohort_id"),
+            start_timestamp=data.get("start_timestamp"),
+            end_timestamp=data.get("end_timestamp"),
+        )
+
+
+def compute_realized_metrics(
+    records: Sequence[MatchedFeedbackRecord],
+    *,
+    positive_decisions: tuple[str, ...] = ("deny", "review", "challenge"),
+    manual_review_cost: float = 15.0,
+    cohort_id: str | None = None,
+    start_timestamp: float | None = None,
+    end_timestamp: float | None = None,
+) -> RealizedMetricsReport:
+    """Compute realized accuracy, precision/recall, AUPRC, and financial impact metrics."""
+    if not records:
+        return RealizedMetricsReport(
+            total_transactions=0,
+            actual_fraud_count=0,
+            actual_fraud_rate=0.0,
+            predicted_positive_count=0,
+            true_positives=0,
+            false_positives=0,
+            true_negatives=0,
+            false_negatives=0,
+            realized_precision=0.0,
+            realized_recall=0.0,
+            realized_f1=0.0,
+            realized_fpr=0.0,
+            realized_auprc=0.0,
+            total_fraud_loss=0.0,
+            prevented_fraud_amount=0.0,
+            missed_fraud_amount=0.0,
+            false_positive_cost=0.0,
+            net_financial_savings=0.0,
+            decision_counts={},
+            cohort_id=cohort_id,
+            start_timestamp=start_timestamp,
+            end_timestamp=end_timestamp,
+        )
+
+    norm_pos = tuple(d.lower() for d in positive_decisions)
+    total = len(records)
+    tp = fp = tn = fn = 0
+    fraud_count = 0
+    pred_pos_count = 0
+    total_loss = 0.0
+    prevented_amt = 0.0
+    missed_amt = 0.0
+    dec_counts: dict[str, int] = {}
+
+    y_true: list[int] = []
+    y_score: list[float] = []
+
+    for r in records:
+        dec = r.predicted_decision.lower()
+        dec_counts[dec] = dec_counts.get(dec, 0) + 1
+        is_pred_pos = dec in norm_pos
+        is_actual = r.actual_fraud
+
+        y_true.append(1 if is_actual else 0)
+        y_score.append(r.predicted_probability)
+
+        if is_actual:
+            fraud_count += 1
+            total_loss += r.amount
+
+        if is_pred_pos:
+            pred_pos_count += 1
+
+        if is_actual and is_pred_pos:
+            tp += 1
+            prevented_amt += r.amount
+        elif not is_actual and is_pred_pos:
+            fp += 1
+        elif not is_actual and not is_pred_pos:
+            tn += 1
+        else:
+            fn += 1
+            missed_amt += r.amount
+
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1 = (2 * precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
+    fpr = fp / (fp + tn) if (fp + tn) > 0 else 0.0
+
+    y_true_arr = np.array(y_true, dtype=int)
+    y_score_arr = np.array(y_score, dtype=float)
+    if len(np.unique(y_true_arr)) > 1:
+        auprc = float(average_precision_score(y_true_arr, y_score_arr))
+    else:
+        auprc = 1.0 if np.all(y_true_arr == 1) else 0.0
+
+    fp_cost = fp * manual_review_cost
+    net_savings = prevented_amt - fp_cost
+
+    return RealizedMetricsReport(
+        total_transactions=total,
+        actual_fraud_count=fraud_count,
+        actual_fraud_rate=fraud_count / total,
+        predicted_positive_count=pred_pos_count,
+        true_positives=tp,
+        false_positives=fp,
+        true_negatives=tn,
+        false_negatives=fn,
+        realized_precision=precision,
+        realized_recall=recall,
+        realized_f1=f1,
+        realized_fpr=fpr,
+        realized_auprc=auprc,
+        total_fraud_loss=total_loss,
+        prevented_fraud_amount=prevented_amt,
+        missed_fraud_amount=missed_amt,
+        false_positive_cost=fp_cost,
+        net_financial_savings=net_savings,
+        decision_counts=dec_counts,
+        cohort_id=cohort_id,
+        start_timestamp=start_timestamp
+        if start_timestamp is not None
+        else records[0].event_timestamp,
+        end_timestamp=end_timestamp if end_timestamp is not None else records[-1].event_timestamp,
+    )
