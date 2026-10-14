@@ -6420,3 +6420,244 @@ def test_pipeline_chaos_cli_workflow(tmp_path: Path, trained_artifact: Path) -> 
     )
     assert res_sim_fail.exit_code == 2
     assert "Chaos simulation failed" in res_sim_fail.output
+
+
+def test_ingest_labels_cli_workflows(tmp_path: Path) -> None:
+    # 1. Ingest from CSV
+    csv_path = tmp_path / "delayed_labels.csv"
+    csv_content = (
+        "transaction_id,event_timestamp,label_timestamp,dispute_type,is_fraud,amount\n"
+        "tx_cli_1,1000.0,87400.0,chargeback,True,150.0\n"
+        "tx_cli_2,1000.0,90000.0,fraud_dispute,True,200.0\n"
+    )
+    csv_path.write_text(csv_content, encoding="utf-8")
+    out_json = tmp_path / "ingest_report.json"
+
+    res_csv = runner.invoke(
+        app,
+        ["ingest-labels", "--labels-path", str(csv_path), "--output", str(out_json)],
+    )
+    assert res_csv.exit_code == 0
+    assert "Successfully ingested 2 delayed label(s)" in res_csv.output
+    assert out_json.is_file()
+    rep = json.loads(out_json.read_text(encoding="utf-8"))
+    assert rep["ingested_count"] == 2
+    assert rep["status"] == "success"
+
+    # 2. Ingest from JSONL with --json flag
+    jsonl_path = tmp_path / "delayed_labels.jsonl"
+    jsonl_content = (
+        json.dumps(
+            {
+                "transaction_id": "tx_cli_3",
+                "event_timestamp": 1000.0,
+                "label_timestamp": 88000.0,
+                "dispute_type": "merchant_inquiry",
+                "is_fraud": False,
+                "amount": 50.0,
+            }
+        )
+        + "\n"
+    )
+    jsonl_path.write_text(jsonl_content, encoding="utf-8")
+
+    res_jsonl = runner.invoke(
+        app,
+        ["ingest-labels", "--labels-path", str(jsonl_path), "--json"],
+    )
+    assert res_jsonl.exit_code == 0
+    parsed = json.loads(res_jsonl.output)
+    assert parsed["ingested_count"] == 1
+
+    # 3. Unsupported file extension error handling
+    txt_path = tmp_path / "delayed_labels.txt"
+    txt_path.write_text("dummy", encoding="utf-8")
+    res_unsupported = runner.invoke(
+        app,
+        ["ingest-labels", "--labels-path", str(txt_path)],
+    )
+    assert res_unsupported.exit_code == 2
+    assert "Unsupported labels file extension" in res_unsupported.output
+
+
+def test_feedback_surveillance_cli_workflows(tmp_path: Path) -> None:
+    # Build audit log and labels
+    audit_file = tmp_path / "audit_cli.jsonl"
+    audit_lines = [
+        json.dumps(
+            {
+                "event_type": "scoring",
+                "timestamp": 1000.0,
+                "payload": {
+                    "predictions": [
+                        {
+                            "transaction_id": "tx_c1",
+                            "fraud_probability": 0.9,
+                            "decision": "deny",
+                            "amount": 300.0,
+                        }
+                    ]
+                },
+            }
+        ),
+        json.dumps(
+            {
+                "event_type": "scoring",
+                "timestamp": 1000.0,
+                "payload": {
+                    "predictions": [
+                        {
+                            "transaction_id": "tx_c2",
+                            "fraud_probability": 0.05,
+                            "decision": "allow",
+                            "amount": 80.0,
+                        }
+                    ]
+                },
+            }
+        ),
+    ]
+    audit_file.write_text("\n".join(audit_lines) + "\n", encoding="utf-8")
+
+    labels_file = tmp_path / "labels_cli.jsonl"
+    labels_lines = [
+        json.dumps(
+            {
+                "transaction_id": "tx_c1",
+                "event_timestamp": 1000.0,
+                "label_timestamp": 87400.0,
+                "dispute_type": "chargeback",
+                "is_fraud": True,
+                "amount": 300.0,
+            }
+        ),
+        json.dumps(
+            {
+                "transaction_id": "tx_c2",
+                "event_timestamp": 1000.0,
+                "label_timestamp": 90000.0,
+                "dispute_type": "merchant_inquiry",
+                "is_fraud": False,
+                "amount": 80.0,
+            }
+        ),
+    ]
+    labels_file.write_text("\n".join(labels_lines) + "\n", encoding="utf-8")
+
+    out_surv = tmp_path / "surv_report.json"
+
+    # 1. Normal surveillance run
+    res_normal = runner.invoke(
+        app,
+        [
+            "feedback-surveillance",
+            "--audit-log",
+            str(audit_file),
+            "--labels-path",
+            str(labels_file),
+            "--target-maturity-level",
+            "0.0",
+            "--min-transactions",
+            "2",
+            "--output",
+            str(out_surv),
+        ],
+    )
+    assert res_normal.exit_code == 0
+    assert "Realized Precision: 1.0000" in res_normal.output
+    assert "[POLICY OK]" in res_normal.output
+    assert out_surv.is_file()
+
+    # 2. JSON stdout output
+    res_json = runner.invoke(
+        app,
+        [
+            "feedback-surveillance",
+            "--audit-log",
+            str(audit_file),
+            "--labels-path",
+            str(labels_file),
+            "--target-maturity-level",
+            "0.0",
+            "--min-transactions",
+            "2",
+            "--json",
+        ],
+    )
+    assert res_json.exit_code == 0
+    parsed = json.loads(res_json.output)
+    assert parsed["policy_breached"] is False
+    assert parsed["total_matured_transactions"] == 2
+
+    # 3. Retraining trigger gate breach exit code 1
+    # Add a false positive to trigger precision drop
+    audit_lines.append(
+        json.dumps(
+            {
+                "event_type": "scoring",
+                "timestamp": 1000.0,
+                "payload": {
+                    "predictions": [
+                        {
+                            "transaction_id": "tx_c3",
+                            "fraud_probability": 0.85,
+                            "decision": "deny",
+                            "amount": 100.0,
+                        }
+                    ]
+                },
+            }
+        )
+    )
+    audit_file.write_text("\n".join(audit_lines) + "\n", encoding="utf-8")
+
+    labels_lines.append(
+        json.dumps(
+            {
+                "transaction_id": "tx_c3",
+                "event_timestamp": 1000.0,
+                "label_timestamp": 88000.0,
+                "dispute_type": "friendly_fraud",
+                "is_fraud": False,
+                "amount": 100.0,
+            }
+        )
+    )
+    labels_file.write_text("\n".join(labels_lines) + "\n", encoding="utf-8")
+
+    # Realized precision is now 1/2 = 0.5. With min_precision=0.7 and gate=True, exit code 1
+    res_gate = runner.invoke(
+        app,
+        [
+            "feedback-surveillance",
+            "--audit-log",
+            str(audit_file),
+            "--labels-path",
+            str(labels_file),
+            "--target-maturity-level",
+            "0.0",
+            "--min-transactions",
+            "2",
+            "--min-precision",
+            "0.70",
+            "--gate",
+        ],
+    )
+    assert res_gate.exit_code == 1
+    assert "[RETRAINING TRIGGERED]" in res_gate.output
+
+    # 4. Error handling on invalid parameter
+    res_invalid_param = runner.invoke(
+        app,
+        [
+            "feedback-surveillance",
+            "--audit-log",
+            str(audit_file),
+            "--labels-path",
+            str(labels_file),
+            "--min-precision",
+            "1.5",
+        ],
+    )
+    assert res_invalid_param.exit_code == 2
+    assert "Feedback surveillance failed" in res_invalid_param.output
