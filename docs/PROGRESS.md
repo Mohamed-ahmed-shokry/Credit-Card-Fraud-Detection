@@ -8,7 +8,7 @@
 ## Task Status
 - [x] Task 1: Create `src/fraud_detection/feedback.py` with domain data models (`DisputeType`, `LabelSource`, `DelayedLabelRecord`, `FeedbackError`) and `LabelIngestionStore` with unit tests in `tests/test_feedback.py`.
 - [x] Task 2: Implement audit log matching and cohort partitioning (`match_labels_with_audit_log`, `FeedbackCohort`) in `feedback.py` with tests in `tests/test_feedback.py`.
-- [ ] Task 3: Implement `LabelMaturationCurve` empirical delay distribution and cohort maturity filtering in `feedback.py` with tests in `tests/test_feedback.py`.
+- [x] Task 3: Implement `LabelMaturationCurve` empirical delay distribution and cohort maturity filtering in `feedback.py` with tests in `tests/test_feedback.py`.
 - [ ] Task 4: Implement `RealizedMetricsReport` and realized precision/recall/AUPRC/cost calculation in `feedback.py` with tests in `tests/test_feedback.py`.
 - [ ] Task 5: Implement `RetrainingTriggerPolicy`, `RetrainingTriggerEvent`, and trigger evaluation logic in `feedback.py` with tests in `tests/test_feedback.py`.
 - [ ] Task 6: Implement audit event builders (`build_delayed_label_audit_event`, `build_retraining_trigger_audit_event`) in `audit.py` with tests in `tests/test_audit.py`.
@@ -19,8 +19,8 @@
 ## Acceptance Criteria Status
 | Criterion | Status | Evidence |
 |-----------|--------|----------|
-| AC-1 (Delayed Label Ingestion & As-Of Matching) | Pending | — |
-| AC-2 (Label Maturation Curve Modeling) | Pending | — |
+| AC-1 (Delayed Label Ingestion & As-Of Matching) | **Verified** | Verified in `tests/test_feedback.py`: `DelayedLabelRecord` validation, `LabelIngestionStore` deduplication/precedence, `match_labels_with_audit_log` as-of matching. |
+| AC-2 (Label Maturation Curve Modeling) | **Verified** | Verified in `tests/test_feedback.py`: empirical CDF quantile modeling, interpolation, and cohort maturity filtering. |
 | AC-3 (Realized Performance & Financial Cost Metrics) | Pending | — |
 | AC-4 (Automated Retraining Trigger Policy) | Pending | — |
 | AC-5 (Audit Trail & Telemetry Integration) | Pending | — |
