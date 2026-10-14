@@ -14,11 +14,14 @@ from fraud_detection.feedback import (
     DisputeType,
     FeedbackCohort,
     FeedbackError,
+    FeedbackSurveillanceAnalyzer,
     LabelIngestionStore,
     LabelMaturationCurve,
     LabelSource,
     MatchedFeedbackRecord,
     RealizedMetricsReport,
+    RetrainingTriggerEvent,
+    RetrainingTriggerPolicy,
     compute_realized_metrics,
     match_labels_with_audit_log,
     partition_into_cohorts,
@@ -563,3 +566,357 @@ def test_compute_realized_metrics() -> None:
     assert recon.total_transactions == report.total_transactions
     assert recon.realized_precision == report.realized_precision
     assert recon.net_financial_savings == report.net_financial_savings
+
+
+def test_retraining_trigger_policy_validation_and_serialization() -> None:
+    # Default policy
+    policy = RetrainingTriggerPolicy()
+    assert policy.min_precision == 0.70
+    assert policy.min_auprc == 0.60
+    assert policy.max_fpr == 0.05
+    assert policy.max_missed_fraud_rate == 0.30
+    assert policy.min_matured_transactions == 10
+    assert policy.recommended_retrain_window_days == 90.0
+    assert policy.recommended_temporal_gap_days == 14.0
+
+    d = policy.to_dict()
+    recon = RetrainingTriggerPolicy.from_dict(d)
+    assert recon == policy
+
+    # Validation errors
+    with pytest.raises(FeedbackError, match="min_precision"):
+        RetrainingTriggerPolicy(min_precision=-0.1)
+    with pytest.raises(FeedbackError, match="min_precision"):
+        RetrainingTriggerPolicy(min_precision=1.1)
+
+    with pytest.raises(FeedbackError, match="min_auprc"):
+        RetrainingTriggerPolicy(min_auprc=-0.1)
+    with pytest.raises(FeedbackError, match="min_auprc"):
+        RetrainingTriggerPolicy(min_auprc=1.1)
+
+    with pytest.raises(FeedbackError, match="max_fpr"):
+        RetrainingTriggerPolicy(max_fpr=-0.1)
+    with pytest.raises(FeedbackError, match="max_fpr"):
+        RetrainingTriggerPolicy(max_fpr=1.1)
+
+    with pytest.raises(FeedbackError, match="max_missed_fraud_rate"):
+        RetrainingTriggerPolicy(max_missed_fraud_rate=-0.1)
+    with pytest.raises(FeedbackError, match="max_missed_fraud_rate"):
+        RetrainingTriggerPolicy(max_missed_fraud_rate=1.1)
+
+    with pytest.raises(FeedbackError, match="min_matured_transactions"):
+        RetrainingTriggerPolicy(min_matured_transactions=0)
+
+    with pytest.raises(FeedbackError, match="recommended_retrain_window_days"):
+        RetrainingTriggerPolicy(recommended_retrain_window_days=0.0)
+
+    with pytest.raises(FeedbackError, match="recommended_temporal_gap_days"):
+        RetrainingTriggerPolicy(recommended_temporal_gap_days=-1.0)
+
+
+def test_retraining_trigger_event_serialization() -> None:
+    rep = RealizedMetricsReport(
+        total_transactions=10,
+        actual_fraud_count=3,
+        actual_fraud_rate=0.3,
+        predicted_positive_count=4,
+        true_positives=2,
+        false_positives=2,
+        true_negatives=5,
+        false_negatives=1,
+        realized_precision=0.5,
+        realized_recall=0.6667,
+        realized_f1=0.5714,
+        realized_fpr=0.2857,
+        realized_auprc=0.45,
+        total_fraud_loss=300.0,
+        prevented_fraud_amount=200.0,
+        missed_fraud_amount=100.0,
+        false_positive_cost=30.0,
+        net_financial_savings=170.0,
+        decision_counts={"deny": 4, "allow": 6},
+        cohort_id="c_2026_01",
+    )
+    event = RetrainingTriggerEvent(
+        trigger_id="trig_1",
+        triggered_at=1000000.0,
+        breached_metrics={
+            "precision": {"observed": 0.5, "threshold": 0.7},
+            "auprc": {"observed": 0.45, "threshold": 0.6},
+        },
+        realized_metrics=rep,
+        recommended_retrain_start=100000.0,
+        recommended_retrain_end=900000.0,
+        recommended_temporal_gap_seconds=100000.0,
+        reason="precision breached; auprc breached",
+        cohort_id="c_2026_01",
+    )
+
+    d = event.to_dict()
+    assert d["trigger_id"] == "trig_1"
+    assert d["cohort_id"] == "c_2026_01"
+
+    recon = RetrainingTriggerEvent.from_dict(d)
+    assert recon.trigger_id == event.trigger_id
+    assert recon.breached_metrics == event.breached_metrics
+    assert recon.realized_metrics.total_transactions == 10
+
+
+def test_feedback_surveillance_analyzer_insufficient_samples() -> None:
+    analyzer = FeedbackSurveillanceAnalyzer()
+    records = [
+        MatchedFeedbackRecord(
+            transaction_id="t1",
+            event_timestamp=100.0,
+            actual_fraud=False,
+            predicted_probability=0.01,
+            predicted_decision="allow",
+            amount=50.0,
+        )
+    ]
+    report, trigger = analyzer.evaluate_cohort(records, current_timestamp=1000.0)
+    assert report.total_transactions == 1
+    assert trigger is None
+
+
+def test_feedback_surveillance_analyzer_no_breach() -> None:
+    analyzer = FeedbackSurveillanceAnalyzer()
+    # High performance records exceeding default policy
+    records: list[MatchedFeedbackRecord] = [
+        MatchedFeedbackRecord(
+            transaction_id=f"neg_{i}",
+            event_timestamp=100.0,
+            actual_fraud=False,
+            predicted_probability=0.01,
+            predicted_decision="allow",
+            amount=50.0,
+        )
+        for i in range(8)
+    ]
+    records.extend(
+        MatchedFeedbackRecord(
+            transaction_id=f"pos_{i}",
+            event_timestamp=100.0,
+            actual_fraud=True,
+            predicted_probability=0.95,
+            predicted_decision="deny",
+            amount=200.0,
+        )
+        for i in range(4)
+    )
+
+    report, trigger = analyzer.evaluate_cohort(records, current_timestamp=1000.0)
+    assert report.total_transactions == 12
+    assert report.realized_precision == 1.0
+    assert report.realized_fpr == 0.0
+    assert trigger is None
+
+
+def test_feedback_surveillance_analyzer_breach_detection() -> None:
+    analyzer = FeedbackSurveillanceAnalyzer()
+    policy = RetrainingTriggerPolicy(
+        min_precision=0.8,
+        min_auprc=0.7,
+        max_fpr=0.05,
+        max_missed_fraud_rate=0.2,
+        min_matured_transactions=5,
+        recommended_retrain_window_days=30.0,
+        recommended_temporal_gap_days=7.0,
+    )
+
+    # Build cohort with poor precision and missed frauds
+    records: list[MatchedFeedbackRecord] = [
+        MatchedFeedbackRecord(
+            transaction_id=f"fp_{i}",
+            event_timestamp=100.0,
+            actual_fraud=False,
+            predicted_probability=0.8,
+            predicted_decision="deny",
+            amount=50.0,
+        )
+        for i in range(5)
+    ]
+    records.extend(
+        MatchedFeedbackRecord(
+            transaction_id=f"fn_{i}",
+            event_timestamp=100.0,
+            actual_fraud=True,
+            predicted_probability=0.1,
+            predicted_decision="allow",
+            amount=100.0,
+        )
+        for i in range(5)
+    )
+
+    now = 1000000.0
+    report, trigger = analyzer.evaluate_cohort(
+        records,
+        policy=policy,
+        current_timestamp=now,
+        cohort_id="c_breach",
+    )
+    assert report.total_transactions == 10
+    assert trigger is not None
+    assert "precision" in trigger.breached_metrics
+    assert "fpr" in trigger.breached_metrics
+    assert "missed_fraud_rate" in trigger.breached_metrics
+    assert trigger.cohort_id == "c_breach"
+    assert trigger.triggered_at == now
+    gap_sec = 7.0 * 86400.0
+    assert trigger.recommended_temporal_gap_seconds == gap_sec
+    assert trigger.recommended_retrain_end == now - gap_sec
+    assert trigger.recommended_retrain_start == now - gap_sec - (30.0 * 86400.0)
+
+
+def test_feedback_coverage_edge_cases(tmp_path: Path) -> None:
+    # 1. DelayedLabelRecord same fraud status update if newer label_timestamp (lines 152-153)
+    store = LabelIngestionStore()
+    r1 = DelayedLabelRecord(
+        transaction_id="tx_up",
+        event_timestamp=100.0,
+        label_timestamp=200.0,
+        dispute_type=DisputeType.MERCHANT_INQUIRY,
+        is_fraud=True,
+    )
+    r2 = DelayedLabelRecord(
+        transaction_id="tx_up",
+        event_timestamp=100.0,
+        label_timestamp=300.0,
+        dispute_type=DisputeType.CHARGEBACK,
+        is_fraud=True,
+    )
+    assert store.ingest_record(r1) is True
+    assert store.ingest_record(r2) is True
+    assert store.get_record("tx_up").label_timestamp == 300.0  # type: ignore[union-attr]
+
+    # 2. ingest_from_dicts (lines 167-168)
+    dict_records = [
+        {
+            "transaction_id": "tx_d1",
+            "event_timestamp": 100.0,
+            "label_timestamp": 200.0,
+            "dispute_type": "chargeback",
+            "is_fraud": True,
+        }
+    ]
+    assert store.ingest_from_dicts(dict_records) == 1
+
+    # 3. ingest_from_jsonl with empty lines (line 193)
+    jsonl_path = tmp_path / "labels.jsonl"
+    jsonl_path.write_text(
+        "\n"
+        + json.dumps(
+            {
+                "transaction_id": "tx_j1",
+                "event_timestamp": 100.0,
+                "label_timestamp": 200.0,
+                "dispute_type": "chargeback",
+                "is_fraud": True,
+            }
+        )
+        + "\n\n",
+        encoding="utf-8",
+    )
+    assert store.ingest_from_jsonl(jsonl_path) == 1
+
+    # 4. match_labels_with_audit_log with Sequence[DelayedLabelRecord] & empty line in audit log
+    # (lines 357, 364)
+    audit_file = tmp_path / "audit.jsonl"
+    audit_file.write_text(
+        "\n"
+        + json.dumps(
+            {
+                "event_type": "scoring",
+                "timestamp": 100.0,
+                "payload": {
+                    "predictions": [
+                        {
+                            "transaction_id": "tx_j1",
+                            "fraud_probability": 0.85,
+                            "decision": "deny",
+                            "amount": 120.0,
+                        }
+                    ]
+                },
+            }
+        )
+        + "\n\n",
+        encoding="utf-8",
+    )
+    seq_records = [
+        DelayedLabelRecord(
+            transaction_id="tx_j1",
+            event_timestamp=100.0,
+            label_timestamp=200.0,
+            dispute_type=DisputeType.CHARGEBACK,
+            is_fraud=True,
+        )
+    ]
+    matched = match_labels_with_audit_log(audit_file, seq_records)
+    assert len(matched) == 1
+    assert matched[0].transaction_id == "tx_j1"
+
+    # Ingest records when duplicate older record is ignored (returns False, lines 161->160)
+    older_rec = DelayedLabelRecord(
+        transaction_id="tx_up",
+        event_timestamp=100.0,
+        label_timestamp=250.0,
+        dispute_type=DisputeType.CHARGEBACK,
+        is_fraud=True,
+    )
+    assert store.ingest_records([older_rec]) == 0
+
+    # 5. fit_from_records with non-empty delays but all actual frauds (auprc 1.0)
+    all_fraud_records = [
+        MatchedFeedbackRecord(
+            transaction_id="f1",
+            event_timestamp=100.0,
+            actual_fraud=True,
+            predicted_probability=0.9,
+            predicted_decision="deny",
+            amount=50.0,
+            label_timestamp=100.0 + 1.5 * 86400.0,
+        ),
+        MatchedFeedbackRecord(
+            transaction_id="f2",
+            event_timestamp=100.0,
+            actual_fraud=True,
+            predicted_probability=0.8,
+            predicted_decision="deny",
+            amount=50.0,
+            label_timestamp=100.0 + 2.5 * 86400.0,
+        ),
+    ]
+    rep = compute_realized_metrics(all_fraud_records)
+    assert rep.realized_auprc == 1.0
+
+    # 6. fit_from_records with delay_days None or negative (lines 561->559)
+    class DummyRecord:
+        delay_days = -5.0
+
+    curve = LabelMaturationCurve.fit_from_records([DummyRecord()])  # type: ignore[list-item]
+    assert curve.total_labels_observed == 0
+
+    # 7. Surveillance when actual_fraud_count is 0 (line 1005->1013)
+    analyzer = FeedbackSurveillanceAnalyzer()
+    policy_missed_only = RetrainingTriggerPolicy(
+        min_precision=None,
+        min_auprc=None,
+        max_fpr=None,
+        max_missed_fraud_rate=0.2,
+        min_matured_transactions=10,
+    )
+    zero_fraud_records = [
+        MatchedFeedbackRecord(
+            transaction_id=f"zf_{i}",
+            event_timestamp=100.0,
+            actual_fraud=False,
+            predicted_probability=0.01,
+            predicted_decision="allow",
+            amount=20.0,
+        )
+        for i in range(12)
+    ]
+    rep_zf, trig_zf = analyzer.evaluate_cohort(zero_fraud_records, policy=policy_missed_only)
+    assert rep_zf.actual_fraud_count == 0
+    assert trig_zf is None
