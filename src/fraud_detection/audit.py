@@ -24,6 +24,7 @@ from fraud_detection.evaluation import (
 )
 
 if TYPE_CHECKING:
+    from fraud_detection.feedback import DelayedLabelRecord, RetrainingTriggerEvent
     from fraud_detection.pipeline import PipelineChaosReport
 
 # Sensitive key keywords that must always be masked in audit payloads
@@ -864,6 +865,78 @@ def build_pipeline_chaos_audit_event(
 
     return AuditEvent(
         event_type="pipeline_chaos",
+        model_version=model_version,
+        dataset_fingerprint=dataset_fingerprint,
+        payload=payload,
+    )
+
+
+def build_delayed_label_audit_event(
+    *,
+    record: DelayedLabelRecord | Mapping[str, Any],
+    ingestion_status: str = "ingested",
+    model_version: str | None = None,
+    dataset_fingerprint: str | None = None,
+    metadata: Mapping[str, Any] | None = None,
+) -> AuditEvent:
+    """Construct a structured audit event for delayed label ingestion."""
+    record_dict = record.to_dict() if hasattr(record, "to_dict") else dict(record)
+    payload: dict[str, Any] = {
+        "transaction_id": str(record_dict.get("transaction_id", "")),
+        "event_timestamp": float(record_dict.get("event_timestamp", 0.0)),
+        "label_timestamp": float(record_dict.get("label_timestamp", 0.0)),
+        "delay_days": record_dict.get("delay_days"),
+        "dispute_type": str(record_dict.get("dispute_type", "")),
+        "is_fraud": bool(record_dict.get("is_fraud", True)),
+        "amount": float(record_dict.get("amount", 0.0)),
+        "label_source": str(record_dict.get("label_source", "")),
+        "entity_key": record_dict.get("entity_key"),
+        "ingestion_status": ingestion_status,
+    }
+    if metadata:
+        payload["metadata"] = dict(metadata)
+
+    return AuditEvent(
+        event_type="delayed_label_ingestion",
+        model_version=model_version,
+        dataset_fingerprint=dataset_fingerprint,
+        payload=payload,
+    )
+
+
+def build_retraining_trigger_audit_event(
+    *,
+    trigger_event: RetrainingTriggerEvent | Mapping[str, Any],
+    model_version: str | None = None,
+    dataset_fingerprint: str | None = None,
+    metadata: Mapping[str, Any] | None = None,
+) -> AuditEvent:
+    """Construct a structured audit event for automated retraining triggers."""
+    event_dict = (
+        trigger_event.to_dict() if hasattr(trigger_event, "to_dict") else dict(trigger_event)
+    )
+    payload: dict[str, Any] = {
+        "trigger_id": str(event_dict.get("trigger_id", "")),
+        "triggered_at": float(event_dict.get("triggered_at", 0.0)),
+        "cohort_id": event_dict.get("cohort_id"),
+        "reason": str(event_dict.get("reason", "")),
+        "breached_metrics": dict(event_dict.get("breached_metrics", {})),
+        "recommended_retrain_start": float(event_dict.get("recommended_retrain_start", 0.0)),
+        "recommended_retrain_end": float(event_dict.get("recommended_retrain_end", 0.0)),
+        "recommended_temporal_gap_seconds": float(
+            event_dict.get("recommended_temporal_gap_seconds", 0.0)
+        ),
+        "realized_metrics": (
+            dict(event_dict.get("realized_metrics", {}))
+            if isinstance(event_dict.get("realized_metrics"), (dict, Mapping))
+            else event_dict.get("realized_metrics")
+        ),
+    }
+    if metadata:
+        payload["metadata"] = dict(metadata)
+
+    return AuditEvent(
+        event_type="retraining_trigger",
         model_version=model_version,
         dataset_fingerprint=dataset_fingerprint,
         payload=payload,
