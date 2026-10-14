@@ -7,7 +7,7 @@
 
 ## Task Status
 - [x] Task 1: Create `src/fraud_detection/feedback.py` with domain data models (`DisputeType`, `LabelSource`, `DelayedLabelRecord`, `FeedbackError`) and `LabelIngestionStore` with unit tests in `tests/test_feedback.py`.
-- [ ] Task 2: Implement audit log matching and cohort partitioning (`match_labels_with_audit_log`, `FeedbackCohort`) in `feedback.py` with tests in `tests/test_feedback.py`.
+- [x] Task 2: Implement audit log matching and cohort partitioning (`match_labels_with_audit_log`, `FeedbackCohort`) in `feedback.py` with tests in `tests/test_feedback.py`.
 - [ ] Task 3: Implement `LabelMaturationCurve` empirical delay distribution and cohort maturity filtering in `feedback.py` with tests in `tests/test_feedback.py`.
 - [ ] Task 4: Implement `RealizedMetricsReport` and realized precision/recall/AUPRC/cost calculation in `feedback.py` with tests in `tests/test_feedback.py`.
 - [ ] Task 5: Implement `RetrainingTriggerPolicy`, `RetrainingTriggerEvent`, and trigger evaluation logic in `feedback.py` with tests in `tests/test_feedback.py`.
