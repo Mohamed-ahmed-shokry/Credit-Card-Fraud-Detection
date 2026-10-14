@@ -623,6 +623,59 @@ export FRAUD_PIPELINE_ENABLED="true"
   - `fraud-detect pipeline-replay <audit_log.jsonl> --model <artifact> [--rules <rules.json>] [--tolerance 1e-4] [--fail-on-divergence] [--json]`
   - `fraud-detect pipeline-counterfactual <audit_log.jsonl> --candidate-review 0.3 --candidate-deny 0.75 [--baseline-review 0.5 --baseline-deny 0.8] [--json]`
 
+## Delayed Ground-Truth Ingestion, Label Maturation & Retraining Surveillance
+
+Production fraud detection suffers from chargeback and dispute lag (often 30–90+ days). Prematurely computing realized metrics on immature transaction cohorts introduces severe survivor bias (unreported frauds look like false positives or unconfirmed negatives). `fraud-detect` provides empirical label delay maturation modeling, cohort maturity gating, realized performance and financial cost tracking, and automated retraining triggers:
+
+```bash
+# Ingest delayed ground-truth labels (chargebacks, reviews, clearing logs) into a thread-safe store
+fraud-detect ingest-labels \
+  --labels-file data/chargebacks.jsonl \
+  --store-path data/labels_store.jsonl
+
+# Ingest an individual label directly from the CLI
+fraud-detect ingest-labels \
+  --transaction-id tx_1001 \
+  --ground-truth-label 1 \
+  --label-type chargeback \
+  --source issuer_network \
+  --timestamp 1718000000.0 \
+  --store-path data/labels_store.jsonl
+
+# Run feedback surveillance against historical scoring audit logs with empirical maturity gating
+fraud-detect feedback-surveillance \
+  --labels-file data/labels_store.jsonl \
+  --audit-log logs/scoring_audit.jsonl \
+  --maturation-days 90 \
+  --min-cohort-maturity 0.90 \
+  --output reports/feedback_surveillance.json
+
+# Gate CI/CD or automated orchestration: exits with code 3 if retraining triggers fire
+fraud-detect feedback-surveillance \
+  --labels-file data/labels_store.jsonl \
+  --audit-log logs/scoring_audit.jsonl \
+  --fail-on-retrain
+```
+
+### Delayed feedback architecture & capabilities
+
+- **Multi-Source Label Ingestion**: `DelayedLabelRecord` and thread-safe `LabelIngestionStore` support chargebacks, merchant disputes, manual analyst reviews, and confirmed non-fraud clears with monotonic timestamp validation.
+- **As-Of Audit Log Matching**: `match_feedback_with_audit_log` joins delayed labels with immutable JSONL scoring audit records via transaction ID, extracting decision, score probability, transaction amount, and inference timestamp to create `MatchedFeedbackRecord`.
+- **Empirical Label Maturation Curve**: `LabelMaturationCurve` fits empirical CDFs of reporting delay ($\Delta t = t_{\text{feedback}} - t_{\text{inference}}$), computing delay quantiles ($p_{50}, p_{75}, p_{90}, p_{95}, p_{99}$, max delay) and filtering immature transaction cohorts to eliminate survivor bias.
+- **Realized Metrics & Business Cost Surveillance**:
+  - `compute_realized_metrics` calculates precision, recall, specificity, F1, PR-AUC, ROC-AUC, and Brier score strictly on mature cohorts.
+  - Financial cost accounting models net financial loss ($C_{\text{FN}} \cdot \text{amount} + C_{\text{FP}} \cdot \text{amount} + C_{\text{review}} \cdot N_{\text{review}}$), fraud loss avoided, false positive friction cost, and net surveillance ROI.
+- **Automated Retraining Triggers**: `RetrainingTriggerPolicy` and `FeedbackSurveillanceAnalyzer` evaluate composite trigger criteria (requiring configurable minimum mature transactions and fraud incidents) across recall degradation, PR-AUC drops, net financial loss surges, and sustained feature drift. Emits exit code 3 (`EXIT_CODE_RETRAIN_TRIGGERED = 3`) for downstream orchestration.
+- **Operational API Endpoints**:
+  - `POST /v1/feedback/labels`: Ingest single or batch delayed labels.
+  - `GET /v1/feedback/maturation`: Retrieve fitted maturation curve percentiles and delay CDF points.
+  - `POST /v1/feedback/surveillance`: Evaluate realized metrics, financial costs, and retraining trigger conditions against audit log scoring data.
+- **Prometheus Telemetry**:
+  - `fraud_feedback_labels_ingested_total{label_type="...", source="..."}`: Ingested ground-truth labels.
+  - `fraud_feedback_matched_total` / `fraud_feedback_unmatched_total`: As-of audit log matching outcomes.
+  - `fraud_feedback_retraining_triggers_total{trigger_type="..."}`: Retraining triggers tripped by type.
+  - `fraud_feedback_realized_recall`, `fraud_feedback_realized_pr_auc`, `fraud_feedback_realized_net_financial_loss`: Realized surveillance gauges.
+
 ## Train on the anonymized dataset
 
 Place the downloaded CSV under the ignored `Dataset/` directory; raw financial data
@@ -1552,6 +1605,7 @@ src/fraud_detection/
 ├── evaluation.py     # threshold tuning, imbalance-aware metrics, and calibration reports
 ├── explanations.py   # isolated explanation provider protocols and cost controls
 ├── features.py       # feature store contracts, point-in-time join, and skew surveillance
+├── feedback.py       # delayed ground truth ingestion, label maturation modeling, and retraining triggers
 ├── model.py          # training, model card, inference, and cryptographic attestation
 ├── pipeline.py       # decision graph execution, stage circuit breakers, and chaos simulation
 ├── recalibration.py  # ECE diagnostics, reliability curves, and post-hoc recalibration
