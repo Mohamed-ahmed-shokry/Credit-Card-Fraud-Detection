@@ -10,7 +10,7 @@
 - [x] Task 2: Implement audit log matching and cohort partitioning (`match_labels_with_audit_log`, `FeedbackCohort`) in `feedback.py` with tests in `tests/test_feedback.py`.
 - [x] Task 3: Implement `LabelMaturationCurve` empirical delay distribution and cohort maturity filtering in `feedback.py` with tests in `tests/test_feedback.py`.
 - [x] Task 4: Implement `RealizedMetricsReport` and realized precision/recall/AUPRC/cost calculation in `feedback.py` with tests in `tests/test_feedback.py`.
-- [ ] Task 5: Implement `RetrainingTriggerPolicy`, `RetrainingTriggerEvent`, and trigger evaluation logic in `feedback.py` with tests in `tests/test_feedback.py`.
+- [x] Task 5: Implement `RetrainingTriggerPolicy`, `RetrainingTriggerEvent`, and trigger evaluation logic in `feedback.py` with tests in `tests/test_feedback.py`.
 - [ ] Task 6: Implement audit event builders (`build_delayed_label_audit_event`, `build_retraining_trigger_audit_event`) in `audit.py` with tests in `tests/test_audit.py`.
 - [ ] Task 7: Wire feedback endpoints (`POST /v1/feedback/labels`, `GET /v1/feedback/surveillance`, `GET /v1/feedback/maturation`) and Prometheus telemetry in `api.py` with tests in `tests/test_api.py`.
 - [ ] Task 8: Implement CLI commands `ingest-labels` and `feedback-surveillance` in `cli.py` with tests in `tests/test_cli.py`.
@@ -22,7 +22,7 @@
 | AC-1 (Delayed Label Ingestion & As-Of Matching) | **Verified** | Verified in `tests/test_feedback.py`: `DelayedLabelRecord` validation, `LabelIngestionStore` deduplication/precedence, `match_labels_with_audit_log` as-of matching. |
 | AC-2 (Label Maturation Curve Modeling) | **Verified** | Verified in `tests/test_feedback.py`: empirical CDF quantile modeling, interpolation, and cohort maturity filtering. |
 | AC-3 (Realized Performance & Financial Cost Metrics) | **Verified** | Verified in `tests/test_feedback.py`: `compute_realized_metrics` precision, recall, F1, FPR, AUPRC, total fraud loss, prevented amount, FP review cost, and net savings. |
-| AC-4 (Automated Retraining Trigger Policy) | Pending | — |
+| AC-4 (Automated Retraining Trigger Policy) | **Verified** | Verified in `tests/test_feedback.py`: `RetrainingTriggerPolicy` parameterization, threshold violation detection, temporal gap and retraining window calculation, and `RetrainingTriggerEvent` generation. |
 | AC-5 (Audit Trail & Telemetry Integration) | Pending | — |
 | AC-6 (CLI Workflows & Exit Code Gating) | Pending | — |
 | AC-7 (Quality Standards & Zero Regressions) | Pending | — |
