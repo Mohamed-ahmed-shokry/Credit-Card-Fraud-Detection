@@ -15,6 +15,7 @@ from fraud_detection.feedback import (
     FeedbackCohort,
     FeedbackError,
     LabelIngestionStore,
+    LabelMaturationCurve,
     LabelSource,
     MatchedFeedbackRecord,
     match_labels_with_audit_log,
@@ -398,3 +399,84 @@ def test_partition_into_cohorts() -> None:
     # Invalid window seconds
     with pytest.raises(FeedbackError, match="must be positive"):
         partition_into_cohorts(records, cohort_window_seconds=-10.0)
+
+
+def test_label_maturation_curve() -> None:
+    # Empty records
+    empty_curve = LabelMaturationCurve.fit_from_records([])
+    assert empty_curve.total_labels_observed == 0
+    assert empty_curve.maturation_fraction(10.0) == 0.0
+
+    # Fit with realistic label delays (days)
+    delays = [5.0, 10.0, 15.0, 20.0, 30.0, 45.0, 60.0, 90.0]
+    records = [
+        DelayedLabelRecord(
+            transaction_id=f"tx_{i}",
+            event_timestamp=1000.0,
+            label_timestamp=1000.0 + d * 86400.0,
+            dispute_type=DisputeType.CHARGEBACK,
+        )
+        for i, d in enumerate(delays)
+    ]
+
+    curve = LabelMaturationCurve.fit_from_records(records)
+    assert curve.total_labels_observed == 8
+    assert curve.p50_delay_days > 0.0
+    assert curve.max_delay_days == 90.0
+
+    # Test maturation fraction
+    assert curve.maturation_fraction(0.0) == 0.0
+    assert curve.maturation_fraction(-5.0) == 0.0
+    assert curve.maturation_fraction(90.0) == 1.0
+    assert curve.maturation_fraction(120.0) == 1.0
+    assert 0.0 < curve.maturation_fraction(30.0) < 1.0
+
+    # Test cohort maturity filtering
+    cohort_early = FeedbackCohort(
+        cohort_id="c_early",
+        start_timestamp=1000.0,
+        end_timestamp=2000.0,
+        records=(),
+    )
+    cohort_recent = FeedbackCohort(
+        cohort_id="c_recent",
+        start_timestamp=1000.0 + 85 * 86400.0,
+        end_timestamp=1000.0 + 89 * 86400.0,
+        records=(),
+    )
+
+    # Current time is 100 days after t=1000
+    now_ts = 1000.0 + 100 * 86400.0
+
+    # c_early ended at t=2000 (~0.01 days), elapsed is ~100 days -> >90 days -> 100% mature
+    assert curve.is_cohort_mature(cohort_early, now_ts, min_maturation_fraction=0.90) is True
+
+    # c_recent ended at day 89, elapsed is only 11 days -> maturation fraction is low (<90%)
+    assert curve.is_cohort_mature(cohort_recent, now_ts, min_maturation_fraction=0.90) is False
+
+    # Filter mature cohorts
+    mature = curve.filter_mature_cohorts(
+        [cohort_early, cohort_recent],
+        now_ts,
+        min_maturation_fraction=0.90,
+    )
+    assert len(mature) == 1
+    assert mature[0].cohort_id == "c_early"
+
+    # Filter with min_elapsed_days
+    mature_elapsed = curve.filter_mature_cohorts(
+        [cohort_early, cohort_recent],
+        now_ts,
+        min_elapsed_days=150.0,
+    )
+    assert len(mature_elapsed) == 0
+
+    # Serialization
+    d = curve.to_dict()
+    assert d["total_labels_observed"] == 8
+    assert d["max_delay_days"] == 90.0
+
+    recon = LabelMaturationCurve.from_dict(d)
+    assert recon.total_labels_observed == curve.total_labels_observed
+    assert recon.max_delay_days == curve.max_delay_days
+    assert len(recon.delay_cdf_points) == len(curve.delay_cdf_points)
