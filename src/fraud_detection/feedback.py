@@ -9,7 +9,9 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
+from time import time
 from typing import Any
+from uuid import uuid4
 
 import numpy as np
 from sklearn.metrics import average_precision_score
@@ -828,3 +830,211 @@ def compute_realized_metrics(
         else records[0].event_timestamp,
         end_timestamp=end_timestamp if end_timestamp is not None else records[-1].event_timestamp,
     )
+
+
+@dataclass(frozen=True)
+class RetrainingTriggerPolicy:
+    """Configurable degradation thresholds triggering automated model retraining."""
+
+    min_precision: float | None = 0.70
+    min_auprc: float | None = 0.60
+    max_fpr: float | None = 0.05
+    max_missed_fraud_rate: float | None = 0.30
+    min_matured_transactions: int = 10
+    recommended_retrain_window_days: float = 90.0
+    recommended_temporal_gap_days: float = 14.0
+
+    def __post_init__(self) -> None:
+        if self.min_precision is not None and not (0.0 <= self.min_precision <= 1.0):
+            raise FeedbackError(
+                f"min_precision must be between 0.0 and 1.0, got {self.min_precision}"
+            )
+        if self.min_auprc is not None and not (0.0 <= self.min_auprc <= 1.0):
+            raise FeedbackError(f"min_auprc must be between 0.0 and 1.0, got {self.min_auprc}")
+        if self.max_fpr is not None and not (0.0 <= self.max_fpr <= 1.0):
+            raise FeedbackError(f"max_fpr must be between 0.0 and 1.0, got {self.max_fpr}")
+        if self.max_missed_fraud_rate is not None and not (
+            0.0 <= self.max_missed_fraud_rate <= 1.0
+        ):
+            raise FeedbackError(
+                f"max_missed_fraud_rate must be between 0.0 and 1.0, "
+                f"got {self.max_missed_fraud_rate}"
+            )
+        if self.min_matured_transactions < 1:
+            raise FeedbackError(
+                f"min_matured_transactions must be at least 1, got {self.min_matured_transactions}"
+            )
+        if self.recommended_retrain_window_days <= 0.0:
+            raise FeedbackError(
+                f"recommended_retrain_window_days must be positive, "
+                f"got {self.recommended_retrain_window_days}"
+            )
+        if self.recommended_temporal_gap_days < 0.0:
+            raise FeedbackError(
+                f"recommended_temporal_gap_days cannot be negative, "
+                f"got {self.recommended_temporal_gap_days}"
+            )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize trigger policy to dictionary."""
+        return {
+            "min_precision": self.min_precision,
+            "min_auprc": self.min_auprc,
+            "max_fpr": self.max_fpr,
+            "max_missed_fraud_rate": self.max_missed_fraud_rate,
+            "min_matured_transactions": self.min_matured_transactions,
+            "recommended_retrain_window_days": self.recommended_retrain_window_days,
+            "recommended_temporal_gap_days": self.recommended_temporal_gap_days,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> RetrainingTriggerPolicy:
+        """Construct trigger policy from dictionary."""
+        return cls(
+            min_precision=(
+                float(data["min_precision"]) if data.get("min_precision") is not None else None
+            ),
+            min_auprc=float(data["min_auprc"]) if data.get("min_auprc") is not None else None,
+            max_fpr=float(data["max_fpr"]) if data.get("max_fpr") is not None else None,
+            max_missed_fraud_rate=(
+                float(data["max_missed_fraud_rate"])
+                if data.get("max_missed_fraud_rate") is not None
+                else None
+            ),
+            min_matured_transactions=int(data.get("min_matured_transactions", 10)),
+            recommended_retrain_window_days=float(
+                data.get("recommended_retrain_window_days", 90.0)
+            ),
+            recommended_temporal_gap_days=float(data.get("recommended_temporal_gap_days", 14.0)),
+        )
+
+
+@dataclass(frozen=True)
+class RetrainingTriggerEvent:
+    """Actionable event generated when realized performance breaches policy thresholds."""
+
+    trigger_id: str
+    triggered_at: float
+    breached_metrics: dict[str, dict[str, float]]
+    realized_metrics: RealizedMetricsReport
+    recommended_retrain_start: float
+    recommended_retrain_end: float
+    recommended_temporal_gap_seconds: float
+    reason: str
+    cohort_id: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize trigger event to dictionary."""
+        return {
+            "trigger_id": self.trigger_id,
+            "triggered_at": self.triggered_at,
+            "cohort_id": self.cohort_id,
+            "reason": self.reason,
+            "breached_metrics": self.breached_metrics,
+            "recommended_retrain_start": self.recommended_retrain_start,
+            "recommended_retrain_end": self.recommended_retrain_end,
+            "recommended_temporal_gap_seconds": self.recommended_temporal_gap_seconds,
+            "realized_metrics": self.realized_metrics.to_dict(),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> RetrainingTriggerEvent:
+        """Construct trigger event from dictionary."""
+        return cls(
+            trigger_id=str(data["trigger_id"]),
+            triggered_at=float(data["triggered_at"]),
+            breached_metrics=dict(data["breached_metrics"]),
+            realized_metrics=RealizedMetricsReport.from_dict(data["realized_metrics"]),
+            recommended_retrain_start=float(data["recommended_retrain_start"]),
+            recommended_retrain_end=float(data["recommended_retrain_end"]),
+            recommended_temporal_gap_seconds=float(data["recommended_temporal_gap_seconds"]),
+            reason=str(data["reason"]),
+            cohort_id=data.get("cohort_id"),
+        )
+
+
+class FeedbackSurveillanceAnalyzer:
+    """Surveillance engine evaluating realized metrics and automated retraining triggers."""
+
+    def __init__(
+        self,
+        maturation_curve: LabelMaturationCurve | None = None,
+        default_policy: RetrainingTriggerPolicy | None = None,
+    ) -> None:
+        self.maturation_curve = maturation_curve
+        self.default_policy = default_policy or RetrainingTriggerPolicy()
+
+    def evaluate_cohort(
+        self,
+        records: Sequence[MatchedFeedbackRecord],
+        *,
+        policy: RetrainingTriggerPolicy | None = None,
+        current_timestamp: float | None = None,
+        cohort_id: str | None = None,
+    ) -> tuple[RealizedMetricsReport, RetrainingTriggerEvent | None]:
+        """Evaluate performance of records and generate retraining trigger if policy is breached."""
+        active_policy = policy or self.default_policy
+        now = time() if current_timestamp is None else current_timestamp
+
+        report = compute_realized_metrics(records, cohort_id=cohort_id)
+
+        # Insufficient records to trigger
+        if report.total_transactions < active_policy.min_matured_transactions:
+            return report, None
+
+        breaches: dict[str, dict[str, float]] = {}
+
+        if active_policy.min_auprc is not None and report.realized_auprc < active_policy.min_auprc:
+            breaches["auprc"] = {
+                "observed": round(report.realized_auprc, 4),
+                "threshold": active_policy.min_auprc,
+            }
+
+        if (
+            active_policy.min_precision is not None
+            and report.realized_precision < active_policy.min_precision
+        ):
+            breaches["precision"] = {
+                "observed": round(report.realized_precision, 4),
+                "threshold": active_policy.min_precision,
+            }
+
+        if active_policy.max_fpr is not None and report.realized_fpr > active_policy.max_fpr:
+            breaches["fpr"] = {
+                "observed": round(report.realized_fpr, 4),
+                "threshold": active_policy.max_fpr,
+            }
+
+        if active_policy.max_missed_fraud_rate is not None and report.actual_fraud_count > 0:
+            missed_rate = report.false_negatives / report.actual_fraud_count
+            if missed_rate > active_policy.max_missed_fraud_rate:
+                breaches["missed_fraud_rate"] = {
+                    "observed": round(missed_rate, 4),
+                    "threshold": active_policy.max_missed_fraud_rate,
+                }
+
+        if not breaches:
+            return report, None
+
+        reasons = [
+            f"{k} breached ({v['observed']} vs threshold {v['threshold']})"
+            for k, v in breaches.items()
+        ]
+        reason_str = "; ".join(reasons)
+
+        gap_sec = active_policy.recommended_temporal_gap_days * 86400.0
+        retrain_end = now - gap_sec
+        retrain_start = retrain_end - (active_policy.recommended_retrain_window_days * 86400.0)
+
+        trigger = RetrainingTriggerEvent(
+            trigger_id=str(uuid4()),
+            triggered_at=now,
+            breached_metrics=breaches,
+            realized_metrics=report,
+            recommended_retrain_start=retrain_start,
+            recommended_retrain_end=retrain_end,
+            recommended_temporal_gap_seconds=gap_sec,
+            reason=reason_str,
+            cohort_id=cohort_id,
+        )
+        return report, trigger
