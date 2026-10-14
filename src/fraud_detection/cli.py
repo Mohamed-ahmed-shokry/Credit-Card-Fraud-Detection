@@ -67,6 +67,15 @@ from fraud_detection.features import (
     SkewStatus,
     point_in_time_join,
 )
+from fraud_detection.feedback import (
+    FeedbackError,
+    FeedbackSurveillanceAnalyzer,
+    LabelIngestionStore,
+    LabelMaturationCurve,
+    RetrainingTriggerPolicy,
+    match_labels_with_audit_log,
+    partition_into_cohorts,
+)
 from fraud_detection.model import (
     MANIFEST_FILENAME,
     CalibrationMethod,
@@ -5915,6 +5924,222 @@ def pipeline_chaos_command(
         raise typer.Exit(code=1)
 
     if fail_on_unrecovered and not report.recovered:
+        raise typer.Exit(code=1)
+
+
+@app.command("ingest-labels")
+def ingest_labels_cmd(
+    labels_path: Annotated[
+        Path,
+        typer.Option(
+            "--labels-path",
+            "-l",
+            help="Path to CSV or JSONL ground-truth labels file.",
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            readable=True,
+        ),
+    ],
+    output: Annotated[
+        Path | None,
+        typer.Option(
+            "--output",
+            "-o",
+            help="Optional path to write JSON ingestion report.",
+            dir_okay=False,
+        ),
+    ] = None,
+    as_json: Annotated[
+        bool,
+        typer.Option("--json", help="Emit report directly to stdout as formatted JSON."),
+    ] = False,
+    overwrite: Annotated[
+        bool,
+        typer.Option("--overwrite", help="Overwrite report file if destination already exists."),
+    ] = False,
+) -> None:
+    """Ingest delayed ground-truth feedback labels from CSV or JSONL into an operational store."""
+    _guard_output(output, overwrite)
+
+    store = LabelIngestionStore()
+    suffix = labels_path.suffix.lower()
+    try:
+        if suffix == ".csv":
+            count = store.ingest_from_csv(labels_path)
+        elif suffix in {".jsonl", ".json"}:
+            count = store.ingest_from_jsonl(labels_path)
+        else:
+            _abort(f"Unsupported labels file extension '{suffix}'. Expected .csv or .jsonl.")
+    except (FeedbackError, ValueError) as exc:
+        _abort(f"Label ingestion failed: {exc}")
+
+    report = {
+        "labels_path": str(labels_path),
+        "ingested_count": count,
+        "total_stored": len(store),
+        "status": "success",
+    }
+    report_json = json.dumps(report, indent=2)
+
+    if output is not None:
+        _atomic_write_text(report_json + "\n", output)
+
+    if as_json:
+        typer.echo(report_json)
+    else:
+        typer.echo(f"Successfully ingested {count} delayed label(s) from {labels_path}.")
+        typer.echo(f"Total unique records in store: {len(store)}")
+        if output is not None:
+            typer.echo(f"Report written to: {output}")
+
+
+@app.command("feedback-surveillance")
+def feedback_surveillance_cmd(
+    audit_log: Annotated[
+        Path,
+        typer.Option(
+            "--audit-log",
+            "-a",
+            help="Path to JSONL audit log containing historical scoring events.",
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            readable=True,
+        ),
+    ],
+    labels_path: Annotated[
+        Path,
+        typer.Option(
+            "--labels-path",
+            "-l",
+            help="Path to CSV or JSONL ground-truth labels file.",
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            readable=True,
+        ),
+    ],
+    min_precision: Annotated[
+        float | None,
+        typer.Option("--min-precision", help="Minimum required realized precision threshold."),
+    ] = None,
+    min_auprc: Annotated[
+        float | None,
+        typer.Option("--min-auprc", help="Minimum required realized AUPRC threshold."),
+    ] = None,
+    max_fpr: Annotated[
+        float | None,
+        typer.Option("--max-fpr", help="Maximum allowable false positive rate threshold."),
+    ] = None,
+    max_missed_rate: Annotated[
+        float | None,
+        typer.Option("--max-missed-rate", help="Maximum allowable missed fraud rate threshold."),
+    ] = None,
+    min_transactions: Annotated[
+        int,
+        typer.Option("--min-transactions", help="Minimum matured transactions to evaluate."),
+    ] = 10,
+    target_maturity_level: Annotated[
+        float,
+        typer.Option("--target-maturity-level", help="Cohort maturity threshold for evaluation."),
+    ] = 0.90,
+    output: Annotated[
+        Path | None,
+        typer.Option(
+            "--output",
+            "-o",
+            help="Optional path to write JSON surveillance report.",
+            dir_okay=False,
+        ),
+    ] = None,
+    gate: Annotated[
+        bool,
+        typer.Option(
+            "--gate", help="Exit with code 1 if any retraining policy threshold is breached."
+        ),
+    ] = False,
+    as_json: Annotated[
+        bool,
+        typer.Option("--json", help="Emit report directly to stdout as formatted JSON."),
+    ] = False,
+    overwrite: Annotated[
+        bool,
+        typer.Option("--overwrite", help="Overwrite report file if destination already exists."),
+    ] = False,
+) -> None:
+    """Surveil realized performance on mature cohorts and evaluate automated retraining triggers."""
+    _guard_output(output, overwrite)
+
+    store = LabelIngestionStore()
+    suffix = labels_path.suffix.lower()
+    try:
+        if suffix == ".csv":
+            store.ingest_from_csv(labels_path)
+        elif suffix in {".jsonl", ".json"}:
+            store.ingest_from_jsonl(labels_path)
+        else:
+            _abort(f"Unsupported labels file extension '{suffix}'. Expected .csv or .jsonl.")
+    except (FeedbackError, ValueError) as exc:
+        _abort(f"Label loading failed: {exc}")
+
+    try:
+        matched = match_labels_with_audit_log(audit_log, store)
+        cohorts = partition_into_cohorts(matched)
+        curve = LabelMaturationCurve.fit_from_records(matched)
+        now = time.time()
+        matured_cohorts = curve.filter_mature_cohorts(
+            cohorts, now, min_maturation_fraction=target_maturity_level
+        )
+        matured_records = [r for c in matured_cohorts for r in c.records]
+
+        policy = RetrainingTriggerPolicy(
+            min_precision=min_precision,
+            min_auprc=min_auprc,
+            max_fpr=max_fpr,
+            max_missed_fraud_rate=max_missed_rate,
+            min_matured_transactions=min_transactions,
+        )
+        analyzer = FeedbackSurveillanceAnalyzer(maturation_curve=curve, default_policy=policy)
+        report, trigger = analyzer.evaluate_cohort(matured_records, policy=policy)
+    except (FeedbackError, ValueError) as exc:
+        _abort(f"Feedback surveillance failed: {exc}")
+
+    out_data = {
+        "audit_log": str(audit_log),
+        "labels_path": str(labels_path),
+        "total_matched": len(matched),
+        "total_cohorts": len(cohorts),
+        "matured_cohort_count": len(matured_cohorts),
+        "total_matured_transactions": len(matured_records),
+        "realized_metrics": report.to_dict(),
+        "trigger_event": trigger.to_dict() if trigger is not None else None,
+        "policy_breached": trigger is not None,
+    }
+    report_json = json.dumps(out_data, indent=2)
+
+    if output is not None:
+        _atomic_write_text(report_json + "\n", output)
+
+    if as_json:
+        typer.echo(report_json)
+    else:
+        typer.echo(
+            f"Feedback surveillance evaluated on {len(matured_records)} mature transaction(s):"
+        )
+        typer.echo(f"  Realized Precision: {report.realized_precision:.4f}")
+        typer.echo(f"  Realized Recall:    {report.realized_recall:.4f}")
+        typer.echo(f"  Realized AUPRC:     {report.realized_auprc:.4f}")
+        typer.echo(f"  Realized FPR:       {report.realized_fpr:.4f}")
+        typer.echo(f"  Net Savings:        ${report.net_financial_savings:.2f}")
+        if trigger is not None:
+            typer.echo(f"  [RETRAINING TRIGGERED]: {trigger.reason}")
+        else:
+            typer.echo("  [POLICY OK]: All thresholds satisfied.")
+        if output is not None:
+            typer.echo(f"Report written to: {output}")
+
+    if gate and trigger is not None:
         raise typer.Exit(code=1)
 
 
