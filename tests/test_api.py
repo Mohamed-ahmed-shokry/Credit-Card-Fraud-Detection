@@ -3880,3 +3880,224 @@ def test_pipeline_circuits_and_chaos_error_handling(
             json={"records": [{}], "fault_specs": []},
         )
         assert ok_res.status_code == 200
+
+
+def test_feedback_api_endpoints_and_telemetry(
+    api_context: tuple[Any, FraudModel, Any],
+    tmp_path: Path,
+) -> None:
+    from fraud_detection.audit import AuditEvent, AuditSink
+
+    class FeedbackTestSink(AuditSink):
+        def __init__(self) -> None:
+            self.events: list[AuditEvent] = []
+
+        def emit(self, event: AuditEvent) -> None:
+            self.events.append(event)
+
+        def close(self) -> None:
+            pass
+
+    _, model, _ = api_context
+    sink = FeedbackTestSink()
+    app = create_app(model=model, audit_sink=sink)
+
+    with TestClient(app) as client:
+        # 1. GET /v1/feedback/maturation on empty store
+        res_mat = client.get("/v1/feedback/maturation")
+        assert res_mat.status_code == 200
+        mat_data = res_mat.json()
+        assert mat_data["total_labels_observed"] == 0
+
+        # 2. POST /v1/feedback/labels validation error
+        bad_res = client.post(
+            "/v1/feedback/labels",
+            json={
+                "labels": [
+                    {
+                        "transaction_id": "tx_bad",
+                        "event_timestamp": 500.0,
+                        "label_timestamp": 100.0,
+                        "dispute_type": "chargeback",
+                    }
+                ]
+            },
+        )
+        assert bad_res.status_code == 400
+
+        # 3. POST /v1/feedback/labels valid batch
+        valid_payload = {
+            "labels": [
+                {
+                    "transaction_id": "tx_fb_1",
+                    "event_timestamp": 1000.0,
+                    "label_timestamp": 1000.0 + 86400.0,
+                    "dispute_type": "chargeback",
+                    "is_fraud": True,
+                    "amount": 250.0,
+                    "label_source": "network_report",
+                    "entity_key": "card_fb_1",
+                },
+                {
+                    "transaction_id": "tx_fb_2",
+                    "event_timestamp": 1000.0,
+                    "label_timestamp": 1000.0 + 172800.0,
+                    "dispute_type": "merchant_inquiry",
+                    "is_fraud": False,
+                    "amount": 75.0,
+                    "label_source": "merchant_feed",
+                },
+            ]
+        }
+        ingest_res = client.post("/v1/feedback/labels", json=valid_payload)
+        assert ingest_res.status_code == 200
+        ingest_data = ingest_res.json()
+        assert ingest_data["status"] == "ingested"
+        assert ingest_data["ingested_count"] == 2
+        assert ingest_data["total_stored"] == 2
+
+        # Verify audit events emitted for label ingestion
+        label_events = [ev for ev in sink.events if ev.event_type == "delayed_label_ingestion"]
+        assert len(label_events) == 2
+        assert label_events[0].payload["transaction_id"] == "tx_fb_1"
+
+        # Verify metrics updated
+        m_res = client.get("/metrics")
+        assert m_res.status_code == 200
+        assert (
+            'fraud_delayed_labels_ingested_total{dispute_type="chargeback",is_fraud="true"} 1.0'
+            in m_res.text
+        )
+
+        # 4. GET /v1/feedback/maturation with data
+        res_mat2 = client.get("/v1/feedback/maturation")
+        assert res_mat2.status_code == 200
+        mat_data2 = res_mat2.json()
+        assert mat_data2["total_labels_observed"] == 2
+        assert mat_data2["p50_delay_days"] == 1.5
+        assert mat_data2["max_delay_days"] == 2.0
+
+        # 5. GET /v1/feedback/surveillance with non-existent audit log
+        res_surv_empty = client.get("/v1/feedback/surveillance?audit_log_path=nonexistent.jsonl")
+        assert res_surv_empty.status_code == 200
+        surv_data_empty = res_surv_empty.json()
+        assert surv_data_empty["total_matured_transactions"] == 0
+        assert surv_data_empty["realized_metrics"]["total_transactions"] == 0
+
+        # 6. GET /v1/feedback/surveillance with valid matched audit log
+        audit_file = tmp_path / "audit_feedback.jsonl"
+        audit_lines = [
+            json.dumps(
+                {
+                    "event_type": "scoring",
+                    "timestamp": 1000.0,
+                    "payload": {
+                        "predictions": [
+                            {
+                                "transaction_id": "tx_fb_1",
+                                "fraud_probability": 0.85,
+                                "decision": "deny",
+                                "amount": 250.0,
+                            }
+                        ]
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "event_type": "scoring",
+                    "timestamp": 1000.0,
+                    "payload": {
+                        "predictions": [
+                            {
+                                "transaction_id": "tx_fb_2",
+                                "fraud_probability": 0.05,
+                                "decision": "allow",
+                                "amount": 75.0,
+                            }
+                        ]
+                    },
+                }
+            ),
+        ]
+        audit_file.write_text("\n".join(audit_lines) + "\n", encoding="utf-8")
+
+        surv_url = (
+            f"/v1/feedback/surveillance?audit_log_path={audit_file.as_posix()}"
+            f"&target_maturity_level=0.0"
+        )
+        res_surv = client.get(surv_url)
+        assert res_surv.status_code == 200
+        surv_data = res_surv.json()
+        assert surv_data["total_matured_transactions"] == 2
+        assert surv_data["realized_metrics"]["true_positives"] == 1
+        assert surv_data["realized_metrics"]["true_negatives"] == 1
+        assert surv_data["realized_metrics"]["realized_precision"] == 1.0
+
+        # Verify gauges updated in /metrics
+        m_res2 = client.get("/metrics")
+        assert "fraud_realized_auprc" in m_res2.text
+        assert "fraud_realized_precision 1.0" in m_res2.text
+
+        # 7. Surveillance with trigger policy breach
+        bad_pol_url = (
+            f"/v1/feedback/surveillance?audit_log_path={audit_file.as_posix()}"
+            f"&target_maturity_level=0.0&min_matured_transactions=1&min_precision=1.1"
+        )
+        res_surv_trig = client.get(bad_pol_url)
+        assert res_surv_trig.status_code == 400
+
+        # Ingest a false positive
+        client.post(
+            "/v1/feedback/labels",
+            json={
+                "labels": [
+                    {
+                        "transaction_id": "tx_fb_3",
+                        "event_timestamp": 1000.0,
+                        "label_timestamp": 1000.0 + 86400.0,
+                        "dispute_type": "friendly_fraud",
+                        "is_fraud": False,
+                        "amount": 100.0,
+                    }
+                ]
+            },
+        )
+        audit_lines.append(
+            json.dumps(
+                {
+                    "event_type": "scoring",
+                    "timestamp": 1000.0,
+                    "payload": {
+                        "predictions": [
+                            {
+                                "transaction_id": "tx_fb_3",
+                                "fraud_probability": 0.9,
+                                "decision": "deny",
+                                "amount": 100.0,
+                            }
+                        ]
+                    },
+                }
+            )
+        )
+        audit_file.write_text("\n".join(audit_lines) + "\n", encoding="utf-8")
+
+        breach_url = (
+            f"/v1/feedback/surveillance?audit_log_path={audit_file.as_posix()}"
+            f"&target_maturity_level=0.0&min_matured_transactions=2&min_precision=0.7"
+        )
+        res_surv_breach = client.get(breach_url)
+        assert res_surv_breach.status_code == 200
+        breach_data = res_surv_breach.json()
+        assert breach_data["trigger_event"] is not None
+        assert "precision" in breach_data["trigger_event"]["breached_metrics"]
+
+        # Verify trigger counter incremented
+        m_res3 = client.get("/metrics")
+        assert "fraud_retraining_triggers_total 1.0" in m_res3.text
+
+        # Verify retraining trigger audit event emitted
+        trig_events = [ev for ev in sink.events if ev.event_type == "retraining_trigger"]
+        assert len(trig_events) == 1
+        assert "precision" in trig_events[0].payload["breached_metrics"]
