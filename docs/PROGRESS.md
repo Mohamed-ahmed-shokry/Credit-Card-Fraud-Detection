@@ -11,7 +11,7 @@
 - [x] Task 3: Implement `ChallengerSafetyVerifier` evaluating PR-AUC, recall, ECE, slice disparity, and cost vs. champion with tests in `tests/test_retraining.py`.
 - [x] Task 4: Implement certified artifact export and attestation signing (`export_certified_candidate`) in `retraining.py` with tests in `tests/test_retraining.py`.
 - [x] Task 5: Implement audit event builders (`build_challenger_retrained_audit_event`, `build_model_promoted_audit_event`) in `audit.py` with tests in `tests/test_audit.py`.
-- [ ] Task 6: Implement zero-downtime hot-reload and dynamic canary promotion endpoints and telemetry in `api.py` with tests in `tests/test_api.py`.
+- [x] Task 6: Implement zero-downtime hot-reload and dynamic canary promotion endpoints and telemetry in `api.py` with tests in `tests/test_api.py`.
 - [ ] Task 7: Implement CLI command `auto-retrain` in `cli.py` with tests in `tests/test_cli.py`.
 - [ ] Task 8: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate.
 
@@ -22,8 +22,8 @@
 | AC-2 (Automated Challenger Training & Tuning) | **Verified** | Verified in `tests/test_retraining.py`: `ChallengerTrainer` maps hyperparameters, handles stratified/temporal CV splits, tunes decision thresholds, and records training duration and lineage metadata. |
 | AC-3 (Multi-Faceted Challenger Verification & Safety Gating) | **Verified** | Verified in `tests/test_retraining.py`: `ChallengerSafetyVerifier` evaluates candidate vs champion across PR-AUC, recall parity, Expected Calibration Error (ECE), financial cost differential, and sub-population slice disparity. |
 | AC-4 (Cryptographic Attestation & Lineage Signing) | **Verified** | Verified in `tests/test_retraining.py`: `export_certified_candidate` exports artifact bundles with Ed25519 signatures and `verify_certified_candidate` validates attestation digest, file SHA-256 integrity, and cryptographic signatures. |
-| AC-5 (Zero-Downtime Hot-Reload & Safe Canary Promotion) | Pending | — |
-| AC-6 (Audit Trail, API Endpoints & Telemetry) | Pending | — |
+| AC-5 (Zero-Downtime Hot-Reload & Safe Canary Promotion) | **Verified** | Verified in `tests/test_api.py`: `/v1/models/reload` provides zero-downtime hot-reload with signature verification; `/v1/models/promote` safely adjusts canary traffic percentage or promotes candidate to full champion. |
+| AC-6 (Audit Trail, API Endpoints & Telemetry) | **Verified** | Verified in `tests/test_audit.py` and `tests/test_api.py`: Challenger retrained and model promoted audit events emitted; Prometheus metrics `fraud_retraining_runs_total`, `fraud_challenger_verification_status`, `fraud_model_promotions_total` exported. |
 | AC-7 (CLI Workflow & Exit Code Gating) | Pending | — |
 | AC-8 (Quality Standards & Zero Regressions) | Pending | — |
 
