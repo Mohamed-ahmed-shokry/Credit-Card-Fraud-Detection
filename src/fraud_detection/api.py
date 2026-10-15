@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 import os
@@ -41,7 +42,9 @@ from fraud_detection.audit import (
     AuditSink,
     JsonlAuditSink,
     NullAuditSink,
+    build_challenger_retrained_audit_event,
     build_delayed_label_audit_event,
+    build_model_promoted_audit_event,
     build_pipeline_chaos_audit_event,
     build_pipeline_replay_audit_event,
     build_retraining_trigger_audit_event,
@@ -77,6 +80,18 @@ from fraud_detection.pipeline import (
     simulate_pipeline_chaos,
 )
 from fraud_detection.recalibration import BaseRecalibrator
+from fraud_detection.retraining import (
+    ChallengerSafetyVerifier,
+    ChallengerTrainer,
+    ChallengerVerificationReport,
+    RetrainingConfig,
+    RetrainingDatasetBuilder,
+    RetrainingError,
+    VerificationError,
+    VerificationStatus,
+    export_certified_candidate,
+    verify_certified_candidate,
+)
 from fraud_detection.routing import (
     CanaryConfig,
     CanaryStatus,
@@ -1022,6 +1037,90 @@ class FeedbackMaturationResponse(BaseModel):
     delay_cdf_points: list[list[float]] = Field(default_factory=list)
 
 
+class ModelReloadRequest(BaseModel):
+    """Payload to trigger dynamic zero-downtime model reload."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    model_path: str | None = None
+    attestation_path: str | None = None
+    require_attestation: bool = False
+    trusted_key_path: str | None = None
+    strict: bool = False
+
+
+class ModelReloadResponse(BaseModel):
+    """Result of dynamic zero-downtime model reload."""
+
+    status: str
+    previous_model_version: str
+    new_model_version: str
+    artifact_path: str
+    verified: bool
+    message: str
+
+
+class ModelPromoteRequest(BaseModel):
+    """Payload to promote candidate model to champion or canary."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    candidate_path: str
+    promotion_type: str = Field(default="full")
+    canary_percentage: float = Field(default=100.0, ge=0.0, le=100.0)
+    attestation_path: str | None = None
+    require_attestation: bool = True
+    trusted_key_path: str | None = None
+    strict: bool = False
+
+
+class ModelPromoteResponse(BaseModel):
+    """Result of candidate model promotion or canary rollout."""
+
+    status: str
+    promotion_type: str
+    champion_model_version: str
+    challenger_model_version: str | None = None
+    canary_percentage: float
+    attestation_verified: bool
+    message: str
+
+
+class RetrainingTriggerRequest(BaseModel):
+    """Payload to invoke closed-loop retraining and safety verification."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    trigger_reason: str = Field(default="manual_api_trigger")
+    start_timestamp: float | None = None
+    end_timestamp: float | None = None
+    holdout_gap_seconds: float = 0.0
+    estimator: str = "logistic_regression"
+    hyperparameters: dict[str, Any] = Field(default_factory=dict)
+    auto_promote: bool = False
+    promotion_type: str = "full"
+    canary_percentage: float = Field(default=100.0, ge=0.0, le=100.0)
+    signing_key_path: str | None = None
+    trusted_key_path: str | None = None
+    output_dir: str | None = None
+    slice_column: str | None = None
+    audit_log_path: str | None = None
+
+
+class RetrainingTriggerResponse(BaseModel):
+    """Outcome of automated closed-loop retraining run."""
+
+    run_id: str
+    status: str
+    candidate_version: str | None = None
+    champion_version: str | None = None
+    verification_passed: bool
+    promoted: bool
+    metrics: dict[str, float] = Field(default_factory=dict)
+    attestation_digest: str | None = None
+    message: str
+
+
 def create_app(
     *,
     model: FraudModel | None = None,
@@ -1519,6 +1618,24 @@ def create_app(
         "Total automated retraining triggers generated due to policy breaches.",
         registry=metrics_registry,
     )
+    retraining_runs_counter = Counter(
+        "fraud_retraining_runs_total",
+        "Total automated closed-loop retraining executions.",
+        ["status", "trigger_reason"],
+        registry=metrics_registry,
+    )
+    challenger_verification_gauge = Gauge(
+        "fraud_challenger_verification_status",
+        "Operational status of challenger verification gating.",
+        ["status", "candidate_version"],
+        registry=metrics_registry,
+    )
+    model_promotions_counter = Counter(
+        "fraud_model_promotions_total",
+        "Total model promotion and dynamic canary adjustment events.",
+        ["promotion_type", "status"],
+        registry=metrics_registry,
+    )
 
     if resolved_cb is not None:
         # Keep a caller-supplied callback: the metrics counter is chained onto it
@@ -1599,8 +1716,8 @@ def create_app(
                 raise RuntimeError(f"Deployment admission failed: {admission_message}")
 
         loaded_model = model
+        configured_path = model_path or os.getenv(MODEL_PATH_ENVIRONMENT_VARIABLE)
         if loaded_model is None:
-            configured_path = model_path or os.getenv(MODEL_PATH_ENVIRONMENT_VARIABLE)
             if configured_path is None:
                 raise RuntimeError(
                     f"No model configured. Set {MODEL_PATH_ENVIRONMENT_VARIABLE} "
@@ -1793,6 +1910,16 @@ def create_app(
         application.state.realized_precision_gauge = realized_precision_gauge
         application.state.realized_recall_gauge = realized_recall_gauge
         application.state.retraining_triggers_counter = retraining_triggers_counter
+        application.state.model_path = configured_path
+        if not getattr(application.state, "audit_log_path", None):
+            application.state.audit_log_path = (
+                str(getattr(resolved_audit_sink, "path", None))
+                if getattr(resolved_audit_sink, "path", None) is not None
+                else os.getenv(AUDIT_LOG_ENVIRONMENT_VARIABLE)
+            )
+        application.state.retraining_runs_counter = retraining_runs_counter
+        application.state.challenger_verification_gauge = challenger_verification_gauge
+        application.state.model_promotions_counter = model_promotions_counter
         shadow_tasks: set[asyncio.Task[None]] = set()
         application.state.shadow_tasks = shadow_tasks
         yield
@@ -3695,6 +3822,418 @@ def create_app(
         store: LabelIngestionStore = request.app.state.label_store
         curve = LabelMaturationCurve.fit_from_records(store.all_records())
         return FeedbackMaturationResponse(**curve.to_dict())
+
+    @application.post(
+        "/v1/models/reload",
+        response_model=ModelReloadResponse,
+        responses={400: {"description": "Invalid artifact or attestation failure."}},
+        tags=["models"],
+    )
+    async def reload_model_endpoint(
+        request: Request,
+        payload: ModelReloadRequest,
+    ) -> ModelReloadResponse | JSONResponse:
+        """Hot-reload model weights and metadata into memory with zero downtime."""
+        target_path_str = payload.model_path or getattr(request.app.state, "model_path", None)
+        if not target_path_str:
+            return JSONResponse(
+                status_code=400,
+                content={"detail": "No model path provided or configured in service state."},
+            )
+        target_path = Path(target_path_str)
+        path_exists = await run_in_threadpool(target_path.exists)
+        if not path_exists:
+            return JSONResponse(
+                status_code=400,
+                content={"detail": f"Target model path does not exist: {target_path}"},
+            )
+
+        promotions_counter: Counter | None = getattr(
+            request.app.state, "model_promotions_counter", None
+        )
+        sink: AuditSink = request.app.state.audit_sink
+
+        # Verify certified candidate attestation if requested or key provided
+        verified = True
+        attestation_dict: dict[str, Any] = {}
+        if payload.require_attestation or payload.trusted_key_path is not None:
+            is_valid, msg, attestation_dict = await run_in_threadpool(
+                verify_certified_candidate,
+                target_path,
+                trusted_public_key_path=payload.trusted_key_path,
+                require_signature=payload.require_attestation,
+                strict=payload.strict,
+            )
+            if not is_valid:
+                if promotions_counter is not None:
+                    promotions_counter.labels(promotion_type="reload", status="failed").inc()
+                return JSONResponse(
+                    status_code=400,
+                    content={"detail": f"Attestation verification failed: {msg}"},
+                )
+            verified = True
+
+        try:
+            new_model = await run_in_threadpool(load_model, target_path)
+        except (ModelArtifactError, OSError, ValueError, TypeError) as exc:
+            if promotions_counter is not None:
+                promotions_counter.labels(promotion_type="reload", status="failed").inc()
+            return JSONResponse(
+                status_code=400,
+                content={"detail": f"Failed to load model from {target_path}: {exc}"},
+            )
+
+        old_model: FraudModel | None = getattr(request.app.state, "model", None)
+        old_ver = _model_version(old_model) if old_model else "unknown"
+        new_ver = _model_version(new_model)
+
+        # Atomic in-memory hot-reload
+        request.app.state.model = new_model
+        request.app.state.model_version = new_ver
+        request.app.state.model_path = target_path
+
+        router: ChampionChallengerRouter | None = getattr(request.app.state, "router", None)
+        if router is not None:
+            router.champion_model = new_model
+
+        if promotions_counter is not None:
+            promotions_counter.labels(promotion_type="reload", status="success").inc()
+
+        audit_ev = build_model_promoted_audit_event(
+            previous_champion_version=old_ver,
+            new_champion_version=new_ver,
+            promotion_type="reload",
+            canary_percentage=100.0,
+            attestation_digest=attestation_dict.get("attestation_digest"),
+            promoted_by="api_model_reload",
+            status="reloaded",
+        )
+        await run_in_threadpool(sink.emit, audit_ev)
+
+        return ModelReloadResponse(
+            status="reloaded",
+            previous_model_version=old_ver,
+            new_model_version=new_ver,
+            artifact_path=str(target_path),
+            verified=verified,
+            message="Model successfully reloaded with zero downtime.",
+        )
+
+    @application.post(
+        "/v1/models/promote",
+        response_model=ModelPromoteResponse,
+        responses={400: {"description": "Promotion rejection or verification failure."}},
+        tags=["models"],
+    )
+    async def promote_model_endpoint(
+        request: Request,
+        payload: ModelPromoteRequest,
+    ) -> ModelPromoteResponse | JSONResponse:
+        """Promote candidate model to Canary or Champion."""
+        target_path = Path(payload.candidate_path)
+        path_exists = await run_in_threadpool(target_path.exists)
+        if not path_exists:
+            return JSONResponse(
+                status_code=400,
+                content={"detail": f"Candidate artifact path does not exist: {target_path}"},
+            )
+
+        promotions_counter: Counter | None = getattr(
+            request.app.state, "model_promotions_counter", None
+        )
+        sink: AuditSink = request.app.state.audit_sink
+
+        # Attestation verification
+        verified = True
+        attestation_dict: dict[str, Any] = {}
+        if payload.require_attestation or payload.trusted_key_path is not None:
+            is_valid, msg, attestation_dict = await run_in_threadpool(
+                verify_certified_candidate,
+                target_path,
+                trusted_public_key_path=payload.trusted_key_path,
+                require_signature=payload.require_attestation,
+                strict=payload.strict,
+            )
+            if not is_valid:
+                if promotions_counter is not None:
+                    promotions_counter.labels(
+                        promotion_type=payload.promotion_type, status="rejected"
+                    ).inc()
+                return JSONResponse(
+                    status_code=400,
+                    content={"detail": f"Candidate verification gate failed: {msg}"},
+                )
+
+        try:
+            cand_model = await run_in_threadpool(load_model, target_path)
+        except (ModelArtifactError, OSError, ValueError, TypeError) as exc:
+            if promotions_counter is not None:
+                promotions_counter.labels(
+                    promotion_type=payload.promotion_type, status="failed"
+                ).inc()
+            return JSONResponse(
+                status_code=400,
+                content={"detail": f"Failed to load candidate model: {exc}"},
+            )
+
+        old_champion: FraudModel | None = getattr(request.app.state, "model", None)
+        old_champ_ver = _model_version(old_champion) if old_champion else "unknown"
+        cand_ver = _model_version(cand_model)
+
+        router: ChampionChallengerRouter | None = getattr(request.app.state, "router", None)
+        norm_type = payload.promotion_type.lower()
+
+        if norm_type == "canary":
+            canary_pct = payload.canary_percentage
+            weight = canary_pct / 100.0
+            if router is None:
+                router = ChampionChallengerRouter(
+                    champion_model=old_champion or cand_model,
+                    challenger_model=cand_model,
+                    policy=RoutingPolicy(
+                        strategy=TrafficSplitStrategy.CANARY,
+                        challenger_weight=weight,
+                    ),
+                )
+                request.app.state.router = router
+            else:
+                router.challenger_model = cand_model
+                router.policy = RoutingPolicy(
+                    strategy=TrafficSplitStrategy.CANARY,
+                    challenger_weight=weight,
+                )
+                router.metrics.reset_canary()
+
+            if promotions_counter is not None:
+                promotions_counter.labels(promotion_type="canary", status="success").inc()
+
+            audit_ev = build_model_promoted_audit_event(
+                previous_champion_version=old_champ_ver,
+                new_champion_version=cand_ver,
+                promotion_type="canary",
+                canary_percentage=canary_pct,
+                attestation_digest=attestation_dict.get("attestation_digest"),
+                promoted_by="api_model_promote",
+                status="canary_active",
+            )
+            await run_in_threadpool(sink.emit, audit_ev)
+
+            return ModelPromoteResponse(
+                status="promoted",
+                promotion_type="canary",
+                champion_model_version=router.champion_version,
+                challenger_model_version=router.challenger_version,
+                canary_percentage=canary_pct,
+                attestation_verified=verified,
+                message=f"Candidate deployed as canary with {canary_pct:.1f}% traffic.",
+            )
+
+        # Full promotion to champion
+        request.app.state.model = cand_model
+        request.app.state.model_version = cand_ver
+        request.app.state.model_path = target_path
+
+        if router is not None:
+            router.champion_model = cand_model
+            router.challenger_model = None
+            router.policy = RoutingPolicy(strategy=TrafficSplitStrategy.CHAMPION_ONLY)
+            router.metrics.reset_canary()
+
+        if promotions_counter is not None:
+            promotions_counter.labels(promotion_type="full", status="success").inc()
+
+        audit_ev = build_model_promoted_audit_event(
+            previous_champion_version=old_champ_ver,
+            new_champion_version=cand_ver,
+            promotion_type="full",
+            canary_percentage=100.0,
+            attestation_digest=attestation_dict.get("attestation_digest"),
+            promoted_by="api_model_promote",
+            status="promoted",
+        )
+        await run_in_threadpool(sink.emit, audit_ev)
+
+        return ModelPromoteResponse(
+            status="promoted",
+            promotion_type="full",
+            champion_model_version=cand_ver,
+            challenger_model_version=None,
+            canary_percentage=100.0,
+            attestation_verified=verified,
+            message="Candidate successfully promoted to primary champion.",
+        )
+
+    @application.post(
+        "/v1/retraining/trigger",
+        response_model=RetrainingTriggerResponse,
+        responses={400: {"description": "Retraining error or insufficient data."}},
+        tags=["retraining"],
+    )
+    async def trigger_retraining_endpoint(
+        request: Request,
+        payload: RetrainingTriggerRequest,
+    ) -> RetrainingTriggerResponse | JSONResponse:
+        """Trigger automated closed-loop model retraining and challenger safety verification."""
+        run_id = f"retrain_{uuid4().hex[:12]}"
+        sink: AuditSink = request.app.state.audit_sink
+        retrain_counter: Counter | None = getattr(
+            request.app.state, "retraining_runs_counter", None
+        )
+        challenger_gauge: Gauge | None = getattr(
+            request.app.state, "challenger_verification_gauge", None
+        )
+
+        champion_model: FraudModel | None = getattr(request.app.state, "model", None)
+        champ_ver = _model_version(champion_model) if champion_model else "champion"
+
+        # 1. Dataset materialization
+        store: LabelIngestionStore = request.app.state.label_store
+        audit_log_path_str: str | None = (
+            payload.audit_log_path
+            or getattr(request.app.state, "audit_log_path", None)
+            or (str(sink.path) if hasattr(sink, "path") and sink.path is not None else None)
+            or os.getenv(AUDIT_LOG_ENVIRONMENT_VARIABLE)
+        )
+
+        retrain_cfg = RetrainingConfig(
+            estimator=payload.estimator,
+            hyperparameters=payload.hyperparameters,
+            holdout_gap_seconds=payload.holdout_gap_seconds,
+            retrain_start_timestamp=payload.start_timestamp,
+            retrain_end_timestamp=payload.end_timestamp,
+        )
+
+        try:
+            builder = RetrainingDatasetBuilder(retrain_cfg)
+            dataset = await run_in_threadpool(
+                builder.build_from_audit_and_labels,
+                audit_log_path_str or "",
+                store,
+            )
+        except (RetrainingError, ValueError, OSError) as exc:
+            if retrain_counter is not None:
+                retrain_counter.labels(status="failed", trigger_reason=payload.trigger_reason).inc()
+            return JSONResponse(
+                status_code=400,
+                content={"detail": f"Failed to materialize retraining dataset: {exc}"},
+            )
+
+        # 2. Train challenger
+        trainer = ChallengerTrainer(retrain_cfg)
+        try:
+            cand_res = await run_in_threadpool(trainer.train, dataset)
+        except (RetrainingError, ValueError, RuntimeError) as exc:
+            if retrain_counter is not None:
+                retrain_counter.labels(status="failed", trigger_reason=payload.trigger_reason).inc()
+            return JSONResponse(
+                status_code=400,
+                content={"detail": f"Challenger training failed: {exc}"},
+            )
+
+        cand_ver = cand_res.model_version
+
+        # 3. Verify against champion if champion is present
+        v_passed = True
+        v_report: ChallengerVerificationReport | None = None
+        if champion_model is not None:
+            verifier = ChallengerSafetyVerifier()
+            try:
+                v_report = await run_in_threadpool(
+                    verifier.verify_candidate,
+                    candidate_model=cand_res.model,
+                    champion_model=champion_model,
+                    holdout_dataset=dataset,
+                    slice_column=payload.slice_column,
+                )
+                v_passed = v_report.status == VerificationStatus.PASSED
+            except (VerificationError, RetrainingError, ValueError, TypeError):
+                v_passed = False
+
+        if challenger_gauge is not None:
+            challenger_gauge.labels(
+                status="passed" if v_passed else "failed", candidate_version=cand_ver
+            ).set(1.0 if v_passed else 0.0)
+
+        # 4. Handle certification and export if output_dir provided
+        attestation_digest: str | None = None
+        if payload.output_dir:
+            out_p = Path(payload.output_dir)
+            try:
+                att_p = await run_in_threadpool(
+                    export_certified_candidate,
+                    cand_res,
+                    out_p,
+                    verification_report=v_report,
+                    signing_key_path=payload.signing_key_path,
+                )
+                text = await run_in_threadpool(att_p.read_text, encoding="utf-8")
+                att_dict: dict[str, Any] = json.loads(text)
+                attestation_digest = att_dict.get("attestation_digest")
+            except (RetrainingError, OSError, ValueError):
+                logger.exception("Failed to export certified candidate.")
+
+        # 5. Promotion if verification passed and auto_promote is set
+        promoted = False
+        if v_passed and payload.auto_promote:
+            norm_type = payload.promotion_type.lower()
+            if norm_type == "canary":
+                router: ChampionChallengerRouter | None = getattr(request.app.state, "router", None)
+                canary_pct = payload.canary_percentage
+                weight = canary_pct / 100.0
+                if router is None:
+                    router = ChampionChallengerRouter(
+                        champion_model=champion_model or cand_res.model,
+                        challenger_model=cand_res.model,
+                        policy=RoutingPolicy(
+                            strategy=TrafficSplitStrategy.CANARY,
+                            challenger_weight=weight,
+                        ),
+                    )
+                    request.app.state.router = router
+                else:
+                    router.challenger_model = cand_res.model
+                    router.policy = RoutingPolicy(
+                        strategy=TrafficSplitStrategy.CANARY,
+                        challenger_weight=weight,
+                    )
+                    router.metrics.reset_canary()
+                promoted = True
+            else:
+                request.app.state.model = cand_res.model
+                request.app.state.model_version = cand_ver
+                promoted = True
+
+        status_str = "completed" if v_passed else "rejected"
+        if retrain_counter is not None:
+            retrain_counter.labels(status=status_str, trigger_reason=payload.trigger_reason).inc()
+
+        audit_ev = build_challenger_retrained_audit_event(
+            candidate_result=cand_res,
+            verification_report=v_report,
+            attestation_digest=attestation_digest,
+            model_version=cand_ver,
+            champion_version=champ_ver,
+            metadata={"run_id": run_id, "trigger_reason": payload.trigger_reason},
+        )
+        await run_in_threadpool(sink.emit, audit_ev)
+
+        msg = (
+            f"Challenger {cand_ver} retrained and verified successfully."
+            if v_passed
+            else f"Challenger {cand_ver} failed safety verification gates."
+        )
+
+        return RetrainingTriggerResponse(
+            run_id=run_id,
+            status=status_str,
+            candidate_version=cand_ver,
+            champion_version=champ_ver,
+            verification_passed=v_passed,
+            promoted=promoted,
+            metrics=cand_res.test_metrics,
+            attestation_digest=attestation_digest,
+            message=msg,
+        )
 
     @application.get("/metrics", tags=["operations"])
     async def metrics() -> Response:
