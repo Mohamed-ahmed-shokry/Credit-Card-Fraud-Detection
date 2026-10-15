@@ -16,6 +16,7 @@ from fraud_detection.feedback import (
 )
 from fraud_detection.model import FraudModel
 from fraud_detection.retraining import (
+    ChallengerSafetyVerifier,
     ChallengerTrainer,
     ChallengerTrainingResult,
     ChallengerVerificationReport,
@@ -27,6 +28,7 @@ from fraud_detection.retraining import (
     RetrainingError,
     RetrainingRecord,
     RetrainingStatus,
+    SafetyGatingThresholds,
     VerificationError,
     VerificationStatus,
 )
@@ -407,3 +409,144 @@ def test_challenger_trainer_training_failure() -> None:
     )
     with pytest.raises(RetrainingError, match="Challenger model training failed"):
         trainer.train(dataset)
+
+
+def test_safety_gating_thresholds_serialization() -> None:
+    """Test SafetyGatingThresholds serialization and defaults."""
+    thresh = SafetyGatingThresholds(
+        min_pr_auc_delta=-0.01,
+        min_recall_delta=-0.02,
+        max_ece_increase=0.04,
+        max_slice_disparity=0.20,
+        max_net_cost_increase_pct=0.08,
+        false_positive_cost=2.0,
+        false_negative_cost=25.0,
+    )
+    data = thresh.to_dict()
+    assert data["min_pr_auc_delta"] == -0.01
+    assert data["false_negative_cost"] == 25.0
+
+    restored = SafetyGatingThresholds.from_dict(data)
+    assert restored.min_pr_auc_delta == -0.01
+    assert restored.false_negative_cost == 25.0
+
+
+def test_challenger_safety_verifier_passed() -> None:
+    """Test ChallengerSafetyVerifier passes when candidate meets all safety gates."""
+    raw_df = generate_synthetic_data(rows=350, fraud_rate=0.1, random_state=42)
+    dataset = ValidatedDataset(features=raw_df.drop(columns=["Class"]), target=raw_df["Class"])
+
+    # Train champion and candidate
+    champ_trainer = ChallengerTrainer(
+        RetrainingConfig(
+            estimator="logistic_regression",
+            random_state=42,
+            hyperparameters={"regularization": 0.5},
+        )
+    )
+    cand_trainer = ChallengerTrainer(
+        RetrainingConfig(
+            estimator="logistic_regression",
+            random_state=42,
+            hyperparameters={"regularization": 1.0},
+        )
+    )
+    champ_res = champ_trainer.train(dataset)
+    cand_res = cand_trainer.train(dataset)
+
+    # Generate holdout dataset
+    holdout_raw = generate_synthetic_data(rows=200, fraud_rate=0.1, random_state=123)
+    holdout_ds = ValidatedDataset(
+        features=holdout_raw.drop(columns=["Class"]),
+        target=holdout_raw["Class"],
+    )
+
+    verifier = ChallengerSafetyVerifier(
+        SafetyGatingThresholds(
+            min_pr_auc_delta=-0.10,
+            min_recall_delta=-0.10,
+            max_ece_increase=0.10,
+            max_slice_disparity=0.50,
+            max_net_cost_increase_pct=0.20,
+        )
+    )
+    report = verifier.verify_candidate(cand_res.model, champ_res.model, holdout_ds)
+
+    assert isinstance(report, ChallengerVerificationReport)
+    assert report.status == VerificationStatus.PASSED
+    assert report.passed is True
+    assert len(report.comparisons) >= 4
+    metric_names = [c.metric_name for c in report.comparisons]
+    assert "pr_auc" in metric_names
+    assert "recall" in metric_names
+    assert "expected_calibration_error" in metric_names
+    assert "financial_cost_change_pct" in metric_names
+
+
+def test_challenger_safety_verifier_failed_on_degradation() -> None:
+    """Test ChallengerSafetyVerifier flags FAILED when candidate violates safety gates."""
+    raw_df = generate_synthetic_data(rows=300, fraud_rate=0.1, random_state=42)
+    dataset = ValidatedDataset(features=raw_df.drop(columns=["Class"]), target=raw_df["Class"])
+
+    champ_trainer = ChallengerTrainer(RetrainingConfig(estimator="logistic_regression"))
+    cand_trainer = ChallengerTrainer(RetrainingConfig(estimator="logistic_regression"))
+    champ_res = champ_trainer.train(dataset)
+    cand_res = cand_trainer.train(dataset)
+
+    holdout_raw = generate_synthetic_data(rows=200, fraud_rate=0.1, random_state=999)
+    holdout_ds = ValidatedDataset(
+        features=holdout_raw.drop(columns=["Class"]),
+        target=holdout_raw["Class"],
+    )
+
+    # Impossible threshold (requires PR-AUC improvement of at least +0.90)
+    strict_thresh = SafetyGatingThresholds(min_pr_auc_delta=0.90)
+    verifier = ChallengerSafetyVerifier(strict_thresh)
+    report = verifier.verify_candidate(cand_res.model, champ_res.model, holdout_ds)
+
+    assert report.status == VerificationStatus.FAILED
+    assert report.passed is False
+    pr_comp = next(c for c in report.comparisons if c.metric_name == "pr_auc")
+    assert pr_comp.passed is False
+
+
+def test_challenger_safety_verifier_empty_dataset_raises() -> None:
+    """Test ChallengerSafetyVerifier raises VerificationError on empty holdout dataset."""
+    raw_df = generate_synthetic_data(rows=250, fraud_rate=0.1, random_state=42)
+    dataset = ValidatedDataset(features=raw_df.drop(columns=["Class"]), target=raw_df["Class"])
+
+    trainer = ChallengerTrainer(RetrainingConfig(estimator="logistic_regression"))
+    model = trainer.train(dataset).model
+
+    empty_df = raw_df.iloc[:0].drop(columns=["Class"])
+    empty_target = raw_df["Class"].iloc[:0]
+    empty_ds = ValidatedDataset(features=empty_df, target=empty_target)
+
+    verifier = ChallengerSafetyVerifier()
+    with pytest.raises(VerificationError, match="Holdout dataset cannot be empty"):
+        verifier.verify_candidate(model, model, empty_ds)
+
+
+def test_challenger_safety_verifier_custom_slice_column() -> None:
+    """Test ChallengerSafetyVerifier evaluates sub-population disparity on custom slice column."""
+    raw_df = generate_synthetic_data(rows=300, fraud_rate=0.1, random_state=42)
+    train_dataset = ValidatedDataset(
+        features=raw_df.drop(columns=["Class"]), target=raw_df["Class"]
+    )
+
+    trainer = ChallengerTrainer(RetrainingConfig(estimator="logistic_regression"))
+    model = trainer.train(train_dataset).model
+
+    # Add categorical channel slice to holdout dataset
+    holdout_df = generate_synthetic_data(rows=200, fraud_rate=0.1, random_state=99)
+    holdout_features = holdout_df.drop(columns=["Class"]).copy()
+    holdout_features["channel"] = [
+        "mobile" if i % 2 == 0 else "web" for i in range(len(holdout_features))
+    ]
+    holdout_dataset = ValidatedDataset(features=holdout_features, target=holdout_df["Class"])
+
+    verifier = ChallengerSafetyVerifier(SafetyGatingThresholds(max_slice_disparity=0.80))
+    report = verifier.verify_candidate(model, model, holdout_dataset, slice_column="channel")
+
+    assert report.status == VerificationStatus.PASSED
+    assert "channel_disparity" in report.slice_disparities
