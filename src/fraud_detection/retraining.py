@@ -10,9 +10,11 @@ from pathlib import Path
 from time import time
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from fraud_detection.data import ValidatedDataset
+from fraud_detection.evaluation import evaluate_predictions, evaluate_slices
 from fraud_detection.feedback import (
     DelayedLabelRecord,
     LabelIngestionStore,
@@ -25,6 +27,7 @@ from fraud_detection.model import (
     TrainingConfig,
     train_model,
 )
+from fraud_detection.recalibration import compute_calibration_diagnostics
 
 
 class RetrainingError(Exception):
@@ -548,4 +551,219 @@ class ChallengerTrainer:
             model_version=str(metadata.get("model_version", "challenger")),
             dataset_fingerprint=str(metadata.get("dataset_fingerprint", "")),
             training_duration_seconds=duration,
+        )
+
+
+@dataclass(frozen=True)
+class SafetyGatingThresholds:
+    """Configurable thresholds determining whether a challenger qualifies for deployment."""
+
+    min_pr_auc_delta: float = -0.02
+    min_recall_delta: float = -0.03
+    max_ece_increase: float = 0.03
+    max_slice_disparity: float = 0.25
+    max_net_cost_increase_pct: float = 0.05
+    false_positive_cost: float = 1.0
+    false_negative_cost: float = 10.0
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert thresholds to JSON-serializable dictionary."""
+        return {
+            "min_pr_auc_delta": self.min_pr_auc_delta,
+            "min_recall_delta": self.min_recall_delta,
+            "max_ece_increase": self.max_ece_increase,
+            "max_slice_disparity": self.max_slice_disparity,
+            "max_net_cost_increase_pct": self.max_net_cost_increase_pct,
+            "false_positive_cost": self.false_positive_cost,
+            "false_negative_cost": self.false_negative_cost,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> SafetyGatingThresholds:
+        """Construct thresholds from dictionary."""
+        return cls(
+            min_pr_auc_delta=float(data.get("min_pr_auc_delta", -0.02)),
+            min_recall_delta=float(data.get("min_recall_delta", -0.03)),
+            max_ece_increase=float(data.get("max_ece_increase", 0.03)),
+            max_slice_disparity=float(data.get("max_slice_disparity", 0.25)),
+            max_net_cost_increase_pct=float(data.get("max_net_cost_increase_pct", 0.05)),
+            false_positive_cost=float(data.get("false_positive_cost", 1.0)),
+            false_negative_cost=float(data.get("false_negative_cost", 10.0)),
+        )
+
+
+class ChallengerSafetyVerifier:
+    """Evaluates candidate model against production champion across safety gates."""
+
+    def __init__(self, thresholds: SafetyGatingThresholds | None = None) -> None:
+        self.thresholds = thresholds or SafetyGatingThresholds()
+
+    def verify_candidate(
+        self,
+        candidate_model: FraudModel,
+        champion_model: FraudModel,
+        holdout_dataset: ValidatedDataset,
+        *,
+        slice_column: str | None = None,
+    ) -> ChallengerVerificationReport:
+        """Evaluate candidate vs. champion on identical holdout data and assess safety gating."""
+        if len(holdout_dataset.features) == 0:
+            raise VerificationError("Holdout dataset cannot be empty for challenger verification.")
+
+        cand_features = holdout_dataset.features
+        if candidate_model.feature_names and all(
+            f in cand_features.columns for f in candidate_model.feature_names
+        ):
+            cand_features = cand_features[list(candidate_model.feature_names)]
+
+        champ_features = holdout_dataset.features
+        if champion_model.feature_names and all(
+            f in champ_features.columns for f in champion_model.feature_names
+        ):
+            champ_features = champ_features[list(champion_model.feature_names)]
+
+        # Predict probabilities
+        cand_probs = np.asarray(candidate_model.predict_probabilities(cand_features), dtype=float)
+        champ_probs = np.asarray(champion_model.predict_probabilities(champ_features), dtype=float)
+        y_true = np.asarray(holdout_dataset.target, dtype=int)
+
+        # Evaluate basic metrics
+        cand_metrics = evaluate_predictions(y_true, cand_probs, threshold=candidate_model.threshold)
+        champ_metrics = evaluate_predictions(
+            y_true, champ_probs, threshold=champion_model.threshold
+        )
+
+        # Calibration ECE
+        cand_cal = compute_calibration_diagnostics(y_true, cand_probs)
+        champ_cal = compute_calibration_diagnostics(y_true, champ_probs)
+        cand_ece = float(cand_cal.expected_calibration_error)
+        champ_ece = float(champ_cal.expected_calibration_error)
+
+        # Financial costs
+        fp_cost = self.thresholds.false_positive_cost
+        fn_cost = self.thresholds.false_negative_cost
+        cand_cost = cand_metrics.false_positives * fp_cost + cand_metrics.false_negatives * fn_cost
+        champ_cost = (
+            champ_metrics.false_positives * fp_cost + champ_metrics.false_negatives * fn_cost
+        )
+        cost_diff_pct = (cand_cost - champ_cost) / max(1e-6, champ_cost)
+
+        comparisons: list[MetricComparison] = []
+
+        # 1. PR-AUC comparison
+        pr_delta = cand_metrics.average_precision - champ_metrics.average_precision
+        pr_passed = pr_delta >= self.thresholds.min_pr_auc_delta
+        comparisons.append(
+            MetricComparison(
+                metric_name="pr_auc",
+                champion_value=champ_metrics.average_precision,
+                challenger_value=cand_metrics.average_precision,
+                delta=pr_delta,
+                threshold=self.thresholds.min_pr_auc_delta,
+                passed=pr_passed,
+            )
+        )
+
+        # 2. Recall comparison
+        rec_delta = cand_metrics.recall - champ_metrics.recall
+        rec_passed = rec_delta >= self.thresholds.min_recall_delta
+        comparisons.append(
+            MetricComparison(
+                metric_name="recall",
+                champion_value=champ_metrics.recall,
+                challenger_value=cand_metrics.recall,
+                delta=rec_delta,
+                threshold=self.thresholds.min_recall_delta,
+                passed=rec_passed,
+            )
+        )
+
+        # 3. ECE comparison
+        ece_delta = cand_ece - champ_ece
+        ece_passed = ece_delta <= self.thresholds.max_ece_increase
+        comparisons.append(
+            MetricComparison(
+                metric_name="expected_calibration_error",
+                champion_value=champ_ece,
+                challenger_value=cand_ece,
+                delta=ece_delta,
+                threshold=self.thresholds.max_ece_increase,
+                passed=ece_passed,
+            )
+        )
+
+        # 4. Cost comparison
+        cost_passed = cost_diff_pct <= self.thresholds.max_net_cost_increase_pct
+        comparisons.append(
+            MetricComparison(
+                metric_name="financial_cost_change_pct",
+                champion_value=champ_cost,
+                challenger_value=cand_cost,
+                delta=cost_diff_pct,
+                threshold=self.thresholds.max_net_cost_increase_pct,
+                passed=cost_passed,
+            )
+        )
+
+        # 5. Sub-population slice disparity
+        slice_disparities: dict[str, float] = {}
+        slice_passed = True
+        if slice_column and slice_column in holdout_dataset.features.columns:
+            slice_col_vals = holdout_dataset.features[slice_column].to_numpy()
+            slice_rep = evaluate_slices(
+                y_true, cand_probs, slice_col_vals, threshold=candidate_model.threshold
+            )
+            recalls = [r.recall for r in slice_rep.slices if r.count >= 5]
+            if len(recalls) >= 2:
+                disp = max(recalls) - min(recalls)
+                slice_disparities[f"{slice_column}_disparity"] = disp
+                if disp > self.thresholds.max_slice_disparity:
+                    slice_passed = False
+        elif "Amount" in holdout_dataset.features.columns:
+            amt = holdout_dataset.features["Amount"].to_numpy()
+            if len(amt) >= 10:
+                q33, q66 = np.percentile(amt, [33, 66])
+                amt_slices = np.where(amt <= q33, "low", np.where(amt <= q66, "medium", "high"))
+                slice_rep = evaluate_slices(
+                    y_true, cand_probs, amt_slices, threshold=candidate_model.threshold
+                )
+                recalls = [r.recall for r in slice_rep.slices if r.count >= 5]
+                if len(recalls) >= 2:
+                    disp = max(recalls) - min(recalls)
+                    slice_disparities["amount_bracket_disparity"] = disp
+                    if disp > self.thresholds.max_slice_disparity:
+                        slice_passed = False
+
+        if slice_disparities:
+            max_disp = max(slice_disparities.values())
+            comparisons.append(
+                MetricComparison(
+                    metric_name="max_slice_disparity",
+                    champion_value=0.0,
+                    challenger_value=max_disp,
+                    delta=max_disp,
+                    threshold=self.thresholds.max_slice_disparity,
+                    passed=slice_passed,
+                )
+            )
+
+        all_passed = all(comp.passed for comp in comparisons)
+        status = VerificationStatus.PASSED if all_passed else VerificationStatus.FAILED
+        failed_count = sum(1 for c in comparisons if not c.passed)
+        if all_passed:
+            summary = f"Candidate passed all {len(comparisons)} safety checks against champion."
+        else:
+            summary = f"Candidate failed {failed_count}/{len(comparisons)} safety checks."
+
+        cand_ver = str(candidate_model.metadata.get("model_version", "challenger"))
+        champ_ver = str(champion_model.metadata.get("model_version", "champion"))
+
+        return ChallengerVerificationReport(
+            status=status,
+            comparisons=comparisons,
+            slice_disparities=slice_disparities,
+            candidate_version=cand_ver,
+            champion_version=champ_ver,
+            summary=summary,
+            timestamp=time(),
         )
