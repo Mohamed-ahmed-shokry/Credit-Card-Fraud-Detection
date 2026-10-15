@@ -8,13 +8,16 @@ from tempfile import TemporaryDirectory
 
 import pytest
 
-from fraud_detection.data import ValidatedDataset
+from fraud_detection.data import ValidatedDataset, generate_synthetic_data
 from fraud_detection.feedback import (
     DelayedLabelRecord,
     DisputeType,
     LabelIngestionStore,
 )
+from fraud_detection.model import FraudModel
 from fraud_detection.retraining import (
+    ChallengerTrainer,
+    ChallengerTrainingResult,
     ChallengerVerificationReport,
     DatasetBuildError,
     MetricComparison,
@@ -305,3 +308,102 @@ def test_dataset_builder_from_audit_and_labels() -> None:
 
         with pytest.raises(DatasetBuildError, match="Labels file not found"):
             builder.build_from_audit_and_labels(audit_file, tmp_path / "missing_labels.jsonl")
+
+
+def test_challenger_trainer_training() -> None:
+    """Test ChallengerTrainer trains and evaluates a candidate FraudModel."""
+    raw_df = generate_synthetic_data(rows=250, fraud_rate=0.1, random_state=42)
+    features = raw_df.drop(columns=["Class"])
+    target = raw_df["Class"]
+    dataset = ValidatedDataset(features=features, target=target)
+
+    cfg = RetrainingConfig(
+        estimator="logistic_regression",
+        split_strategy="temporal",
+        time_column="Time",
+        test_size=0.2,
+        validation_size=0.2,
+        random_state=42,
+    )
+    trainer = ChallengerTrainer(cfg)
+    result = trainer.train(dataset, provenance={"trigger_id": "trig_001"})
+
+    assert isinstance(result, ChallengerTrainingResult)
+    assert isinstance(result.model, FraudModel)
+    assert result.model_version
+    assert result.dataset_fingerprint
+    assert result.training_duration_seconds > 0.0
+    assert "f1" in result.validation_metrics
+    assert "pr_auc" in result.validation_metrics
+    assert "f1" in result.test_metrics
+    assert "pr_auc" in result.test_metrics
+
+    # Test serialization
+    data = result.to_dict()
+    assert data["model_version"] == result.model_version
+    assert "validation_metrics" in data
+    assert "test_metrics" in data
+    assert "config" in data
+
+
+def test_challenger_trainer_hyperparameters() -> None:
+    """Test ChallengerTrainer with custom hyperparameters."""
+    raw_df = generate_synthetic_data(rows=250, fraud_rate=0.1, random_state=42)
+    dataset = ValidatedDataset(features=raw_df.drop(columns=["Class"]), target=raw_df["Class"])
+
+    cfg = RetrainingConfig(
+        estimator="hist_gradient_boosting",
+        split_strategy="stratified",
+        test_size=0.2,
+        validation_size=0.2,
+        hyperparameters={
+            "max_depth": 3,
+            "learning_rate": 0.05,
+            "calibration_method": "none",
+        },
+    )
+    trainer = ChallengerTrainer(cfg)
+    result = trainer.train(dataset)
+    assert isinstance(result.model, FraudModel)
+    assert "HistGradientBoosting" in str(result.model.metadata.get("estimator"))
+
+
+def test_challenger_trainer_invalid_configs() -> None:
+    """Test ChallengerTrainer error handling for unsupported configurations."""
+    raw_df = generate_synthetic_data(rows=250, fraud_rate=0.1, random_state=42)
+    dataset = ValidatedDataset(features=raw_df.drop(columns=["Class"]), target=raw_df["Class"])
+
+    # Unsupported estimator
+    bad_est = ChallengerTrainer(RetrainingConfig(estimator="unsupported_estimator"))
+    with pytest.raises(RetrainingError, match="Unsupported estimator type"):
+        bad_est.train(dataset)
+
+    # Unsupported split strategy
+    bad_split = ChallengerTrainer(RetrainingConfig(split_strategy="invalid_split"))
+    with pytest.raises(RetrainingError, match="Unsupported split strategy"):
+        bad_split.train(dataset)
+
+    # Unsupported calibration method
+    bad_cal = ChallengerTrainer(
+        RetrainingConfig(hyperparameters={"calibration_method": "invalid_cal"})
+    )
+    with pytest.raises(RetrainingError, match="Unsupported calibration method"):
+        bad_cal.train(dataset)
+
+
+def test_challenger_trainer_training_failure() -> None:
+    """Test ChallengerTrainer handles underlying training failures gracefully."""
+    # Build dataset where one split class is too small for calibration folds
+    raw_df = generate_synthetic_data(rows=200, fraud_rate=0.01, random_state=42)
+    # Only ~2 fraud cases across entire dataset; 3-fold CV inside split will fail
+    dataset = ValidatedDataset(features=raw_df.drop(columns=["Class"]), target=raw_df["Class"])
+
+    trainer = ChallengerTrainer(
+        RetrainingConfig(
+            test_size=0.3,
+            validation_size=0.3,
+            hyperparameters={"calibration_folds": 5},
+        )
+    )
+    with pytest.raises(RetrainingError, match="Challenger model training failed"):
+        trainer.train(dataset)
