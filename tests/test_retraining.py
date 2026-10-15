@@ -16,6 +16,7 @@ from fraud_detection.feedback import (
 )
 from fraud_detection.model import FraudModel
 from fraud_detection.retraining import (
+    ATTESTATION_FILENAME,
     ChallengerSafetyVerifier,
     ChallengerTrainer,
     ChallengerTrainingResult,
@@ -31,6 +32,12 @@ from fraud_detection.retraining import (
     SafetyGatingThresholds,
     VerificationError,
     VerificationStatus,
+    export_certified_candidate,
+    verify_certified_candidate,
+)
+from fraud_detection.signing import (
+    load_public_key,
+    write_keypair,
 )
 
 
@@ -550,3 +557,140 @@ def test_challenger_safety_verifier_custom_slice_column() -> None:
 
     assert report.status == VerificationStatus.PASSED
     assert "channel_disparity" in report.slice_disparities
+
+
+def test_export_certified_candidate_unsigned_and_verify() -> None:
+    """Test candidate export and verification without signature."""
+    raw_df = generate_synthetic_data(rows=300, fraud_rate=0.1, random_state=42)
+    dataset = ValidatedDataset(features=raw_df.drop(columns=["Class"]), target=raw_df["Class"])
+
+    trainer = ChallengerTrainer(RetrainingConfig(estimator="logistic_regression"))
+    cand_res = trainer.train(dataset)
+
+    with TemporaryDirectory() as tmp_dir:
+        out_dir = Path(tmp_dir) / "candidate_artifact"
+        attestation_file = export_certified_candidate(cand_res, out_dir)
+
+        assert attestation_file.is_file()
+        assert (out_dir / "model.joblib").is_file()
+        assert (out_dir / "manifest.json").is_file()
+        assert (out_dir / "metadata.json").is_file()
+
+        # Without signature required, it passes
+        verified, msg, att = verify_certified_candidate(out_dir, require_signature=False)
+        assert verified is True
+        assert "certified and verified successfully" in msg
+        assert att["dataset_fingerprint"] == cand_res.dataset_fingerprint
+        assert "model.joblib" in att["files"]
+
+        # With signature required, it rejects unsigned
+        verified, msg, att = verify_certified_candidate(out_dir, require_signature=True)
+        assert verified is False
+        assert "signature is required" in msg
+
+
+def test_export_certified_candidate_signed_and_tamper_detection() -> None:
+    """Test signed candidate export and tampering detection."""
+    raw_df = generate_synthetic_data(rows=300, fraud_rate=0.1, random_state=42)
+    dataset = ValidatedDataset(features=raw_df.drop(columns=["Class"]), target=raw_df["Class"])
+
+    trainer = ChallengerTrainer(RetrainingConfig(estimator="logistic_regression"))
+    cand_res = trainer.train(dataset)
+
+    with TemporaryDirectory() as tmp_dir:
+        key_dir = Path(tmp_dir) / "keys"
+        key_dir.mkdir()
+        priv_pem = key_dir / "ed25519_private.pem"
+        pub_pem = key_dir / "ed25519_public.pem"
+        write_keypair(priv_pem, pub_pem)
+
+        out_dir = Path(tmp_dir) / "candidate_artifact"
+        export_certified_candidate(cand_res, out_dir, signing_key_path=priv_pem)
+
+        trusted_pub = load_public_key(pub_pem)
+
+        # 1. Valid signed artifact verifies
+        verified, msg, att = verify_certified_candidate(
+            out_dir, trusted_public_key=trusted_pub, require_signature=True
+        )
+        assert verified is True
+        assert "signature" in att
+
+        # 2. Tampering with model weights fails file hash check
+        model_file = out_dir / "model.joblib"
+        original_bytes = model_file.read_bytes()
+        model_file.write_bytes(original_bytes + b"\x00")
+
+        verified, msg, _ = verify_certified_candidate(
+            out_dir, trusted_public_key=trusted_pub, require_signature=True
+        )
+        assert verified is False
+        assert "failed" in msg or "mismatch" in msg
+
+        # Restore model
+        model_file.write_bytes(original_bytes)
+
+        # 3. Tampering with attestation digest fails digest verification
+        att_file = out_dir / ATTESTATION_FILENAME
+        att_data = json.loads(att_file.read_text(encoding="utf-8"))
+        att_data["attestation_digest"] = "bad" * 16
+        att_file.write_text(json.dumps(att_data), encoding="utf-8")
+
+        verified, msg, _ = verify_certified_candidate(
+            out_dir, trusted_public_key=trusted_pub, require_signature=True
+        )
+        assert verified is False
+        assert "Tampered attestation digest" in msg
+
+
+def test_export_certified_candidate_failed_status_rejection() -> None:
+    """Test candidate with failed verification report is rejected by verify."""
+    raw_df = generate_synthetic_data(rows=300, fraud_rate=0.1, random_state=42)
+    dataset = ValidatedDataset(features=raw_df.drop(columns=["Class"]), target=raw_df["Class"])
+
+    trainer = ChallengerTrainer(RetrainingConfig(estimator="logistic_regression"))
+    cand_res = trainer.train(dataset)
+
+    # Synthetic failed report
+    failed_rep = ChallengerVerificationReport(
+        status=VerificationStatus.FAILED,
+        comparisons=[
+            MetricComparison(
+                metric_name="pr_auc",
+                champion_value=0.9,
+                challenger_value=0.5,
+                delta=-0.4,
+                threshold=-0.01,
+                passed=False,
+            )
+        ],
+        slice_disparities={},
+        candidate_version="v2",
+        champion_version="v1",
+        summary="Failed safety checks",
+        timestamp=1000.0,
+    )
+
+    with TemporaryDirectory() as tmp_dir:
+        out_dir = Path(tmp_dir) / "candidate_artifact"
+        export_certified_candidate(cand_res, out_dir, verification_report=failed_rep)
+
+        verified, msg, att = verify_certified_candidate(out_dir, require_signature=False)
+        assert verified is False
+        assert "expected 'PASSED'" in msg
+        assert att["status"] == "failed"
+
+
+def test_verify_certified_candidate_edge_cases() -> None:
+    """Test missing directory, missing attestation, or corrupt attestation."""
+    with TemporaryDirectory() as tmp_dir:
+        nonexistent = Path(tmp_dir) / "does_not_exist"
+        verified, msg, _ = verify_certified_candidate(nonexistent)
+        assert verified is False
+        assert "does not exist" in msg
+
+        empty_dir = Path(tmp_dir) / "empty"
+        empty_dir.mkdir()
+        verified, msg, _ = verify_certified_candidate(empty_dir)
+        assert verified is False
+        assert "failed" in msg or "Missing" in msg
