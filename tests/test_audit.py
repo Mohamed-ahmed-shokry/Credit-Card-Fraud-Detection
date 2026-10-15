@@ -19,7 +19,9 @@ from fraud_detection.audit import (
     _is_luhn_valid,
     _mask_pans_in_string,
     backtest_audit_policy,
+    build_challenger_retrained_audit_event,
     build_delayed_label_audit_event,
+    build_model_promoted_audit_event,
     build_pipeline_chaos_audit_event,
     build_pipeline_replay_audit_event,
     build_promotion_audit_event,
@@ -1064,3 +1066,93 @@ def test_build_retraining_trigger_audit_event() -> None:
     )
     assert event_dict.payload["trigger_id"] == "trig_dict_2"
     assert "metadata" not in event_dict.payload
+
+
+def test_build_challenger_retrained_audit_event_passed_and_rejected() -> None:
+    """Test challenger retrained audit event creation for both passing and rejected runs."""
+    cand_dict = {
+        "model_version": "cand_v2",
+        "dataset_fingerprint": "fp_retrain_123",
+        "training_duration_seconds": 12.34,
+        "validation_metrics": {"pr_auc": 0.88, "f1": 0.82},
+        "test_metrics": {"pr_auc": 0.87, "f1": 0.81},
+        "config": {"hyperparameters": {"regularization": 0.5}},
+    }
+    pass_report = {
+        "status": "passed",
+        "candidate_version": "cand_v2",
+        "champion_version": "champ_v1",
+        "summary": "Passed all safety gates",
+    }
+
+    # 1. Successful retraining run with attestation
+    event_pass = build_challenger_retrained_audit_event(
+        candidate_result=cand_dict,
+        verification_report=pass_report,
+        attestation_digest="sha256:abc1234567890",
+        metadata={"user": "mlops_agent", "api_key": "secret_key_123"},
+    )
+    assert event_pass.event_type == "fraud.retraining.completed"
+    assert event_pass.model_version == "cand_v2"
+    assert event_pass.dataset_fingerprint == "fp_retrain_123"
+    assert event_pass.payload["training_duration_seconds"] == 12.34
+    assert event_pass.payload["verification_status"] == "passed"
+    assert event_pass.payload["is_certified"] is True
+    assert event_pass.payload["attestation_digest"] == "sha256:abc1234567890"
+
+    # Redaction check
+    redacted = event_pass.to_dict(redact=True)
+    assert redacted["payload"]["metadata"]["user"] == "mlops_agent"
+    assert redacted["payload"]["metadata"]["api_key"] == "[REDACTED]"
+
+    # 2. Rejected retraining run
+    fail_report = {
+        "status": "failed",
+        "candidate_version": "cand_v3",
+        "champion_version": "champ_v1",
+        "summary": "Degraded recall",
+    }
+    event_fail = build_challenger_retrained_audit_event(
+        candidate_result=cand_dict,
+        verification_report=fail_report,
+    )
+    assert event_fail.event_type == "fraud.retraining.rejected"
+    assert event_fail.payload["verification_status"] == "failed"
+    assert event_fail.payload["is_certified"] is False
+
+
+def test_build_model_promoted_audit_event_full_and_canary() -> None:
+    """Test model promotion audit event for full rollout and canary shift."""
+    # 1. Full promotion
+    event_full = build_model_promoted_audit_event(
+        previous_champion_version="champ_v1",
+        new_champion_version="cand_v2",
+        promotion_type="full",
+        canary_percentage=100.0,
+        attestation_digest="digest_v2",
+        promoted_by="release_pipeline",
+        dataset_fingerprint="fp_promoted_999",
+        metadata={"actor": "deployer", "auth_token": "token_abc"},
+    )
+    assert event_full.event_type == "fraud.model.promoted"
+    assert event_full.model_version == "cand_v2"
+    assert event_full.dataset_fingerprint == "fp_promoted_999"
+    assert event_full.payload["previous_champion_version"] == "champ_v1"
+    assert event_full.payload["new_champion_version"] == "cand_v2"
+    assert event_full.payload["canary_percentage"] == 100.0
+    assert event_full.payload["promoted_by"] == "release_pipeline"
+
+    redacted = event_full.to_dict(redact=True)
+    assert redacted["payload"]["metadata"]["actor"] == "deployer"
+    assert redacted["payload"]["metadata"]["auth_token"] == "[REDACTED]"  # noqa: S105
+
+    # 2. Canary update
+    event_canary = build_model_promoted_audit_event(
+        previous_champion_version="champ_v1",
+        new_champion_version="cand_v2",
+        promotion_type="canary",
+        canary_percentage=20.0,
+    )
+    assert event_canary.event_type == "fraud.canary.updated"
+    assert event_canary.payload["promotion_type"] == "canary"
+    assert event_canary.payload["canary_percentage"] == 20.0
