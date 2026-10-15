@@ -5,14 +5,18 @@ from __future__ import annotations
 import json
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from enum import StrEnum
+from hashlib import sha256
 from pathlib import Path
 from time import time
 from typing import Any
 
 import numpy as np
 import pandas as pd
+from nacl.signing import SigningKey, VerifyKey
 
+from fraud_detection import __version__
 from fraud_detection.data import ValidatedDataset
 from fraud_detection.evaluation import evaluate_predictions, evaluate_slices
 from fraud_detection.feedback import (
@@ -20,14 +24,24 @@ from fraud_detection.feedback import (
     LabelIngestionStore,
 )
 from fraud_detection.model import (
+    MANIFEST_FILENAME,
     CalibrationMethod,
     EstimatorType,
     FraudModel,
     SplitStrategy,
     TrainingConfig,
+    save_model,
     train_model,
+    validate_artifact,
+    verify_attestation,
 )
 from fraud_detection.recalibration import compute_calibration_diagnostics
+from fraud_detection.signing import (
+    load_private_key,
+    load_public_key,
+    sign_payload,
+    verify_attestation_signature,
+)
 
 
 class RetrainingError(Exception):
@@ -767,3 +781,235 @@ class ChallengerSafetyVerifier:
             summary=summary,
             timestamp=time(),
         )
+
+
+ATTESTATION_FILENAME = "attestation.json"
+
+
+def _compute_sha256(path: Path) -> str:
+    """Compute sha256 hex digest of a file in chunks."""
+    digest = sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(65536):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def export_certified_candidate(
+    candidate_result: ChallengerTrainingResult,
+    output_dir: Path | str,
+    *,
+    verification_report: ChallengerVerificationReport | None = None,
+    signing_key_path: Path | str | None = None,
+    signing_key: SigningKey | None = None,
+    signer: str = "fraud-retraining-pipeline",
+    strict: bool = False,
+) -> Path:
+    """Persist a candidate model artifact, compute digests, and sign an attestation manifest.
+
+    Parameters
+    ----------
+    candidate_result : ChallengerTrainingResult
+        Fitted candidate model result from ChallengerTrainer.
+    output_dir : Path | str
+        Destination directory to persist the certified artifact bundle.
+    verification_report : ChallengerVerificationReport | None
+        Optional safety gating report from ChallengerSafetyVerifier.
+    signing_key_path : Path | str | None
+        Path to an Ed25519 private key in PEM format.
+    signing_key : SigningKey | None
+        Loaded Ed25519 private key instance.
+    signer : str
+        Entity or pipeline identifier signing the attestation.
+    strict : bool
+        Whether to enforce strict artifact validation (e.g., mandatory git commit provenance).
+
+    Returns
+    -------
+    Path
+        Path to the generated attestation manifest (attestation.json).
+    """
+    destination = Path(output_dir)
+    destination.mkdir(parents=True, exist_ok=True)
+
+    # 1. Persist model, metadata, and manifest via save_model
+    save_model(candidate_result.model, destination)
+
+    manifest_path = destination / MANIFEST_FILENAME
+    if not manifest_path.is_file():
+        raise RetrainingError(f"Model manifest was not created in {destination}")
+
+    try:
+        manifest_data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        files_map = dict(manifest_data.get("files", {}))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RetrainingError(
+            f"Failed to load artifact manifest from {manifest_path}: {exc}"
+        ) from exc
+
+    # 2. Validate artifact integrity
+    val_report = validate_artifact(destination, strict=strict)
+    if not val_report.valid:
+        error_msgs = "; ".join(val_report.errors)
+        raise RetrainingError(f"Candidate artifact failed integrity validation: {error_msgs}")
+
+    # 3. Construct attestation payload
+    status_str = (
+        verification_report.status.value
+        if verification_report is not None
+        else VerificationStatus.PASSED.value
+    )
+
+    payload: dict[str, Any] = {
+        "artifact_path": str(destination.resolve()),
+        "artifact_version": candidate_result.model.artifact_version,
+        "attestation_schema": "1.0",
+        "dataset_fingerprint": candidate_result.dataset_fingerprint,
+        "files": files_map,
+        "hyperparameters": dict(candidate_result.config.hyperparameters),
+        "metrics": dict(candidate_result.test_metrics),
+        "status": status_str,
+        "timestamp": datetime.now(UTC).isoformat(),
+        "verification_report": (
+            verification_report.to_dict() if verification_report is not None else None
+        ),
+        "verifier": {
+            "code_version": __version__,
+            "signer": signer,
+        },
+    }
+
+    try:
+        canonical_body = json.dumps(payload, allow_nan=False, sort_keys=True, separators=(",", ":"))
+    except (TypeError, ValueError) as exc:
+        raise RetrainingError(
+            f"Failed to canonically serialize attestation payload: {exc}"
+        ) from exc
+
+    attestation_digest = sha256(canonical_body.encode("utf-8")).hexdigest()
+
+    full_attestation: dict[str, Any] = dict(payload)
+    full_attestation["attestation_digest"] = attestation_digest
+
+    # 4. Sign if signing key is provided
+    key_to_use: SigningKey | None = signing_key
+    if key_to_use is None and signing_key_path is not None:
+        key_to_use = load_private_key(signing_key_path)
+
+    if key_to_use is not None:
+        full_attestation["signature"] = sign_payload(full_attestation, key_to_use)
+
+    # 5. Atomically write attestation.json
+    attestation_path = destination / ATTESTATION_FILENAME
+    temp_attestation = destination / f".{ATTESTATION_FILENAME}.tmp"
+    try:
+        temp_attestation.write_text(
+            json.dumps(full_attestation, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        temp_attestation.replace(attestation_path)
+    finally:
+        temp_attestation.unlink(missing_ok=True)
+
+    return attestation_path
+
+
+def verify_certified_candidate(
+    artifact_dir: Path | str,
+    *,
+    trusted_public_key_path: Path | str | None = None,
+    trusted_public_key: VerifyKey | None = None,
+    require_signature: bool = True,
+    strict: bool = False,
+) -> tuple[bool, str, dict[str, Any]]:
+    """Verify cryptographic attestation, model weights sha256, and lineage integrity.
+
+    Parameters
+    ----------
+    artifact_dir : Path | str
+        Path to candidate model artifact directory.
+    trusted_public_key_path : Path | str | None
+        Path to trusted Ed25519 public key in PEM format.
+    trusted_public_key : VerifyKey | None
+        Loaded trusted Ed25519 VerifyKey instance.
+    require_signature : bool
+        If True, rejects unsigned artifacts. Defaults to True.
+    strict : bool
+        Whether to enforce strict artifact validation (e.g. mandatory git commit provenance).
+
+    Returns
+    -------
+    tuple[bool, str, dict[str, Any]]
+        (is_verified, reason_message, attestation_dict)
+    """
+    destination = Path(artifact_dir)
+    if not destination.is_dir():
+        return False, f"Artifact directory does not exist: {destination}", {}
+
+    # 1. Validate underlying artifact (manifest, model.joblib, metadata.json)
+    art_report = validate_artifact(destination, strict=strict)
+    if not art_report.valid:
+        err_msg = "; ".join(art_report.errors)
+        return False, f"Artifact integrity check failed: {err_msg}", {}
+
+    # 2. Check attestation manifest exists
+    attestation_path = destination / ATTESTATION_FILENAME
+    if not attestation_path.is_file():
+        return False, f"Attestation file missing: {attestation_path}", {}
+
+    try:
+        raw_attestation: object = json.loads(attestation_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        return False, f"Failed to parse attestation JSON: {exc}", {}
+
+    if not isinstance(raw_attestation, dict):
+        return False, "Attestation root must be a JSON object", {}
+
+    attestation: dict[str, Any] = raw_attestation
+
+    # 3. Verify attestation digest
+    digest_ok, digest_msg = verify_attestation(attestation)
+    if not digest_ok:
+        return False, f"Tampered attestation digest: {digest_msg}", attestation
+
+    # 4. Verify file hashes match disk contents
+    files_map = attestation.get("files")
+    if not isinstance(files_map, dict) or not files_map:
+        return False, "Attestation must declare non-empty files map", attestation
+
+    for fname, expected_hash in files_map.items():
+        fpath = destination / fname
+        if not fpath.is_file():
+            return False, f"Attested file missing on disk: {fname}", attestation
+        actual_hash = _compute_sha256(fpath)
+        if actual_hash != expected_hash:
+            return (
+                False,
+                f"File hash mismatch for {fname}: expected {expected_hash}, got {actual_hash}",
+                attestation,
+            )
+
+    # 5. Verify cryptographic signature
+    envelope = attestation.get("signature")
+    if require_signature and not envelope:
+        return False, "Attestation is unsigned but signature is required.", attestation
+
+    if envelope is not None:
+        key: VerifyKey | None = trusted_public_key
+        if key is None and trusted_public_key_path is not None:
+            try:
+                key = load_public_key(trusted_public_key_path)
+            except (OSError, ValueError, TypeError) as exc:
+                return False, f"Failed to load trusted public key: {exc}", attestation
+
+        if key is not None:
+            sig_ok, sig_msg = verify_attestation_signature(attestation, key)
+            if not sig_ok:
+                return False, f"Attestation signature verification failed: {sig_msg}", attestation
+
+    # 6. Verify status
+    status = attestation.get("status")
+    if status not in {"PASSED", "passed", "verified"}:
+        return False, f"Attestation status is '{status}', expected 'PASSED'", attestation
+
+    return True, "Candidate artifact certified and verified successfully.", attestation
