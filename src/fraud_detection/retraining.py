@@ -17,6 +17,14 @@ from fraud_detection.feedback import (
     DelayedLabelRecord,
     LabelIngestionStore,
 )
+from fraud_detection.model import (
+    CalibrationMethod,
+    EstimatorType,
+    FraudModel,
+    SplitStrategy,
+    TrainingConfig,
+    train_model,
+)
 
 
 class RetrainingError(Exception):
@@ -423,3 +431,121 @@ class RetrainingDatasetBuilder:
                         )
 
         return self.build_from_records(retraining_records, feature_names=feature_names)
+
+
+@dataclass(frozen=True)
+class ChallengerTrainingResult:
+    """Result of an automated challenger model training run."""
+
+    model: FraudModel
+    config: RetrainingConfig
+    validation_metrics: dict[str, float]
+    test_metrics: dict[str, float]
+    model_version: str
+    dataset_fingerprint: str
+    training_duration_seconds: float
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert training result summary to JSON-serializable dictionary."""
+        return {
+            "model_version": self.model_version,
+            "dataset_fingerprint": self.dataset_fingerprint,
+            "training_duration_seconds": round(float(self.training_duration_seconds), 4),
+            "validation_metrics": {
+                k: round(float(v), 6) for k, v in self.validation_metrics.items()
+            },
+            "test_metrics": {k: round(float(v), 6) for k, v in self.test_metrics.items()},
+            "config": self.config.to_dict(),
+        }
+
+
+class ChallengerTrainer:
+    """Automates model training, hyperparameter mapping, and threshold tuning for challengers."""
+
+    def __init__(self, config: RetrainingConfig | None = None) -> None:
+        self.config = config or RetrainingConfig()
+
+    def _build_training_config(self) -> TrainingConfig:
+        """Map RetrainingConfig to model.TrainingConfig."""
+        try:
+            estimator_type = EstimatorType(self.config.estimator)
+        except ValueError as exc:
+            raise RetrainingError(
+                f"Unsupported estimator type: '{self.config.estimator}'."
+            ) from exc
+
+        try:
+            split_strategy = SplitStrategy(self.config.split_strategy)
+        except ValueError as exc:
+            raise RetrainingError(
+                f"Unsupported split strategy: '{self.config.split_strategy}'."
+            ) from exc
+
+        hp = dict(self.config.hyperparameters)
+        cal_method_str = str(hp.get("calibration_method", "sigmoid"))
+        try:
+            cal_method = CalibrationMethod(cal_method_str)
+        except ValueError as exc:
+            raise RetrainingError(f"Unsupported calibration method: '{cal_method_str}'.") from exc
+
+        return TrainingConfig(
+            test_size=self.config.test_size,
+            validation_size=self.config.validation_size,
+            random_state=self.config.random_state,
+            estimator=estimator_type,
+            split_strategy=split_strategy,
+            time_column=self.config.time_column,
+            temporal_gap=self.config.holdout_gap_seconds,
+            max_iterations=int(hp.get("max_iterations", 1_000)),
+            regularization=float(hp.get("regularization", 1.0)),
+            calibration_method=cal_method,
+            calibration_folds=int(hp.get("calibration_folds", 3)),
+            n_estimators=int(hp.get("n_estimators", 100)),
+            max_depth=hp.get("max_depth"),
+            learning_rate=float(hp.get("learning_rate", 0.1)),
+            tune_tiered=bool(hp.get("tune_tiered", False)),
+            review_threshold=hp.get("review_threshold"),
+            deny_threshold=hp.get("deny_threshold"),
+        )
+
+    def train(
+        self,
+        dataset: ValidatedDataset,
+        *,
+        provenance: dict[str, str] | None = None,
+    ) -> ChallengerTrainingResult:
+        """Train and evaluate candidate model on the provided dataset."""
+        training_config = self._build_training_config()
+        start_time = time()
+        try:
+            model = train_model(dataset, config=training_config, provenance=provenance)
+        except Exception as exc:
+            raise RetrainingError(f"Challenger model training failed: {exc}") from exc
+        duration = time() - start_time
+
+        metadata = model.metadata
+        val_metrics = {
+            k: float(v)
+            for k, v in metadata.get("validation_metrics", {}).items()
+            if isinstance(v, (int, float))
+        }
+        test_metrics = {
+            k: float(v)
+            for k, v in metadata.get("test_metrics", {}).items()
+            if isinstance(v, (int, float))
+        }
+
+        if "average_precision" in val_metrics and "pr_auc" not in val_metrics:
+            val_metrics["pr_auc"] = val_metrics["average_precision"]
+        if "average_precision" in test_metrics and "pr_auc" not in test_metrics:
+            test_metrics["pr_auc"] = test_metrics["average_precision"]
+
+        return ChallengerTrainingResult(
+            model=model,
+            config=self.config,
+            validation_metrics=val_metrics,
+            test_metrics=test_metrics,
+            model_version=str(metadata.get("model_version", "challenger")),
+            dataset_fingerprint=str(metadata.get("dataset_fingerprint", "")),
+            training_duration_seconds=duration,
+        )
