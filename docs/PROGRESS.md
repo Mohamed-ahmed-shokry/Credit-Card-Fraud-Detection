@@ -7,7 +7,7 @@
 
 ## Task Status
 - [x] Task 1: Create `src/fraud_detection/retraining.py` with domain data models (`RetrainingConfig`, `ChallengerVerificationReport`, `RetrainingStatus`, `RetrainingError`) and `RetrainingDatasetBuilder` with unit tests in `tests/test_retraining.py`.
-- [ ] Task 2: Implement `ChallengerTrainer` with hyperparameter configuration and threshold tuning in `retraining.py` with tests in `tests/test_retraining.py`.
+- [x] Task 2: Implement `ChallengerTrainer` with hyperparameter configuration and threshold tuning in `retraining.py` with tests in `tests/test_retraining.py`.
 - [ ] Task 3: Implement `ChallengerSafetyVerifier` evaluating PR-AUC, recall, ECE, slice disparity, and cost vs. champion with tests in `tests/test_retraining.py`.
 - [ ] Task 4: Implement certified artifact export and attestation signing (`export_certified_candidate`) in `retraining.py` with tests in `tests/test_retraining.py`.
 - [ ] Task 5: Implement audit event builders (`build_challenger_retrained_audit_event`, `build_model_promoted_audit_event`) in `audit.py` with tests in `tests/test_audit.py`.
@@ -19,7 +19,7 @@
 | Criterion | Status | Evidence |
 |-----------|--------|----------|
 | AC-1 (Retraining Dataset Materialization) | **Verified** | Verified in `tests/test_retraining.py`: `RetrainingDatasetBuilder` builds `ValidatedDataset` from `RetrainingRecord` and audit logs + labels with temporal filtering, capacity checks, and multi-class assertions. |
-| AC-2 (Automated Challenger Training & Tuning) | Pending | — |
+| AC-2 (Automated Challenger Training & Tuning) | **Verified** | Verified in `tests/test_retraining.py`: `ChallengerTrainer` maps hyperparameters, handles stratified/temporal CV splits, tunes decision thresholds, and records training duration and lineage metadata. |
 | AC-3 (Multi-Faceted Challenger Verification & Safety Gating) | Pending | — |
 | AC-4 (Cryptographic Attestation & Lineage Signing) | Pending | — |
 | AC-5 (Zero-Downtime Hot-Reload & Safe Canary Promotion) | Pending | — |
