@@ -5127,14 +5127,17 @@ def test_cli_recalibrate_error_handling(
 
 
 def test_cli_route_eval_help() -> None:
+    import re
+
     res = runner.invoke(app, ["route-eval", "--help"])
     assert res.exit_code == 0
-    assert "--champion" in res.output
-    assert "--challenger" in res.output
-    assert "--data" in res.output
-    assert "Evaluate decision discrepancies" in res.output
-    assert "--json" in res.output
-    assert "--output" in res.output
+    clean_output = re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", res.output)
+    assert "--champion" in clean_output
+    assert "--challenger" in clean_output
+    assert "--data" in clean_output
+    assert "Evaluate decision discrepancies" in clean_output
+    assert "--json" in clean_output
+    assert "--output" in clean_output
 
 
 def test_cli_route_eval_csv_and_json(
