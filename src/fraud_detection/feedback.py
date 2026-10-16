@@ -104,12 +104,17 @@ class DelayedLabelRecord:
             label_source = (
                 raw_source if isinstance(raw_source, LabelSource) else LabelSource(str(raw_source))
             )
+            raw_fraud = data.get("is_fraud", True)
+            if isinstance(raw_fraud, str):
+                is_fraud = raw_fraud.strip().lower() in {"true", "1", "yes", "t"}
+            else:
+                is_fraud = bool(raw_fraud)
             return cls(
                 transaction_id=str(data["transaction_id"]),
                 event_timestamp=float(data["event_timestamp"]),
                 label_timestamp=float(data["label_timestamp"]),
                 dispute_type=dispute_type,
-                is_fraud=bool(data.get("is_fraud", True)),
+                is_fraud=is_fraud,
                 amount=float(data.get("amount", 0.0)),
                 label_source=label_source,
                 entity_key=str(data["entity_key"]) if data.get("entity_key") is not None else None,

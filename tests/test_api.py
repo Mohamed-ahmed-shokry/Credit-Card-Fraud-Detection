@@ -64,8 +64,10 @@ from fraud_detection.features import (
 from fraud_detection.model import FraudModel, save_model, train_model, validate_artifact
 from fraud_detection.recalibration import PlattRecalibrator
 from fraud_detection.retraining import (
+    ATTESTATION_FILENAME,
     ChallengerTrainer,
     RetrainingConfig,
+    RetrainingError,
     export_certified_candidate,
 )
 from fraud_detection.routing import TrafficSplitStrategy
@@ -4306,3 +4308,252 @@ def test_api_retraining_trigger_endpoint(tmp_path: Path) -> None:
         app.state.audit_log_path = str(tmp_path / "empty_log.jsonl")
         res_empty = client.post("/v1/retraining/trigger", json={"trigger_reason": "test_failure"})
         assert res_empty.status_code == 400
+
+
+def test_api_models_reload_and_promote_error_branches(tmp_path: Path) -> None:
+    """Test error handling in reload, promote, and trigger endpoints."""
+    raw_df = generate_synthetic_data(rows=200, fraud_rate=0.1, random_state=42)
+    dataset = ValidatedDataset(features=raw_df.drop(columns=["Class"]), target=raw_df["Class"])
+    trainer = ChallengerTrainer(RetrainingConfig(estimator="logistic_regression"))
+    cand = trainer.train(dataset)
+    m_dir = tmp_path / "model"
+    export_certified_candidate(cand, m_dir)
+
+    app = create_app(model=cand.model, model_path=m_dir)
+    with TestClient(app) as client:
+        # 1. Attestation failure on reload
+        res_reload_att = client.post(
+            "/v1/models/reload",
+            json={"model_path": str(m_dir), "require_attestation": True},
+        )
+        assert res_reload_att.status_code == 400
+        assert "Attestation verification failed" in res_reload_att.json()["detail"]
+
+        # 2. Corrupt model on reload
+        corrupt_dir = tmp_path / "corrupt_model"
+        corrupt_dir.mkdir()
+        (corrupt_dir / "model.joblib").write_text("junk")
+        (corrupt_dir / "manifest.json").write_text("{}")
+        res_reload_corrupt = client.post(
+            "/v1/models/reload",
+            json={"model_path": str(corrupt_dir)},
+        )
+        assert res_reload_corrupt.status_code == 400
+
+        # 3. Attestation failure on promote
+        res_promote_att = client.post(
+            "/v1/models/promote",
+            json={"candidate_path": str(m_dir), "require_attestation": True},
+        )
+        assert res_promote_att.status_code == 400
+        assert "Candidate verification gate failed" in res_promote_att.json()["detail"]
+
+        # 4. Corrupt candidate on promote
+        res_promote_corrupt = client.post(
+            "/v1/models/promote",
+            json={"candidate_path": str(corrupt_dir)},
+        )
+        assert res_promote_corrupt.status_code == 400
+
+
+def test_api_models_promote_canary_creates_router(tmp_path: Path) -> None:
+    """Test /v1/models/promote with canary creates router when router is None."""
+    raw_df = generate_synthetic_data(rows=200, fraud_rate=0.1, random_state=42)
+    dataset = ValidatedDataset(features=raw_df.drop(columns=["Class"]), target=raw_df["Class"])
+    cand = ChallengerTrainer(RetrainingConfig(estimator="logistic_regression")).train(dataset)
+    m_dir = tmp_path / "model_canary"
+    export_certified_candidate(cand, m_dir)
+
+    app = create_app(model=cand.model, model_path=m_dir)
+    app.state.router = None  # Explicitly ensure router is None
+
+    with TestClient(app) as client:
+        res = client.post(
+            "/v1/models/promote",
+            json={
+                "candidate_path": str(m_dir),
+                "promotion_type": "canary",
+                "canary_percentage": 20.0,
+                "require_attestation": False,
+            },
+        )
+        assert res.status_code == 200
+        assert res.json()["canary_percentage"] == 20.0
+        assert app.state.router is not None
+
+
+def test_api_retraining_trigger_auto_promote_and_export(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test /v1/retraining/trigger handles auto_promote (canary & full) and candidate export."""
+    raw_df = generate_synthetic_data(rows=300, fraud_rate=0.1, random_state=42)
+    dataset = ValidatedDataset(features=raw_df.drop(columns=["Class"]), target=raw_df["Class"])
+    champ = ChallengerTrainer(RetrainingConfig(estimator="logistic_regression")).train(dataset)
+    m_dir = tmp_path / "champ_model"
+    export_certified_candidate(champ, m_dir)
+
+    # Prepare audit log and labels
+    audit_lines = []
+    labels = []
+    for idx, row in raw_df.iterrows():
+        tx_id = f"tx_{idx:04d}"
+        feat_dict = {c: float(row[c]) for c in raw_df.columns if c != "Class"}
+        is_fraud = int(row["Class"])
+        audit_lines.append(
+            json.dumps(
+                {
+                    "event_type": "scoring",
+                    "timestamp": 1000.0 + float(idx),
+                    "payload": {
+                        "predictions": [
+                            {
+                                "transaction_id": tx_id,
+                                "fraud_probability": 0.8 if is_fraud else 0.1,
+                                "decision": "deny" if is_fraud else "allow",
+                                "amount": float(row["Amount"]),
+                            }
+                        ],
+                        "features": [feat_dict],
+                    },
+                }
+            )
+        )
+        labels.append(
+            {
+                "transaction_id": tx_id,
+                "event_timestamp": 1000.0 + float(idx),
+                "label_timestamp": 1000.0 + float(idx) + 3600.0,
+                "dispute_type": "chargeback" if is_fraud else "friendly_fraud",
+                "is_fraud": bool(is_fraud),
+                "amount": float(row["Amount"]),
+            }
+        )
+    audit_log = tmp_path / "audit_retrain.jsonl"
+    audit_log.write_text("\n".join(audit_lines) + "\n", encoding="utf-8")
+
+    out_export = tmp_path / "cand_export"
+    app = create_app(model=champ.model, model_path=m_dir)
+    app.state.audit_log_path = str(audit_log)
+    app.state.router = None
+
+    with TestClient(app) as client:
+        # Clear champion model so candidate verification passes unconditionally
+        app.state.model = None
+
+        # Ingest labels
+        res_lbl = client.post("/v1/feedback/labels", json={"labels": labels})
+        assert res_lbl.status_code == 200
+
+        # 1. Trigger with auto_promote canary and output_dir
+        res_canary = client.post(
+            "/v1/retraining/trigger",
+            json={
+                "trigger_reason": "scheduled_weekly",
+                "auto_promote": True,
+                "promotion_type": "canary",
+                "canary_percentage": 15.0,
+                "output_dir": str(out_export),
+            },
+        )
+        assert res_canary.status_code == 200
+        data_canary = res_canary.json()
+        assert data_canary["promoted"] is True
+        assert data_canary["attestation_digest"] is not None
+        assert (out_export / ATTESTATION_FILENAME).is_file()
+        assert app.state.router is not None
+
+        # 2. Trigger with auto_promote direct / full
+        res_full = client.post(
+            "/v1/retraining/trigger",
+            json={
+                "trigger_reason": "manual_ad_hoc",
+                "auto_promote": True,
+                "promotion_type": "full",
+            },
+        )
+        assert res_full.status_code == 200
+        assert res_full.json()["promoted"] is True
+
+        # 3. Candidate export error during trigger is handled gracefully
+        import fraud_detection.api as api_mod
+
+        def mock_exp_fail(*_args: Any, **_kwargs: Any) -> Any:
+            raise RetrainingError("Export failure in trigger")
+
+        monkeypatch.setattr(api_mod, "export_certified_candidate", mock_exp_fail)
+        res_exp_fail = client.post(
+            "/v1/retraining/trigger",
+            json={
+                "trigger_reason": "test_export_err",
+                "output_dir": str(out_export / "fail"),
+            },
+        )
+        assert res_exp_fail.status_code == 200
+        assert res_exp_fail.json()["attestation_digest"] is None
+
+
+def test_api_retraining_trigger_trainer_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test /v1/retraining/trigger returns 400 when ChallengerTrainer raises an error."""
+    raw_df = generate_synthetic_data(rows=250, fraud_rate=0.1, random_state=42)
+    dataset = ValidatedDataset(features=raw_df.drop(columns=["Class"]), target=raw_df["Class"])
+    champ = ChallengerTrainer(RetrainingConfig(estimator="logistic_regression")).train(dataset)
+    m_dir = tmp_path / "champ_m"
+    export_certified_candidate(champ, m_dir)
+
+    audit_lines = []
+    labels = []
+    for idx, row in raw_df.iterrows():
+        tx_id = f"tx_{idx:04d}"
+        feat_dict = {c: float(row[c]) for c in raw_df.columns if c != "Class"}
+        is_fraud = int(row["Class"])
+        audit_lines.append(
+            json.dumps(
+                {
+                    "event_type": "scoring",
+                    "timestamp": 1000.0 + float(idx),
+                    "payload": {
+                        "predictions": [
+                            {
+                                "transaction_id": tx_id,
+                                "fraud_probability": 0.8 if is_fraud else 0.1,
+                                "decision": "deny" if is_fraud else "allow",
+                                "amount": float(row["Amount"]),
+                            }
+                        ],
+                        "features": [feat_dict],
+                    },
+                }
+            )
+        )
+        labels.append(
+            {
+                "transaction_id": tx_id,
+                "event_timestamp": 1000.0 + float(idx),
+                "label_timestamp": 1000.0 + float(idx) + 3600.0,
+                "dispute_type": "chargeback" if is_fraud else "friendly_fraud",
+                "is_fraud": bool(is_fraud),
+                "amount": float(row["Amount"]),
+            }
+        )
+    audit_log = tmp_path / "audit_err.jsonl"
+    audit_log.write_text("\n".join(audit_lines) + "\n", encoding="utf-8")
+
+    app = create_app(model=champ.model, model_path=m_dir)
+    app.state.audit_log_path = str(audit_log)
+
+    import fraud_detection.retraining as retrain_mod
+
+    def mock_train_fail(*_args: Any, **_kwargs: Any) -> Any:
+        raise RetrainingError("Simulated training crash")
+
+    monkeypatch.setattr(retrain_mod.ChallengerTrainer, "train", mock_train_fail)
+
+    with TestClient(app) as client:
+        res_lbl = client.post("/v1/feedback/labels", json={"labels": labels})
+        assert res_lbl.status_code == 200
+
+        res = client.post("/v1/retraining/trigger", json={"trigger_reason": "failing_train"})
+        assert res.status_code == 400
+        assert "Challenger training failed" in res.json()["detail"]

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+from hashlib import sha256
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import Any
 
 import pytest
 
@@ -14,7 +16,7 @@ from fraud_detection.feedback import (
     DisputeType,
     LabelIngestionStore,
 )
-from fraud_detection.model import FraudModel
+from fraud_detection.model import MANIFEST_FILENAME, FraudModel
 from fraud_detection.retraining import (
     ATTESTATION_FILENAME,
     ChallengerSafetyVerifier,
@@ -694,3 +696,344 @@ def test_verify_certified_candidate_edge_cases() -> None:
         verified, msg, _ = verify_certified_candidate(empty_dir)
         assert verified is False
         assert "failed" in msg or "Missing" in msg
+
+
+def test_retraining_dataset_builder_edge_cases(tmp_path: Path) -> None:
+    """Test feature NaN validation, comments, malformed JSON, and unmatched_as_legitimate."""
+    # 1. Feature NaN validation with min_training_samples=2
+    builder = RetrainingDatasetBuilder(
+        RetrainingConfig(min_training_samples=2, min_fraud_samples=1)
+    )
+    record_nan1 = RetrainingRecord(
+        transaction_id="tx_nan1",
+        event_timestamp=100.0,
+        label=0,
+        features={"Amount": float("nan")},
+    )
+    record_nan2 = RetrainingRecord(
+        transaction_id="tx_nan2",
+        event_timestamp=101.0,
+        label=1,
+        features={"Amount": 10.0},
+    )
+    with pytest.raises(DatasetBuildError, match="non-numeric or missing"):
+        builder.build_from_records([record_nan1, record_nan2])
+
+    # 2. Labels as sequence of DelayedLabelRecord and audit log with empty lines / comments
+    raw_df = generate_synthetic_data(rows=200, fraud_rate=0.1, random_state=42)
+    labels = [
+        DelayedLabelRecord(
+            transaction_id=f"tx_{i:04d}",
+            event_timestamp=1000.0 + float(i),
+            label_timestamp=2000.0 + float(i),
+            dispute_type="chargeback" if int(row["Class"]) else "friendly_fraud",
+            is_fraud=bool(int(row["Class"])),
+            amount=50.0,
+        )
+        for i, row in raw_df.iterrows()
+    ]
+    audit_file = tmp_path / "audit_mixed.jsonl"
+    lines = [
+        "",  # empty line
+        json.dumps({"event_type": "pipeline_cache", "timestamp": 999.0}),  # non-scoring
+    ]
+    for i, row in raw_df.iterrows():
+        feat = {c: float(row[c]) for c in raw_df.columns if c != "Class"}
+        lines.append(
+            json.dumps(
+                {
+                    "event_type": "scoring",
+                    "timestamp": 1000.0 + float(i),
+                    "payload": {
+                        "predictions": [
+                            {"transaction_id": f"tx_{i:04d}", "fraud_probability": 0.5}
+                        ],
+                        "features": [feat],
+                    },
+                }
+            )
+        )
+    # Add an unmatched scoring record
+    lines.append(
+        json.dumps(
+            {
+                "event_type": "scoring",
+                "timestamp": 9999.0,
+                "payload": {
+                    "predictions": [
+                        {"transaction_id": "tx_unmatched_999", "fraud_probability": 0.1}
+                    ],
+                    "features": [{c: 1.0 for c in raw_df.columns if c != "Class"}],
+                },
+            }
+        )
+    )
+    audit_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    # Build with unmatched_as_legitimate=True
+    ds = builder.build_from_audit_and_labels(audit_file, labels, unmatched_as_legitimate=True)
+    assert len(ds.features) == 201
+
+    # Malformed JSON in audit log raises DatasetBuildError
+    bad_log = tmp_path / "bad_audit.jsonl"
+    bad_log.write_text('{"event_type": \n', encoding="utf-8")
+    with pytest.raises(DatasetBuildError, match="Malformed audit event"):
+        builder.build_from_audit_and_labels(bad_log, labels)
+
+
+def test_challenger_safety_verifier_slice_disparity_branch() -> None:
+    """Test slice disparity exceeding thresholds with explicit column and Amount fallback."""
+    raw_df = generate_synthetic_data(rows=200, fraud_rate=0.1, random_state=42)
+    train_ds = ValidatedDataset(features=raw_df.drop(columns=["Class"]), target=raw_df["Class"])
+
+    trainer = ChallengerTrainer(RetrainingConfig(estimator="logistic_regression"))
+    cand = trainer.train(train_ds)
+    champ = trainer.train(train_ds)
+
+    # Holdout with explicit slice column
+    holdout_features = raw_df.drop(columns=["Class"]).copy()
+    holdout_features["channel"] = ["web" if i % 2 == 0 else "mobile" for i in range(len(raw_df))]
+    holdout_ds = ValidatedDataset(features=holdout_features, target=raw_df["Class"])
+
+    verifier = ChallengerSafetyVerifier(
+        SafetyGatingThresholds(max_slice_disparity=0.0001)  # Strict disparity threshold
+    )
+    # 1. With explicit slice_column
+    rep_slice = verifier.verify_candidate(
+        cand.model, champ.model, holdout_ds, slice_column="channel"
+    )
+    assert rep_slice.status == VerificationStatus.FAILED
+    assert any("slice_disparity" in c.metric_name for c in rep_slice.comparisons)
+
+    # 2. With Amount bracket disparity
+    rep_amt = verifier.verify_candidate(cand.model, champ.model, train_ds)
+    assert rep_amt.status == VerificationStatus.FAILED
+
+
+def test_verify_certified_candidate_more_edge_cases(tmp_path: Path) -> None:
+    """Test corrupted JSON, non-dict attestation, missing files, tampered files, and invalid key."""
+    raw_df = generate_synthetic_data(rows=200, fraud_rate=0.1, random_state=42)
+    ds = ValidatedDataset(features=raw_df.drop(columns=["Class"]), target=raw_df["Class"])
+    trainer = ChallengerTrainer(RetrainingConfig(estimator="logistic_regression"))
+    cand = trainer.train(ds)
+
+    key_dir = tmp_path / "keys"
+    key_dir.mkdir()
+    priv = key_dir / "ed.key"
+    pub = key_dir / "ed.pub"
+    write_keypair(priv, pub)
+
+    out_dir = tmp_path / "candidate_art"
+    export_certified_candidate(cand, out_dir, signing_key_path=priv)
+
+    # 1. Non-dict attestation
+    att_file = out_dir / ATTESTATION_FILENAME
+    att_file.write_text('["not", "a", "dict"]\n', encoding="utf-8")
+    ok, msg, _ = verify_certified_candidate(out_dir)
+    assert ok is False
+    assert "root must be a JSON object" in msg
+
+    # 2. Corrupted JSON
+    att_file.write_text("not json", encoding="utf-8")
+    ok, msg, _ = verify_certified_candidate(out_dir)
+    assert ok is False
+    assert "Failed to parse attestation JSON" in msg
+
+    # Re-export clean artifact
+    export_certified_candidate(cand, out_dir, signing_key_path=priv)
+
+    # 3. Missing files map
+    att_data = json.loads(att_file.read_text(encoding="utf-8"))
+    att_data["files"] = {}
+    att_file.write_text(json.dumps(att_data), encoding="utf-8")
+    ok, msg, _ = verify_certified_candidate(out_dir)
+    assert ok is False
+    assert "Tampered" in msg or "files map" in msg
+
+    # Re-export clean artifact
+    export_certified_candidate(cand, out_dir, signing_key_path=priv)
+
+    # 4. Tampered model file on disk
+    model_file = out_dir / "model.joblib"
+    model_file.write_bytes(b"tampered content")
+    ok, msg, _ = verify_certified_candidate(out_dir)
+    assert ok is False
+    assert "integrity" in msg or "hash mismatch" in msg
+
+    # 5. Invalid public key file
+    export_certified_candidate(cand, out_dir, signing_key_path=priv)
+    bad_pub = key_dir / "bad.pub"
+    bad_pub.write_text("not a valid pem key")
+    ok, msg, _ = verify_certified_candidate(out_dir, trusted_public_key_path=bad_pub)
+    assert ok is False
+    assert "Failed to load trusted public key" in msg
+
+
+def test_export_certified_candidate_manifest_missing_or_corrupt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test candidate export handles missing manifest or corrupt manifest."""
+    raw_df = generate_synthetic_data(rows=200, fraud_rate=0.1, random_state=42)
+    ds = ValidatedDataset(features=raw_df.drop(columns=["Class"]), target=raw_df["Class"])
+    trainer = ChallengerTrainer(RetrainingConfig(estimator="logistic_regression"))
+    cand = trainer.train(ds)
+    out_dir = tmp_path / "art_err"
+
+    # Simulate save_model omitting manifest
+    import fraud_detection.retraining as retrain_mod
+
+    orig_save = retrain_mod.save_model
+
+    def mock_save_no_manifest(model: Any, dest: Path) -> Path:
+        orig_save(model, dest)
+        man = dest / MANIFEST_FILENAME
+        if man.is_file():
+            man.unlink()
+        return dest
+
+    monkeypatch.setattr(retrain_mod, "save_model", mock_save_no_manifest)
+    with pytest.raises(RetrainingError, match="Model manifest was not created"):
+        export_certified_candidate(cand, out_dir)
+
+    # Corrupt manifest
+    def mock_save_corrupt_manifest(model: Any, dest: Path) -> Path:
+        orig_save(model, dest)
+        man = dest / MANIFEST_FILENAME
+        man.write_text("invalid json {{{", encoding="utf-8")
+        return dest
+
+    monkeypatch.setattr(retrain_mod, "save_model", mock_save_corrupt_manifest)
+    with pytest.raises(RetrainingError, match="Failed to load artifact manifest"):
+        export_certified_candidate(cand, out_dir)
+
+
+def test_export_certified_candidate_integrity_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test candidate export raises RetrainingError if artifact validation fails."""
+    raw_df = generate_synthetic_data(rows=200, fraud_rate=0.1, random_state=42)
+    ds = ValidatedDataset(features=raw_df.drop(columns=["Class"]), target=raw_df["Class"])
+    cand = ChallengerTrainer(RetrainingConfig(estimator="logistic_regression")).train(ds)
+    out_dir = tmp_path / "art_fail"
+
+    import fraud_detection.retraining as retrain_mod
+    from fraud_detection.model import ArtifactValidationReport
+
+    def mock_validate(dest: Path, strict: bool = False) -> ArtifactValidationReport:
+        return ArtifactValidationReport(
+            artifact_path=dest,
+            artifact_version=2,
+            valid=False,
+            errors=["Synthetic corruption"],
+            warnings=[],
+            checks={"strict": strict},
+        )
+
+    monkeypatch.setattr(retrain_mod, "validate_artifact", mock_validate)
+    with pytest.raises(RetrainingError, match="Candidate artifact failed integrity validation"):
+        export_certified_candidate(cand, out_dir)
+
+
+def test_export_certified_candidate_serialization_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test candidate export handles canonical json dumps failure."""
+    raw_df = generate_synthetic_data(rows=200, fraud_rate=0.1, random_state=42)
+    ds = ValidatedDataset(features=raw_df.drop(columns=["Class"]), target=raw_df["Class"])
+    cand = ChallengerTrainer(RetrainingConfig(estimator="logistic_regression")).train(ds)
+    out_dir = tmp_path / "art_ser_err"
+
+    import json as json_mod
+
+    orig_dumps = json_mod.dumps
+
+    def mock_dumps(*args: Any, **kwargs: Any) -> str:
+        if args and isinstance(args[0], dict) and "attestation_schema" in args[0]:
+            raise TypeError("synthetic json error")
+        return orig_dumps(*args, **kwargs)
+
+    monkeypatch.setattr(json_mod, "dumps", mock_dumps)
+    with pytest.raises(RetrainingError, match="Failed to canonically serialize"):
+        export_certified_candidate(cand, out_dir)
+
+
+def test_verify_certified_candidate_missing_attestation_and_missing_disk_file(
+    tmp_path: Path,
+) -> None:
+    """Test candidate verification handles missing attestation file and missing files on disk."""
+    raw_df = generate_synthetic_data(rows=200, fraud_rate=0.1, random_state=42)
+    ds = ValidatedDataset(features=raw_df.drop(columns=["Class"]), target=raw_df["Class"])
+    cand = ChallengerTrainer(RetrainingConfig(estimator="logistic_regression")).train(ds)
+    out_dir = tmp_path / "art_check"
+
+    export_certified_candidate(cand, out_dir)
+
+    # 1. Missing attestation file
+    att_file = out_dir / ATTESTATION_FILENAME
+    att_file.unlink()
+    ok, msg, _ = verify_certified_candidate(out_dir)
+    assert ok is False
+    assert "Attestation file missing" in msg
+
+    # Re-export clean
+    export_certified_candidate(cand, out_dir)
+
+    # 2. Missing attested file on disk: add non-existent file to attestation payload
+    att_data = json.loads(att_file.read_text(encoding="utf-8"))
+    att_data["files"]["missing_extra_file.json"] = "abcdef1234567890"
+    canonical = json.dumps(
+        {k: v for k, v in att_data.items() if k not in {"attestation_digest", "signature"}},
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    att_data["attestation_digest"] = sha256(canonical.encode("utf-8")).hexdigest()
+    att_file.write_text(json.dumps(att_data), encoding="utf-8")
+    ok, msg, _ = verify_certified_candidate(out_dir)
+    assert ok is False
+    assert "Attested file missing on disk" in msg
+
+
+def test_verify_certified_candidate_signature_mismatch(tmp_path: Path) -> None:
+    """Test candidate verification fails when attestation signature does not match public key."""
+    raw_df = generate_synthetic_data(rows=200, fraud_rate=0.1, random_state=42)
+    ds = ValidatedDataset(features=raw_df.drop(columns=["Class"]), target=raw_df["Class"])
+    cand = ChallengerTrainer(RetrainingConfig(estimator="logistic_regression")).train(ds)
+
+    key_dir = tmp_path / "keys"
+    key_dir.mkdir()
+    priv1 = key_dir / "k1.key"
+    pub1 = key_dir / "k1.pub"
+    priv2 = key_dir / "k2.key"
+    pub2 = key_dir / "k2.pub"
+    write_keypair(priv1, pub1)
+    write_keypair(priv2, pub2)
+
+    out_dir = tmp_path / "art_sig_mismatch"
+    export_certified_candidate(cand, out_dir, signing_key_path=priv1)
+
+    # Verify against pub2 (mismatched)
+    ok, msg, _ = verify_certified_candidate(out_dir, trusted_public_key_path=pub2)
+    assert ok is False
+    assert "Attestation signature verification failed" in msg
+
+
+def test_challenger_safety_verifier_amount_bracket_passed() -> None:
+    """Test ChallengerSafetyVerifier evaluates amount bracket disparity when within threshold."""
+    raw_df = generate_synthetic_data(rows=250, fraud_rate=0.1, random_state=42)
+    train_ds = ValidatedDataset(features=raw_df.drop(columns=["Class"]), target=raw_df["Class"])
+
+    trainer = ChallengerTrainer(RetrainingConfig(estimator="logistic_regression"))
+    cand = trainer.train(train_ds)
+    champ = trainer.train(train_ds)
+
+    verifier = ChallengerSafetyVerifier(
+        SafetyGatingThresholds(
+            min_pr_auc_delta=-0.5,
+            min_recall_delta=-0.5,
+            max_slice_disparity=0.99,  # Generous disparity threshold
+        )
+    )
+    report = verifier.verify_candidate(cand.model, champ.model, train_ds)
+    assert report.status == VerificationStatus.PASSED
+    assert "amount_bracket_disparity" in report.slice_disparities
