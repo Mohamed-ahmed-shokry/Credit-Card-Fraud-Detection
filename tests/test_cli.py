@@ -6942,3 +6942,227 @@ def test_cli_auto_retrain_workflow_and_exit_codes(tmp_path: Path) -> None:
         parsed_api = json.loads(res_api_promo.output)
         assert parsed_api["promoted"] is True
         assert "Promoted via mock API" in parsed_api["promotion_message"]
+
+
+def test_cli_auto_retrain_additional_branches(tmp_path: Path) -> None:
+    """Test hyperparameters-file, csv labels, report-output, human formatting, and API errors."""
+    raw_df = generate_synthetic_data(rows=200, fraud_rate=0.1, random_state=42)
+    raw_df["channel"] = [0.0 if i % 2 == 0 else 1.0 for i in range(len(raw_df))]
+    champ_dir = tmp_path / "champ_cli2"
+    champ_dataset = validate_frame(raw_df)
+    champ_cfg = TrainingConfig(estimator=EstimatorType.LOGISTIC_REGRESSION, random_state=42)
+    champ_model = train_model(champ_dataset, config=champ_cfg)
+    save_model(champ_model, champ_dir)
+
+    # 1. Prepare CSV labels
+    labels_csv = tmp_path / "labels.csv"
+    with labels_csv.open("w", encoding="utf-8") as f:
+        f.write("transaction_id,event_timestamp,label_timestamp,dispute_type,is_fraud,amount\n")
+        for idx in range(150):
+            is_f = 1 if raw_df.iloc[idx]["Class"] == 1 else 0
+            f.write(
+                f"tx_{idx},1700000000.0,1700003600.0,chargeback,{is_f},{raw_df.iloc[idx]['Amount']}\n"
+            )
+
+    # Prepare audit log with slice column "channel"
+    audit_file = tmp_path / "audit2.jsonl"
+    with audit_file.open("w", encoding="utf-8") as f:
+        for idx in range(150):
+            row = raw_df.iloc[idx].to_dict()
+            rec = {
+                "event_type": "scoring",
+                "timestamp": 1700000000.0 + float(idx),
+                "payload": {
+                    "request_id": f"req_{idx}",
+                    "predictions": [
+                        {"transaction_id": f"tx_{idx}", "amount": float(row["Amount"])}
+                    ],
+                    "features": [row],
+                },
+            }
+            f.write(json.dumps(rec) + "\n")
+
+    # Hyperparameters file
+    hp_file = tmp_path / "hparams.json"
+    hp_file.write_text(json.dumps({"regularization": 0.5}), encoding="utf-8")
+
+    # 2. Run with hyperparameters-file, csv labels, report-output, and human formatting
+    rep_file = tmp_path / "out_report.json"
+    cand_dir = tmp_path / "cand_out2"
+    res_human = runner.invoke(
+        app,
+        [
+            "auto-retrain",
+            "--audit-log-path",
+            str(audit_file),
+            "--labels-path",
+            str(labels_csv),
+            "--champion-model-path",
+            str(champ_dir),
+            "--output-dir",
+            str(cand_dir),
+            "--hyperparameters-file",
+            str(hp_file),
+            "--slice-column",
+            "channel",
+            "--promote",
+            "full",
+            "--report-output",
+            str(rep_file),
+        ],
+    )
+    assert res_human.exit_code == 0, res_human.output
+    assert "Candidate Retraining Complete:" in res_human.output
+    assert rep_file.is_file()
+    saved_rep = json.loads(rep_file.read_text(encoding="utf-8"))
+    assert saved_rep["status"] == "completed"
+
+    # 3. Corrupt hyperparameters file
+    bad_hp = tmp_path / "bad_hp.json"
+    bad_hp.write_text("invalid json {{{", encoding="utf-8")
+    res_bad_hp = runner.invoke(
+        app,
+        [
+            "auto-retrain",
+            "--audit-log-path",
+            str(audit_file),
+            "--labels-path",
+            str(labels_csv),
+            "--champion-model-path",
+            str(champ_dir),
+            "--output-dir",
+            str(cand_dir),
+            "--hyperparameters-file",
+            str(bad_hp),
+        ],
+    )
+    assert res_bad_hp.exit_code == 2
+    assert "Failed to read hyperparameters file" in res_bad_hp.output
+
+    # 4. Corrupt champion model
+    bad_champ = tmp_path / "bad_champ"
+    bad_champ.mkdir()
+    res_bad_champ = runner.invoke(
+        app,
+        [
+            "auto-retrain",
+            "--audit-log-path",
+            str(audit_file),
+            "--labels-path",
+            str(labels_csv),
+            "--champion-model-path",
+            str(bad_champ),
+            "--output-dir",
+            str(cand_dir),
+        ],
+    )
+    assert res_bad_champ.exit_code == 2
+    assert "Failed to load champion model" in res_bad_champ.output
+
+    # 5. Invalid api-url scheme (not http/https)
+    res_bad_url = runner.invoke(
+        app,
+        [
+            "auto-retrain",
+            "--audit-log-path",
+            str(audit_file),
+            "--labels-path",
+            str(labels_csv),
+            "--champion-model-path",
+            str(champ_dir),
+            "--output-dir",
+            str(cand_dir),
+            "--promote",
+            "canary",
+            "--api-url",
+            "ftp://localhost:8000",
+        ],
+    )
+    assert res_bad_url.exit_code == 2
+    assert "Invalid api-url" in res_bad_url.output
+
+    # 6. API call network failure raises exit code 1
+    with patch("urllib.request.urlopen") as mock_url:
+        mock_url.side_effect = urllib.error.URLError("Connection refused")
+        res_promo_fail = runner.invoke(
+            app,
+            [
+                "auto-retrain",
+                "--audit-log-path",
+                str(audit_file),
+                "--labels-path",
+                str(labels_csv),
+                "--champion-model-path",
+                str(champ_dir),
+                "--output-dir",
+                str(cand_dir),
+                "--promote",
+                "canary",
+                "--api-url",
+                "http://localhost:8000",
+            ],
+        )
+        assert res_promo_fail.exit_code == 1
+        assert "API promotion call failed" in res_promo_fail.output
+
+    # 7. ChallengerTrainer failure
+    with patch("fraud_detection.cli.ChallengerTrainer.train") as mock_tr:
+        from fraud_detection.retraining import RetrainingError
+
+        mock_tr.side_effect = RetrainingError("Synthetic train failure")
+        res_tr_fail = runner.invoke(
+            app,
+            [
+                "auto-retrain",
+                "--audit-log-path",
+                str(audit_file),
+                "--labels-path",
+                str(labels_csv),
+                "--champion-model-path",
+                str(champ_dir),
+                "--output-dir",
+                str(cand_dir),
+            ],
+        )
+        assert res_tr_fail.exit_code == 1
+        assert "Challenger model training failed" in res_tr_fail.output
+
+    # 8. ChallengerSafetyVerifier failure
+    with patch("fraud_detection.cli.ChallengerSafetyVerifier.verify_candidate") as mock_vf:
+        mock_vf.side_effect = RetrainingError("Synthetic verify failure")
+        res_vf_fail = runner.invoke(
+            app,
+            [
+                "auto-retrain",
+                "--audit-log-path",
+                str(audit_file),
+                "--labels-path",
+                str(labels_csv),
+                "--champion-model-path",
+                str(champ_dir),
+                "--output-dir",
+                str(cand_dir),
+            ],
+        )
+        assert res_vf_fail.exit_code == 1
+        assert "Candidate verification error" in res_vf_fail.output
+
+    # 9. export_certified_candidate failure
+    with patch("fraud_detection.cli.export_certified_candidate") as mock_exp:
+        mock_exp.side_effect = RetrainingError("Synthetic export failure")
+        res_exp_fail = runner.invoke(
+            app,
+            [
+                "auto-retrain",
+                "--audit-log-path",
+                str(audit_file),
+                "--labels-path",
+                str(labels_csv),
+                "--champion-model-path",
+                str(champ_dir),
+                "--output-dir",
+                str(cand_dir),
+            ],
+        )
+        assert res_exp_fail.exit_code == 1
+        assert "Failed to export candidate artifact" in res_exp_fail.output
