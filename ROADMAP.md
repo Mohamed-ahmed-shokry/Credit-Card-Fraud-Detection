@@ -45,7 +45,8 @@ dynamic decision graph replay with counterfactual policy optimization,
 per-stage circuit breakers with zero-latency fast-fail isolation, deterministic
 chaos fault injection, and delayed feedback ingestion with empirical label maturation
 curve modeling, realized performance and financial cost surveillance, and automated
-retraining triggers.
+retraining triggers. Phase 37 is in progress to automate closed-loop champion-challenger
+retraining, candidate verification safety gating, and zero-downtime safe canary promotion.
 
 ## Phase 1 — Distribution
 
@@ -1663,6 +1664,76 @@ This phase does not implement live webhook callbacks to external payment card ne
 
 - **Status**: Completed across 27 micro-commits.
 - **Verification**: 100% test pass rate (848+ tests), branch coverage $\ge 97.0\%$, strict mypy 0 issues across 21 source files, Ruff format and check clean, pip-audit 0 vulnerabilities, wheel build and twine check valid.
+
+## Phase 37 — Automated Closed-Loop Retraining, Candidate Verification & Zero-Downtime Safe Promotion (In progress)
+
+### Objective
+
+Close the autonomous continuous learning and model adaptation lifecycle by implementing an end-to-end retraining and zero-downtime canary promotion pipeline (`RetrainingDatasetBuilder`, `ChallengerTrainer`, `ChallengerSafetyVerifier`, `ChallengerVerificationReport`). When triggered by surveillance degradation events (`RetrainingTriggerEvent`) or operational CLI commands, this pipeline materializes leakage-safe holdout-separated datasets from matured feedback labels and feature views, automatically trains and tunes candidate challenger models, verifies candidates against multi-dimensional safety criteria (PR-AUC non-regression, calibration ECE bounds, slice disparity parity, net financial cost savings), exports cryptographically signed attestation manifests, and enables zero-downtime canary hot-reloading with automated divergence rollback.
+
+### Scope
+
+1. **Retraining Dataset Materialization (`retraining.py`)**:
+   - `RetrainingDatasetBuilder`: joins mature ground-truth feedback records (`MatchedFeedbackRecord` / `DelayedLabelRecord`) with point-in-time feature snapshots (`features.py`) or historical scoring features (`audit.py`).
+   - Temporal windowing: strictly applies recommended retraining start/end timestamps and enforces the required holdout temporal gap (`recommended_holdout_gap_seconds`) to guarantee zero future-data leakage.
+   - Class balance and minimum sample validation: asserts minimum training instances and minimum confirmed fraud events.
+2. **Automated Challenger Training & Tuning (`retraining.py`)**:
+   - `ChallengerTrainer`: automatically trains candidate model estimators (`FraudModel` using logistic regression, random forest, or histogram gradient boosting) on the materialized dataset.
+   - Evaluates validation split metrics and tunes decision thresholds (`tune_threshold`, `TieredThresholds`).
+   - Records full training lineage, dataset fingerprints, hyperparameter configurations, and model metadata.
+3. **Multi-Faceted Challenger Verification & Safety Gating (`retraining.py`)**:
+   - `ChallengerSafetyVerifier`: compares candidate against champion across rigorous safety gates:
+     - Holdout PR-AUC non-regression ($\text{PR-AUC}_{\text{candidate}} \ge \text{PR-AUC}_{\text{champion}} - \epsilon$).
+     - Holdout Recall non-regression at target precision or threshold.
+     - Expected Calibration Error (ECE) drift check ($\text{ECE} \le \text{tolerance}$).
+     - Sub-population slice disparity parity: maximum F1 disparity across transaction slices $\le$ threshold.
+     - Expected financial net loss differential: $\Delta \text{Cost} \le 0$.
+   - Produces `ChallengerVerificationReport` with overall admission status (`PASSED`, `WARNING`, `FAILED`).
+4. **Cryptographic Attestation & Lineage Signing (`retraining.py`, `signing.py`, `trust.py`)**:
+   - `export_certified_candidate`: writes artifact directory (`manifest.json`, `metadata.json`, `model.joblib`), signs artifact attestation using a configured Ed25519 signing key, and validates admission readiness via `verify_attestation`.
+5. **Zero-Downtime Hot-Reload & Safe Canary Promotion (`api.py`, `routing.py`)**:
+   - Dynamic hot-reload: API endpoints to safely load newly trained certified artifacts without restarting the server or dropping in-flight scoring requests.
+   - Dynamic canary staging: promotes certified candidate to Challenger status with configurable starting traffic split (e.g. 10%) and active discrepancy safeguards with automatic rollback.
+6. **Structured Audit Trail & Redaction (`audit.py`)**:
+   - `build_challenger_retrained_audit_event`: logs training metrics, candidate version, dataset fingerprint, and verification report.
+   - `build_model_promoted_audit_event`: logs champion-to-challenger promotion, traffic split ratio, and admission signature.
+7. **FastAPI Serving & Prometheus Telemetry (`api.py`)**:
+   - `POST /v1/retraining/trigger`: accept a `RetrainingTriggerEvent` or trigger retraining on demand.
+   - `GET /v1/retraining/status`: inspect active and past retraining jobs, candidate evaluation reports, and admission results.
+   - `POST /v1/models/promote`: promote verified candidate to active canary or champion.
+   - Prometheus metrics:
+     - `fraud_retraining_runs_total{status="success|failed|rejected"}`: counter tracking retraining attempts.
+     - `fraud_challenger_verification_status{status="passed|failed"}`: gauge tracking verification outcomes.
+     - `fraud_model_promotions_total{promotion_type="canary|champion"}`: counter tracking promotion events.
+8. **CLI Orchestration (`cli.py`)**:
+   - `fraud-detect auto-retrain`: coordinates end-to-end dataset materialization, candidate training, verification gating, signed attestation export, and optional promotion report generation.
+   - Flags: `--trigger-file`, `--audit-log`, `--labels-file`, `--feature-store`, `--candidate-dir`, `--signing-key`, `--fail-on-rejected`, `--output-report`, `--json`.
+   - Exit codes: 0 on successful certified promotion, 3 if candidate is rejected by safety gates, 1 on fatal error.
+9. **Integration, Test Coverage & Quality Gates**:
+   - Comprehensive unit and integration tests across `retraining.py`, `audit.py`, `api.py`, and `cli.py`.
+   - Zero lint errors, strict mypy 0 issues, branch coverage $\ge 97.0\%$, packaging and build verification.
+
+### Acceptance Criteria
+
+1. **AC-1 (Retraining Dataset Materialization)**: `RetrainingDatasetBuilder` materializes leak-free tabular datasets from feedback labels and audit logs / feature store adhering strictly to temporal holdout separation and class balance checks.
+2. **AC-2 (Automated Challenger Training & Tuning)**: `ChallengerTrainer` fits candidate models on materialized datasets, performs threshold tuning, and records complete training metadata and dataset fingerprints.
+3. **AC-3 (Multi-Faceted Challenger Verification & Safety Gating)**: `ChallengerSafetyVerifier` evaluates candidate against champion across PR-AUC, recall, calibration ECE, slice disparity, and financial cost, rejecting candidates that regress beyond configured tolerances.
+4. **AC-4 (Cryptographic Attestation & Lineage Signing)**: Certified candidates generate valid, verifiable Ed25519-signed attestation manifests satisfying deployment admission policies.
+5. **AC-5 (Zero-Downtime Hot-Reload & Safe Canary Promotion)**: API enables runtime reloading of model artifacts and safe staging of canary traffic without server restart or dropped requests.
+6. **AC-6 (Audit Trail, API Endpoints & Telemetry)**: Structured audit events (`challenger_retrained`, `model_promoted`) and Prometheus metrics track retraining executions, safety evaluations, and promotions.
+7. **AC-7 (CLI Workflow & Exit Code Gating)**: `fraud-detect auto-retrain` coordinates the closed-loop retraining pipeline with exit code 3 gating on candidate rejection and structured JSON output.
+8. **AC-8 (Quality Standards & Zero Regressions)**: Full test suite passes 100%, branch coverage remains $\ge 97.0\%$, Ruff format and check pass cleanly, strict mypy reports 0 errors in all source files, and build/twine checks pass.
+
+### Task List
+
+- [ ] Task 1: Create `src/fraud_detection/retraining.py` with domain data models (`RetrainingConfig`, `ChallengerVerificationReport`, `RetrainingStatus`, `RetrainingError`) and `RetrainingDatasetBuilder` with unit tests in `tests/test_retraining.py`.
+- [ ] Task 2: Implement `ChallengerTrainer` with hyperparameter configuration and threshold tuning in `retraining.py` with tests in `tests/test_retraining.py`.
+- [ ] Task 3: Implement `ChallengerSafetyVerifier` evaluating PR-AUC, recall, ECE, slice disparity, and cost vs. champion with tests in `tests/test_retraining.py`.
+- [ ] Task 4: Implement certified artifact export and attestation signing (`export_certified_candidate`) in `retraining.py` with tests in `tests/test_retraining.py`.
+- [ ] Task 5: Implement audit event builders (`build_challenger_retrained_audit_event`, `build_model_promoted_audit_event`) in `audit.py` with tests in `tests/test_audit.py`.
+- [ ] Task 6: Implement zero-downtime hot-reload and dynamic canary promotion endpoints and telemetry in `api.py` with tests in `tests/test_api.py`.
+- [ ] Task 7: Implement CLI command `auto-retrain` in `cli.py` with tests in `tests/test_cli.py`.
+- [ ] Task 8: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate.
 
 
 ## Contributing to the roadmap

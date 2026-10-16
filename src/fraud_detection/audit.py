@@ -26,6 +26,10 @@ from fraud_detection.evaluation import (
 if TYPE_CHECKING:
     from fraud_detection.feedback import DelayedLabelRecord, RetrainingTriggerEvent
     from fraud_detection.pipeline import PipelineChaosReport
+    from fraud_detection.retraining import (
+        ChallengerTrainingResult,
+        ChallengerVerificationReport,
+    )
 
 # Sensitive key keywords that must always be masked in audit payloads
 DEFAULT_SENSITIVE_KEYS: tuple[str, ...] = (
@@ -938,6 +942,110 @@ def build_retraining_trigger_audit_event(
     return AuditEvent(
         event_type="retraining_trigger",
         model_version=model_version,
+        dataset_fingerprint=dataset_fingerprint,
+        payload=payload,
+    )
+
+
+def build_challenger_retrained_audit_event(
+    *,
+    candidate_result: ChallengerTrainingResult | Mapping[str, Any],
+    verification_report: ChallengerVerificationReport | Mapping[str, Any] | None = None,
+    attestation_digest: str | None = None,
+    model_version: str | None = None,
+    champion_version: str | None = None,
+    metadata: Mapping[str, Any] | None = None,
+) -> AuditEvent:
+    """Construct a structured audit event for an automated retraining run and candidate gating."""
+    result_dict = (
+        candidate_result.to_dict()
+        if hasattr(candidate_result, "to_dict")
+        else dict(candidate_result)
+    )
+    v_dict: dict[str, Any] | None = None
+    if verification_report is not None:
+        v_dict = (
+            verification_report.to_dict()
+            if hasattr(verification_report, "to_dict")
+            else dict(verification_report)
+        )
+
+    ver_status = "unverified"
+    if v_dict is not None:
+        ver_status = str(v_dict.get("status", "failed"))
+
+    is_passed = ver_status in {"PASSED", "passed"}
+    event_type = (
+        "fraud.retraining.completed"
+        if (is_passed or v_dict is None)
+        else "fraud.retraining.rejected"
+    )
+
+    cand_ver = (
+        model_version
+        or str(result_dict.get("model_version", ""))
+        or (str(v_dict.get("candidate_version", "")) if v_dict else "challenger")
+    )
+    champ_ver = champion_version or (
+        str(v_dict.get("champion_version", "")) if v_dict else "champion"
+    )
+    ds_fp = str(result_dict.get("dataset_fingerprint", ""))
+
+    payload: dict[str, Any] = {
+        "candidate_version": cand_ver,
+        "champion_version": champ_ver,
+        "dataset_fingerprint": ds_fp,
+        "training_duration_seconds": float(result_dict.get("training_duration_seconds", 0.0)),
+        "validation_metrics": dict(result_dict.get("validation_metrics", {})),
+        "test_metrics": dict(result_dict.get("test_metrics", {})),
+        "hyperparameters": dict(result_dict.get("config", {}).get("hyperparameters", {})),
+        "verification_status": ver_status,
+        "verification_report": v_dict,
+        "attestation_digest": attestation_digest,
+        "is_certified": attestation_digest is not None,
+    }
+    if metadata:
+        payload["metadata"] = dict(metadata)
+
+    return AuditEvent(
+        event_type=event_type,
+        model_version=cand_ver,
+        dataset_fingerprint=ds_fp or None,
+        payload=payload,
+    )
+
+
+def build_model_promoted_audit_event(
+    *,
+    previous_champion_version: str,
+    new_champion_version: str,
+    promotion_type: str = "full",
+    canary_percentage: float = 100.0,
+    attestation_digest: str | None = None,
+    promoted_by: str = "automated-safety-gate",
+    status: str = "promoted",
+    dataset_fingerprint: str | None = None,
+    metadata: Mapping[str, Any] | None = None,
+) -> AuditEvent:
+    """Construct a structured audit event for a model promotion or canary rollout."""
+    norm_prom_type = str(promotion_type).lower()
+    event_type = "fraud.canary.updated" if norm_prom_type == "canary" else "fraud.model.promoted"
+
+    payload: dict[str, Any] = {
+        "promotion_type": norm_prom_type,
+        "previous_champion_version": str(previous_champion_version),
+        "new_champion_version": str(new_champion_version),
+        "canary_percentage": float(canary_percentage),
+        "attestation_digest": attestation_digest,
+        "promoted_by": str(promoted_by),
+        "status": str(status),
+    }
+    if metadata:
+        payload["metadata"] = dict(metadata)
+
+    return AuditEvent(
+        event_type=event_type,
+        model_version=new_champion_version,
         dataset_fingerprint=dataset_fingerprint,
         payload=payload,
     )

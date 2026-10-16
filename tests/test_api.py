@@ -63,6 +63,11 @@ from fraud_detection.features import (
 )
 from fraud_detection.model import FraudModel, save_model, train_model, validate_artifact
 from fraud_detection.recalibration import PlattRecalibrator
+from fraud_detection.retraining import (
+    ChallengerTrainer,
+    RetrainingConfig,
+    export_certified_candidate,
+)
 from fraud_detection.routing import TrafficSplitStrategy
 from fraud_detection.rules import (
     DecisionRule,
@@ -4101,3 +4106,203 @@ def test_feedback_api_endpoints_and_telemetry(
         trig_events = [ev for ev in sink.events if ev.event_type == "retraining_trigger"]
         assert len(trig_events) == 1
         assert "precision" in trig_events[0].payload["breached_metrics"]
+
+
+def test_api_models_reload_endpoint(tmp_path: Path) -> None:
+    """Test POST /v1/models/reload with valid, attestation-verified, and invalid paths."""
+    raw_df = generate_synthetic_data(rows=200, fraud_rate=0.1, random_state=42)
+    dataset = ValidatedDataset(features=raw_df.drop(columns=["Class"]), target=raw_df["Class"])
+
+    trainer1 = ChallengerTrainer(RetrainingConfig(estimator="logistic_regression", random_state=1))
+    cand1 = trainer1.train(dataset)
+    m1_path = tmp_path / "model_v1"
+    export_certified_candidate(cand1, m1_path)
+
+    trainer2 = ChallengerTrainer(RetrainingConfig(estimator="logistic_regression", random_state=2))
+    cand2 = trainer2.train(dataset)
+    m2_path = tmp_path / "model_v2"
+    key_dir = tmp_path / "keys"
+    key_dir.mkdir()
+    priv_pem = key_dir / "ed25519_private.pem"
+    pub_pem = key_dir / "ed25519_public.pem"
+    write_keypair(priv_pem, pub_pem)
+    export_certified_candidate(cand2, m2_path, signing_key_path=priv_pem)
+
+    app = create_app(model=cand1.model, model_path=m1_path)
+    with TestClient(app) as client:
+        # 1. Reload to model_v2 without attestation requirement
+        res = client.post("/v1/models/reload", json={"model_path": str(m2_path)})
+        assert res.status_code == 200
+        data = res.json()
+        assert data["status"] == "reloaded"
+        expected_v2 = str(cand2.model.metadata.get("dataset_fingerprint", ""))[:12]
+        assert data["new_model_version"] == expected_v2
+
+        # 2. Reload with attestation and public key verification
+        res_att = client.post(
+            "/v1/models/reload",
+            json={
+                "model_path": str(m2_path),
+                "require_attestation": True,
+                "trusted_key_path": str(pub_pem),
+            },
+        )
+        assert res_att.status_code == 200
+        assert res_att.json()["verified"] is True
+
+        # 3. Reload with non-existent path returns 400
+        res_bad = client.post(
+            "/v1/models/reload",
+            json={"model_path": str(tmp_path / "nonexistent")},
+        )
+        assert res_bad.status_code == 400
+
+        # 4. Check telemetry counter
+        m_res = client.get("/metrics")
+        assert "fraud_model_promotions_total" in m_res.text
+
+
+def test_api_models_promote_endpoint(tmp_path: Path) -> None:
+    """Test POST /v1/models/promote for Canary and Full champion promotion."""
+    raw_df = generate_synthetic_data(rows=200, fraud_rate=0.1, random_state=42)
+    dataset = ValidatedDataset(features=raw_df.drop(columns=["Class"]), target=raw_df["Class"])
+
+    trainer1 = ChallengerTrainer(RetrainingConfig(estimator="logistic_regression", random_state=1))
+    cand1 = trainer1.train(dataset)
+    m1_path = tmp_path / "model_v1"
+    export_certified_candidate(cand1, m1_path)
+
+    trainer2 = ChallengerTrainer(RetrainingConfig(estimator="logistic_regression", random_state=2))
+    cand2 = trainer2.train(dataset)
+    m2_path = tmp_path / "model_v2"
+    export_certified_candidate(cand2, m2_path)
+    expected_v2 = str(cand2.model.metadata.get("dataset_fingerprint", ""))[:12]
+
+    app = create_app(model=cand1.model, model_path=m1_path)
+    with TestClient(app) as client:
+        # 1. Promote to canary with 25% traffic
+        res_canary = client.post(
+            "/v1/models/promote",
+            json={
+                "candidate_path": str(m2_path),
+                "promotion_type": "canary",
+                "canary_percentage": 25.0,
+                "require_attestation": False,
+            },
+        )
+        assert res_canary.status_code == 200
+        c_data = res_canary.json()
+        assert c_data["status"] == "promoted"
+        assert c_data["promotion_type"] == "canary"
+        assert c_data["canary_percentage"] == 25.0
+        assert c_data["challenger_model_version"] == expected_v2
+
+        # 2. Promote to full champion
+        res_full = client.post(
+            "/v1/models/promote",
+            json={
+                "candidate_path": str(m2_path),
+                "promotion_type": "full",
+                "require_attestation": False,
+            },
+        )
+        assert res_full.status_code == 200
+        f_data = res_full.json()
+        assert f_data["status"] == "promoted"
+        assert f_data["promotion_type"] == "full"
+        assert f_data["champion_model_version"] == expected_v2
+
+        # 3. Reject invalid path
+        res_bad = client.post(
+            "/v1/models/promote",
+            json={"candidate_path": str(tmp_path / "missing")},
+        )
+        assert res_bad.status_code == 400
+
+
+def test_api_retraining_trigger_endpoint(tmp_path: Path) -> None:
+    """Test POST /v1/retraining/trigger with synthetic audit log and label store."""
+    raw_df = generate_synthetic_data(rows=200, fraud_rate=0.1, random_state=42)
+    dataset = ValidatedDataset(features=raw_df.drop(columns=["Class"]), target=raw_df["Class"])
+
+    trainer = ChallengerTrainer(RetrainingConfig(estimator="logistic_regression"))
+    base_cand = trainer.train(dataset)
+    m_path = tmp_path / "base_model"
+    export_certified_candidate(base_cand, m_path)
+
+    audit_file = tmp_path / "scoring_audit.jsonl"
+    audit_lines = []
+    labels = []
+    for i, row in raw_df.iterrows():
+        tx_id = f"tx_{i:04d}"
+        feat_dict = {c: float(row[c]) for c in raw_df.columns if c != "Class"}
+        is_fraud = int(row["Class"])
+        audit_lines.append(
+            json.dumps(
+                {
+                    "event_type": "scoring",
+                    "timestamp": 1000.0 + float(i),
+                    "payload": {
+                        "predictions": [
+                            {
+                                "transaction_id": tx_id,
+                                "fraud_probability": 0.8 if is_fraud else 0.1,
+                                "decision": "deny" if is_fraud else "allow",
+                                "amount": 50.0,
+                            }
+                        ],
+                        "features": [feat_dict],
+                    },
+                }
+            )
+        )
+        labels.append(
+            {
+                "transaction_id": tx_id,
+                "event_timestamp": 1000.0 + float(i),
+                "label_timestamp": 1000.0 + float(i) + 3600.0,
+                "dispute_type": "chargeback" if is_fraud else "friendly_fraud",
+                "is_fraud": bool(is_fraud),
+                "amount": 50.0,
+            }
+        )
+    audit_file.write_text("\n".join(audit_lines) + "\n", encoding="utf-8")
+
+    app = create_app(model=base_cand.model, model_path=m_path)
+    app.state.audit_log_path = str(audit_file)
+
+    with TestClient(app) as client:
+        # Ingest labels
+        res_lbl = client.post("/v1/feedback/labels", json={"labels": labels})
+        assert res_lbl.status_code == 200
+
+        # Trigger retraining
+        out_dir = tmp_path / "candidate_export"
+        res_trig = client.post(
+            "/v1/retraining/trigger",
+            json={
+                "trigger_reason": "scheduled_pipeline",
+                "estimator": "logistic_regression",
+                "output_dir": str(out_dir),
+                "auto_promote": True,
+                "promotion_type": "canary",
+                "canary_percentage": 10.0,
+                "audit_log_path": str(audit_file),
+            },
+        )
+        assert res_trig.status_code == 200
+        trig_data = res_trig.json()
+        assert trig_data["status"] == "completed"
+        assert trig_data["verification_passed"] is True
+        assert trig_data["promoted"] is True
+        assert "pr_auc" in trig_data["metrics"]
+
+        # Check prometheus metrics
+        m_res = client.get("/metrics")
+        assert "fraud_retraining_runs_total" in m_res.text
+        assert "fraud_challenger_verification_status" in m_res.text
+
+        # Test failure on insufficient data / invalid log
+        app.state.audit_log_path = str(tmp_path / "empty_log.jsonl")
+        res_empty = client.post("/v1/retraining/trigger", json={"trigger_reason": "test_failure"})
+        assert res_empty.status_code == 400

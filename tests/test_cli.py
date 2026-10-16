@@ -34,6 +34,7 @@ from fraud_detection.model import (
     METADATA_FILENAME,
     MODEL_FILENAME,
     CalibrationMethod,
+    EstimatorType,
     FraudModel,
     ModelArtifactError,
     TrainingConfig,
@@ -6661,3 +6662,280 @@ def test_feedback_surveillance_cli_workflows(tmp_path: Path) -> None:
     )
     assert res_invalid_param.exit_code == 2
     assert "Feedback surveillance failed" in res_invalid_param.output
+
+
+def test_cli_auto_retrain_workflow_and_exit_codes(tmp_path: Path) -> None:
+    """Test fraud-detect auto-retrain command end-to-end including exit code gating."""
+    raw_df = generate_synthetic_data(rows=200, fraud_rate=0.1, random_state=42)
+    features_df = raw_df.drop(columns=["Class"])
+
+    # 1. Train and save champion model
+    dataset = validate_frame(raw_df)
+    champ_cfg = TrainingConfig(estimator=EstimatorType.LOGISTIC_REGRESSION, random_state=42)
+    champ_model = train_model(dataset, config=champ_cfg)
+    champ_dir = tmp_path / "champion_model"
+    save_model(champ_model, champ_dir)
+
+    # 2. Prepare audit log and labels files
+    audit_file = tmp_path / "scoring_audit.jsonl"
+    labels_file = tmp_path / "labels.jsonl"
+    audit_lines = []
+    labels_lines = []
+    for i, row in raw_df.iterrows():
+        tx_id = f"tx_retrain_{i:04d}"
+        feat_dict = {c: float(row[c]) for c in features_df.columns}
+        is_fraud = int(row["Class"])
+        audit_lines.append(
+            json.dumps(
+                {
+                    "event_type": "scoring",
+                    "timestamp": 1000.0 + float(i),
+                    "payload": {
+                        "predictions": [
+                            {
+                                "transaction_id": tx_id,
+                                "fraud_probability": 0.85 if is_fraud else 0.05,
+                                "decision": "deny" if is_fraud else "allow",
+                                "amount": float(feat_dict.get("Amount", 50.0)),
+                            }
+                        ],
+                        "features": [feat_dict],
+                    },
+                }
+            )
+        )
+        labels_lines.append(
+            json.dumps(
+                {
+                    "transaction_id": tx_id,
+                    "event_timestamp": 1000.0 + float(i),
+                    "label_timestamp": 1000.0 + float(i) + 1800.0,
+                    "dispute_type": "chargeback" if is_fraud else "friendly_fraud",
+                    "is_fraud": bool(is_fraud),
+                    "amount": float(feat_dict.get("Amount", 50.0)),
+                }
+            )
+        )
+    audit_file.write_text("\n".join(audit_lines) + "\n", encoding="utf-8")
+    labels_file.write_text("\n".join(labels_lines) + "\n", encoding="utf-8")
+
+    # Keypair for cryptographic attestation
+    key_dir = tmp_path / "keys"
+    key_dir.mkdir()
+    priv_key = key_dir / "ed25519.pem"
+    pub_key = key_dir / "ed25519.pub"
+    write_keypair(priv_key, pub_key)
+
+    # 3. Success run with --json (exit code 0)
+    cand_dir = tmp_path / "candidate_model"
+    res_success = runner.invoke(
+        app,
+        [
+            "auto-retrain",
+            "--audit-log-path",
+            str(audit_file),
+            "--labels-path",
+            str(labels_file),
+            "--champion-model-path",
+            str(champ_dir),
+            "--output-dir",
+            str(cand_dir),
+            "--estimator",
+            "logistic_regression",
+            "--signing-key-path",
+            str(priv_key),
+            "--promote",
+            "canary",
+            "--canary-percentage",
+            "20.0",
+            "--min-pr-auc-delta",
+            "-0.10",
+            "--json",
+        ],
+    )
+    assert res_success.exit_code == 0
+    report_data = json.loads(res_success.output)
+    assert report_data["status"] == "completed"
+    assert report_data["verification_status"] == "passed"
+    assert report_data["promoted"] is True
+    assert report_data["promotion_type"] == "canary"
+    assert (cand_dir / "attestation.json").is_file()
+
+    # 4. Text output run without json flag
+    cand_dir_text = tmp_path / "candidate_model_text"
+    res_text = runner.invoke(
+        app,
+        [
+            "auto-retrain",
+            "--audit-log-path",
+            str(audit_file),
+            "--labels-path",
+            str(labels_file),
+            "--champion-model-path",
+            str(champ_dir),
+            "--output-dir",
+            str(cand_dir_text),
+            "--estimator",
+            "logistic_regression",
+            "--min-pr-auc-delta",
+            "-0.10",
+        ],
+    )
+    assert res_text.exit_code == 0
+    assert "Candidate Retraining Complete:" in res_text.output
+    assert "PASSED" in res_text.output
+
+    # 5. Candidate safety verification rejection (exit code 3)
+    cand_dir_reject = tmp_path / "candidate_rejected"
+    res_reject = runner.invoke(
+        app,
+        [
+            "auto-retrain",
+            "--audit-log-path",
+            str(audit_file),
+            "--labels-path",
+            str(labels_file),
+            "--champion-model-path",
+            str(champ_dir),
+            "--output-dir",
+            str(cand_dir_reject),
+            "--min-pr-auc-delta",
+            "0.99",  # Impossible requirement to trigger safety gate failure
+        ],
+    )
+    assert res_reject.exit_code == 3
+    assert "FAILED" in res_reject.output
+    # Artifact bundle is preserved for audit trail even when rejected
+    assert (cand_dir_reject / "attestation.json").is_file()
+
+    # 6. Exit code 2 on configuration/argument errors
+    # Invalid promote option
+    res_bad_promote = runner.invoke(
+        app,
+        [
+            "auto-retrain",
+            "--audit-log-path",
+            str(audit_file),
+            "--labels-path",
+            str(labels_file),
+            "--champion-model-path",
+            str(champ_dir),
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--promote",
+            "invalid_option",
+        ],
+    )
+    assert res_bad_promote.exit_code == 2
+
+    # Invalid canary percentage
+    res_bad_pct = runner.invoke(
+        app,
+        [
+            "auto-retrain",
+            "--audit-log-path",
+            str(audit_file),
+            "--labels-path",
+            str(labels_file),
+            "--champion-model-path",
+            str(champ_dir),
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--canary-percentage",
+            "150.0",
+        ],
+    )
+    assert res_bad_pct.exit_code == 2
+
+    # Malformed hyperparameters json
+    res_bad_hparams = runner.invoke(
+        app,
+        [
+            "auto-retrain",
+            "--audit-log-path",
+            str(audit_file),
+            "--labels-path",
+            str(labels_file),
+            "--champion-model-path",
+            str(champ_dir),
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--hyperparameters-json",
+            "{not_valid_json",
+        ],
+    )
+    assert res_bad_hparams.exit_code == 2
+
+    # Invalid labels extension
+    bad_labels_file = tmp_path / "labels.txt"
+    bad_labels_file.write_text("dummy")
+    res_bad_ext = runner.invoke(
+        app,
+        [
+            "auto-retrain",
+            "--audit-log-path",
+            str(audit_file),
+            "--labels-path",
+            str(bad_labels_file),
+            "--champion-model-path",
+            str(champ_dir),
+            "--output-dir",
+            str(tmp_path / "out"),
+        ],
+    )
+    assert res_bad_ext.exit_code == 2
+
+    # 7. Exit code 1 on dataset materialization failure (empty audit log)
+    empty_log = tmp_path / "empty_audit.jsonl"
+    empty_log.write_text("")
+    res_dataset_err = runner.invoke(
+        app,
+        [
+            "auto-retrain",
+            "--audit-log-path",
+            str(empty_log),
+            "--labels-path",
+            str(labels_file),
+            "--champion-model-path",
+            str(champ_dir),
+            "--output-dir",
+            str(tmp_path / "out"),
+        ],
+    )
+    assert res_dataset_err.exit_code == 1
+
+    # 8. Promotion via API URL
+    cand_dir_api = tmp_path / "candidate_api"
+    with patch("urllib.request.urlopen") as mock_urlopen:
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = json.dumps(
+            {"status": "promoted", "message": "Promoted via mock API"}
+        ).encode("utf-8")
+        mock_resp.__enter__.return_value = mock_resp
+        mock_urlopen.return_value = mock_resp
+
+        res_api_promo = runner.invoke(
+            app,
+            [
+                "auto-retrain",
+                "--audit-log-path",
+                str(audit_file),
+                "--labels-path",
+                str(labels_file),
+                "--champion-model-path",
+                str(champ_dir),
+                "--output-dir",
+                str(cand_dir_api),
+                "--promote",
+                "canary",
+                "--min-pr-auc-delta",
+                "-0.10",
+                "--api-url",
+                "http://localhost:8000",
+                "--json",
+            ],
+        )
+        assert res_api_promo.exit_code == 0
+        parsed_api = json.loads(res_api_promo.output)
+        assert parsed_api["promoted"] is True
+        assert "Promoted via mock API" in parsed_api["promotion_message"]

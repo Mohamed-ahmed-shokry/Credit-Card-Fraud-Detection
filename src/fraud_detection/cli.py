@@ -110,6 +110,16 @@ from fraud_detection.recalibration import (
     compute_calibration_drift,
 )
 from fraud_detection.reporting import ComplianceReportError, render_compliance_report
+from fraud_detection.retraining import (
+    ChallengerSafetyVerifier,
+    ChallengerTrainer,
+    RetrainingConfig,
+    RetrainingDatasetBuilder,
+    RetrainingError,
+    SafetyGatingThresholds,
+    VerificationStatus,
+    export_certified_candidate,
+)
 from fraud_detection.routing import (
     CanaryConfig,
     TrafficSplitStrategy,
@@ -6141,6 +6151,359 @@ def feedback_surveillance_cmd(
 
     if gate and trigger is not None:
         raise typer.Exit(code=1)
+
+
+@app.command("auto-retrain")
+def auto_retrain(
+    audit_log_path: Annotated[
+        Path,
+        typer.Option(
+            "--audit-log-path",
+            help="Path to JSONL scoring audit log file.",
+            dir_okay=False,
+            file_okay=True,
+            exists=True,
+            readable=True,
+        ),
+    ],
+    labels_path: Annotated[
+        Path,
+        typer.Option(
+            "--labels-path",
+            "--labels-file",
+            help="Path to ground truth labels file (.jsonl or .csv).",
+            dir_okay=False,
+            file_okay=True,
+            exists=True,
+            readable=True,
+        ),
+    ],
+    champion_model_path: Annotated[
+        Path,
+        typer.Option(
+            "--champion-model-path",
+            help="Directory path to active champion model artifact.",
+            dir_okay=True,
+            file_okay=False,
+            exists=True,
+        ),
+    ],
+    output_dir: Annotated[
+        Path,
+        typer.Option(
+            "--output-dir",
+            "-o",
+            help="Directory path where candidate artifact bundle will be exported.",
+            dir_okay=True,
+            file_okay=False,
+        ),
+    ],
+    estimator: Annotated[
+        str,
+        typer.Option(
+            "--estimator",
+            help="Estimator to train (logistic_regression, random_forest, lightgbm).",
+        ),
+    ] = "logistic_regression",
+    hyperparameters_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--hyperparameters-file",
+            help="Optional JSON file path containing model hyperparameters.",
+            dir_okay=False,
+            file_okay=True,
+            readable=True,
+        ),
+    ] = None,
+    hyperparameters_json: Annotated[
+        str | None,
+        typer.Option(
+            "--hyperparameters-json",
+            help="Optional JSON string containing model hyperparameters.",
+        ),
+    ] = None,
+    signing_key_path: Annotated[
+        Path | None,
+        typer.Option(
+            "--signing-key-path",
+            "--signing-key",
+            help="Optional path to Ed25519 private key PEM file for candidate signing.",
+            dir_okay=False,
+            file_okay=True,
+            readable=True,
+        ),
+    ] = None,
+    holdout_gap_seconds: Annotated[
+        float,
+        typer.Option(
+            "--holdout-gap-seconds",
+            help="Temporal purge gap in seconds between train and holdout splits.",
+        ),
+    ] = 0.0,
+    promote: Annotated[
+        str,
+        typer.Option("--promote", help="Promotion target: 'canary', 'full', or 'none'."),
+    ] = "none",
+    canary_percentage: Annotated[
+        float,
+        typer.Option(
+            "--canary-percentage", help="Traffic percentage for canary promotion (0.0 to 100.0)."
+        ),
+    ] = 10.0,
+    slice_column: Annotated[
+        str | None,
+        typer.Option(
+            "--slice-column", help="Optional feature column name for slice disparity evaluation."
+        ),
+    ] = None,
+    api_url: Annotated[
+        str | None,
+        typer.Option(
+            "--api-url", help="Optional base URL of running fraud detection service for promotion."
+        ),
+    ] = None,
+    min_pr_auc_delta: Annotated[
+        float,
+        typer.Option(
+            "--min-pr-auc-delta",
+            help="Minimum required PR-AUC difference (candidate - champion).",
+        ),
+    ] = -0.02,
+    min_recall_delta: Annotated[
+        float,
+        typer.Option(
+            "--min-recall-delta",
+            help="Minimum required Recall difference (candidate - champion).",
+        ),
+    ] = -0.03,
+    max_ece_increase: Annotated[
+        float,
+        typer.Option(
+            "--max-ece-increase", help="Maximum allowable increase in Expected Calibration Error."
+        ),
+    ] = 0.03,
+    max_slice_disparity: Annotated[
+        float,
+        typer.Option(
+            "--max-slice-disparity",
+            help="Maximum allowable slice disparity between candidate and champion.",
+        ),
+    ] = 0.25,
+    max_net_cost_increase_pct: Annotated[
+        float,
+        typer.Option(
+            "--max-net-cost-increase-pct",
+            help="Maximum allowable percentage increase in net expected cost.",
+        ),
+    ] = 0.05,
+    false_positive_cost: Annotated[
+        float,
+        typer.Option(
+            "--false-positive-cost", help="Cost of a false positive in financial evaluation."
+        ),
+    ] = 1.0,
+    false_negative_cost: Annotated[
+        float,
+        typer.Option(
+            "--false-negative-cost", help="Cost of a false negative in financial evaluation."
+        ),
+    ] = 10.0,
+    report_output: Annotated[
+        Path | None,
+        typer.Option(
+            "--report-output", help="Optional path to write JSON retraining report.", dir_okay=False
+        ),
+    ] = None,
+    as_json: Annotated[
+        bool,
+        typer.Option("--json", help="Emit report directly to stdout as formatted JSON."),
+    ] = False,
+    overwrite: Annotated[
+        bool,
+        typer.Option("--overwrite", help="Overwrite report file if destination already exists."),
+    ] = False,
+) -> None:
+    """Automate closed-loop candidate retraining, safety verification gating, and safe promotion."""
+    _guard_output(report_output, overwrite)
+
+    promote_norm = promote.strip().lower()
+    if promote_norm not in {"canary", "full", "none"}:
+        _abort(f"Invalid --promote option '{promote}'. Must be one of: 'canary', 'full', 'none'.")
+
+    if canary_percentage < 0.0 or canary_percentage > 100.0:
+        _abort(f"Invalid --canary-percentage '{canary_percentage}'. Must be between 0.0 and 100.0.")
+
+    # Parse hyperparameters
+    hparams: dict[str, Any] = {}
+    if hyperparameters_file is not None:
+        try:
+            hparams = json.loads(hyperparameters_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            _abort(f"Failed to read hyperparameters file: {exc}")
+    elif hyperparameters_json is not None:
+        try:
+            hparams = json.loads(hyperparameters_json)
+        except (ValueError, json.JSONDecodeError) as exc:
+            _abort(f"Failed to parse hyperparameters JSON: {exc}")
+
+    # Load labels
+    store = LabelIngestionStore()
+    suffix = labels_path.suffix.lower()
+    try:
+        if suffix == ".csv":
+            store.ingest_from_csv(labels_path)
+        elif suffix in {".jsonl", ".json"}:
+            store.ingest_from_jsonl(labels_path)
+        else:
+            _abort(f"Unsupported labels file extension '{suffix}'. Expected .csv or .jsonl.")
+    except (FeedbackError, ValueError, OSError) as exc:
+        _abort(f"Label loading failed: {exc}")
+
+    # Load champion model
+    try:
+        champion_model = load_model(champion_model_path)
+    except (ModelArtifactError, OSError, ValueError) as exc:
+        _abort(f"Failed to load champion model from {champion_model_path}: {exc}")
+
+    # Materialize dataset
+    cfg = RetrainingConfig(
+        estimator=estimator,
+        hyperparameters=hparams,
+        holdout_gap_seconds=holdout_gap_seconds,
+    )
+    try:
+        builder = RetrainingDatasetBuilder(cfg)
+        dataset = builder.build_from_audit_and_labels(audit_log_path, store)
+    except (RetrainingError, ValueError, OSError) as exc:
+        typer.echo(f"Retraining dataset materialization failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    # Train challenger candidate
+    try:
+        trainer = ChallengerTrainer(cfg)
+        cand_res = trainer.train(dataset)
+    except (RetrainingError, ValueError, RuntimeError) as exc:
+        typer.echo(f"Challenger model training failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    # Evaluate safety gating
+    thresholds = SafetyGatingThresholds(
+        min_pr_auc_delta=min_pr_auc_delta,
+        min_recall_delta=min_recall_delta,
+        max_ece_increase=max_ece_increase,
+        max_slice_disparity=max_slice_disparity,
+        max_net_cost_increase_pct=max_net_cost_increase_pct,
+        false_positive_cost=false_positive_cost,
+        false_negative_cost=false_negative_cost,
+    )
+    verifier = ChallengerSafetyVerifier(thresholds)
+    try:
+        verif_report = verifier.verify_candidate(
+            cand_res.model,
+            champion_model,
+            dataset,
+            slice_column=slice_column,
+        )
+    except (RetrainingError, ValueError, TypeError, KeyError) as exc:
+        typer.echo(f"Candidate verification error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    # Export candidate artifact bundle and attestation
+    output_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        attestation_path = export_certified_candidate(
+            cand_res,
+            output_dir,
+            verification_report=verif_report,
+            signing_key_path=signing_key_path,
+        )
+        attestation_data = json.loads(attestation_path.read_text(encoding="utf-8"))
+        attestation_digest = attestation_data.get("attestation_digest")
+    except (RetrainingError, OSError, ValueError, TypeError) as exc:
+        typer.echo(f"Failed to export candidate artifact: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    # Promotion handling
+    promoted = False
+    promotion_message: str | None = None
+    if verif_report.status == VerificationStatus.PASSED and promote_norm != "none":
+        if api_url:
+            base = api_url.rstrip("/")
+            if not base.startswith(("http://", "https://")):
+                _abort(f"Invalid api-url '{api_url}'. Must begin with http:// or https://")
+            endpoint = f"{base}/v1/models/promote"
+            promote_payload = {
+                "candidate_path": str(output_dir.resolve()),
+                "promotion_type": promote_norm,
+                "canary_percentage": canary_percentage if promote_norm == "canary" else 100.0,
+                "require_attestation": False,
+            }
+            try:
+                req = urllib.request.Request(  # noqa: S310
+                    endpoint,
+                    data=json.dumps(promote_payload).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=30.0) as resp:  # noqa: S310
+                    resp_data = json.loads(resp.read().decode("utf-8"))
+                    promoted = True
+                    promotion_message = resp_data.get("message", "Candidate successfully promoted.")
+            except (
+                urllib.error.URLError,
+                urllib.error.HTTPError,
+                OSError,
+                TimeoutError,
+                json.JSONDecodeError,
+            ) as exc:
+                typer.echo(f"API promotion call failed to {endpoint}: {exc}", err=True)
+                raise typer.Exit(code=1) from exc
+        else:
+            promoted = True
+            promotion_message = (
+                f"Candidate certified for {promote_norm} promotion (no API URL specified)."
+            )
+
+    report_dict: dict[str, Any] = {
+        "status": "completed",
+        "verification_status": verif_report.status.value,
+        "verification_report": verif_report.to_dict(),
+        "training_metrics": cand_res.test_metrics,
+        "model_version": cand_res.model_version,
+        "artifact_path": str(output_dir.resolve()),
+        "attestation_digest": attestation_digest,
+        "promoted": promoted,
+        "promotion_type": promote_norm,
+        "promotion_message": promotion_message,
+    }
+    report_json = json.dumps(report_dict, indent=2)
+
+    if report_output is not None:
+        _atomic_write_text(report_json + "\n", report_output)
+
+    if as_json:
+        typer.echo(report_json)
+    else:
+        typer.echo("Candidate Retraining Complete:")
+        typer.echo(f"  Status:                 {verif_report.status.value.upper()}")
+        typer.echo(f"  Artifact Export:        {output_dir.resolve()}")
+        typer.echo(f"  Attestation Digest:     {attestation_digest}")
+        typer.echo(f"  Summary:                {verif_report.summary}")
+        for comp in verif_report.comparisons:
+            tag = "[PASS]" if comp.passed else "[FAIL]"
+            typer.echo(
+                f"  {tag} {comp.metric_name}: Cand={comp.challenger_value:.4f} "
+                f"Champ={comp.champion_value:.4f} "
+                f"(delta={comp.delta:+.4f}, thresh={comp.threshold})"
+            )
+        if verif_report.slice_disparities:
+            for sname, sval in verif_report.slice_disparities.items():
+                typer.echo(f"  Slice disparity ({sname}): {sval:.4f}")
+        if promoted:
+            typer.echo(f"  Promotion:              {promotion_message}")
+
+    if verif_report.status == VerificationStatus.FAILED:
+        raise typer.Exit(code=3)
 
 
 def _abort(message: str) -> NoReturn:
