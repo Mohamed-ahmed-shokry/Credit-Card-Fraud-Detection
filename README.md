@@ -676,6 +676,68 @@ fraud-detect feedback-surveillance \
   - `fraud_feedback_retraining_triggers_total{trigger_type="..."}`: Retraining triggers tripped by type.
   - `fraud_feedback_realized_recall`, `fraud_feedback_realized_pr_auc`, `fraud_feedback_realized_net_financial_loss`: Realized surveillance gauges.
 
+## Automated Closed-Loop Retraining, Candidate Verification & Safe Promotion
+
+Phase 37 introduces end-to-end automated closed-loop model retraining, multi-metric challenger safety verification gating, cryptographic attestation, zero-downtime hot-reloading, and safe canary traffic promotion.
+
+```bash
+# Execute end-to-end closed-loop retraining and safety verification
+fraud-detect auto-retrain \
+  --audit-log-path logs/scoring_audit.jsonl \
+  --labels-path data/labels_store.jsonl \
+  --champion-model-path artifacts/model \
+  --output-dir artifacts/candidate \
+  --estimator logistic_regression \
+  --promote canary \
+  --canary-percentage 10.0 \
+  --json
+
+# Sign certified candidate artifact with Ed25519 private key
+fraud-detect auto-retrain \
+  --audit-log-path logs/scoring_audit.jsonl \
+  --labels-path data/labels_store.jsonl \
+  --champion-model-path artifacts/model \
+  --output-dir artifacts/candidate \
+  --signing-key-path keys/ed25519_private.pem \
+  --promote full
+
+# Trigger hot-reload / canary promotion directly on a running production API service
+fraud-detect auto-retrain \
+  --audit-log-path logs/scoring_audit.jsonl \
+  --labels-path data/labels_store.jsonl \
+  --champion-model-path artifacts/model \
+  --output-dir artifacts/candidate \
+  --promote canary \
+  --canary-percentage 20.0 \
+  --api-url http://localhost:8000
+```
+
+### Closed-Loop Retraining Architecture & Capabilities
+
+- **Dataset Materialization**: `RetrainingDatasetBuilder` joins mature feedback labels with production scoring audit logs, enforcing temporal holdout purge gaps, minimum sample and fraud count thresholds, and multi-class target assertions.
+- **Automated Challenger Training**: `ChallengerTrainer` supports Logistic Regression, Random Forest, and LightGBM with hyperparameter mapping, stratified/temporal CV splitting, decision threshold optimization, and training duration capture.
+- **Multi-Faceted Challenger Verification**: `ChallengerSafetyVerifier` evaluates candidate models against production champions on identical holdout data across five safety gates:
+  - Minimum PR-AUC delta ($\ge -0.02$)
+  - Recall non-regression ($\ge -0.03$)
+  - Expected Calibration Error increase ($\Delta \text{ECE} \le 0.03$)
+  - Net expected financial fraud cost change ($\le 5\%$)
+  - Sub-population slice disparity ($\le 0.25$)
+- **Cryptographic Attestation & Lineage Signing**: `export_certified_candidate` bundles model weights, metadata, verification reports, and SHA-256 manifests into an `attestation.json` signed with Ed25519; `verify_certified_candidate` validates file integrity and signatures.
+- **Zero-Downtime Hot-Reload & Safe Canary Promotion**:
+  - `POST /v1/models/reload`: Atomically swaps model in memory with optional cryptographic attestation verification.
+  - `POST /v1/models/promote`: Deploys candidate as canary with configurable traffic percentage (`0.0% - 100.0%`) or promotes to full primary champion.
+  - `POST /v1/retraining/trigger`: Programmatically triggers automated retraining, safety verification, and canary promotion from the API.
+- **CLI Workflow & Deterministic Exit Codes**: `fraud-detect auto-retrain` emits:
+  - `0`: Retraining and verification passed; candidate exported / promoted.
+  - `1`: Runtime failure (dataset materialization, training exception, promotion network error).
+  - `2`: Configuration or argument error (missing file, invalid percentage).
+  - `3`: Candidate rejected by safety verification gating (differentiates safety rejections from operational pipeline crashes in CI/CD, Airflow, or Kubeflow).
+- **Prometheus Telemetry & Structured Audit Events**:
+  - `fraud_retraining_runs_total{status="...", trigger_reason="..."}`
+  - `fraud_challenger_verification_status{status="..."}`
+  - `fraud_model_promotions_total{promotion_type="...", status="..."}`
+  - `challenger_retrained` and `model_promoted` structured audit events.
+
 ## Train on the anonymized dataset
 
 Place the downloaded CSV under the ignored `Dataset/` directory; raw financial data
