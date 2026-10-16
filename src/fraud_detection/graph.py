@@ -461,3 +461,168 @@ class EntityGraph:
             self._entity_to_tx.clear()
             self._edges.clear()
             self._last_prune_timestamp = 0.0
+
+
+@dataclass(frozen=True)
+class GraphFeatureConfig:
+    """Configuration for graph feature extraction and risk diffusion."""
+
+    windows_seconds: tuple[float, ...] = (3600.0, 86400.0)
+    max_hops: int = 2
+    diffusion_damping: float = 0.85
+    diffusion_iterations: int = 5
+
+    def __post_init__(self) -> None:
+        if not self.windows_seconds:
+            raise GraphError("windows_seconds must be a non-empty sequence of positive floats.")
+        for w in self.windows_seconds:
+            if not isinstance(w, (int, float)) or math.isnan(w) or math.isinf(w) or w <= 0.0:
+                raise GraphError("Each window in windows_seconds must be a positive finite float.")
+        if not isinstance(self.max_hops, int) or not (1 <= self.max_hops <= 5):
+            raise GraphError("max_hops must be an integer between 1 and 5.")
+        if (
+            not isinstance(self.diffusion_damping, (int, float))
+            or math.isnan(self.diffusion_damping)
+            or math.isinf(self.diffusion_damping)
+            or not (0.0 <= self.diffusion_damping <= 1.0)
+        ):
+            raise GraphError("diffusion_damping must be a float between 0.0 and 1.0.")
+        if not isinstance(self.diffusion_iterations, int) or not (
+            1 <= self.diffusion_iterations <= 20
+        ):
+            raise GraphError("diffusion_iterations must be an integer between 1 and 20.")
+
+
+class GraphFeatureExtractor:
+    """Extracts structural graph features and risk diffusion scores from EntityGraph."""
+
+    def __init__(self, graph: EntityGraph, config: GraphFeatureConfig | None = None) -> None:
+        self.graph = graph
+        self.config = config or GraphFeatureConfig()
+
+    def extract_features(
+        self,
+        transaction_id: str | None = None,
+        timestamp: float | None = None,
+        entities: dict[EntityType, str] | None = None,
+    ) -> dict[str, float]:
+        """Extract graph features for a candidate or existing transaction without lookahead bias."""
+        if entities is None and transaction_id is not None:
+            tx = self.graph.get_transaction(transaction_id)
+            if tx is not None:
+                entities = tx.entities
+                if timestamp is None:
+                    timestamp = tx.timestamp
+
+        if entities is None:
+            entities = {}
+
+        if timestamp is None:
+            timestamp = 0.0
+
+        features: dict[str, float] = {}
+
+        # 1. Degree Centrality across configured windows
+        for w in self.config.windows_seconds:
+            w_suffix = f"_{int(w)}s"
+            since_ts = max(0.0, timestamp - w)
+
+            # Degree features for each entity type in the transaction
+            for et in (
+                EntityType.CARD_ID,
+                EntityType.DEVICE_ID,
+                EntityType.IP_ADDRESS,
+                EntityType.MERCHANT_ID,
+                EntityType.USER_ID,
+            ):
+                eid = entities.get(et)
+                if eid:
+                    txs = self.graph.get_entity_transactions(et, eid, since_timestamp=since_ts)
+                    # Filter out transactions strictly after timestamp to avoid lookahead bias
+                    valid_txs = [
+                        t
+                        for t in txs
+                        if t.timestamp <= timestamp and t.transaction_id != transaction_id
+                    ]
+                    features[f"graph_{et.value}_tx_count{w_suffix}"] = float(len(valid_txs))
+                    features[f"graph_{et.value}_monetary_sum{w_suffix}"] = float(
+                        sum(t.amount for t in valid_txs)
+                    )
+
+                    # Distinct peer cards connected to this device or IP
+                    if et in (EntityType.DEVICE_ID, EntityType.IP_ADDRESS):
+                        distinct_cards = {
+                            t.entities[EntityType.CARD_ID]
+                            for t in valid_txs
+                            if EntityType.CARD_ID in t.entities
+                        }
+                        features[f"graph_{et.value}_distinct_cards{w_suffix}"] = float(
+                            len(distinct_cards)
+                        )
+
+                    # Distinct devices or IPs connected to this card
+                    if et == EntityType.CARD_ID:
+                        distinct_devs = {
+                            t.entities[EntityType.DEVICE_ID]
+                            for t in valid_txs
+                            if EntityType.DEVICE_ID in t.entities
+                        }
+                        distinct_ips = {
+                            t.entities[EntityType.IP_ADDRESS]
+                            for t in valid_txs
+                            if EntityType.IP_ADDRESS in t.entities
+                        }
+                        features[f"graph_card_distinct_devices{w_suffix}"] = float(
+                            len(distinct_devs)
+                        )
+                        features[f"graph_card_distinct_ips{w_suffix}"] = float(len(distinct_ips))
+                else:
+                    features[f"graph_{et.value}_tx_count{w_suffix}"] = 0.0
+                    features[f"graph_{et.value}_monetary_sum{w_suffix}"] = 0.0
+                    if et in (EntityType.DEVICE_ID, EntityType.IP_ADDRESS):
+                        features[f"graph_{et.value}_distinct_cards{w_suffix}"] = 0.0
+                    if et == EntityType.CARD_ID:
+                        features[f"graph_card_distinct_devices{w_suffix}"] = 0.0
+                        features[f"graph_card_distinct_ips{w_suffix}"] = 0.0
+
+        # 2. 2-Hop Network Sharing & Connected Syndicate Size
+        card_id = entities.get(EntityType.CARD_ID)
+        if card_id:
+            peer_cards = self.graph.get_2hop_entities(
+                EntityType.CARD_ID, card_id, target_type=EntityType.CARD_ID
+            )
+            features["graph_shared_device_cards_count"] = float(len(peer_cards))
+        else:
+            features["graph_shared_device_cards_count"] = 0.0
+
+        device_id = entities.get(EntityType.DEVICE_ID)
+        if device_id:
+            peer_devices = self.graph.get_2hop_entities(
+                EntityType.DEVICE_ID, device_id, target_type=EntityType.DEVICE_ID
+            )
+            features["graph_shared_card_devices_count"] = float(len(peer_devices))
+        else:
+            features["graph_shared_card_devices_count"] = 0.0
+
+        # 3. Localized Personalized Risk Diffusion Score
+        risk_scores: list[float] = []
+        for et, eid in entities.items():
+            enode = self.graph.get_entity(et, eid)
+            if enode is not None:
+                risk_scores.append(enode.risk_score)
+                # also consider 2-hop connected entities
+                risk_scores.extend(
+                    peer.risk_score * (1.0 - self.config.diffusion_damping)
+                    for peer in self.graph.get_2hop_entities(et, eid)
+                )
+
+        if risk_scores:
+            features["graph_risk_diffusion"] = float(min(1.0, max(0.0, max(risk_scores))))
+            features["graph_neighborhood_avg_risk"] = float(
+                min(1.0, max(0.0, sum(risk_scores) / len(risk_scores)))
+            )
+        else:
+            features["graph_risk_diffusion"] = 0.0
+            features["graph_neighborhood_avg_risk"] = 0.0
+
+        return features
