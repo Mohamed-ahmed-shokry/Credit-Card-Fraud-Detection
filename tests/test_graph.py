@@ -3,8 +3,10 @@
 import pytest
 
 from fraud_detection.graph import (
+    EntityGraph,
     EntityNode,
     EntityType,
+    GraphConfig,
     GraphEdge,
     GraphError,
     GraphMetrics,
@@ -126,3 +128,183 @@ def test_graph_metrics() -> None:
     )
     assert metrics.total_transactions == 10
     assert metrics.entities_by_type["card_id"] == 3
+
+
+def test_graph_config_validation() -> None:
+    config = GraphConfig(window_seconds=3600.0, max_transactions=1000)
+    assert config.window_seconds == 3600.0
+    assert config.max_transactions == 1000
+
+    with pytest.raises(GraphError, match="window_seconds must be a positive finite float"):
+        GraphConfig(window_seconds=-10.0)
+
+    with pytest.raises(GraphError, match="max_transactions must be a positive integer"):
+        GraphConfig(max_transactions=0)
+
+    with pytest.raises(GraphError, match="max_entities must be a positive integer"):
+        GraphConfig(max_entities=-5)
+
+    with pytest.raises(
+        GraphError, match="prune_interval_seconds must be a non-negative finite float"
+    ):
+        GraphConfig(prune_interval_seconds=-1.0)
+
+
+def test_entity_graph_add_and_query() -> None:
+    graph = EntityGraph()
+    tx = graph.add_transaction(
+        transaction_id="tx_101",
+        timestamp=100.0,
+        amount=150.0,
+        entities={
+            EntityType.CARD_ID: "card_A",
+            EntityType.DEVICE_ID: "dev_1",
+            EntityType.IP_ADDRESS: "10.0.0.1",
+        },
+        is_fraud=False,
+        risk_score=0.2,
+    )
+    assert tx.transaction_id == "tx_101"
+    assert graph.get_transaction("tx_101") == tx
+
+    # Check entity indexing
+    card_node = graph.get_entity(EntityType.CARD_ID, "card_A")
+    assert card_node is not None
+    assert card_node.first_seen_timestamp == 100.0
+    assert card_node.risk_score == 0.2
+
+    # Query transaction entities
+    entities = graph.get_transaction_entities("tx_101")
+    assert len(entities) == 3
+    assert entities[EntityType.DEVICE_ID].entity_id == "dev_1"
+
+    # Query entity transactions
+    txs = graph.get_entity_transactions(EntityType.DEVICE_ID, "dev_1")
+    assert len(txs) == 1
+    assert txs[0].transaction_id == "tx_101"
+
+
+def test_entity_graph_risk_propagation() -> None:
+    graph = EntityGraph()
+    graph.add_transaction(
+        transaction_id="tx_normal",
+        timestamp=100.0,
+        amount=20.0,
+        entities={EntityType.CARD_ID: "card_B", EntityType.DEVICE_ID: "dev_2"},
+        is_fraud=False,
+        risk_score=0.1,
+    )
+    dev = graph.get_entity(EntityType.DEVICE_ID, "dev_2")
+    assert dev is not None
+    assert dev.risk_score == 0.1
+
+    # Now add fraud transaction on same device
+    graph.add_transaction(
+        transaction_id="tx_fraud",
+        timestamp=200.0,
+        amount=500.0,
+        entities={EntityType.CARD_ID: "card_C", EntityType.DEVICE_ID: "dev_2"},
+        is_fraud=True,
+    )
+    dev = graph.get_entity(EntityType.DEVICE_ID, "dev_2")
+    assert dev is not None
+    assert dev.risk_score == 1.0
+
+
+def test_entity_graph_2hop_neighbors() -> None:
+    graph = EntityGraph()
+    # tx1 links card1 and device1
+    graph.add_transaction(
+        transaction_id="tx_1",
+        timestamp=10.0,
+        amount=30.0,
+        entities={EntityType.CARD_ID: "card_1", EntityType.DEVICE_ID: "dev_shared"},
+    )
+    # tx2 links card2 and device1
+    graph.add_transaction(
+        transaction_id="tx_2",
+        timestamp=20.0,
+        amount=40.0,
+        entities={EntityType.CARD_ID: "card_2", EntityType.DEVICE_ID: "dev_shared"},
+    )
+    # tx3 links card3 and device_other
+    graph.add_transaction(
+        transaction_id="tx_3",
+        timestamp=30.0,
+        amount=50.0,
+        entities={EntityType.CARD_ID: "card_3", EntityType.DEVICE_ID: "dev_other"},
+    )
+
+    # 2-hop transactions from tx_1 (shares dev_shared with tx_2)
+    peer_txs = graph.get_2hop_transactions("tx_1")
+    assert len(peer_txs) == 1
+    # Co-occurring entities from card_1 (directly in tx_1: dev_shared)
+    co_entities = graph.get_cooccurring_entities(EntityType.CARD_ID, "card_1")
+    assert len(co_entities) == 1
+    assert co_entities[0].entity_id == "dev_shared"
+
+    # 2-hop entities from card_1 (connected to card_2 via shared dev_shared)
+    peer_cards = graph.get_2hop_entities(
+        EntityType.CARD_ID, "card_1", target_type=EntityType.CARD_ID
+    )
+    assert len(peer_cards) == 1
+    assert peer_cards[0].entity_id == "card_2"
+
+
+def test_entity_graph_temporal_eviction_and_metrics() -> None:
+    config = GraphConfig(window_seconds=100.0, prune_interval_seconds=1000.0)
+    graph = EntityGraph(config=config)
+
+    graph.add_transaction(
+        transaction_id="tx_old",
+        timestamp=50.0,
+        amount=10.0,
+        entities={EntityType.CARD_ID: "card_old"},
+    )
+    graph.add_transaction(
+        transaction_id="tx_new",
+        timestamp=200.0,
+        amount=25.0,
+        entities={EntityType.CARD_ID: "card_new"},
+    )
+
+    metrics_before = graph.get_metrics()
+    assert metrics_before.total_transactions == 2
+    assert metrics_before.total_entities == 2
+
+    # Evict relative to ts=200 (cutoff = 100). tx_old (ts=50) should be evicted.
+    evicted = graph.evict_expired(current_timestamp=200.0)
+    assert evicted == 1
+    assert graph.get_transaction("tx_old") is None
+    assert graph.get_entity(EntityType.CARD_ID, "card_old") is None
+    assert graph.get_transaction("tx_new") is not None
+
+    metrics_after = graph.get_metrics()
+    assert metrics_after.total_transactions == 1
+    assert metrics_after.total_entities == 1
+
+
+def test_entity_graph_capacity_and_reset() -> None:
+    config = GraphConfig(max_transactions=2)
+    graph = EntityGraph(config=config)
+
+    graph.add_transaction(
+        transaction_id="t1", timestamp=1.0, amount=1.0, entities={EntityType.CARD_ID: "c1"}
+    )
+    graph.add_transaction(
+        transaction_id="t2", timestamp=2.0, amount=2.0, entities={EntityType.CARD_ID: "c2"}
+    )
+    graph.add_transaction(
+        transaction_id="t3", timestamp=3.0, amount=3.0, entities={EntityType.CARD_ID: "c3"}
+    )
+
+    metrics_cap = graph.get_metrics()
+    assert metrics_cap.total_transactions == 2
+    assert graph.get_transaction("t1") is None
+    assert graph.get_transaction("t2") is not None
+    assert graph.get_transaction("t3") is not None
+
+    graph.reset()
+    metrics_empty = graph.get_metrics()
+    assert metrics_empty.total_transactions == 0
+    assert metrics_empty.total_entities == 0

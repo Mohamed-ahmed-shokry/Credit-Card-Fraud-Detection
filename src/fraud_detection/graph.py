@@ -371,25 +371,58 @@ class EntityGraph:
             ]
             return sorted(result, key=lambda t: t.timestamp)
 
+    def get_cooccurring_entities(
+        self,
+        entity_type: EntityType,
+        entity_id: str,
+        target_type: EntityType | None = None,
+    ) -> list[EntityNode]:
+        """Find entities directly co-occurring in the same transactions as the source entity."""
+        with self._lock:
+            entity_key = (entity_type, entity_id)
+            tx_ids = self._entity_to_tx.get(entity_key, set())
+            target_keys: set[tuple[EntityType, str]] = set()
+            for tid in tx_ids:
+                for pt in self._tx_to_entities.get(tid, set()):
+                    if pt == entity_key:
+                        continue
+                    if target_type is not None and pt[0] != target_type:
+                        continue
+                    target_keys.add(pt)
+            result = [self._entities[k] for k in target_keys if k in self._entities]
+            return sorted(result, key=lambda e: (e.entity_type, e.entity_id))
+
     def get_2hop_entities(
         self,
         entity_type: EntityType,
         entity_id: str,
         target_type: EntityType | None = None,
     ) -> list[EntityNode]:
-        """Find entities connected to the source entity through shared transactions."""
+        """Find entities connected to the source entity through shared intermediate entities."""
         with self._lock:
             entity_key = (entity_type, entity_id)
             tx_ids = self._entity_to_tx.get(entity_key, set())
-            target_keys: set[tuple[EntityType, str]] = set()
+            # Find intermediate entities appearing in these transactions
+            intermediate_entities: set[tuple[EntityType, str]] = set()
             for tid in tx_ids:
-                peer_keys = self._tx_to_entities.get(tid, set())
-                for pt, pid in peer_keys:
-                    if (pt, pid) == entity_key:
+                for pt in self._tx_to_entities.get(tid, set()):
+                    if pt != entity_key:
+                        intermediate_entities.add(pt)
+
+            # Find all transactions touching any of these intermediate entities
+            connected_tx_ids: set[str] = set()
+            for i_ent in intermediate_entities:
+                connected_tx_ids.update(self._entity_to_tx.get(i_ent, set()))
+
+            # Find all entities appearing in those connected transactions
+            target_keys: set[tuple[EntityType, str]] = set()
+            for c_tid in connected_tx_ids:
+                for pt in self._tx_to_entities.get(c_tid, set()):
+                    if pt == entity_key:
                         continue
-                    if target_type is not None and pt != target_type:
+                    if target_type is not None and pt[0] != target_type:
                         continue
-                    target_keys.add((pt, pid))
+                    target_keys.add(pt)
 
             result = [self._entities[k] for k in target_keys if k in self._entities]
             return sorted(result, key=lambda e: (e.entity_type, e.entity_id))
