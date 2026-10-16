@@ -44,9 +44,10 @@ deterministic stage node caching with speculative asynchronous model inference,
 dynamic decision graph replay with counterfactual policy optimization,
 per-stage circuit breakers with zero-latency fast-fail isolation, deterministic
 chaos fault injection, and delayed feedback ingestion with empirical label maturation
-curve modeling, realized performance and financial cost surveillance, and automated
-retraining triggers. Phase 37 is in progress to automate closed-loop champion-challenger
-retraining, candidate verification safety gating, and zero-downtime safe canary promotion.
+curve modeling, realized performance and financial cost surveillance, automated
+retraining triggers, and automated closed-loop champion-challenger retraining, multi-dimensional
+candidate verification safety gating, cryptographic attestation signing, and zero-downtime safe
+canary promotion (Phase 37).
 
 ## Phase 1 — Distribution
 
@@ -1665,7 +1666,7 @@ This phase does not implement live webhook callbacks to external payment card ne
 - **Status**: Completed across 27 micro-commits.
 - **Verification**: 100% test pass rate (848+ tests), branch coverage $\ge 97.0\%$, strict mypy 0 issues across 21 source files, Ruff format and check clean, pip-audit 0 vulnerabilities, wheel build and twine check valid.
 
-## Phase 37 — Automated Closed-Loop Retraining, Candidate Verification & Zero-Downtime Safe Promotion (In progress)
+## Phase 37 — Automated Closed-Loop Retraining, Candidate Verification & Zero-Downtime Safe Promotion (Done)
 
 ### Objective
 
@@ -1726,14 +1727,14 @@ Close the autonomous continuous learning and model adaptation lifecycle by imple
 
 ### Task List
 
-- [ ] Task 1: Create `src/fraud_detection/retraining.py` with domain data models (`RetrainingConfig`, `ChallengerVerificationReport`, `RetrainingStatus`, `RetrainingError`) and `RetrainingDatasetBuilder` with unit tests in `tests/test_retraining.py`.
-- [ ] Task 2: Implement `ChallengerTrainer` with hyperparameter configuration and threshold tuning in `retraining.py` with tests in `tests/test_retraining.py`.
-- [ ] Task 3: Implement `ChallengerSafetyVerifier` evaluating PR-AUC, recall, ECE, slice disparity, and cost vs. champion with tests in `tests/test_retraining.py`.
-- [ ] Task 4: Implement certified artifact export and attestation signing (`export_certified_candidate`) in `retraining.py` with tests in `tests/test_retraining.py`.
-- [ ] Task 5: Implement audit event builders (`build_challenger_retrained_audit_event`, `build_model_promoted_audit_event`) in `audit.py` with tests in `tests/test_audit.py`.
-- [ ] Task 6: Implement zero-downtime hot-reload and dynamic canary promotion endpoints and telemetry in `api.py` with tests in `tests/test_api.py`.
-- [ ] Task 7: Implement CLI command `auto-retrain` in `cli.py` with tests in `tests/test_cli.py`.
-- [ ] Task 8: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate.
+- [x] Task 1: Create `src/fraud_detection/retraining.py` with domain data models (`RetrainingConfig`, `ChallengerVerificationReport`, `RetrainingStatus`, `RetrainingError`) and `RetrainingDatasetBuilder` with unit tests in `tests/test_retraining.py`.
+- [x] Task 2: Implement `ChallengerTrainer` with hyperparameter configuration and threshold tuning in `retraining.py` with tests in `tests/test_retraining.py`.
+- [x] Task 3: Implement `ChallengerSafetyVerifier` evaluating PR-AUC, recall, ECE, slice disparity, and cost vs. champion with tests in `tests/test_retraining.py`.
+- [x] Task 4: Implement certified artifact export and attestation signing (`export_certified_candidate`) in `retraining.py` with tests in `tests/test_retraining.py`.
+- [x] Task 5: Implement audit event builders (`build_challenger_retrained_audit_event`, `build_model_promoted_audit_event`) in `audit.py` with tests in `tests/test_audit.py`.
+- [x] Task 6: Implement zero-downtime hot-reload and dynamic canary promotion endpoints and telemetry in `api.py` with tests in `tests/test_api.py`.
+- [x] Task 7: Implement CLI command `auto-retrain` in `cli.py` with tests in `tests/test_cli.py`.
+- [x] Task 8: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate.
 
 
 ## Contributing to the roadmap
