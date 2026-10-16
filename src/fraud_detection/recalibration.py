@@ -461,7 +461,7 @@ class IsotonicRecalibrator(BaseRecalibrator):
         if regressor is None:
             return probs
         calibrated = np.asarray(regressor.predict(probs), dtype=float)
-        return np.clip(calibrated, 0.0, 1.0)
+        return np.asarray(np.clip(calibrated, 0.0, 1.0), dtype=float)
 
     def to_dict(self) -> dict[str, Any]:
         return {
