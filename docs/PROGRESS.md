@@ -7,7 +7,7 @@
 
 ## Task Status
 - [x] Task 1: Create `src/fraud_detection/graph.py` with domain data models (`EntityType`, `EntityNode`, `TransactionNode`, `GraphEdge`, `GraphMetrics`) and `EntityGraph` bipartite engine with unit tests in `tests/test_graph.py`.
-- [ ] Task 2: Implement `GraphFeatureConfig` and `GraphFeatureExtractor` (degree centrality, 2-hop entity sharing, risk diffusion) in `graph.py` with tests in `tests/test_graph.py`.
+- [x] Task 2: Implement `GraphFeatureConfig` and `GraphFeatureExtractor` (degree centrality, 2-hop entity sharing, risk diffusion) in `graph.py` with tests in `tests/test_graph.py`.
 - [ ] Task 3: Implement `FraudRingCluster`, `FraudRingReport`, and `FraudRingDetector` (bicliques, star card-testing, cycles) in `graph.py` with tests in `tests/test_graph.py`.
 - [ ] Task 4: Integrate graph features with `rules.py` and `pipeline.py` (`GraphEnrichmentStage`) with tests in `tests/test_rules.py` and `tests/test_pipeline.py`.
 - [ ] Task 5: Implement audit event builder `build_fraud_ring_detected_audit_event` in `audit.py` with tests in `tests/test_audit.py`.
