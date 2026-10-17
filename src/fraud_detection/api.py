@@ -21,7 +21,7 @@ from uuid import uuid4
 
 import numpy as np
 import pandas as pd
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from prometheus_client import (
@@ -66,6 +66,12 @@ from fraud_detection.feedback import (
     RetrainingTriggerPolicy,
     match_labels_with_audit_log,
     partition_into_cohorts,
+)
+from fraud_detection.graph import (
+    EntityGraph,
+    EntityType,
+    FraudRingDetector,
+    GraphConfig,
 )
 from fraud_detection.model import FraudModel, ModelArtifactError, load_model
 from fraud_detection.pipeline import (
@@ -160,6 +166,8 @@ PIPELINE_CIRCUIT_FAILURE_THRESHOLD_ENVIRONMENT_VARIABLE = "FRAUD_PIPELINE_CIRCUI
 PIPELINE_CIRCUIT_RECOVERY_TIMEOUT_ENVIRONMENT_VARIABLE = (
     "FRAUD_PIPELINE_CIRCUIT_RECOVERY_TIMEOUT_SECONDS"
 )
+GRAPH_WINDOW_SECONDS_ENVIRONMENT_VARIABLE = "FRAUD_GRAPH_WINDOW_SECONDS"
+MAX_GRAPH_NODES_ENVIRONMENT_VARIABLE = "FRAUD_MAX_GRAPH_NODES"
 REQUEST_ID_HEADER = "X-Request-ID"
 PROCESS_TIME_HEADER = "X-Process-Time-Ms"
 MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024
@@ -181,6 +189,9 @@ OPERATIONAL_PATHS = frozenset(
         "/v1/pipeline/circuits",
         "/v1/pipeline/circuits/reset",
         "/v1/pipeline/chaos",
+        "/v1/graph/stats",
+        "/v1/graph/rings",
+        "/v1/graph/reset",
     }
 )
 UNMATCHED_ROUTE_LABEL = "unmatched"
@@ -1179,6 +1190,10 @@ def create_app(
     label_store: LabelIngestionStore | None = None,
     feedback_surveillance_analyzer: FeedbackSurveillanceAnalyzer | None = None,
     retraining_policy: RetrainingTriggerPolicy | None = None,
+    entity_graph: EntityGraph | None = None,
+    fraud_ring_detector: FraudRingDetector | None = None,
+    graph_window_seconds: float = 86400.0,
+    max_graph_nodes: int = 50000,
 ) -> FastAPI:
     """Create an application using an injected model or a trusted artifact path.
 
@@ -1418,7 +1433,45 @@ def create_app(
         else pipeline_circuit_recovery_timeout_seconds
     )
 
+    resolved_entity_graph: EntityGraph | None = entity_graph
+    if resolved_entity_graph is None:
+        raw_graph_window = os.getenv(GRAPH_WINDOW_SECONDS_ENVIRONMENT_VARIABLE)
+        eff_graph_window = (
+            float(raw_graph_window) if raw_graph_window is not None else graph_window_seconds
+        )
+        raw_graph_nodes = os.getenv(MAX_GRAPH_NODES_ENVIRONMENT_VARIABLE)
+        eff_graph_nodes = int(raw_graph_nodes) if raw_graph_nodes is not None else max_graph_nodes
+        resolved_entity_graph = EntityGraph(
+            GraphConfig(window_seconds=eff_graph_window, max_transactions=eff_graph_nodes)
+        )
+
+    resolved_fraud_ring_detector: FraudRingDetector | None = fraud_ring_detector
+    if resolved_fraud_ring_detector is None and resolved_entity_graph is not None:
+        resolved_fraud_ring_detector = FraudRingDetector(resolved_entity_graph)
+
     metrics_registry = CollectorRegistry()
+    graph_nodes_gauge = Gauge(
+        "fraud_graph_nodes_total",
+        "Total active entity nodes in the link graph by entity type.",
+        ["entity_type"],
+        registry=metrics_registry,
+    )
+    graph_edges_gauge = Gauge(
+        "fraud_graph_edges_total",
+        "Total active edges in the bipartite entity-transaction graph.",
+        registry=metrics_registry,
+    )
+    graph_rings_counter = Counter(
+        "fraud_graph_rings_detected_total",
+        "Total fraud syndicates and rings detected by severity.",
+        ["severity"],
+        registry=metrics_registry,
+    )
+    graph_ring_detection_duration = Histogram(
+        "fraud_graph_ring_detection_seconds",
+        "Latency of fraud ring community detection in seconds.",
+        registry=metrics_registry,
+    )
     request_counter = Counter(
         "http_requests_total",
         "Total HTTP requests handled.",
@@ -1825,6 +1878,8 @@ def create_app(
                 enable_circuit_breaker=resolved_pipeline_cb_enabled,
                 circuit_failure_threshold=resolved_pipeline_cb_failure_threshold,
                 circuit_recovery_timeout_seconds=resolved_pipeline_cb_recovery_timeout,
+                entity_graph=resolved_entity_graph,
+                fraud_ring_detector=resolved_fraud_ring_detector,
             )
 
         resolved_pipeline_exec = pipeline_executor
@@ -1843,6 +1898,12 @@ def create_app(
         application.state.challenger_model = loaded_challenger
         application.state.router = active_router
         application.state.circuit_breaker = resolved_cb
+        application.state.entity_graph = resolved_entity_graph
+        application.state.fraud_ring_detector = resolved_fraud_ring_detector
+        application.state.graph_nodes_gauge = graph_nodes_gauge
+        application.state.graph_edges_gauge = graph_edges_gauge
+        application.state.graph_rings_counter = graph_rings_counter
+        application.state.graph_ring_detection_duration = graph_ring_detection_duration
         application.state.audit_sink = resolved_audit_sink
         application.state.explanation_provider = explanation_provider
         application.state.fallback_mode = resolved_fallback_mode
@@ -2950,6 +3011,33 @@ def create_app(
             )
         except _ScoringOverloadedError:
             return _scoring_overloaded_response()
+
+        entity_graph_obj: EntityGraph | None = getattr(request.app.state, "entity_graph", None)
+        if entity_graph_obj is not None:
+            tx_data = payload.transaction
+            graph_entities: dict[EntityType, str] = {}
+            for et in EntityType:
+                val = (
+                    tx_data.get(et.value)
+                    or tx_data.get(et.name.lower())
+                    or tx_data.get(et.value.replace("_", ""))
+                )
+                if val is not None and str(val).strip():
+                    graph_entities[et] = str(val).strip()
+            if graph_entities:
+                tx_id = str(tx_data.get("transaction_id") or tx_data.get("tx_id") or uuid4())
+                ts = float(tx_data.get("timestamp") or tx_data.get("Time") or time.time())
+                amt = float(tx_data.get("Amount") or tx_data.get("amount") or 0.0)
+                pred_result = results[0]
+                entity_graph_obj.add_transaction(
+                    transaction_id=tx_id,
+                    timestamp=ts,
+                    amount=amt,
+                    entities=graph_entities,
+                    is_fraud=pred_result.is_fraud,
+                    risk_score=pred_result.fraud_probability,
+                )
+
         return ScoreResponse(
             model_version=_model_version(loaded),
             threshold=applied_threshold,
@@ -3042,6 +3130,126 @@ def create_app(
                 },
             )
         return result.to_dict()
+
+    @application.get("/v1/graph/stats", tags=["graph"])
+    async def graph_stats(request: Request) -> dict[str, Any]:
+        """Return operational metrics of the real-time bipartite entity graph."""
+        eg: EntityGraph | None = getattr(request.app.state, "entity_graph", None)
+        if eg is None:
+            return {
+                "enabled": False,
+                "total_transactions": 0,
+                "total_entities": 0,
+                "total_edges": 0,
+                "entities_by_type": {},
+                "window_seconds": 0.0,
+                "oldest_timestamp": None,
+                "newest_timestamp": None,
+            }
+        metrics = eg.get_metrics()
+        return {
+            "enabled": True,
+            "total_transactions": metrics.total_transactions,
+            "total_entities": metrics.total_entities,
+            "total_edges": metrics.total_edges,
+            "entities_by_type": metrics.entities_by_type,
+            "window_seconds": metrics.window_seconds,
+            "oldest_timestamp": metrics.oldest_timestamp,
+            "newest_timestamp": metrics.newest_timestamp,
+        }
+
+    @application.get("/v1/graph/entity/{entity_type}/{entity_id}", tags=["graph"])
+    async def graph_entity(entity_type: str, entity_id: str, request: Request) -> Any:
+        """Inspect topological details, degree, and 2-hop reachability for an entity node."""
+        eg: EntityGraph | None = getattr(request.app.state, "entity_graph", None)
+        if eg is None:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": "Entity graph link analysis is not enabled on this service."},
+            )
+        try:
+            matched_et = EntityType(entity_type.lower())
+        except ValueError:
+            valid_types = [e.value for e in EntityType]
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "detail": f"Invalid entity_type: '{entity_type}'. Must be one of {valid_types}."
+                },
+            )
+        node = eg.get_entity(matched_et, entity_id)
+        if node is None:
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "detail": (
+                        f"Entity '{entity_id}' of type '{matched_et.value}' "
+                        "not found in link graph."
+                    )
+                },
+            )
+        txs = eg.get_entity_transactions(matched_et, entity_id)
+        two_hop_nodes = eg.get_2hop_entities(matched_et, entity_id)
+        two_hop_counts: dict[str, int] = {}
+        for n in two_hop_nodes:
+            t_key = n.entity_type.value
+            two_hop_counts[t_key] = two_hop_counts.get(t_key, 0) + 1
+
+        return {
+            "entity_type": node.entity_type.value,
+            "entity_id": node.entity_id,
+            "first_seen_timestamp": node.first_seen_timestamp,
+            "last_seen_timestamp": node.last_seen_timestamp,
+            "risk_score": node.risk_score,
+            "transaction_count": len(txs),
+            "recent_transaction_ids": [t.transaction_id for t in txs[-10:]],
+            "two_hop_entity_counts": two_hop_counts,
+        }
+
+    @application.get("/v1/graph/rings", tags=["graph"])
+    async def graph_rings(
+        request: Request,
+        min_risk: float = Query(0.0, ge=0.0, le=1.0),
+        max_rings: int = Query(50, ge=1, le=500),
+    ) -> dict[str, Any]:
+        """Detect and return active fraud rings, botnets, and syndicate bicliques."""
+        detector: FraudRingDetector | None = getattr(request.app.state, "fraud_ring_detector", None)
+        if detector is None:
+            return {"enabled": False, "count": 0, "total_detected": 0, "rings": []}
+
+        t0 = perf_counter()
+        report = detector.detect_rings()
+        duration = perf_counter() - t0
+
+        ring_duration_hist: Histogram | None = getattr(
+            request.app.state, "graph_ring_detection_duration", None
+        )
+        if ring_duration_hist is not None:
+            ring_duration_hist.observe(duration)
+
+        filtered_clusters = [c for c in report.clusters if c.risk_score >= min_risk]
+
+        rings_counter: Counter | None = getattr(request.app.state, "graph_rings_counter", None)
+        if rings_counter is not None:
+            for cluster in filtered_clusters:
+                rings_counter.labels(severity=cluster.severity.value).inc()
+
+        limited = filtered_clusters[:max_rings]
+        return {
+            "enabled": True,
+            "count": len(limited),
+            "total_detected": len(filtered_clusters),
+            "detection_duration_ms": round(duration * 1000.0, 2),
+            "rings": [c.to_dict() for c in limited],
+        }
+
+    @application.post("/v1/graph/reset", tags=["graph"])
+    async def graph_reset(request: Request) -> dict[str, str]:
+        """Reset the real-time link analysis entity graph and clear active topology."""
+        eg: EntityGraph | None = getattr(request.app.state, "entity_graph", None)
+        if eg is not None:
+            eg.reset()
+        return {"status": "ok", "message": "Entity graph reset successfully."}
 
     @application.get(
         "/v1/routing/status",
@@ -4256,6 +4464,19 @@ def create_app(
             }
             for stage_name, breaker in pipe_exec.circuits.breakers.items():
                 pipe_gauge.labels(stage=stage_name).set(stage_map.get(breaker.state, 0.0))
+
+        entity_graph_obj: EntityGraph | None = getattr(application.state, "entity_graph", None)
+        if entity_graph_obj is not None:
+            g_nodes_gauge: Gauge | None = getattr(application.state, "graph_nodes_gauge", None)
+            g_edges_gauge: Gauge | None = getattr(application.state, "graph_edges_gauge", None)
+            g_metrics = entity_graph_obj.get_metrics()
+            if g_edges_gauge is not None:
+                g_edges_gauge.set(float(g_metrics.total_edges))
+            if g_nodes_gauge is not None:
+                for et in EntityType:
+                    g_nodes_gauge.labels(entity_type=et.value).set(
+                        float(g_metrics.entities_by_type.get(et.value, 0))
+                    )
 
         return Response(
             content=generate_latest(metrics_registry),
