@@ -12,6 +12,7 @@ from fraud_detection.rules import (
     RuleOperator,
     RulePrecedence,
     RuleSet,
+    build_fraud_ring_rule,
 )
 
 
@@ -283,3 +284,26 @@ def test_ruleset_io_and_persistence(tmp_path: Path) -> None:
     bad_file.write_text("{corrupt json", encoding="utf-8")
     with pytest.raises(RuleError, match="Invalid JSON"):
         RuleSet.load_file(bad_file)
+
+
+def test_build_fraud_ring_rule_and_graph_evaluation() -> None:
+    rule = build_fraud_ring_rule(
+        rule_id="RULE_RING_CRIT",
+        min_ring_size=4,
+        min_risk_diffusion=0.8,
+    )
+    assert rule.rule_id == "RULE_RING_CRIT"
+    assert rule.action == RuleAction.DENY
+    assert rule.priority == 10
+
+    # Matching record
+    match_rec = {
+        "graph_ring_size": 5,
+        "graph_risk_diffusion": 0.85,
+    }
+    assert rule.evaluate(match_rec) is True
+
+    # Non-matching records
+    assert rule.evaluate({"graph_ring_size": 2, "graph_risk_diffusion": 0.9}) is False
+    assert rule.evaluate({"graph_ring_size": 6, "graph_risk_diffusion": 0.5}) is False
+    assert rule.evaluate({"Amount": 500.0}) is False
