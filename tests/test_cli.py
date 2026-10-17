@@ -7166,3 +7166,246 @@ def test_cli_auto_retrain_additional_branches(tmp_path: Path) -> None:
         )
         assert res_exp_fail.exit_code == 1
         assert "Failed to export candidate artifact" in res_exp_fail.output
+
+
+def test_cli_graph_rings_workflow(tmp_path: Path) -> None:
+    """Verify graph-rings CLI command with CSV, JSON options, and failure thresholds."""
+    runner = CliRunner()
+
+    rows = [
+        {
+            "transaction_id": f"tx_bot_{i}",
+            "Time": 100.0 + i * 10.0,
+            "Amount": 1.50,
+            "card_id": f"card_bot_{i}",
+            "device_id": "dev_bot",
+            "ip_address": "192.168.1.10",
+            "Class": 1,
+            "risk_score": 0.95,
+        }
+        for i in range(5)
+    ] + [
+        {
+            "transaction_id": f"tx_legit_{i}",
+            "Time": 500.0 + i * 20.0,
+            "Amount": 45.0,
+            "card_id": f"card_legit_{i}",
+            "device_id": f"dev_legit_{i}",
+            "ip_address": f"10.0.0.{i}",
+            "Class": 0,
+            "risk_score": 0.05,
+        }
+        for i in range(3)
+    ]
+
+    tx_csv = tmp_path / "transactions.csv"
+    pd.DataFrame(rows).to_csv(tx_csv, index=False)
+
+    out_json = tmp_path / "rings_report.json"
+
+    # 1. Successful run with json flag and output persistence
+    res = runner.invoke(
+        app,
+        [
+            "graph-rings",
+            "--input-file",
+            str(tx_csv),
+            "--output",
+            str(out_json),
+            "--json",
+            "--min-risk",
+            "0.5",
+        ],
+    )
+    assert res.exit_code == 0
+    assert out_json.exists()
+    report_data = json.loads(res.output)
+    assert report_data["total_clusters"] >= 1
+    assert report_data["critical_count"] >= 1
+
+    # 2. Refuse overwrite without flag
+    res_overwrite_err = runner.invoke(
+        app,
+        [
+            "graph-rings",
+            "--input-file",
+            str(tx_csv),
+            "--output",
+            str(out_json),
+        ],
+    )
+    assert res_overwrite_err.exit_code == 2
+    assert "Output already exists" in res_overwrite_err.output
+
+    # 3. Allow overwrite with flag and test human-readable output
+    res_table = runner.invoke(
+        app,
+        [
+            "graph-rings",
+            "--input-file",
+            str(tx_csv),
+            "--output",
+            str(out_json),
+            "--overwrite",
+        ],
+    )
+    assert res_table.exit_code == 0
+    assert "Fraud Ring Link Analysis Report:" in res_table.output
+    assert "Critical Severity:" in res_table.output
+
+    # 4. Fail on rings when critical or high detected
+    res_fail = runner.invoke(
+        app,
+        [
+            "graph-rings",
+            "--input-file",
+            str(tx_csv),
+            "--fail-on-rings",
+        ],
+    )
+    assert res_fail.exit_code == 3
+    assert "Fraud rings detected" in res_fail.output
+
+    # 5. Missing input file
+    res_missing = runner.invoke(
+        app,
+        [
+            "graph-rings",
+            "--input-file",
+            str(tmp_path / "missing.csv"),
+        ],
+    )
+    assert res_missing.exit_code == 2
+    assert "Input file not found" in res_missing.output
+
+
+def test_cli_graph_rings_json_input(tmp_path: Path) -> None:
+    """Verify graph-rings with JSON input format."""
+    runner = CliRunner()
+    tx_json = tmp_path / "transactions.json"
+    records = [
+        {
+            "transaction_id": "tx1",
+            "Time": 10.0,
+            "Amount": 10.0,
+            "card_id": "card_a",
+            "device_id": "dev_shared",
+            "ip_address": "1.1.1.1",
+        },
+        {
+            "transaction_id": "tx2",
+            "Time": 20.0,
+            "Amount": 15.0,
+            "card_id": "card_b",
+            "device_id": "dev_shared",
+            "ip_address": "1.1.1.1",
+        },
+    ]
+    tx_json.write_text(json.dumps(records), encoding="utf-8")
+
+    res = runner.invoke(
+        app,
+        [
+            "graph-rings",
+            "--input-file",
+            str(tx_json),
+            "--json",
+        ],
+    )
+    assert res.exit_code == 0
+    data = json.loads(res.output)
+    assert "total_clusters" in data
+
+
+def test_cli_graph_enrich_workflow(tmp_path: Path) -> None:
+    """Verify graph-enrich CLI command and streaming feature column creation."""
+    runner = CliRunner()
+
+    df_in = pd.DataFrame(
+        [
+            {
+                "transaction_id": "tx1",
+                "Time": 100.0,
+                "Amount": 25.0,
+                "card_id": "card_1",
+                "device_id": "dev_1",
+                "ip_address": "10.0.0.1",
+                "V1": 0.5,
+                "Class": 0,
+            },
+            {
+                "transaction_id": "tx2",
+                "Time": 200.0,
+                "Amount": 125.0,
+                "card_id": "card_2",
+                "device_id": "dev_1",
+                "ip_address": "10.0.0.1",
+                "V1": -0.2,
+                "Class": 1,
+            },
+            {
+                "transaction_id": "tx3",
+                "Time": 300.0,
+                "Amount": 300.0,
+                "card_id": "card_1",
+                "device_id": "dev_2",
+                "ip_address": "10.0.0.2",
+                "V1": 1.2,
+                "Class": 0,
+            },
+        ]
+    )
+    in_csv = tmp_path / "raw_tx.csv"
+    df_in.to_csv(in_csv, index=False)
+    out_csv = tmp_path / "enriched_tx.csv"
+
+    # 1. Successful enrichment
+    res = runner.invoke(
+        app,
+        [
+            "graph-enrich",
+            "--input-file",
+            str(in_csv),
+            "--output-file",
+            str(out_csv),
+            "--window-seconds",
+            "3600.0",
+        ],
+    )
+    assert res.exit_code == 0
+    assert "Successfully enriched 3 transactions" in res.output
+    assert out_csv.exists()
+
+    df_out = pd.read_csv(out_csv)
+    assert len(df_out) == len(df_in)
+    assert len(df_out.columns) > len(df_in.columns)
+    assert "graph_card_id_tx_count_3600s" in df_out.columns
+    assert "graph_risk_diffusion" in df_out.columns
+
+    # 2. Refuse overwrite without flag
+    res_ov = runner.invoke(
+        app,
+        [
+            "graph-enrich",
+            "--input-file",
+            str(in_csv),
+            "--output-file",
+            str(out_csv),
+        ],
+    )
+    assert res_ov.exit_code == 2
+    assert "Output already exists" in res_ov.output
+
+    # 3. Missing input file
+    res_miss = runner.invoke(
+        app,
+        [
+            "graph-enrich",
+            "--input-file",
+            str(tmp_path / "no_such_file.csv"),
+            "--output-file",
+            str(tmp_path / "out.csv"),
+        ],
+    )
+    assert res_miss.exit_code == 2
+    assert "Input file not found" in res_miss.output
