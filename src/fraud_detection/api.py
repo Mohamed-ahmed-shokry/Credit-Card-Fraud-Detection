@@ -640,6 +640,7 @@ class ScoreRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     transaction: dict[str, TransactionValue]
+    entities: dict[str, str] | None = None
     explain: bool = False
     explain_llm: bool = False
     threshold: float | None = Field(default=None, ge=0.0, le=1.0)
@@ -3015,17 +3016,33 @@ def create_app(
         entity_graph_obj: EntityGraph | None = getattr(request.app.state, "entity_graph", None)
         if entity_graph_obj is not None:
             tx_data = payload.transaction
+            req_entities = payload.entities or {}
             graph_entities: dict[EntityType, str] = {}
             for et in EntityType:
                 val = (
-                    tx_data.get(et.value)
-                    or tx_data.get(et.name.lower())
-                    or tx_data.get(et.value.replace("_", ""))
+                    req_entities.get(et.value)
+                    or req_entities.get(et.name.lower())
+                    or req_entities.get(et.value.replace("_", ""))
                 )
+                if not val:
+                    h_val = request.headers.get(f"X-{et.value.replace('_', '-').title()}")
+                    if not h_val and et == EntityType.CARD_ID:
+                        h_val = request.headers.get("X-Entity-ID")
+                    if h_val:
+                        val = h_val
+                if not val:
+                    num_val = tx_data.get(et.value) or tx_data.get(et.value.replace("_", ""))
+                    if num_val is not None:
+                        val = (
+                            str(int(num_val))
+                            if isinstance(num_val, (int, float)) and float(num_val).is_integer()
+                            else str(num_val)
+                        )
                 if val is not None and str(val).strip():
                     graph_entities[et] = str(val).strip()
+
             if graph_entities:
-                tx_id = str(tx_data.get("transaction_id") or tx_data.get("tx_id") or uuid4())
+                tx_id = str(req_entities.get("transaction_id") or uuid4())
                 ts = float(tx_data.get("timestamp") or tx_data.get("Time") or time.time())
                 amt = float(tx_data.get("Amount") or tx_data.get("amount") or 0.0)
                 pred_result = results[0]
