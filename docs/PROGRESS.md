@@ -10,7 +10,7 @@
 - [x] Task 2: Implement `GraphFeatureConfig` and `GraphFeatureExtractor` (degree centrality, 2-hop entity sharing, risk diffusion) in `graph.py` with tests in `tests/test_graph.py`.
 - [x] Task 3: Implement `FraudRingCluster`, `FraudRingReport`, and `FraudRingDetector` (bicliques, star card-testing, cycles) in `graph.py` with tests in `tests/test_graph.py`.
 - [x] Task 4: Integrate graph features with `rules.py` and `pipeline.py` (`GraphEnrichmentStage`) with tests in `tests/test_rules.py` and `tests/test_pipeline.py`.
-- [ ] Task 5: Implement audit event builder `build_fraud_ring_detected_audit_event` in `audit.py` with tests in `tests/test_audit.py`.
+- [x] Task 5: Implement audit event builder `build_fraud_ring_detected_audit_event` in `audit.py` with tests in `tests/test_audit.py`.
 - [ ] Task 6: Implement graph API endpoints (`/v1/graph/stats`, `/v1/graph/entity/{entity_type}/{entity_id}`, `/v1/graph/rings`, `/v1/graph/reset`) and Prometheus metrics in `api.py` with tests in `tests/test_api.py`.
 - [ ] Task 7: Implement CLI commands `graph-rings` and `graph-enrich` in `cli.py` with tests in `tests/test_cli.py`.
 - [ ] Task 8: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate.
