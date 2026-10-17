@@ -61,6 +61,11 @@ from fraud_detection.features import (
     FileFeatureStore,
     InMemoryFeatureStore,
 )
+from fraud_detection.graph import (
+    EntityGraph,
+    FraudRingDetector,
+    GraphConfig,
+)
 from fraud_detection.model import FraudModel, save_model, train_model, validate_artifact
 from fraud_detection.recalibration import PlattRecalibrator
 from fraud_detection.retraining import (
@@ -4557,3 +4562,150 @@ def test_api_retraining_trigger_trainer_failure(
         res = client.post("/v1/retraining/trigger", json={"trigger_reason": "failing_train"})
         assert res.status_code == 400
         assert "Challenger training failed" in res.json()["detail"]
+
+
+def test_graph_endpoints_lifecycle(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    """Verify operational graph endpoints: stats, entity inspection, ring detection, and reset."""
+    _, model, _ = api_context
+    graph = EntityGraph(GraphConfig(window_seconds=3600.0, max_transactions=100))
+    detector = FraudRingDetector(graph)
+    app = create_app(
+        model=model,
+        entity_graph=graph,
+        fraud_ring_detector=detector,
+    )
+
+    with TestClient(app) as client:
+        # 1. Stats initially empty
+        stats_resp = client.get("/v1/graph/stats")
+        assert stats_resp.status_code == 200
+        stats = stats_resp.json()
+        assert stats["enabled"] is True
+        assert stats["total_transactions"] == 0
+        assert stats["total_entities"] == 0
+
+        # 2. Score transactions that ingest into graph
+        sample_tx1: dict[str, float] = {
+            "Time": 100.0,
+            "Amount": 50.0,
+        }
+        for i in range(1, 29):
+            sample_tx1[f"V{i}"] = 0.0
+
+        score_resp1 = client.post(
+            "/v1/score",
+            json={
+                "transaction": sample_tx1,
+                "entities": {
+                    "card_id": "card-alpha",
+                    "device_id": "dev-1",
+                    "ip_address": "10.0.0.1",
+                },
+            },
+        )
+        assert score_resp1.status_code == 200
+
+        sample_tx2: dict[str, float] = {
+            "Time": 110.0,
+            "Amount": 75.0,
+        }
+        for i in range(1, 29):
+            sample_tx2[f"V{i}"] = 0.0
+
+        score_resp2 = client.post(
+            "/v1/score",
+            json={
+                "transaction": sample_tx2,
+                "entities": {
+                    "card_id": "card-beta",
+                    "device_id": "dev-1",
+                    "ip_address": "10.0.0.1",
+                },
+            },
+        )
+        assert score_resp2.status_code == 200
+
+        # 3. Stats after scoring
+        stats_resp2 = client.get("/v1/graph/stats")
+        assert stats_resp2.status_code == 200
+        stats2 = stats_resp2.json()
+        assert stats2["total_transactions"] == 2
+        assert stats2["total_entities"] >= 3
+
+        # 4. Entity lookup
+        ent_resp = client.get("/v1/graph/entity/card_id/card-alpha")
+        assert ent_resp.status_code == 200
+        ent_data = ent_resp.json()
+        assert ent_data["entity_type"] == "card_id"
+        assert ent_data["entity_id"] == "card-alpha"
+        assert ent_data["transaction_count"] == 1
+        assert "device_id" in ent_data["two_hop_entity_counts"]
+
+        # 5. Invalid entity type -> 400
+        bad_type = client.get("/v1/graph/entity/invalid_type/foo")
+        assert bad_type.status_code == 400
+        assert "Invalid entity_type" in bad_type.json()["detail"]
+
+        # 6. Non-existent entity -> 404
+        missing_ent = client.get("/v1/graph/entity/card_id/does-not-exist")
+        assert missing_ent.status_code == 404
+
+        # 7. Ring detection endpoint
+        rings_resp = client.get("/v1/graph/rings")
+        assert rings_resp.status_code == 200
+        rings_data = rings_resp.json()
+        assert rings_data["enabled"] is True
+        assert "rings" in rings_data
+        assert "total_detected" in rings_data
+
+        # 8. Metrics endpoint exports graph gauges
+        metrics_resp = client.get("/metrics")
+        assert metrics_resp.status_code == 200
+        metrics_text = metrics_resp.text
+        assert "fraud_graph_nodes_total" in metrics_text
+        assert "fraud_graph_edges_total" in metrics_text
+
+        # 9. Reset endpoint
+        reset_resp = client.post("/v1/graph/reset")
+        assert reset_resp.status_code == 200
+        assert reset_resp.json()["status"] == "ok"
+
+        # Verify stats after reset
+        stats_resp3 = client.get("/v1/graph/stats")
+        assert stats_resp3.json()["total_transactions"] == 0
+
+
+def test_graph_disabled_and_environment_defaults(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify behavior when graph is uninitialized or configured via env vars."""
+    _, model, _ = api_context
+
+    monkeypatch.setenv("FRAUD_GRAPH_WINDOW_SECONDS", "7200.0")
+    monkeypatch.setenv("FRAUD_MAX_GRAPH_NODES", "250")
+
+    app = create_app(model=model)
+    with TestClient(app) as client:
+        eg = getattr(app.state, "entity_graph", None)
+        assert eg is not None
+        assert eg.config.window_seconds == 7200.0
+        assert eg.config.max_transactions == 250
+
+        # Test when app.state.entity_graph is explicitly cleared
+        app.state.entity_graph = None
+        app.state.fraud_ring_detector = None
+
+        stats_resp = client.get("/v1/graph/stats")
+        assert stats_resp.status_code == 200
+        assert stats_resp.json()["enabled"] is False
+
+        ent_resp = client.get("/v1/graph/entity/card_id/c1")
+        assert ent_resp.status_code == 404
+        assert "not enabled" in ent_resp.json()["detail"]
+
+        rings_resp = client.get("/v1/graph/rings")
+        assert rings_resp.status_code == 200
+        assert rings_resp.json()["enabled"] is False
