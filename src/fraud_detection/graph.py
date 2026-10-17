@@ -719,6 +719,25 @@ class FraudRingCluster:
         if not isinstance(self.description, str):
             raise GraphError("description must be a string.")
 
+    def to_dict(self) -> dict[str, Any]:
+        """Convert fraud ring cluster to a JSON-serializable dictionary."""
+        return {
+            "cluster_id": self.cluster_id,
+            "pattern_type": self.pattern_type.value,
+            "severity": self.severity.value,
+            "recommended_action": self.recommended_action.value,
+            "entities": {
+                (k.value if isinstance(k, EntityType) else str(k)): list(v)
+                for k, v in self.entities.items()
+            },
+            "transaction_ids": list(self.transaction_ids),
+            "transaction_count": self.transaction_count,
+            "total_amount": round(self.total_amount, 2),
+            "density": round(self.density, 4),
+            "risk_score": round(self.risk_score, 4),
+            "description": self.description,
+        }
+
 
 @dataclass(frozen=True)
 class FraudRingReport:
@@ -744,6 +763,19 @@ class FraudRingReport:
             raise GraphError("total_clusters must be a non-negative integer.")
         if not isinstance(self.clusters, tuple):
             raise GraphError("clusters must be a tuple of FraudRingCluster objects.")
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert fraud ring report to a JSON-serializable dictionary."""
+        return {
+            "generated_at": self.generated_at,
+            "total_clusters": self.total_clusters,
+            "critical_count": self.critical_count,
+            "high_count": self.high_count,
+            "medium_count": self.medium_count,
+            "low_count": self.low_count,
+            "clusters": [c.to_dict() for c in self.clusters],
+            "summary": self.summary,
+        }
 
 
 @dataclass(frozen=True)
