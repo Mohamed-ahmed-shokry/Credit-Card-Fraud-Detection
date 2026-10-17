@@ -76,6 +76,16 @@ from fraud_detection.feedback import (
     match_labels_with_audit_log,
     partition_into_cohorts,
 )
+from fraud_detection.graph import (
+    EntityGraph,
+    EntityType,
+    FraudRingDetector,
+    FraudRingDetectorConfig,
+    GraphConfig,
+    GraphFeatureConfig,
+    GraphFeatureExtractor,
+    RingSeverity,
+)
 from fraud_detection.model import (
     MANIFEST_FILENAME,
     CalibrationMethod,
@@ -6504,6 +6514,309 @@ def auto_retrain(
 
     if verif_report.status == VerificationStatus.FAILED:
         raise typer.Exit(code=3)
+
+
+@app.command("graph-rings")
+def graph_rings(
+    input_file: Annotated[
+        Path,
+        typer.Option(
+            "--input-file",
+            "-i",
+            help="Input CSV or JSON file containing transactions with entity identifiers.",
+        ),
+    ],
+    output: Annotated[
+        Path | None,
+        typer.Option(
+            "--output",
+            "-o",
+            help="Optional file path to persist the fraud rings JSON report.",
+        ),
+    ] = None,
+    overwrite: Annotated[
+        bool,
+        typer.Option(
+            "--overwrite",
+            help="Overwrite existing output file if it exists.",
+        ),
+    ] = False,
+    as_json: Annotated[
+        bool,
+        typer.Option(
+            "--json",
+            help="Print report as raw JSON to stdout.",
+        ),
+    ] = False,
+    window_seconds: Annotated[
+        float,
+        typer.Option(
+            "--window-seconds",
+            help="Sliding temporal lookback window for entity link analysis.",
+        ),
+    ] = 86400.0,
+    min_cards_per_device: Annotated[
+        int,
+        typer.Option(
+            "--min-cards-per-device",
+            help="Minimum cards sharing a device/IP to flag as dense biclique.",
+        ),
+    ] = 3,
+    min_devices_per_card: Annotated[
+        int,
+        typer.Option(
+            "--min-devices-per-card",
+            help="Minimum devices/IPs associated with a card to flag as dense biclique.",
+        ),
+    ] = 2,
+    card_testing_window_seconds: Annotated[
+        float,
+        typer.Option(
+            "--card-testing-window-seconds",
+            help="Rapid burst window threshold in seconds for card-testing botnet attacks.",
+        ),
+    ] = 300.0,
+    card_testing_min_cards: Annotated[
+        int,
+        typer.Option(
+            "--card-testing-min-cards",
+            help="Minimum cards tested within burst window to detect botnet attack.",
+        ),
+    ] = 4,
+    min_risk: Annotated[
+        float,
+        typer.Option(
+            "--min-risk",
+            help="Minimum risk score threshold to include in fraud ring clusters.",
+        ),
+    ] = 0.0,
+    fail_on_rings: Annotated[
+        bool,
+        typer.Option(
+            "--fail-on-rings",
+            help="Exit with code 3 if any critical or high severity rings are detected.",
+        ),
+    ] = False,
+) -> None:
+    """Detect organized fraud rings, botnets, and syndicate bicliques from transaction history."""
+    if not input_file.exists():
+        _abort(f"Input file not found: {input_file}")
+    _guard_output(output, overwrite)
+
+    if input_file.suffix.lower() in (".json", ".jsonl"):
+        content = input_file.read_text(encoding="utf-8")
+        if input_file.suffix.lower() == ".jsonl" or "\n" in content.strip():
+            raw_records = [json.loads(line) for line in content.splitlines() if line.strip()]
+        else:
+            raw_records = json.loads(content)
+        records = raw_records if isinstance(raw_records, list) else [raw_records]
+    else:
+        df = pd.read_csv(input_file)
+        records = df.to_dict(orient="records")
+
+    graph = EntityGraph(
+        GraphConfig(window_seconds=window_seconds, max_transactions=max(1000, len(records) * 2))
+    )
+    for idx, rec in enumerate(records):
+        entities: dict[EntityType, str] = {}
+        for et in EntityType:
+            val = (
+                rec.get(et.value) or rec.get(et.name.lower()) or rec.get(et.value.replace("_", ""))
+            )
+            if val is not None and str(val).strip() and str(val).strip().lower() != "nan":
+                entities[et] = str(val).strip()
+        if not entities:
+            continue
+        tx_id = str(rec.get("transaction_id") or rec.get("tx_id") or f"tx_{idx}")
+        ts = float(rec.get("timestamp") or rec.get("Time") or float(idx))
+        amt = float(rec.get("Amount") or rec.get("amount") or 0.0)
+        is_fraud = bool(rec.get("Class") or rec.get("is_fraud") or False)
+        risk = float(
+            rec.get("risk_score") or rec.get("fraud_probability") or (1.0 if is_fraud else 0.0)
+        )
+        graph.add_transaction(
+            transaction_id=tx_id,
+            timestamp=ts,
+            amount=amt,
+            entities=entities,
+            is_fraud=is_fraud,
+            risk_score=risk,
+        )
+
+    detector_config = FraudRingDetectorConfig(
+        min_cards_per_device=min_cards_per_device,
+        min_devices_per_card=min_devices_per_card,
+        card_testing_window_seconds=card_testing_window_seconds,
+        card_testing_min_cards=card_testing_min_cards,
+    )
+    detector = FraudRingDetector(graph, detector_config)
+    report = detector.detect_rings()
+
+    if min_risk > 0.0:
+        filtered_clusters = tuple(c for c in report.clusters if c.risk_score >= min_risk)
+        crit = sum(1 for c in filtered_clusters if c.severity == RingSeverity.CRITICAL)
+        high = sum(1 for c in filtered_clusters if c.severity == RingSeverity.HIGH)
+        med = sum(1 for c in filtered_clusters if c.severity == RingSeverity.MEDIUM)
+        low = sum(1 for c in filtered_clusters if c.severity == RingSeverity.LOW)
+        report_dict: dict[str, Any] = {
+            "generated_at": report.generated_at,
+            "total_clusters": len(filtered_clusters),
+            "critical_count": crit,
+            "high_count": high,
+            "medium_count": med,
+            "low_count": low,
+            "clusters": [c.to_dict() for c in filtered_clusters],
+            "summary": report.summary,
+        }
+    else:
+        report_dict = report.to_dict()
+
+    report_json = json.dumps(report_dict, indent=2)
+    if output is not None:
+        _atomic_write_text(report_json + "\n", output)
+
+    if as_json:
+        typer.echo(report_json)
+    else:
+        typer.echo("Fraud Ring Link Analysis Report:")
+        typer.echo(f"  Total Clusters:         {report_dict['total_clusters']}")
+        typer.echo(f"  Critical Severity:      {report_dict['critical_count']}")
+        typer.echo(f"  High Severity:          {report_dict['high_count']}")
+        typer.echo(f"  Medium Severity:        {report_dict['medium_count']}")
+        typer.echo(f"  Low Severity:           {report_dict['low_count']}")
+        for c in report_dict["clusters"]:
+            typer.echo(
+                f"  [{c['severity'].upper()}] Cluster '{c['cluster_id']}' "
+                f"({c['pattern_type']}): {c['transaction_count']} txs, "
+                f"${c['total_amount']:.2f}, risk={c['risk_score']:.2f} -> {c['recommended_action']}"
+            )
+            typer.echo(f"    Description: {c['description']}")
+
+    if fail_on_rings and (report_dict["critical_count"] > 0 or report_dict["high_count"] > 0):
+        typer.echo(
+            f"Error: Fraud rings detected ({report_dict['critical_count']} critical, "
+            f"{report_dict['high_count']} high). Failing per --fail-on-rings.",
+            err=True,
+        )
+        raise typer.Exit(code=3)
+
+
+@app.command("graph-enrich")
+def graph_enrich(
+    input_file: Annotated[
+        Path,
+        typer.Option(
+            "--input-file",
+            "-i",
+            help="Input CSV file containing transactions to enrich with graph features.",
+        ),
+    ],
+    output_file: Annotated[
+        Path,
+        typer.Option(
+            "--output-file",
+            "-o",
+            help="Output CSV file destination for enriched transaction dataset.",
+        ),
+    ],
+    overwrite: Annotated[
+        bool,
+        typer.Option(
+            "--overwrite",
+            help="Overwrite existing output file if it exists.",
+        ),
+    ] = False,
+    window_seconds: Annotated[
+        float,
+        typer.Option(
+            "--window-seconds",
+            help="Sliding temporal lookback window for entity graph aggregation.",
+        ),
+    ] = 86400.0,
+    diffusion_damping: Annotated[
+        float,
+        typer.Option(
+            "--diffusion-damping",
+            help="Damping factor alpha for Personalized PageRank risk diffusion.",
+        ),
+    ] = 0.85,
+    diffusion_iterations: Annotated[
+        int,
+        typer.Option(
+            "--diffusion-iterations",
+            help="Iteration count for power-iteration risk diffusion.",
+        ),
+    ] = 5,
+) -> None:
+    """Enrich transactions with streaming bipartite link analysis and graph features.
+
+    Features are extracted sequentially without lookahead bias.
+    """
+    if not input_file.exists():
+        _abort(f"Input file not found: {input_file}")
+    _guard_output(output_file, overwrite)
+
+    df = pd.read_csv(input_file)
+    if df.empty:
+        _abort(f"Input file contains no transactions: {input_file}")
+
+    graph = EntityGraph(
+        GraphConfig(window_seconds=window_seconds, max_transactions=max(1000, len(df) * 2))
+    )
+    feat_config = GraphFeatureConfig(
+        windows_seconds=(window_seconds,),
+        diffusion_damping=diffusion_damping,
+        diffusion_iterations=diffusion_iterations,
+    )
+    extractor = GraphFeatureExtractor(graph, feat_config)
+
+    records = df.to_dict(orient="records")
+    enriched_rows: list[dict[str, Any]] = []
+
+    for idx, row in enumerate(records):
+        entities: dict[EntityType, str] = {}
+        for et in EntityType:
+            val = (
+                row.get(et.value) or row.get(et.name.lower()) or row.get(et.value.replace("_", ""))
+            )
+            if val is not None and str(val).strip() and str(val).strip().lower() != "nan":
+                entities[et] = str(val).strip()
+
+        tx_id = str(row.get("transaction_id") or row.get("tx_id") or f"tx_{idx}")
+        ts = float(row.get("timestamp") or row.get("Time") or float(idx))
+        amt = float(row.get("Amount") or row.get("amount") or 0.0)
+        is_fraud = bool(row.get("Class") or row.get("is_fraud") or False)
+        risk = float(
+            row.get("risk_score") or row.get("fraud_probability") or (1.0 if is_fraud else 0.0)
+        )
+
+        graph_features = extractor.extract_features(
+            transaction_id=tx_id,
+            timestamp=ts,
+            entities=entities,
+        )
+
+        if entities:
+            graph.add_transaction(
+                transaction_id=tx_id,
+                timestamp=ts,
+                amount=amt,
+                entities=entities,
+                is_fraud=is_fraud,
+                risk_score=risk,
+            )
+
+        new_row: dict[str, Any] = {str(k): v for k, v in row.items()}
+        new_row.update(graph_features)
+        enriched_rows.append(new_row)
+
+    enriched_df = pd.DataFrame(enriched_rows)
+    _atomic_write_csv(enriched_df, output_file)
+    feature_count = len(enriched_df.columns) - len(df.columns)
+    typer.echo(
+        f"Successfully enriched {len(enriched_df)} transactions with {feature_count} "
+        f"graph features -> {output_file}"
+    )
 
 
 def _abort(message: str) -> NoReturn:
