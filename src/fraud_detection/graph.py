@@ -313,6 +313,16 @@ class EntityGraph:
         with self._lock:
             return self._entities.get((entity_type, entity_id))
 
+    def get_entities(
+        self,
+        entity_type: EntityType | None = None,
+    ) -> list[EntityNode]:
+        """Return all entities currently in the graph, optionally filtered by type."""
+        with self._lock:
+            if entity_type is None:
+                return list(self._entities.values())
+            return [node for (et, _), node in self._entities.items() if et == entity_type]
+
     def get_transaction(self, transaction_id: str) -> TransactionNode | None:
         """Retrieve a TransactionNode by identifier."""
         with self._lock:
@@ -770,3 +780,314 @@ class FraudRingDetectorConfig:
             or self.min_cluster_amount < 0.0
         ):
             raise GraphError("min_cluster_amount must be a non-negative finite float.")
+
+
+class FraudRingDetector:
+    """Detects fraud syndicates, star card-testing botnets, and transaction cycles."""
+
+    def __init__(self, graph: EntityGraph, config: FraudRingDetectorConfig | None = None) -> None:
+        self.graph = graph
+        self.config = config or FraudRingDetectorConfig()
+
+    def detect_rings(self, current_timestamp: float | None = None) -> FraudRingReport:
+        """Analyze graph structure and detect all active fraud rings and attack clusters."""
+        clusters: list[FraudRingCluster] = []
+        clusters.extend(self._detect_card_testing_attacks(current_timestamp))
+        clusters.extend(self._detect_dense_bicliques())
+        clusters.extend(self._detect_cycles())
+
+        severity_order = {
+            RingSeverity.CRITICAL: 0,
+            RingSeverity.HIGH: 1,
+            RingSeverity.MEDIUM: 2,
+            RingSeverity.LOW: 3,
+        }
+        clusters.sort(
+            key=lambda c: (severity_order.get(c.severity, 4), -c.risk_score, -c.total_amount)
+        )
+
+        ref_time = current_timestamp if current_timestamp is not None else 0.0
+        if current_timestamp is None:
+            metrics = self.graph.get_metrics()
+            ref_time = metrics.newest_timestamp or 0.0
+
+        crit = sum(1 for c in clusters if c.severity == RingSeverity.CRITICAL)
+        high = sum(1 for c in clusters if c.severity == RingSeverity.HIGH)
+        med = sum(1 for c in clusters if c.severity == RingSeverity.MEDIUM)
+        low = sum(1 for c in clusters if c.severity == RingSeverity.LOW)
+
+        return FraudRingReport(
+            generated_at=ref_time,
+            total_clusters=len(clusters),
+            clusters=tuple(clusters),
+            critical_count=crit,
+            high_count=high,
+            medium_count=med,
+            low_count=low,
+            summary={
+                "total_clusters": len(clusters),
+                "critical": crit,
+                "high": high,
+                "medium": med,
+                "low": low,
+            },
+        )
+
+    def evaluate_transaction(
+        self,
+        transaction_id: str | None = None,
+        entities: dict[EntityType, str] | None = None,
+        timestamp: float | None = None,
+    ) -> list[FraudRingCluster]:
+        """Check if a specific transaction or entity set intersects any detected fraud ring."""
+        report = self.detect_rings(current_timestamp=timestamp)
+        if not report.clusters:
+            return []
+
+        if entities is None and transaction_id is not None:
+            tx = self.graph.get_transaction(transaction_id)
+            if tx is not None:
+                entities = tx.entities
+
+        matched: list[FraudRingCluster] = []
+        for cluster in report.clusters:
+            is_match = False
+            if transaction_id and transaction_id in cluster.transaction_ids:
+                is_match = True
+            elif entities:
+                for et, eid in entities.items():
+                    if et in cluster.entities and eid in cluster.entities[et]:
+                        is_match = True
+                        break
+            if is_match:
+                matched.append(cluster)
+        return matched
+
+    def _detect_card_testing_attacks(
+        self, current_timestamp: float | None
+    ) -> list[FraudRingCluster]:
+        """Detect rapid star-topology attacks (single device/IP hitting many cards)."""
+        clusters: list[FraudRingCluster] = []
+        window = self.config.card_testing_window_seconds
+        target_entities = self.graph.get_entities(EntityType.DEVICE_ID) + self.graph.get_entities(
+            EntityType.IP_ADDRESS
+        )
+
+        for enode in target_entities:
+            et = enode.entity_type
+            eid = enode.entity_id
+
+            ref_time = (
+                current_timestamp if current_timestamp is not None else enode.last_seen_timestamp
+            )
+            cutoff = ref_time - window
+
+            txs = self.graph.get_entity_transactions(et, eid, since_timestamp=cutoff)
+            valid_txs = [t for t in txs if t.timestamp <= ref_time]
+            distinct_cards = {
+                t.entities[EntityType.CARD_ID]
+                for t in valid_txs
+                if EntityType.CARD_ID in t.entities
+            }
+
+            if len(distinct_cards) >= self.config.card_testing_min_cards:
+                total_amt = sum(t.amount for t in valid_txs)
+                if total_amt < self.config.min_cluster_amount:
+                    continue
+
+                if len(distinct_cards) >= 8 or total_amt >= 5000.0 or enode.risk_score >= 0.8:
+                    severity = RingSeverity.CRITICAL
+                    action = RingAction.DENY
+                    risk = 0.95
+                elif len(distinct_cards) >= 4:
+                    severity = RingSeverity.HIGH
+                    action = RingAction.DENY
+                    risk = 0.85
+                else:
+                    severity = RingSeverity.MEDIUM
+                    action = RingAction.CHALLENGE
+                    risk = 0.65
+
+                tx_ids = tuple(sorted(t.transaction_id for t in valid_txs))
+                c_id = f"star_{et.value}_{eid}"
+                cluster_entities = {
+                    et: (eid,),
+                    EntityType.CARD_ID: tuple(sorted(distinct_cards)),
+                }
+                desc = (
+                    f"High-velocity card-testing attack on {et.value} '{eid}' "
+                    f"with {len(distinct_cards)} distinct cards across {len(valid_txs)} txs."
+                )
+                clusters.append(
+                    FraudRingCluster(
+                        cluster_id=c_id,
+                        pattern_type=RingPatternType.STAR_CARD_TESTING,
+                        severity=severity,
+                        recommended_action=action,
+                        entities=cluster_entities,
+                        transaction_ids=tx_ids,
+                        transaction_count=len(valid_txs),
+                        total_amount=total_amt,
+                        density=1.0,
+                        risk_score=risk,
+                        description=desc,
+                    )
+                )
+        return clusters
+
+    def _detect_dense_bicliques(self) -> list[FraudRingCluster]:
+        """Detect dense bipartite card-device clusters (syndicate rings)."""
+        clusters: list[FraudRingCluster] = []
+        card_entities = self.graph.get_entities(EntityType.CARD_ID)
+        card_to_devices: dict[str, set[str]] = {}
+
+        for enode in card_entities:
+            eid = enode.entity_id
+            devices = {
+                node.entity_id
+                for node in self.graph.get_cooccurring_entities(
+                    EntityType.CARD_ID, eid, target_type=EntityType.DEVICE_ID
+                )
+            }
+            if len(devices) >= self.config.min_devices_per_card:
+                card_to_devices[eid] = devices
+
+        visited_cards: set[str] = set()
+        for card1, dev1 in card_to_devices.items():
+            if card1 in visited_cards:
+                continue
+            syndicate_cards: set[str] = {card1}
+            shared_devices: set[str] = set(dev1)
+
+            for card2, dev2 in card_to_devices.items():
+                if card1 == card2:
+                    continue
+                common = dev1.intersection(dev2)
+                if len(common) >= self.config.min_devices_per_card:
+                    syndicate_cards.add(card2)
+                    shared_devices.update(common)
+
+            if (
+                len(syndicate_cards) >= self.config.min_cards_per_device
+                and len(shared_devices) >= self.config.min_devices_per_card
+            ):
+                visited_cards.update(syndicate_cards)
+                all_tx_ids: set[str] = set()
+                total_amt = 0.0
+                for c_id in syndicate_cards:
+                    for tx in self.graph.get_entity_transactions(EntityType.CARD_ID, c_id):
+                        all_tx_ids.add(tx.transaction_id)
+                        total_amt += tx.amount
+
+                if total_amt < self.config.min_cluster_amount:
+                    continue
+
+                actual_edges = sum(
+                    len(card_to_devices.get(c, set()).intersection(shared_devices))
+                    for c in syndicate_cards
+                )
+                possible_edges = len(syndicate_cards) * len(shared_devices)
+                density = float(actual_edges / possible_edges) if possible_edges > 0 else 0.0
+
+                if len(syndicate_cards) >= 5 or total_amt >= 5000.0:
+                    sev = RingSeverity.CRITICAL
+                    act = RingAction.DENY
+                    risk = 0.92
+                elif len(syndicate_cards) >= 3:
+                    sev = RingSeverity.HIGH
+                    act = RingAction.DENY
+                    risk = 0.82
+                else:
+                    sev = RingSeverity.MEDIUM
+                    act = RingAction.CHALLENGE
+                    risk = 0.65
+
+                sorted_cards = tuple(sorted(syndicate_cards))
+                sorted_devices = tuple(sorted(shared_devices))
+                cluster_id = f"biclique_cards_{sorted_cards[0]}"
+                desc = (
+                    f"Dense card-device syndicate ring with {len(syndicate_cards)} cards "
+                    f"operating across {len(shared_devices)} devices."
+                )
+                clusters.append(
+                    FraudRingCluster(
+                        cluster_id=cluster_id,
+                        pattern_type=RingPatternType.BICLIQUE,
+                        severity=sev,
+                        recommended_action=act,
+                        entities={
+                            EntityType.CARD_ID: sorted_cards,
+                            EntityType.DEVICE_ID: sorted_devices,
+                        },
+                        transaction_ids=tuple(sorted(all_tx_ids)),
+                        transaction_count=len(all_tx_ids),
+                        total_amount=total_amt,
+                        density=density,
+                        risk_score=risk,
+                        description=desc,
+                    )
+                )
+        return clusters
+
+    def _detect_cycles(self) -> list[FraudRingCluster]:
+        """Detect circular loops in entity relationships."""
+        clusters: list[FraudRingCluster] = []
+        card_entities = self.graph.get_entities(EntityType.CARD_ID)
+        card_adj: dict[str, set[str]] = {}
+
+        for enode in card_entities:
+            eid = enode.entity_id
+            peer_cards = {
+                peer.entity_id
+                for peer in self.graph.get_2hop_entities(
+                    EntityType.CARD_ID, eid, target_type=EntityType.CARD_ID
+                )
+            }
+            if peer_cards:
+                card_adj[eid] = peer_cards
+
+        visited: set[str] = set()
+        for start_card in card_adj:
+            if start_card in visited:
+                continue
+            path = [start_card]
+            stack = [(start_card, iter(card_adj.get(start_card, set())))]
+            while stack:
+                _curr, neighbors = stack[-1]
+                try:
+                    nxt = next(neighbors)
+                    if nxt == start_card and len(path) >= 3:
+                        cycle_cards = tuple(sorted(set(path)))
+                        visited.update(cycle_cards)
+                        all_tx_ids: set[str] = set()
+                        total_amt = 0.0
+                        for c in cycle_cards:
+                            for tx in self.graph.get_entity_transactions(EntityType.CARD_ID, c):
+                                all_tx_ids.add(tx.transaction_id)
+                                total_amt += tx.amount
+
+                        desc = f"Closed circular transaction cycle of length {len(cycle_cards)}."
+                        clusters.append(
+                            FraudRingCluster(
+                                cluster_id=f"cycle_{cycle_cards[0]}",
+                                pattern_type=RingPatternType.CYCLE,
+                                severity=RingSeverity.HIGH,
+                                recommended_action=RingAction.DENY,
+                                entities={EntityType.CARD_ID: cycle_cards},
+                                transaction_ids=tuple(sorted(all_tx_ids)),
+                                transaction_count=len(all_tx_ids),
+                                total_amount=total_amt,
+                                density=1.0,
+                                risk_score=0.88,
+                                description=desc,
+                            )
+                        )
+                        break
+                    if nxt not in path and len(path) < self.config.cycle_max_depth:
+                        path.append(nxt)
+                        stack.append((nxt, iter(card_adj.get(nxt, set()))))
+                except StopIteration:
+                    stack.pop()
+                    path.pop()
+
+        return clusters
