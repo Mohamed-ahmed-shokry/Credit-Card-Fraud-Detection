@@ -1879,8 +1879,8 @@ def create_app(
                 enable_circuit_breaker=resolved_pipeline_cb_enabled,
                 circuit_failure_threshold=resolved_pipeline_cb_failure_threshold,
                 circuit_recovery_timeout_seconds=resolved_pipeline_cb_recovery_timeout,
-                entity_graph=resolved_entity_graph,
-                fraud_ring_detector=resolved_fraud_ring_detector,
+                entity_graph=entity_graph,
+                fraud_ring_detector=fraud_ring_detector,
             )
 
         resolved_pipeline_exec = pipeline_executor
