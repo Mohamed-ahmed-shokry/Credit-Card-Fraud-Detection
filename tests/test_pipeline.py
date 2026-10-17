@@ -19,6 +19,12 @@ from fraud_detection.features import (
     FeatureView,
     InMemoryFeatureStore,
 )
+from fraud_detection.graph import (
+    EntityGraph,
+    EntityType,
+    FraudRingDetector,
+    FraudRingDetectorConfig,
+)
 from fraud_detection.model import train_model
 from fraud_detection.pipeline import (
     ActionAggregatorStageProcessor,
@@ -26,6 +32,8 @@ from fraud_detection.pipeline import (
     DecisionGraph,
     DecisionGraphExecutor,
     EnrichmentStageProcessor,
+    GraphEnrichmentStage,
+    GraphEnrichmentStageProcessor,
     InferenceStageProcessor,
     NodeCachePolicy,
     NodeCacheStats,
@@ -1901,3 +1909,98 @@ def test_simulate_pipeline_chaos_edge_cases_and_validation() -> None:
     rep_async = simulate_pipeline_chaos([{}, {}, {}], async_graph, async_specs, sla_budget_ms=100.0)
     assert rep_async.total_transactions == 3
     assert rep_async.degraded_transactions >= 2
+
+
+def test_graph_enrichment_stage_processor_standalone() -> None:
+    graph = EntityGraph()
+    # Populate historical transaction
+    graph.add_transaction(
+        transaction_id="tx_hist_1",
+        timestamp=1000.0,
+        amount=150.0,
+        entities={
+            EntityType.CARD_ID: "card_prev",
+            EntityType.DEVICE_ID: "dev_shared",
+        },
+        risk_score=0.2,
+    )
+
+    processor = GraphEnrichmentStageProcessor(graph=graph, update_graph=True)
+    assert GraphEnrichmentStage is GraphEnrichmentStageProcessor
+
+    ctx = PipelineContext(
+        transaction={
+            "transaction_id": "tx_candidate",
+            "timestamp": 1200.0,
+            "Amount": 250.0,
+            "card_id": "card_new",
+            "device_id": "dev_shared",
+        }
+    )
+
+    out = processor(ctx)
+    assert "graph_features" in out
+    assert ctx.transaction["graph_device_id_tx_count_3600s"] == 1.0
+    assert ctx.transaction["graph_device_id_monetary_sum_3600s"] == 150.0
+    assert ctx.transaction["in_fraud_ring"] is False
+
+    # Check that candidate tx was ingested into graph
+    tx_node = graph.get_transaction("tx_candidate")
+    assert tx_node is not None
+    assert tx_node.amount == 250.0
+
+
+def test_create_default_fraud_pipeline_with_entity_graph() -> None:
+    df = validate_frame(generate_synthetic_data(rows=300, fraud_rate=0.1, random_state=42))
+    model = train_model(df)
+
+    graph = EntityGraph()
+    detector = FraudRingDetector(
+        graph,
+        config=FraudRingDetectorConfig(
+            card_testing_window_seconds=300.0,
+            card_testing_min_cards=3,
+        ),
+    )
+
+    # Simulate card testing botnet on dev_bot
+    for i in range(4):
+        graph.add_transaction(
+            transaction_id=f"tx_bot_{i}",
+            timestamp=100.0 + i * 10.0,
+            amount=5.0,
+            entities={
+                EntityType.DEVICE_ID: "dev_bot",
+                EntityType.CARD_ID: f"card_bot_{i}",
+            },
+        )
+
+    # Rule to deny if in fraud ring
+    ring_rule = DecisionRule(
+        rule_id="RULE_RING_DENY",
+        name="Deny Fraud Ring",
+        action=RuleAction.DENY,
+        conditions=(RuleCondition("in_fraud_ring", RuleOperator.EQUALS, True),),
+        priority=1,
+    )
+    ruleset = RuleSet((ring_rule,))
+
+    pipeline = create_default_fraud_pipeline(
+        model=model,
+        rules=ruleset,
+        entity_graph=graph,
+        fraud_ring_detector=detector,
+    )
+
+    # Candidate transaction from dev_bot
+    sample_tx = dict(df.features.iloc[0].to_dict())
+    sample_tx["device_id"] = "dev_bot"
+    sample_tx["card_id"] = "card_bot_new"
+    sample_tx["timestamp"] = 150.0
+    sample_tx["transaction_id"] = "tx_candidate_bot"
+
+    executor = DecisionGraphExecutor(pipeline)
+    result = executor.execute_sync(sample_tx)
+    assert result.decision == "DENY"
+    assert result.stage_results["graph_enrichment"].status == StageStatus.SUCCESS
+    assert result.stage_results["graph_enrichment"].output["in_fraud_ring"] is True
