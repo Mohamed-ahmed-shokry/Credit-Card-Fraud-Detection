@@ -319,3 +319,35 @@ class RuleSet:
         temp_file = dest.with_name(f".{dest.name}.tmp")
         temp_file.write_text(self.to_json() + "\n", encoding="utf-8")
         temp_file.replace(dest)
+
+
+def build_fraud_ring_rule(
+    rule_id: str = "RULE_FRAUD_RING_DENY",
+    name: str = "Fraud Ring Auto Deny",
+    action: RuleAction = RuleAction.DENY,
+    min_ring_size: int = 3,
+    min_risk_diffusion: float = 0.75,
+    priority: int = 10,
+    reason: str = "Transaction associated with high-risk fraud syndicate or attack cluster.",
+) -> DecisionRule:
+    """Build a pre-configured DecisionRule for fraud ring and risk diffusion mitigation."""
+    conditions = (
+        RuleCondition(
+            field="graph_ring_size",
+            operator=RuleOperator.GREATER_THAN_OR_EQUAL,
+            value=min_ring_size,
+        ),
+        RuleCondition(
+            field="graph_risk_diffusion",
+            operator=RuleOperator.GREATER_THAN_OR_EQUAL,
+            value=min_risk_diffusion,
+        ),
+    )
+    return DecisionRule(
+        rule_id=rule_id,
+        name=name,
+        action=action,
+        conditions=conditions,
+        priority=priority,
+        reason=reason,
+    )
