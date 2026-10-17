@@ -33,6 +33,12 @@ from fraud_detection.evaluation import (
     evaluate_tiered_policy,
 )
 from fraud_detection.features import FeatureStoreProtocol
+from fraud_detection.graph import (
+    EntityGraph,
+    EntityType,
+    FraudRingDetector,
+    GraphFeatureExtractor,
+)
 from fraud_detection.model import FraudModel
 from fraud_detection.recalibration import BaseRecalibrator
 from fraud_detection.rules import RuleAction, RulePrecedence, RuleSet
@@ -947,6 +953,109 @@ class EnrichmentStageProcessor:
         }
 
 
+class GraphEnrichmentStageProcessor:
+    """Enriches transaction records with entity graph features and active fraud ring flags."""
+
+    def __init__(
+        self,
+        graph: EntityGraph | None = None,
+        feature_extractor: GraphFeatureExtractor | None = None,
+        ring_detector: FraudRingDetector | None = None,
+        update_graph: bool = True,
+    ) -> None:
+        self.graph = graph
+        self.feature_extractor = (
+            feature_extractor
+            if feature_extractor is not None
+            else (GraphFeatureExtractor(graph) if graph is not None else None)
+        )
+        self.ring_detector = (
+            ring_detector
+            if ring_detector is not None
+            else (FraudRingDetector(graph) if graph is not None else None)
+        )
+        self.update_graph = update_graph
+
+    def __call__(self, context: PipelineContext) -> dict[str, Any]:
+        tx = dict(context.transaction)
+        graph_features: dict[str, float] = {}
+        detected_rings: list[dict[str, Any]] = []
+
+        entities: dict[EntityType, str] = {}
+        for et in EntityType:
+            val = tx.get(et.value) or tx.get(et.name.lower()) or tx.get(et.value.replace("_", ""))
+            if val is not None and str(val).strip():
+                entities[et] = str(val).strip()
+
+        ts = float(tx.get("timestamp") or tx.get("Time") or 0.0)
+        tx_id = str(tx.get("transaction_id") or tx.get("tx_id") or "")
+        amount = float(tx.get("Amount") or tx.get("amount") or 0.0)
+
+        # 1. Feature extraction
+        if self.feature_extractor is not None and self.graph is not None:
+            graph_features = self.feature_extractor.extract_features(
+                transaction_id=tx_id or None,
+                timestamp=ts,
+                entities=entities,
+            )
+            tx.update(graph_features)
+
+        # 2. Ring detection evaluation
+        if self.ring_detector is not None:
+            matched_clusters = self.ring_detector.evaluate_transaction(
+                transaction_id=tx_id or None,
+                entities=entities,
+                timestamp=ts,
+            )
+            if matched_clusters:
+                max_severity = matched_clusters[0].severity.value
+                max_risk = max(c.risk_score for c in matched_clusters)
+                max_ring_size = max(c.transaction_count for c in matched_clusters)
+                tx["in_fraud_ring"] = True
+                tx["graph_ring_severity"] = max_severity
+                tx["graph_ring_risk"] = max_risk
+                tx["graph_ring_size"] = float(max_ring_size)
+                tx["graph_ring_action"] = matched_clusters[0].recommended_action.value
+                detected_rings = [
+                    {
+                        "cluster_id": c.cluster_id,
+                        "pattern_type": c.pattern_type.value,
+                        "severity": c.severity.value,
+                        "action": c.recommended_action.value,
+                        "risk_score": c.risk_score,
+                    }
+                    for c in matched_clusters
+                ]
+            else:
+                tx["in_fraud_ring"] = False
+                tx["graph_ring_severity"] = "none"
+                tx["graph_ring_risk"] = 0.0
+                tx["graph_ring_size"] = 0.0
+                tx["graph_ring_action"] = "none"
+
+        # 3. Ingest transaction into graph if configured
+        if self.update_graph and self.graph is not None and tx_id and entities:
+            self.graph.add_transaction(
+                transaction_id=tx_id,
+                timestamp=ts,
+                amount=amount,
+                entities=entities,
+            )
+
+        context.transaction = tx
+        context.metadata["graph_features"] = list(graph_features.keys())
+        context.metadata["detected_rings"] = detected_rings
+
+        return {
+            "graph_features": graph_features,
+            "detected_rings": detected_rings,
+            "in_fraud_ring": tx.get("in_fraud_ring", False),
+        }
+
+
+GraphEnrichmentStage = GraphEnrichmentStageProcessor
+
+
 class RuleStageProcessor:
     """Evaluates declarative rules against current transaction features."""
 
@@ -1676,6 +1785,10 @@ def create_default_fraud_pipeline(
     enable_circuit_breaker: bool = False,
     circuit_failure_threshold: int = 5,
     circuit_recovery_timeout_seconds: float = 30.0,
+    entity_graph: EntityGraph | None = None,
+    graph_feature_extractor: GraphFeatureExtractor | None = None,
+    fraud_ring_detector: FraudRingDetector | None = None,
+    graph_enrichment_timeout_seconds: float | None = 0.25,
 ) -> DecisionGraph:
     """Build a standard, production-ready fraud decision execution graph."""
     applied_threshold = model.threshold if threshold is None else threshold
@@ -1729,13 +1842,34 @@ def create_default_fraud_pipeline(
         )
     )
 
+    upstream_deps = ["enrichment"]
+    if entity_graph is not None:
+        graph_proc = GraphEnrichmentStageProcessor(
+            graph=entity_graph,
+            feature_extractor=graph_feature_extractor,
+            ring_detector=fraud_ring_detector,
+        )
+        graph.add_node(
+            PipelineNode(
+                name="graph_enrichment",
+                stage_type=StageType.ENRICHMENT,
+                processor=graph_proc,
+                dependencies=["enrichment"],
+                timeout_seconds=graph_enrichment_timeout_seconds,
+                fallback_value={},
+                required=False,
+                circuit_policy=circuit_policy,
+            )
+        )
+        upstream_deps = ["graph_enrichment"]
+
     rule_proc = RuleStageProcessor(rules=rules)
     graph.add_node(
         PipelineNode(
             name="rules",
             stage_type=StageType.RULES,
             processor=rule_proc,
-            dependencies=["enrichment"],
+            dependencies=upstream_deps,
             timeout_seconds=rules_timeout_seconds,
             fallback_value={"matched": False, "short_circuited": False},
             required=False,
@@ -1750,7 +1884,7 @@ def create_default_fraud_pipeline(
             name="inference",
             stage_type=StageType.INFERENCE,
             processor=inf_proc,
-            dependencies=["enrichment"],
+            dependencies=upstream_deps,
             timeout_seconds=inference_timeout_seconds,
             fallback_value={
                 "skipped": False,
