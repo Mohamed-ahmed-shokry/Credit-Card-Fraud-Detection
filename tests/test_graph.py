@@ -9,6 +9,8 @@ from fraud_detection.graph import (
     GraphConfig,
     GraphEdge,
     GraphError,
+    GraphFeatureConfig,
+    GraphFeatureExtractor,
     GraphMetrics,
     TransactionNode,
 )
@@ -308,3 +310,128 @@ def test_entity_graph_capacity_and_reset() -> None:
     metrics_empty = graph.get_metrics()
     assert metrics_empty.total_transactions == 0
     assert metrics_empty.total_entities == 0
+
+
+def test_graph_feature_config_validation() -> None:
+    cfg = GraphFeatureConfig(windows_seconds=(1800.0, 7200.0), max_hops=3, diffusion_damping=0.8)
+    assert cfg.windows_seconds == (1800.0, 7200.0)
+    assert cfg.max_hops == 3
+    assert cfg.diffusion_damping == 0.8
+    assert cfg.diffusion_iterations == 5
+
+    with pytest.raises(
+        GraphError, match="windows_seconds must be a non-empty sequence of positive floats"
+    ):
+        GraphFeatureConfig(windows_seconds=())
+
+    with pytest.raises(
+        GraphError, match="Each window in windows_seconds must be a positive finite float"
+    ):
+        GraphFeatureConfig(windows_seconds=(-100.0,))
+
+    with pytest.raises(GraphError, match="max_hops must be an integer between 1 and 5"):
+        GraphFeatureConfig(max_hops=10)
+
+    with pytest.raises(
+        GraphError, match=r"diffusion_damping must be a float between 0\.0 and 1\.0"
+    ):
+        GraphFeatureConfig(diffusion_damping=1.5)
+
+    with pytest.raises(
+        GraphError, match="diffusion_iterations must be an integer between 1 and 20"
+    ):
+        GraphFeatureConfig(diffusion_iterations=0)
+
+
+def test_graph_feature_extractor_degree_and_sharing() -> None:
+    graph = EntityGraph()
+    # Add historical transaction 1
+    graph.add_transaction(
+        transaction_id="tx_h1",
+        timestamp=1000.0,
+        amount=100.0,
+        entities={
+            EntityType.CARD_ID: "card_1",
+            EntityType.DEVICE_ID: "dev_1",
+            EntityType.IP_ADDRESS: "1.2.3.4",
+        },
+        risk_score=0.1,
+    )
+    # Add historical transaction 2 on same device with different card
+    graph.add_transaction(
+        transaction_id="tx_h2",
+        timestamp=1200.0,
+        amount=200.0,
+        entities={
+            EntityType.CARD_ID: "card_2",
+            EntityType.DEVICE_ID: "dev_1",
+            EntityType.IP_ADDRESS: "5.6.7.8",
+        },
+        risk_score=0.9,
+    )
+
+    extractor = GraphFeatureExtractor(
+        graph,
+        config=GraphFeatureConfig(windows_seconds=(3600.0,), diffusion_damping=0.5),
+    )
+
+    # Candidate transaction using card_1 on dev_1 at timestamp 1500.0
+    features = extractor.extract_features(
+        timestamp=1500.0,
+        entities={
+            EntityType.CARD_ID: "card_1",
+            EntityType.DEVICE_ID: "dev_1",
+        },
+    )
+
+    # Device dev_1 was used by 2 distinct cards in the last 1h (card_1, card_2)
+    assert features["graph_device_id_tx_count_3600s"] == 2.0
+    assert features["graph_device_id_monetary_sum_3600s"] == 300.0
+    assert features["graph_device_id_distinct_cards_3600s"] == 2.0
+
+    # Card_1 had 1 transaction in the last 1h
+    assert features["graph_card_id_tx_count_3600s"] == 1.0
+    assert features["graph_card_id_monetary_sum_3600s"] == 100.0
+
+    # 2-hop shared cards via dev_1: card_1 is connected to card_2
+    assert features["graph_shared_device_cards_count"] == 1.0
+
+    # Risk diffusion: dev_1 risk is 0.9 (from card_2 tx_h2).
+    # Since dev_1 is in candidate entities, its risk (0.9) propagates.
+    assert features["graph_risk_diffusion"] >= 0.9
+
+
+def test_graph_feature_extractor_temporal_causality() -> None:
+    graph = EntityGraph()
+    # Past transaction at t=500
+    graph.add_transaction(
+        transaction_id="tx_past",
+        timestamp=500.0,
+        amount=50.0,
+        entities={EntityType.CARD_ID: "card_X"},
+    )
+    # Future transaction at t=1500
+    graph.add_transaction(
+        transaction_id="tx_future",
+        timestamp=1500.0,
+        amount=500.0,
+        entities={EntityType.CARD_ID: "card_X"},
+    )
+
+    extractor = GraphFeatureExtractor(
+        graph,
+        config=GraphFeatureConfig(windows_seconds=(3600.0,)),
+    )
+
+    # Evaluate at t=1000: future transaction at t=1500 MUST NOT leak!
+    features = extractor.extract_features(
+        timestamp=1000.0,
+        entities={EntityType.CARD_ID: "card_X"},
+    )
+    assert features["graph_card_id_tx_count_3600s"] == 1.0
+    assert features["graph_card_id_monetary_sum_3600s"] == 50.0
+
+    # Features for empty entities
+    empty_features = extractor.extract_features(timestamp=1000.0, entities=None)
+    assert empty_features["graph_shared_device_cards_count"] == 0.0
+    assert empty_features["graph_risk_diffusion"] == 0.0
