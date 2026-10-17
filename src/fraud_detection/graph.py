@@ -7,6 +7,7 @@ import threading
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from enum import StrEnum
+from typing import Any
 
 
 class GraphError(ValueError):
@@ -626,3 +627,146 @@ class GraphFeatureExtractor:
             features["graph_neighborhood_avg_risk"] = 0.0
 
         return features
+
+
+class RingSeverity(StrEnum):
+    """Severity classification for detected fraud rings."""
+
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    CRITICAL = "critical"
+
+
+class RingAction(StrEnum):
+    """Recommended decision policy action for entities in a detected fraud ring."""
+
+    ALLOW = "allow"
+    CHALLENGE = "challenge"
+    DENY = "deny"
+
+
+class RingPatternType(StrEnum):
+    """Topological pattern archetype for fraud syndicate rings."""
+
+    BICLIQUE = "biclique"
+    STAR_CARD_TESTING = "star_card_testing"
+    CYCLE = "cycle"
+
+
+@dataclass(frozen=True)
+class FraudRingCluster:
+    """Detected fraud syndicate cluster or attack ring."""
+
+    cluster_id: str
+    pattern_type: RingPatternType
+    severity: RingSeverity
+    recommended_action: RingAction
+    entities: dict[EntityType, tuple[str, ...]]
+    transaction_ids: tuple[str, ...]
+    transaction_count: int
+    total_amount: float
+    density: float
+    risk_score: float
+    description: str
+
+    def __post_init__(self) -> None:
+        if not self.cluster_id or not isinstance(self.cluster_id, str):
+            raise GraphError("cluster_id must be a non-empty string.")
+        if not isinstance(self.pattern_type, RingPatternType):
+            raise GraphError(f"Invalid pattern_type: {self.pattern_type}")
+        if not isinstance(self.severity, RingSeverity):
+            raise GraphError(f"Invalid severity: {self.severity}")
+        if not isinstance(self.recommended_action, RingAction):
+            raise GraphError(f"Invalid recommended_action: {self.recommended_action}")
+        if not isinstance(self.entities, dict):
+            raise GraphError("entities must be a dictionary.")
+        if not isinstance(self.transaction_ids, tuple):
+            raise GraphError("transaction_ids must be a tuple.")
+        if not isinstance(self.transaction_count, int) or self.transaction_count < 0:
+            raise GraphError("transaction_count must be a non-negative integer.")
+        if (
+            not isinstance(self.total_amount, (int, float))
+            or math.isnan(self.total_amount)
+            or math.isinf(self.total_amount)
+            or self.total_amount < 0.0
+        ):
+            raise GraphError("total_amount must be a non-negative finite float.")
+        if (
+            not isinstance(self.density, (int, float))
+            or math.isnan(self.density)
+            or math.isinf(self.density)
+            or not (0.0 <= self.density <= 1.0)
+        ):
+            raise GraphError("density must be a float between 0.0 and 1.0.")
+        if (
+            not isinstance(self.risk_score, (int, float))
+            or math.isnan(self.risk_score)
+            or math.isinf(self.risk_score)
+            or not (0.0 <= self.risk_score <= 1.0)
+        ):
+            raise GraphError("risk_score must be a float between 0.0 and 1.0.")
+        if not isinstance(self.description, str):
+            raise GraphError("description must be a string.")
+
+
+@dataclass(frozen=True)
+class FraudRingReport:
+    """Comprehensive report summarizing detected active fraud rings."""
+
+    generated_at: float
+    total_clusters: int
+    clusters: tuple[FraudRingCluster, ...]
+    critical_count: int
+    high_count: int
+    medium_count: int
+    low_count: int
+    summary: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.generated_at, (int, float))
+            or math.isnan(self.generated_at)
+            or math.isinf(self.generated_at)
+        ):
+            raise GraphError("generated_at must be a finite float.")
+        if not isinstance(self.total_clusters, int) or self.total_clusters < 0:
+            raise GraphError("total_clusters must be a non-negative integer.")
+        if not isinstance(self.clusters, tuple):
+            raise GraphError("clusters must be a tuple of FraudRingCluster objects.")
+
+
+@dataclass(frozen=True)
+class FraudRingDetectorConfig:
+    """Configuration thresholds for automated fraud ring detection."""
+
+    min_cards_per_device: int = 3
+    min_devices_per_card: int = 2
+    card_testing_window_seconds: float = 300.0
+    card_testing_min_cards: int = 4
+    cycle_max_depth: int = 4
+    min_cluster_amount: float = 0.0
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.min_cards_per_device, int) or self.min_cards_per_device < 2:
+            raise GraphError("min_cards_per_device must be an integer >= 2.")
+        if not isinstance(self.min_devices_per_card, int) or self.min_devices_per_card < 1:
+            raise GraphError("min_devices_per_card must be an integer >= 1.")
+        if (
+            not isinstance(self.card_testing_window_seconds, (int, float))
+            or math.isnan(self.card_testing_window_seconds)
+            or math.isinf(self.card_testing_window_seconds)
+            or self.card_testing_window_seconds <= 0.0
+        ):
+            raise GraphError("card_testing_window_seconds must be a positive finite float.")
+        if not isinstance(self.card_testing_min_cards, int) or self.card_testing_min_cards < 2:
+            raise GraphError("card_testing_min_cards must be an integer >= 2.")
+        if not isinstance(self.cycle_max_depth, int) or not (2 <= self.cycle_max_depth <= 10):
+            raise GraphError("cycle_max_depth must be an integer between 2 and 10.")
+        if (
+            not isinstance(self.min_cluster_amount, (int, float))
+            or math.isnan(self.min_cluster_amount)
+            or math.isinf(self.min_cluster_amount)
+            or self.min_cluster_amount < 0.0
+        ):
+            raise GraphError("min_cluster_amount must be a non-negative finite float.")
