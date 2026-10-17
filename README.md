@@ -738,6 +738,64 @@ fraud-detect auto-retrain \
   - `fraud_model_promotions_total{promotion_type="...", status="..."}`
   - `challenger_retrained` and `model_promoted` structured audit events.
 
+## Real-Time Entity Link Analysis, Fraud Ring Detection & Graph Feature Aggregation
+
+Uncover organized fraud syndicates, botnet card-testing attacks, and collusion rings in real time using a streaming bipartite entity-transaction link graph engine:
+
+```bash
+# Detect organized fraud rings and card-testing syndicates from transaction data
+fraud-detect graph-rings \
+  --input-file data/transactions.csv \
+  --output reports/fraud_rings.json \
+  --window-seconds 86400 \
+  --min-cards-per-device 3 \
+  --min-devices-per-card 2 \
+  --card-testing-window-seconds 300 \
+  --card-testing-min-cards 4 \
+  --fail-on-rings
+
+# Output as raw JSON for automated downstream alert orchestration
+fraud-detect graph-rings \
+  --input-file data/transactions.json \
+  --json
+
+# Stream-enrich transactions with 26+ graph topological features without lookahead bias
+fraud-detect graph-enrich \
+  --input-file data/raw_transactions.csv \
+  --output-file data/enriched_transactions.csv \
+  --window-seconds 86400 \
+  --diffusion-damping 0.85 \
+  --diffusion-iterations 5
+```
+
+### Graph link analysis capabilities
+
+- **Streaming Bipartite Topology (`EntityGraph`)**: In-memory bipartite link graph with thread-safe operations (`RLock`), sliding temporal lookback windows, $O(1)$ adjacency lookups, and hard capacity capping. Connects discrete entities (`card_id`, `device_id`, `ip_address`, `merchant_id`, `user_id`, `session_id`, `terminal_id`) to transaction nodes.
+- **Lookahead-Safe Feature Extraction (`GraphFeatureExtractor`)**: Computes 26+ link features strictly before candidate transaction ingestion:
+  - Degree centrality across sliding time windows (e.g. 1h, 24h)
+  - 2-hop entity sharing (distinct cards sharing a device or IP, distinct devices per card)
+  - Connected syndicate network size and bipartite density
+  - Personalized PageRank risk diffusion scores ($\alpha=0.85, k=5$)
+  - Neighborhood average risk and confirmed fraud propagation
+- **Automated Fraud Ring Detection (`FraudRingDetector`)**: Discovers attack archetypes:
+  - **Dense Bicliques**: High-degree card-device/IP sharing clusters indicating organized fraud syndicates.
+  - **Star Card-Testing Botnets**: Rapid bursts of distinct cards tested on single merchant terminals, IPs, or devices within short windows ($\le 300\text{s}$).
+  - **Circular Flow Cycles**: Alternating cycles of cards and shared infrastructure.
+- **Pipeline & Rule Integration**:
+  - `GraphEnrichmentStageProcessor` wires the entity graph into the real-time decision graph DAG.
+  - `build_fraud_ring_rule` enforces automatic `CHALLENGE` or `DENY` policies on detected syndicate clusters.
+- **Operational Endpoints**:
+  - `GET /v1/graph/stats`: Live graph topology metrics (active nodes, edges, entity breakdown, timestamps).
+  - `GET /v1/graph/entity/{entity_type}/{entity_id}`: Inspects entity node degree, 2-hop reachability, and recent transactions.
+  - `GET /v1/graph/rings`: Discovers and returns active fraud rings and botnet clusters with severity breakdown.
+  - `POST /v1/graph/reset`: Resets link graph topology and clears active in-memory state.
+- **Prometheus Telemetry & Auditing**:
+  - `fraud_graph_nodes_total{entity_type="..."}`: Active entity nodes by type.
+  - `fraud_graph_edges_total`: Active bipartite graph edges.
+  - `fraud_graph_rings_detected_total{severity="..."}`: Detected fraud rings by severity.
+  - `fraud_graph_ring_detection_seconds`: Latency histogram for community ring detection.
+  - `fraud_ring_detected` structured audit events with automated Luhn PAN redaction.
+
 ## Train on the anonymized dataset
 
 Place the downloaded CSV under the ignored `Dataset/` directory; raw financial data
@@ -1668,6 +1726,7 @@ src/fraud_detection/
 ├── explanations.py   # isolated explanation provider protocols and cost controls
 ├── features.py       # feature store contracts, point-in-time join, and skew surveillance
 ├── feedback.py       # delayed ground truth ingestion, label maturation modeling, and retraining triggers
+├── graph.py          # real-time bipartite entity link analysis, fraud ring detection, and risk diffusion
 ├── model.py          # training, model card, inference, and cryptographic attestation
 ├── pipeline.py       # decision graph execution, stage circuit breakers, and chaos simulation
 ├── recalibration.py  # ECE diagnostics, reliability curves, and post-hoc recalibration
