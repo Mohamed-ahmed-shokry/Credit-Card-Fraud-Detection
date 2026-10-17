@@ -7,6 +7,7 @@ from fraud_detection.graph import (
     EntityNode,
     EntityType,
     FraudRingCluster,
+    FraudRingDetector,
     FraudRingDetectorConfig,
     FraudRingReport,
     GraphConfig,
@@ -545,3 +546,154 @@ def test_fraud_ring_detector_config_validation() -> None:
 
     with pytest.raises(GraphError, match="cycle_max_depth must be an integer between 2 and 10"):
         FraudRingDetectorConfig(cycle_max_depth=20)
+
+
+def test_fraud_ring_detector_card_testing_star() -> None:
+    graph = EntityGraph()
+    detector = FraudRingDetector(
+        graph,
+        config=FraudRingDetectorConfig(
+            card_testing_window_seconds=300.0,
+            card_testing_min_cards=4,
+        ),
+    )
+
+    # 4 distinct cards tested on dev_bot in 100 seconds
+    for i in range(4):
+        graph.add_transaction(
+            transaction_id=f"tx_test_{i}",
+            timestamp=1000.0 + i * 20.0,
+            amount=5.0 + i,
+            entities={
+                EntityType.DEVICE_ID: "dev_bot",
+                EntityType.CARD_ID: f"card_test_{i}",
+            },
+        )
+
+    report = detector.detect_rings(current_timestamp=1100.0)
+    assert report.total_clusters >= 1
+    star_clusters = [
+        c for c in report.clusters if c.pattern_type == RingPatternType.STAR_CARD_TESTING
+    ]
+    assert len(star_clusters) == 1
+    cluster = star_clusters[0]
+    assert cluster.severity in (RingSeverity.HIGH, RingSeverity.CRITICAL)
+    assert cluster.recommended_action == RingAction.DENY
+    assert cluster.transaction_count == 4
+    assert cluster.entities[EntityType.DEVICE_ID] == ("dev_bot",)
+    assert len(cluster.entities[EntityType.CARD_ID]) == 4
+
+    # Evaluate transaction intersection
+    matched = detector.evaluate_transaction(
+        entities={EntityType.DEVICE_ID: "dev_bot", EntityType.CARD_ID: "card_new"}
+    )
+    assert len(matched) >= 1
+    assert matched[0].cluster_id == cluster.cluster_id
+
+    # Non-matching entity
+    no_match = detector.evaluate_transaction(
+        entities={EntityType.DEVICE_ID: "dev_innocent", EntityType.CARD_ID: "card_innocent"}
+    )
+    assert len(no_match) == 0
+
+
+def test_fraud_ring_detector_dense_biclique() -> None:
+    graph = EntityGraph()
+    detector = FraudRingDetector(
+        graph,
+        config=FraudRingDetectorConfig(
+            min_cards_per_device=3,
+            min_devices_per_card=2,
+        ),
+    )
+
+    # 3 cards (c1, c2, c3) sharing 2 devices (d1, d2)
+    tx_id = 0
+    for card in ("c1", "c2", "c3"):
+        for dev in ("d1", "d2"):
+            graph.add_transaction(
+                transaction_id=f"tx_b_{tx_id}",
+                timestamp=1000.0 + tx_id * 10.0,
+                amount=100.0,
+                entities={
+                    EntityType.CARD_ID: card,
+                    EntityType.DEVICE_ID: dev,
+                },
+            )
+            tx_id += 1
+
+    report = detector.detect_rings(current_timestamp=2000.0)
+    bicliques = [c for c in report.clusters if c.pattern_type == RingPatternType.BICLIQUE]
+    assert len(bicliques) >= 1
+    b_cluster = bicliques[0]
+    assert b_cluster.severity in (RingSeverity.HIGH, RingSeverity.CRITICAL)
+    assert b_cluster.recommended_action == RingAction.DENY
+    assert len(b_cluster.entities[EntityType.CARD_ID]) == 3
+    assert len(b_cluster.entities[EntityType.DEVICE_ID]) == 2
+    assert b_cluster.density == 1.0
+
+
+def test_fraud_ring_detector_cycles() -> None:
+    graph = EntityGraph()
+    detector = FraudRingDetector(
+        graph,
+        config=FraudRingDetectorConfig(cycle_max_depth=4),
+    )
+
+    # Card 1 and User 1
+    graph.add_transaction(
+        transaction_id="tx_c1",
+        timestamp=100.0,
+        amount=50.0,
+        entities={EntityType.CARD_ID: "card_1", EntityType.USER_ID: "u1"},
+    )
+    # User 1 and Card 2
+    graph.add_transaction(
+        transaction_id="tx_c2",
+        timestamp=110.0,
+        amount=50.0,
+        entities={EntityType.CARD_ID: "card_2", EntityType.USER_ID: "u1"},
+    )
+    # Card 2 and User 2
+    graph.add_transaction(
+        transaction_id="tx_c3",
+        timestamp=120.0,
+        amount=50.0,
+        entities={EntityType.CARD_ID: "card_2", EntityType.USER_ID: "u2"},
+    )
+    # User 2 and Card 3
+    graph.add_transaction(
+        transaction_id="tx_c4",
+        timestamp=130.0,
+        amount=50.0,
+        entities={EntityType.CARD_ID: "card_3", EntityType.USER_ID: "u2"},
+    )
+    # Card 3 and User 3
+    graph.add_transaction(
+        transaction_id="tx_c5",
+        timestamp=140.0,
+        amount=50.0,
+        entities={EntityType.CARD_ID: "card_3", EntityType.USER_ID: "u3"},
+    )
+    # User 3 and Card 1 (closes loop: card 1 -> card 2 -> card 3 -> card 1)
+    graph.add_transaction(
+        transaction_id="tx_c6",
+        timestamp=150.0,
+        amount=50.0,
+        entities={EntityType.CARD_ID: "card_1", EntityType.USER_ID: "u3"},
+    )
+
+    report = detector.detect_rings(current_timestamp=200.0)
+    cycles = [c for c in report.clusters if c.pattern_type == RingPatternType.CYCLE]
+    assert len(cycles) >= 1
+    assert cycles[0].severity == RingSeverity.HIGH
+    assert set(cycles[0].entities[EntityType.CARD_ID]) == {"card_1", "card_2", "card_3"}
+
+
+def test_fraud_ring_detector_empty_and_get_entities() -> None:
+    graph = EntityGraph()
+    detector = FraudRingDetector(graph)
+    report = detector.detect_rings()
+    assert report.total_clusters == 0
+    assert report.clusters == ()
+    assert graph.get_entities() == []
