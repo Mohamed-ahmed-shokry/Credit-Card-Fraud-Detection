@@ -697,3 +697,526 @@ def test_fraud_ring_detector_empty_and_get_entities() -> None:
     assert report.total_clusters == 0
     assert report.clusters == ()
     assert graph.get_entities() == []
+
+
+def test_graph_dataclass_validation_errors() -> None:
+    # EntityNode validation
+    with pytest.raises(GraphError, match="Invalid entity_type"):
+        EntityNode(
+            entity_type="not_an_entity_type",  # type: ignore[arg-type]
+            entity_id="e1",
+            first_seen_timestamp=10.0,
+            last_seen_timestamp=20.0,
+        )
+
+    # TransactionNode validation
+    with pytest.raises(GraphError, match="timestamp must be a finite float"):
+        TransactionNode(
+            transaction_id="tx_invalid_ts",
+            timestamp=float("nan"),
+            amount=50.0,
+        )
+
+    with pytest.raises(GraphError, match="entities must be a dictionary"):
+        TransactionNode(
+            transaction_id="tx_invalid_ent",
+            timestamp=100.0,
+            amount=50.0,
+            entities="not_a_dict",  # type: ignore[arg-type]
+        )
+
+    # GraphEdge validation
+    with pytest.raises(GraphError, match="transaction_id must not be empty"):
+        GraphEdge(
+            transaction_id="",
+            entity_type=EntityType.CARD_ID,
+            entity_id="c1",
+            timestamp=100.0,
+        )
+
+    with pytest.raises(GraphError, match="entity_id must not be empty"):
+        GraphEdge(
+            transaction_id="tx_1",
+            entity_type=EntityType.CARD_ID,
+            entity_id="",
+            timestamp=100.0,
+        )
+
+    with pytest.raises(GraphError, match="Invalid entity_type"):
+        GraphEdge(
+            transaction_id="tx_1",
+            entity_type="bad_type",  # type: ignore[arg-type]
+            entity_id="c1",
+            timestamp=100.0,
+        )
+
+    with pytest.raises(GraphError, match="timestamp must be a finite float"):
+        GraphEdge(
+            transaction_id="tx_1",
+            entity_type=EntityType.CARD_ID,
+            entity_id="c1",
+            timestamp=float("inf"),
+        )
+
+    # FraudRingCluster validations
+    with pytest.raises(GraphError, match="Invalid severity"):
+        FraudRingCluster(
+            cluster_id="c1",
+            pattern_type=RingPatternType.STAR_CARD_TESTING,
+            severity="extreme",  # type: ignore[arg-type]
+            recommended_action=RingAction.DENY,
+            entities={EntityType.CARD_ID: ("c1",)},
+            transaction_ids=("tx1",),
+            transaction_count=1,
+            total_amount=100.0,
+            density=1.0,
+            risk_score=0.9,
+            description="desc",
+        )
+
+    with pytest.raises(GraphError, match="Invalid recommended_action"):
+        FraudRingCluster(
+            cluster_id="c1",
+            pattern_type=RingPatternType.STAR_CARD_TESTING,
+            severity=RingSeverity.HIGH,
+            recommended_action="drop",  # type: ignore[arg-type]
+            entities={EntityType.CARD_ID: ("c1",)},
+            transaction_ids=("tx1",),
+            transaction_count=1,
+            total_amount=100.0,
+            density=1.0,
+            risk_score=0.9,
+            description="desc",
+        )
+
+    with pytest.raises(GraphError, match="entities must be a dictionary"):
+        FraudRingCluster(
+            cluster_id="c1",
+            pattern_type=RingPatternType.STAR_CARD_TESTING,
+            severity=RingSeverity.HIGH,
+            recommended_action=RingAction.DENY,
+            entities="not_dict",  # type: ignore[arg-type]
+            transaction_ids=("tx1",),
+            transaction_count=1,
+            total_amount=100.0,
+            density=1.0,
+            risk_score=0.9,
+            description="desc",
+        )
+
+    with pytest.raises(GraphError, match="transaction_ids must be a tuple"):
+        FraudRingCluster(
+            cluster_id="c1",
+            pattern_type=RingPatternType.STAR_CARD_TESTING,
+            severity=RingSeverity.HIGH,
+            recommended_action=RingAction.DENY,
+            entities={EntityType.CARD_ID: ("c1",)},
+            transaction_ids=["tx1"],  # type: ignore[arg-type]
+            transaction_count=1,
+            total_amount=100.0,
+            density=1.0,
+            risk_score=0.9,
+            description="desc",
+        )
+
+    with pytest.raises(GraphError, match="transaction_count must be a non-negative integer"):
+        FraudRingCluster(
+            cluster_id="c1",
+            pattern_type=RingPatternType.STAR_CARD_TESTING,
+            severity=RingSeverity.HIGH,
+            recommended_action=RingAction.DENY,
+            entities={EntityType.CARD_ID: ("c1",)},
+            transaction_ids=("tx1",),
+            transaction_count=-1,
+            total_amount=100.0,
+            density=1.0,
+            risk_score=0.9,
+            description="desc",
+        )
+
+    with pytest.raises(GraphError, match="total_amount must be a non-negative finite float"):
+        FraudRingCluster(
+            cluster_id="c1",
+            pattern_type=RingPatternType.STAR_CARD_TESTING,
+            severity=RingSeverity.HIGH,
+            recommended_action=RingAction.DENY,
+            entities={EntityType.CARD_ID: ("c1",)},
+            transaction_ids=("tx1",),
+            transaction_count=1,
+            total_amount=-50.0,
+            density=1.0,
+            risk_score=0.9,
+            description="desc",
+        )
+
+    with pytest.raises(GraphError, match=r"density must be a float between 0\.0 and 1\.0"):
+        FraudRingCluster(
+            cluster_id="c1",
+            pattern_type=RingPatternType.STAR_CARD_TESTING,
+            severity=RingSeverity.HIGH,
+            recommended_action=RingAction.DENY,
+            entities={EntityType.CARD_ID: ("c1",)},
+            transaction_ids=("tx1",),
+            transaction_count=1,
+            total_amount=100.0,
+            density=1.5,
+            risk_score=0.9,
+            description="desc",
+        )
+
+    with pytest.raises(GraphError, match=r"risk_score must be a float between 0\.0 and 1\.0"):
+        FraudRingCluster(
+            cluster_id="c1",
+            pattern_type=RingPatternType.STAR_CARD_TESTING,
+            severity=RingSeverity.HIGH,
+            recommended_action=RingAction.DENY,
+            entities={EntityType.CARD_ID: ("c1",)},
+            transaction_ids=("tx1",),
+            transaction_count=1,
+            total_amount=100.0,
+            density=0.5,
+            risk_score=-0.1,
+            description="desc",
+        )
+
+    with pytest.raises(GraphError, match="description must be a string"):
+        FraudRingCluster(
+            cluster_id="c1",
+            pattern_type=RingPatternType.STAR_CARD_TESTING,
+            severity=RingSeverity.HIGH,
+            recommended_action=RingAction.DENY,
+            entities={EntityType.CARD_ID: ("c1",)},
+            transaction_ids=("tx1",),
+            transaction_count=1,
+            total_amount=100.0,
+            density=0.5,
+            risk_score=0.5,
+            description=123,  # type: ignore[arg-type]
+        )
+
+    # FraudRingReport validations
+    with pytest.raises(GraphError, match="total_clusters must be a non-negative integer"):
+        FraudRingReport(
+            generated_at=100.0,
+            total_clusters=-1,
+            clusters=(),
+            critical_count=0,
+            high_count=0,
+            medium_count=0,
+            low_count=0,
+        )
+
+    with pytest.raises(GraphError, match="clusters must be a tuple of FraudRingCluster objects"):
+        FraudRingReport(
+            generated_at=100.0,
+            total_clusters=0,
+            clusters=[],  # type: ignore[arg-type]
+            critical_count=0,
+            high_count=0,
+            medium_count=0,
+            low_count=0,
+        )
+
+    # FraudRingDetectorConfig validation
+    with pytest.raises(GraphError, match="min_cluster_amount must be a non-negative finite float"):
+        FraudRingDetectorConfig(min_cluster_amount=-1.0)
+
+
+def test_entity_graph_transaction_overwrite_and_empty_entities() -> None:
+    graph = EntityGraph()
+    # Add initial transaction
+    graph.add_transaction(
+        transaction_id="tx_1",
+        timestamp=100.0,
+        amount=50.0,
+        entities={
+            EntityType.CARD_ID: "card_A",
+            EntityType.DEVICE_ID: "dev_A",
+            EntityType.IP_ADDRESS: "",  # empty entity_id is skipped
+        },
+    )
+    assert graph.get_metrics().total_entities == 2
+
+    # Overwrite transaction with different entities
+    graph.add_transaction(
+        transaction_id="tx_1",
+        timestamp=150.0,
+        amount=75.0,
+        entities={
+            EntityType.CARD_ID: "card_B",
+            EntityType.DEVICE_ID: "dev_B",
+        },
+    )
+    # card_A and dev_A should have been removed since no other txs reference them
+    assert graph.get_entity(EntityType.CARD_ID, "card_A") is None
+    assert graph.get_entity(EntityType.CARD_ID, "card_B") is not None
+    assert graph.get_transaction("tx_1") is not None
+    assert graph.get_transaction("tx_1").amount == 75.0  # type: ignore[union-attr]
+
+
+def test_entity_graph_evict_expired_default_timestamp() -> None:
+    graph = EntityGraph(config=GraphConfig(window_seconds=100.0, prune_interval_seconds=1000.0))
+    graph.add_transaction(
+        transaction_id="tx_old",
+        timestamp=50.0,
+        amount=20.0,
+        entities={EntityType.CARD_ID: "c1"},
+    )
+    graph.add_transaction(
+        transaction_id="tx_new",
+        timestamp=200.0,
+        amount=30.0,
+        entities={EntityType.CARD_ID: "c2"},
+    )
+    # Calling evict_expired without current_timestamp should use newest tx timestamp (200.0)
+    evicted = graph.evict_expired(current_timestamp=None)
+    assert evicted == 1
+    assert graph.get_transaction("tx_old") is None
+    assert graph.get_transaction("tx_new") is not None
+
+
+def test_entity_graph_2hop_via_entity_type_filter() -> None:
+    graph = EntityGraph()
+    # tx1 connects card_1 and dev_1
+    graph.add_transaction(
+        transaction_id="tx1",
+        timestamp=100.0,
+        amount=10.0,
+        entities={EntityType.CARD_ID: "c1", EntityType.DEVICE_ID: "d1"},
+    )
+    # tx2 connects card_1 and dev_2 (shares card_1)
+    graph.add_transaction(
+        transaction_id="tx2",
+        timestamp=110.0,
+        amount=20.0,
+        entities={EntityType.CARD_ID: "c1", EntityType.DEVICE_ID: "d2"},
+    )
+    # tx3 connects card_2 and dev_1 (shares dev_1)
+    graph.add_transaction(
+        transaction_id="tx3",
+        timestamp=120.0,
+        amount=30.0,
+        entities={EntityType.CARD_ID: "c2", EntityType.DEVICE_ID: "d1"},
+    )
+
+    # Query 2-hop transactions via CARD_ID only
+    card_peers = graph.get_2hop_transactions(
+        transaction_id="tx1", via_entity_type=EntityType.CARD_ID
+    )
+    assert len(card_peers) == 1
+    assert card_peers[0].transaction_id == "tx2"
+
+    # Query 2-hop transactions via DEVICE_ID only
+    dev_peers = graph.get_2hop_transactions(
+        transaction_id="tx1", via_entity_type=EntityType.DEVICE_ID
+    )
+    assert len(dev_peers) == 1
+    assert dev_peers[0].transaction_id == "tx3"
+
+
+def test_graph_feature_extractor_from_existing_transaction() -> None:
+    graph = EntityGraph()
+    graph.add_transaction(
+        transaction_id="tx_existing",
+        timestamp=100.0,
+        amount=50.0,
+        entities={EntityType.CARD_ID: "c1", EntityType.DEVICE_ID: "d1"},
+    )
+    extractor = GraphFeatureExtractor(graph)
+    # Extract features using transaction_id only (entities and timestamp inferred)
+    features = extractor.extract_features(transaction_id="tx_existing")
+    assert "graph_card_id_tx_count_3600s" in features
+    assert features["graph_risk_diffusion"] == 0.0
+
+    # Extract features with no arguments (empty defaults)
+    empty_features = extractor.extract_features()
+    assert empty_features["graph_shared_device_cards_count"] == 0.0
+
+
+def test_fraud_ring_detector_evaluate_transaction_variants() -> None:
+    graph = EntityGraph()
+    detector = FraudRingDetector(
+        graph,
+        config=FraudRingDetectorConfig(
+            card_testing_window_seconds=300.0,
+            card_testing_min_cards=3,
+            min_cluster_amount=10.0,
+        ),
+    )
+
+    # Empty graph evaluation should return []
+    assert detector.evaluate_transaction(transaction_id="nonexistent") == []
+
+    for i in range(3):
+        graph.add_transaction(
+            transaction_id=f"tx_{i}",
+            timestamp=100.0 + i * 10,
+            amount=50.0,
+            entities={
+                EntityType.DEVICE_ID: "dev_attack",
+                EntityType.CARD_ID: f"card_{i}",
+            },
+        )
+
+    # Evaluate by existing transaction_id
+    matched_by_tx = detector.evaluate_transaction(transaction_id="tx_0")
+    assert len(matched_by_tx) >= 1
+    star_clusters = [
+        c for c in matched_by_tx if c.pattern_type == RingPatternType.STAR_CARD_TESTING
+    ]
+    assert len(star_clusters) == 1
+    assert star_clusters[0].severity == RingSeverity.MEDIUM
+    assert star_clusters[0].recommended_action == RingAction.CHALLENGE
+
+    # Test cluster to_dict and report to_dict
+    c_dict = star_clusters[0].to_dict()
+    assert c_dict["cluster_id"] == "star_device_id_dev_attack"
+    assert c_dict["pattern_type"] == "star_card_testing"
+    assert c_dict["severity"] == "medium"
+
+    report = detector.detect_rings(current_timestamp=200.0)
+    r_dict = report.to_dict()
+    assert r_dict["total_clusters"] == report.total_clusters
+    assert len(r_dict["clusters"]) == len(report.clusters)
+
+    # Evaluate by non-matching entities
+    matched_non = detector.evaluate_transaction(entities={EntityType.CARD_ID: "card_nonexistent"})
+    assert len(matched_non) == 0
+
+
+def test_fraud_ring_detector_critical_star_attack() -> None:
+    graph = EntityGraph()
+    detector = FraudRingDetector(
+        graph,
+        config=FraudRingDetectorConfig(
+            card_testing_window_seconds=300.0,
+            card_testing_min_cards=3,
+            min_cluster_amount=10.0,
+        ),
+    )
+    # 9 cards connected to single device -> CRITICAL
+    for i in range(9):
+        graph.add_transaction(
+            transaction_id=f"tx_crit_{i}",
+            timestamp=100.0 + i * 5,
+            amount=50.0,
+            entities={
+                EntityType.DEVICE_ID: "dev_botnet",
+                EntityType.CARD_ID: f"card_bot_{i}",
+            },
+        )
+    report = detector.detect_rings(current_timestamp=200.0)
+    crit_stars = [
+        c
+        for c in report.clusters
+        if c.pattern_type == RingPatternType.STAR_CARD_TESTING
+        and c.severity == RingSeverity.CRITICAL
+    ]
+    assert len(crit_stars) == 1
+    assert crit_stars[0].recommended_action == RingAction.DENY
+    assert crit_stars[0].risk_score == 0.95
+
+
+def test_fraud_ring_detector_min_cluster_amount_and_biclique_thresholds() -> None:
+    # Test card testing skipped when total_amt < min_cluster_amount
+    graph = EntityGraph()
+    detector = FraudRingDetector(
+        graph,
+        config=FraudRingDetectorConfig(
+            card_testing_min_cards=3,
+            min_cluster_amount=500.0,  # high threshold
+        ),
+    )
+    for i in range(3):
+        graph.add_transaction(
+            transaction_id=f"tx_small_{i}",
+            timestamp=100.0 + i,
+            amount=10.0,  # 3 * 10 = 30 < 500
+            entities={
+                EntityType.DEVICE_ID: "dev_small",
+                EntityType.CARD_ID: f"card_{i}",
+            },
+        )
+    report = detector.detect_rings(current_timestamp=200.0)
+    stars = [c for c in report.clusters if c.pattern_type == RingPatternType.STAR_CARD_TESTING]
+    assert len(stars) == 0
+
+    # Test biclique severity CRITICAL with 5 cards
+    graph2 = EntityGraph()
+    detector2 = FraudRingDetector(
+        graph2,
+        config=FraudRingDetectorConfig(
+            min_cards_per_device=2,
+            min_devices_per_card=2,
+            min_cluster_amount=10.0,
+        ),
+    )
+    # 5 cards connected to 2 devices
+    for c_idx in range(5):
+        for d_idx in range(2):
+            graph2.add_transaction(
+                transaction_id=f"tx_bi_{c_idx}_{d_idx}",
+                timestamp=100.0 + c_idx * 10 + d_idx,
+                amount=100.0,
+                entities={
+                    EntityType.CARD_ID: f"card_synd_{c_idx}",
+                    EntityType.DEVICE_ID: f"dev_synd_{d_idx}",
+                },
+            )
+    report2 = detector2.detect_rings(current_timestamp=300.0)
+    bicliques = [c for c in report2.clusters if c.pattern_type == RingPatternType.BICLIQUE]
+    assert len(bicliques) >= 1
+    assert bicliques[0].severity == RingSeverity.CRITICAL
+    assert bicliques[0].recommended_action == RingAction.DENY
+    assert bicliques[0].risk_score == 0.92
+
+    # Test biclique severity MEDIUM with 2 cards
+    graph3 = EntityGraph()
+    detector3 = FraudRingDetector(
+        graph3,
+        config=FraudRingDetectorConfig(
+            min_cards_per_device=2,
+            min_devices_per_card=2,
+            min_cluster_amount=10.0,
+        ),
+    )
+    for c_idx in range(2):
+        for d_idx in range(2):
+            graph3.add_transaction(
+                transaction_id=f"tx_med_{c_idx}_{d_idx}",
+                timestamp=100.0 + c_idx * 10 + d_idx,
+                amount=20.0,
+                entities={
+                    EntityType.CARD_ID: f"card_med_{c_idx}",
+                    EntityType.DEVICE_ID: f"dev_med_{d_idx}",
+                },
+            )
+    report3 = detector3.detect_rings(current_timestamp=300.0)
+    bicliques3 = [c for c in report3.clusters if c.pattern_type == RingPatternType.BICLIQUE]
+    assert len(bicliques3) >= 1
+    assert bicliques3[0].severity == RingSeverity.MEDIUM
+    assert bicliques3[0].recommended_action == RingAction.CHALLENGE
+
+    # Test biclique skipped when total_amt < min_cluster_amount
+    graph_bi_low = EntityGraph()
+    det_bi_low = FraudRingDetector(
+        graph_bi_low,
+        config=FraudRingDetectorConfig(
+            min_cards_per_device=2,
+            min_devices_per_card=2,
+            min_cluster_amount=500.0,
+        ),
+    )
+    for c_idx in range(2):
+        for d_idx in range(2):
+            graph_bi_low.add_transaction(
+                transaction_id=f"tx_low_{c_idx}_{d_idx}",
+                timestamp=100.0,
+                amount=5.0,
+                entities={
+                    EntityType.CARD_ID: f"c_{c_idx}",
+                    EntityType.DEVICE_ID: f"d_{d_idx}",
+                },
+            )
+    report_low = det_bi_low.detect_rings(current_timestamp=200.0)
+    assert len([c for c in report_low.clusters if c.pattern_type == RingPatternType.BICLIQUE]) == 0
