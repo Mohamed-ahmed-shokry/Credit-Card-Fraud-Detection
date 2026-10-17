@@ -6,12 +6,18 @@ from fraud_detection.graph import (
     EntityGraph,
     EntityNode,
     EntityType,
+    FraudRingCluster,
+    FraudRingDetectorConfig,
+    FraudRingReport,
     GraphConfig,
     GraphEdge,
     GraphError,
     GraphFeatureConfig,
     GraphFeatureExtractor,
     GraphMetrics,
+    RingAction,
+    RingPatternType,
+    RingSeverity,
     TransactionNode,
 )
 
@@ -435,3 +441,107 @@ def test_graph_feature_extractor_temporal_causality() -> None:
     empty_features = extractor.extract_features(timestamp=1000.0, entities=None)
     assert empty_features["graph_shared_device_cards_count"] == 0.0
     assert empty_features["graph_risk_diffusion"] == 0.0
+
+
+def test_fraud_ring_enums_and_cluster_validation() -> None:
+    assert RingSeverity.LOW == "low"
+    assert RingSeverity.CRITICAL == "critical"
+    assert RingAction.ALLOW == "allow"
+    assert RingAction.DENY == "deny"
+    assert RingPatternType.BICLIQUE == "biclique"
+    assert RingPatternType.STAR_CARD_TESTING == "star_card_testing"
+    assert RingPatternType.CYCLE == "cycle"
+
+    cluster = FraudRingCluster(
+        cluster_id="ring_1",
+        pattern_type=RingPatternType.BICLIQUE,
+        severity=RingSeverity.HIGH,
+        recommended_action=RingAction.DENY,
+        entities={EntityType.CARD_ID: ("c1", "c2"), EntityType.DEVICE_ID: ("d1",)},
+        transaction_ids=("tx_1", "tx_2"),
+        transaction_count=2,
+        total_amount=500.0,
+        density=0.8,
+        risk_score=0.9,
+        description="Dense card-device cluster",
+    )
+    assert cluster.cluster_id == "ring_1"
+    assert cluster.severity == RingSeverity.HIGH
+    assert cluster.recommended_action == RingAction.DENY
+
+    with pytest.raises(GraphError, match="cluster_id must be a non-empty string"):
+        FraudRingCluster(
+            cluster_id="",
+            pattern_type=RingPatternType.BICLIQUE,
+            severity=RingSeverity.HIGH,
+            recommended_action=RingAction.DENY,
+            entities={},
+            transaction_ids=(),
+            transaction_count=0,
+            total_amount=0.0,
+            density=0.0,
+            risk_score=0.0,
+            description="",
+        )
+
+    with pytest.raises(GraphError, match="Invalid pattern_type"):
+        FraudRingCluster(
+            cluster_id="r",
+            pattern_type="unknown",  # type: ignore[arg-type]
+            severity=RingSeverity.HIGH,
+            recommended_action=RingAction.DENY,
+            entities={},
+            transaction_ids=(),
+            transaction_count=0,
+            total_amount=0.0,
+            density=0.0,
+            risk_score=0.0,
+            description="",
+        )
+
+
+def test_fraud_ring_report_validation() -> None:
+    report = FraudRingReport(
+        generated_at=1000.0,
+        total_clusters=0,
+        clusters=(),
+        critical_count=0,
+        high_count=0,
+        medium_count=0,
+        low_count=0,
+    )
+    assert report.total_clusters == 0
+
+    with pytest.raises(GraphError, match="generated_at must be a finite float"):
+        FraudRingReport(
+            generated_at=float("nan"),
+            total_clusters=0,
+            clusters=(),
+            critical_count=0,
+            high_count=0,
+            medium_count=0,
+            low_count=0,
+        )
+
+
+def test_fraud_ring_detector_config_validation() -> None:
+    cfg = FraudRingDetectorConfig()
+    assert cfg.min_cards_per_device == 3
+    assert cfg.min_devices_per_card == 2
+
+    with pytest.raises(GraphError, match="min_cards_per_device must be an integer >= 2"):
+        FraudRingDetectorConfig(min_cards_per_device=1)
+
+    with pytest.raises(GraphError, match="min_devices_per_card must be an integer >= 1"):
+        FraudRingDetectorConfig(min_devices_per_card=0)
+
+    with pytest.raises(
+        GraphError, match="card_testing_window_seconds must be a positive finite float"
+    ):
+        FraudRingDetectorConfig(card_testing_window_seconds=0.0)
+
+    with pytest.raises(GraphError, match="card_testing_min_cards must be an integer >= 2"):
+        FraudRingDetectorConfig(card_testing_min_cards=1)
+
+    with pytest.raises(GraphError, match="cycle_max_depth must be an integer between 2 and 10"):
+        FraudRingDetectorConfig(cycle_max_depth=20)
