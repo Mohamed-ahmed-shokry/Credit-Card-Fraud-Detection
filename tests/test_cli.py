@@ -7970,3 +7970,46 @@ def test_device_enrich_cli_guard_and_errors(tmp_path: Path) -> None:
         app, ["device-enrich", "-i", str(in_csv), "-o", str(out_file), "--overwrite"]
     )
     assert res_ov_ok.exit_code == 0
+
+
+def test_device_clusters_and_enrich_advanced_branches(tmp_path: Path) -> None:
+    csv_path = tmp_path / "advanced.csv"
+    csv_path.write_text(
+        "device_id,card_id,timestamp,user_agent,screen_width,screen_height,hardware_concurrency,device_memory_gb,canvas_hash,audio_hash\n"
+        "d_base,c_shared,1000.0,Mozilla/5.0,1920,1080,8,16.0,c1,a1\n"
+        "d_other,c_shared,1005.0,Mozilla/5.0,1920,1080,8,16.0,c1,a1\n"
+        "d_drift,c_drift,1010.0,Mozilla/5.0,1920,1080,8,16.0,c1,a1\n"
+        "d_drift,c_drift,1015.0,DifferentUA/2.0,100,100,2,2.0,c2,a2\n"
+        ",c_auto,1020.0,AutoDevice/1.0,1920,1080,4,8.0,,\n"
+        ",,1025.0,,,,,,,\n"
+        "d_bad_scr,c_bad,1030.0,Mozilla/5.0,-10,not_int,4,8.0,,\n",
+        encoding="utf-8",
+    )
+    res = runner.invoke(
+        app,
+        [
+            "device-clusters",
+            "-i",
+            str(csv_path),
+            "--device-cycling-threshold",
+            "2",
+            "--similarity-threshold",
+            "0.8",
+            "--json",
+        ],
+    )
+    assert res.exit_code == 0
+    data = json.loads(res.output)
+    assert data["device_cycling_anomalies_count"] >= 1
+    assert data["drift_anomalies_count"] >= 1
+
+    # EmptyDataError check (completely empty file without headers)
+    zero_file = tmp_path / "zero.csv"
+    zero_file.write_text("", encoding="utf-8")
+    res_zero_clusters = runner.invoke(app, ["device-clusters", "-i", str(zero_file)])
+    assert res_zero_clusters.exit_code == 2
+
+    res_zero_enrich = runner.invoke(
+        app, ["device-enrich", "-i", str(zero_file), "-o", str(tmp_path / "out.csv")]
+    )
+    assert res_zero_enrich.exit_code == 2

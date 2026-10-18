@@ -5123,3 +5123,32 @@ def test_device_api_disabled_and_environment_defaults(
         )
         assert assess_resp.status_code == 404
         assert "not enabled" in assess_resp.json()["detail"]
+
+
+def test_device_api_metrics_and_reset_branches(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, model, _ = api_context
+    app = create_app(model=model)
+    with TestClient(app) as client:
+        # Populate a device event
+        client.post(
+            "/v1/device/assess",
+            json={
+                "device": {
+                    "device_id": "metrics_dev",
+                    "user_agent": "Mozilla/5.0",
+                },
+                "card_id": "c_metrics",
+            },
+        )
+        # 1. /metrics with device_tracker active
+        metrics_resp = client.get("/metrics")
+        assert metrics_resp.status_code == 200
+        assert "fraud_device_evaluations_total" in metrics_resp.text
+
+        # 2. Reset when disabled
+        app.state.device_tracker = None
+        reset_resp = client.post("/v1/device/reset")
+        assert reset_resp.status_code == 200
+        assert reset_resp.json()["status"] == "ok"
