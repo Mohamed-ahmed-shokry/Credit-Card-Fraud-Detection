@@ -8,8 +8,11 @@ import ipaddress
 import math
 import threading
 from collections import OrderedDict, deque
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
+
+import pandas as pd
 
 
 class GeoLocationError(ValueError):
@@ -344,7 +347,7 @@ class IPGeoResolver:
                 if ip in rec.network:
                     return IPGeoResult(
                         ip_address=str(ip),
-                        is_private=ip.is_private or ip.is_loopback or ip.is_link_local,
+                        is_private=False,
                         coordinates=rec.coordinates,
                         asn=rec.asn,
                         is_proxy=rec.is_proxy,
@@ -479,8 +482,10 @@ class GeoLocationTracker:
                 self._trajectories.move_to_end(event.entity_id)
 
             prev_event: GeoLocationEvent | None = None
-            if history:
-                prev_event = history[-1]
+            for ev in reversed(history):
+                if ev.timestamp <= event.timestamp:
+                    prev_event = ev
+                    break
 
             velocity: TravelVelocity | None = None
             if prev_event is not None:
@@ -490,7 +495,16 @@ class GeoLocationTracker:
                     max_speed_kmh=self.max_speed_kmh,
                 )
 
-            history.append(event)
+            if not history or event.timestamp >= history[-1].timestamp:
+                history.append(event)
+            else:
+                idx = 0
+                for i, ev in enumerate(history):
+                    if ev.timestamp > event.timestamp:
+                        idx = i
+                        break
+                history.insert(idx, event)
+
             self._trim_entity_history(history, event.timestamp)
             return velocity
 
@@ -526,11 +540,18 @@ class GeoLocationTracker:
             raise GeoLocationError("candidate_event must be an instance of GeoLocationEvent.")
 
         with self._lock:
-            last_event = self.get_last_known_event(entity_id)
-            if last_event is None:
+            history = self._trajectories.get(entity_id)
+            if not history:
+                return None
+            prev_event: GeoLocationEvent | None = None
+            for ev in reversed(history):
+                if ev.timestamp <= candidate_event.timestamp:
+                    prev_event = ev
+                    break
+            if prev_event is None:
                 return None
             return calculate_travel_velocity(
-                prev_event=last_event,
+                prev_event=prev_event,
                 curr_event=candidate_event,
                 max_speed_kmh=self.max_speed_kmh,
             )
@@ -580,3 +601,266 @@ class GeoLocationTracker:
         cutoff = current_ts - self.window_seconds
         while history and history[0].timestamp < cutoff:
             history.popleft()
+
+
+GEO_FEATURE_NAMES: tuple[str, ...] = (
+    "geo_distance_km",
+    "geo_speed_kmh",
+    "geo_time_delta_seconds",
+    "geo_is_impossible_travel",
+    "geo_is_cross_border",
+    "geo_is_proxy",
+    "geo_country_mismatch",
+)
+
+
+@dataclass(frozen=True)
+class GeoFeatureConfig:
+    """Configuration for geolocation feature extraction and anomaly thresholds."""
+
+    max_speed_kmh: float = DEFAULT_MAX_SPEED_KMH
+    billing_country_field: str = "billing_country"
+    ip_address_field: str = "ip_address"
+    latitude_field: str = "latitude"
+    longitude_field: str = "longitude"
+    timestamp_field: str = "timestamp"
+    entity_id_field: str = "card_id"
+    event_id_field: str = "transaction_id"
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.max_speed_kmh, (int, float))
+            or math.isnan(self.max_speed_kmh)
+            or math.isinf(self.max_speed_kmh)
+            or self.max_speed_kmh <= 0.0
+        ):
+            raise GeoLocationError("max_speed_kmh must be a positive finite float.")
+        for f in (
+            "billing_country_field",
+            "ip_address_field",
+            "latitude_field",
+            "longitude_field",
+            "timestamp_field",
+            "entity_id_field",
+            "event_id_field",
+        ):
+            val = getattr(self, f)
+            if not isinstance(val, str) or not val.strip():
+                raise GeoLocationError(f"{f} must be a non-empty string.")
+
+
+@dataclass(frozen=True)
+class GeoAnomalyReport:
+    """Summary metrics of detected geolocation anomalies and impossible travel incidents."""
+
+    total_events: int
+    impossible_travel_events: int
+    cross_border_events: int
+    proxy_events: int
+    country_mismatch_events: int
+    anomalous_event_ids: list[str]
+
+
+class GeoFeatureExtractor:
+    """Streaming feature extractor converting transactions to geolocation velocity features."""
+
+    def __init__(
+        self,
+        tracker: GeoLocationTracker | None = None,
+        resolver: IPGeoResolver | None = None,
+        config: GeoFeatureConfig | None = None,
+    ) -> None:
+        self.tracker = tracker if tracker is not None else GeoLocationTracker()
+        self.resolver = resolver if resolver is not None else IPGeoResolver()
+        self.config = config if config is not None else GeoFeatureConfig()
+
+    def extract_features(
+        self,
+        record: Mapping[str, Any],
+        mutate_tracker: bool = True,
+    ) -> dict[str, float]:
+        """Extract geolocation and velocity features for a single transaction record."""
+        features: dict[str, float] = dict.fromkeys(GEO_FEATURE_NAMES, 0.0)
+
+        raw_entity = record.get(self.config.entity_id_field)
+        entity_id = str(raw_entity) if raw_entity is not None else ""
+        if not entity_id or entity_id == "nan":
+            return features
+
+        raw_ts = record.get(self.config.timestamp_field)
+        if raw_ts is None:
+            return features
+        try:
+            timestamp = float(raw_ts)
+            if math.isnan(timestamp) or math.isinf(timestamp):
+                return features
+        except (ValueError, TypeError):
+            return features
+
+        raw_evt = record.get(self.config.event_id_field)
+        event_id = str(raw_evt) if raw_evt is not None else f"evt-{entity_id}-{timestamp}"
+
+        coords: GeoCoordinates | None = None
+        is_proxy = False
+        is_vpn = False
+        is_tor = False
+        ip_addr: str | None = None
+        asn: int | None = None
+
+        lat_val = record.get(self.config.latitude_field)
+        lon_val = record.get(self.config.longitude_field)
+
+        if lat_val is not None and lon_val is not None:
+            try:
+                lat = float(lat_val)
+                lon = float(lon_val)
+                if not (math.isnan(lat) or math.isnan(lon) or math.isinf(lat) or math.isinf(lon)):
+                    c_code = record.get("country_code")
+                    country_str = (
+                        str(c_code) if c_code is not None and str(c_code).strip() else None
+                    )
+                    coords = GeoCoordinates(latitude=lat, longitude=lon, country_code=country_str)
+            except (ValueError, TypeError, GeoLocationError):
+                coords = None
+
+        raw_ip = record.get(self.config.ip_address_field)
+        if raw_ip is not None and str(raw_ip).strip() and str(raw_ip).strip() != "nan":
+            ip_addr = str(raw_ip).strip()
+            try:
+                ip_res = self.resolver.resolve(ip_addr)
+                is_proxy = ip_res.is_proxy
+                is_vpn = ip_res.is_vpn
+                is_tor = ip_res.is_tor
+                asn = ip_res.asn
+                if (
+                    coords is None
+                    and not ip_res.is_private
+                    and ip_res.coordinates.country_code != "XX"
+                ):
+                    coords = ip_res.coordinates
+                elif (
+                    coords is not None
+                    and coords.country_code is None
+                    and ip_res.coordinates.country_code != "XX"
+                ):
+                    coords = GeoCoordinates(
+                        latitude=coords.latitude,
+                        longitude=coords.longitude,
+                        country_code=ip_res.coordinates.country_code,
+                        city=ip_res.coordinates.city,
+                    )
+            except GeoLocationError:
+                pass
+
+        if coords is None:
+            features["geo_is_proxy"] = 1.0 if (is_proxy or is_vpn or is_tor) else 0.0
+            return features
+
+        event = GeoLocationEvent(
+            event_id=event_id,
+            entity_id=entity_id,
+            timestamp=timestamp,
+            coordinates=coords,
+            ip_address=ip_addr,
+            asn=asn,
+            is_proxy=is_proxy,
+            is_vpn=is_vpn,
+            is_tor=is_tor,
+        )
+
+        vel: TravelVelocity | None = None
+        if mutate_tracker:
+            vel = self.tracker.record_event(event)
+        else:
+            vel = self.tracker.assess_travel(entity_id, event)
+
+        if vel is not None:
+            features["geo_distance_km"] = float(vel.distance_km)
+            features["geo_speed_kmh"] = float(vel.velocity_kmh)
+            features["geo_time_delta_seconds"] = float(vel.time_elapsed_seconds)
+            features["geo_is_impossible_travel"] = 1.0 if vel.is_impossible_travel else 0.0
+            features["geo_is_cross_border"] = 1.0 if vel.is_cross_border else 0.0
+
+        features["geo_is_proxy"] = 1.0 if (is_proxy or is_vpn or is_tor) else 0.0
+
+        billing_country = record.get(self.config.billing_country_field)
+        if billing_country is not None and coords.country_code is not None:
+            b_str = str(billing_country).strip().upper()
+            if b_str and b_str != coords.country_code:
+                features["geo_country_mismatch"] = 1.0
+
+        return features
+
+    def extract_batch(
+        self,
+        data: Sequence[Mapping[str, Any]] | pd.DataFrame,
+        mutate_tracker: bool = True,
+    ) -> pd.DataFrame:
+        """Enrich a batch of transactions with geolocation features."""
+        if isinstance(data, pd.DataFrame):
+            df = data.copy()
+            records: list[dict[str, Any]] = [
+                {str(k): v for k, v in r.items()} for r in df.to_dict(orient="records")
+            ]
+        else:
+            records = [dict(r) for r in data]
+            df = pd.DataFrame(records)
+
+        ts_col = self.config.timestamp_field
+        if ts_col in df.columns:
+            sorted_indices = sorted(
+                range(len(records)), key=lambda i: float(records[i].get(ts_col, 0.0))
+            )
+            ordered_records = [records[i] for i in sorted_indices]
+            feature_rows = [
+                self.extract_features(r, mutate_tracker=mutate_tracker) for r in ordered_records
+            ]
+            restored_feature_rows: list[dict[str, float]] = [{} for _ in range(len(records))]
+            for orig_idx, feat in zip(sorted_indices, feature_rows, strict=True):
+                restored_feature_rows[orig_idx] = feat
+            feature_df = pd.DataFrame(restored_feature_rows)
+        else:
+            feature_rows = [
+                self.extract_features(r, mutate_tracker=mutate_tracker) for r in records
+            ]
+            feature_df = pd.DataFrame(feature_rows)
+
+        for col in GEO_FEATURE_NAMES:
+            df[col] = feature_df[col].values
+
+        return df
+
+    def analyze_anomalies(
+        self,
+        data: Sequence[Mapping[str, Any]] | pd.DataFrame,
+        reset_tracker: bool = True,
+    ) -> GeoAnomalyReport:
+        """Scan a dataset and generate a structured anomaly audit report."""
+        if reset_tracker:
+            self.tracker.reset()
+        enriched = self.extract_batch(data, mutate_tracker=True)
+        total = len(enriched)
+        impossible = int((enriched["geo_is_impossible_travel"] == 1.0).sum())
+        cross_border = int((enriched["geo_is_cross_border"] == 1.0).sum())
+        proxy = int((enriched["geo_is_proxy"] == 1.0).sum())
+        mismatch = int((enriched["geo_country_mismatch"] == 1.0).sum())
+
+        evt_col = self.config.event_id_field
+        anomalous_mask = (
+            (enriched["geo_is_impossible_travel"] == 1.0)
+            | (enriched["geo_is_proxy"] == 1.0)
+            | (enriched["geo_country_mismatch"] == 1.0)
+        )
+        if evt_col in enriched.columns:
+            anomalous_ids = enriched.loc[anomalous_mask, evt_col].astype(str).tolist()
+        else:
+            anomalous_ids = [str(i) for i in enriched.loc[anomalous_mask].index]
+
+        return GeoAnomalyReport(
+            total_events=total,
+            impossible_travel_events=impossible,
+            cross_border_events=cross_border,
+            proxy_events=proxy,
+            country_mismatch_events=mismatch,
+            anomalous_event_ids=anomalous_ids,
+        )

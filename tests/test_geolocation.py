@@ -4,13 +4,18 @@ from __future__ import annotations
 
 from typing import Any
 
+import pandas as pd
 import pytest
 
 from fraud_detection.geolocation import (
     DEFAULT_GEO_WINDOW_SECONDS,
     DEFAULT_MAX_ENTITIES,
     DEFAULT_MAX_SPEED_KMH,
+    GEO_FEATURE_NAMES,
+    GeoAnomalyReport,
     GeoCoordinates,
+    GeoFeatureConfig,
+    GeoFeatureExtractor,
     GeoLocationError,
     GeoLocationEvent,
     GeoLocationTracker,
@@ -513,3 +518,120 @@ def test_geo_location_tracker_validation_errors() -> None:
 
     with pytest.raises(GeoLocationError, match="current_timestamp must be a finite float"):
         tracker.evict_expired(float("nan"))
+
+
+def test_geo_feature_config_validation() -> None:
+    cfg = GeoFeatureConfig()
+    assert cfg.max_speed_kmh == 900.0
+    assert cfg.entity_id_field == "card_id"
+
+    with pytest.raises(GeoLocationError, match="max_speed_kmh must be a positive finite float"):
+        GeoFeatureConfig(max_speed_kmh=-10.0)
+
+    with pytest.raises(GeoLocationError, match="entity_id_field must be a non-empty string"):
+        GeoFeatureConfig(entity_id_field="")
+
+
+def test_geo_feature_extractor_streaming() -> None:
+    extractor = GeoFeatureExtractor()
+
+    # Record 1: London transaction via latitude/longitude
+    r1 = {
+        "transaction_id": "tx-1",
+        "card_id": "card-100",
+        "timestamp": 1000.0,
+        "latitude": 51.5074,
+        "longitude": -0.1278,
+        "country_code": "GB",
+        "billing_country": "GB",
+    }
+    f1 = extractor.extract_features(r1)
+    assert f1["geo_distance_km"] == 0.0
+    assert f1["geo_speed_kmh"] == 0.0
+    assert f1["geo_is_impossible_travel"] == 0.0
+    assert f1["geo_is_cross_border"] == 0.0
+    assert f1["geo_is_proxy"] == 0.0
+    assert f1["geo_country_mismatch"] == 0.0
+
+    # Record 2: Impossible travel to NYC in 1800s via IP
+    r2 = {
+        "transaction_id": "tx-2",
+        "card_id": "card-100",
+        "timestamp": 2800.0,
+        "ip_address": "198.51.100.25",  # Resolves to NYC (US)
+        "billing_country": "GB",
+    }
+    f2 = extractor.extract_features(r2)
+    assert 5560.0 <= f2["geo_distance_km"] <= 5585.0
+    assert f2["geo_speed_kmh"] > 900.0
+    assert f2["geo_is_impossible_travel"] == 1.0
+    assert f2["geo_is_cross_border"] == 1.0
+    assert f2["geo_country_mismatch"] == 1.0  # US transaction vs GB billing
+
+    # Record 3: Proxy IP detection
+    r3 = {
+        "transaction_id": "tx-3",
+        "card_id": "card-200",
+        "timestamp": 3000.0,
+        "ip_address": "192.0.2.10",  # Commercial VPN proxy
+        "billing_country": "US",
+    }
+    f3 = extractor.extract_features(r3)
+    assert f3["geo_is_proxy"] == 1.0
+
+
+def test_geo_feature_extractor_batch_and_anomalies() -> None:
+    assert len(GEO_FEATURE_NAMES) == 7
+    extractor = GeoFeatureExtractor()
+
+    records = [
+        {
+            "transaction_id": "tx-10",
+            "card_id": "card-500",
+            "timestamp": 1000.0,
+            "latitude": 51.5074,
+            "longitude": -0.1278,
+            "billing_country": "GB",
+        },
+        {
+            "transaction_id": "tx-11",
+            "card_id": "card-500",
+            "timestamp": 1600.0,  # 600 seconds later in NYC = impossible
+            "latitude": 40.7128,
+            "longitude": -74.0060,
+            "billing_country": "GB",
+        },
+        {
+            "transaction_id": "tx-12",
+            "card_id": "card-600",
+            "timestamp": 2000.0,
+            "ip_address": "192.0.2.70",  # Tor exit node
+            "billing_country": "NL",
+        },
+        {
+            "transaction_id": "tx-13",
+            "card_id": "",  # Missing entity ID
+            "timestamp": 2100.0,
+        },
+    ]
+
+    df = pd.DataFrame(records)
+    enriched = extractor.extract_batch(df)
+    assert len(enriched) == 4
+    for feat in GEO_FEATURE_NAMES:
+        assert feat in enriched.columns
+
+    assert (
+        enriched.loc[enriched["transaction_id"] == "tx-11", "geo_is_impossible_travel"].iloc[0]
+        == 1.0
+    )
+    assert enriched.loc[enriched["transaction_id"] == "tx-12", "geo_is_proxy"].iloc[0] == 1.0
+
+    # Test analyze_anomalies
+    report = extractor.analyze_anomalies(records[:3])
+    assert isinstance(report, GeoAnomalyReport)
+    assert report.total_events == 3
+    assert report.impossible_travel_events == 1
+    assert report.proxy_events == 1
+    assert "tx-11" in report.anomalous_event_ids
+    assert "tx-12" in report.anomalous_event_ids
