@@ -584,8 +584,10 @@ class DeviceTracker:
             is_emulator = profile.is_emulator if profile is not None else False
             similarity_to_baseline = 1.0
             if fingerprint is not None:
-                if fingerprint.has_webdriver:
+                detected_emu, _ = detect_emulator_signatures(fingerprint)
+                if detected_emu:
                     is_emulator = True
+
                 if profile is not None and profile.baseline_fingerprint is not None:
                     similarity_to_baseline = calculate_fingerprint_similarity(
                         profile.baseline_fingerprint, fingerprint
