@@ -7603,6 +7603,24 @@ def test_cli_geo_velocity_json_and_ip_workflow(tmp_path: Path) -> None:
     res_empty = runner.invoke(app, ["geo-velocity", "-i", str(empty_json)])
     assert res_empty.exit_code == 2
 
+    # Test malformed JSON array
+    bad_json = tmp_path / "bad.json"
+    bad_json.write_text("[{invalid", encoding="utf-8")
+    res_bad_json = runner.invoke(app, ["geo-velocity", "-i", str(bad_json)])
+    assert res_bad_json.exit_code == 2
+
+    # Test malformed JSONL line
+    bad_jsonl = tmp_path / "bad.jsonl"
+    bad_jsonl.write_text('{"a": 1}\n{bad_line\n', encoding="utf-8")
+    res_bad_jsonl = runner.invoke(app, ["geo-velocity", "-i", str(bad_jsonl)])
+    assert res_bad_jsonl.exit_code == 2
+
+    # Test empty array JSON
+    empty_arr = tmp_path / "empty_arr.json"
+    empty_arr.write_text("[]", encoding="utf-8")
+    res_empty_arr = runner.invoke(app, ["geo-velocity", "-i", str(empty_arr)])
+    assert res_empty_arr.exit_code == 2
+
 
 def test_cli_geo_enrich_workflow(tmp_path: Path) -> None:
     """Verify geo-enrich command enriching dataset with 7 geolocation features."""
