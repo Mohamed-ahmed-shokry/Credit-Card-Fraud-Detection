@@ -67,6 +67,14 @@ from fraud_detection.feedback import (
     match_labels_with_audit_log,
     partition_into_cohorts,
 )
+from fraud_detection.geolocation import (
+    GeoCoordinates,
+    GeoFeatureConfig,
+    GeoFeatureExtractor,
+    GeoLocationEvent,
+    GeoLocationTracker,
+    IPGeoResolver,
+)
 from fraud_detection.graph import (
     EntityGraph,
     EntityType,
@@ -168,6 +176,8 @@ PIPELINE_CIRCUIT_RECOVERY_TIMEOUT_ENVIRONMENT_VARIABLE = (
 )
 GRAPH_WINDOW_SECONDS_ENVIRONMENT_VARIABLE = "FRAUD_GRAPH_WINDOW_SECONDS"
 MAX_GRAPH_NODES_ENVIRONMENT_VARIABLE = "FRAUD_MAX_GRAPH_NODES"
+GEO_WINDOW_SECONDS_ENVIRONMENT_VARIABLE = "FRAUD_GEO_WINDOW_SECONDS"
+GEO_MAX_SPEED_KMH_ENVIRONMENT_VARIABLE = "FRAUD_GEO_MAX_SPEED_KMH"
 REQUEST_ID_HEADER = "X-Request-ID"
 PROCESS_TIME_HEADER = "X-Process-Time-Ms"
 MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024
@@ -192,6 +202,9 @@ OPERATIONAL_PATHS = frozenset(
         "/v1/graph/stats",
         "/v1/graph/rings",
         "/v1/graph/reset",
+        "/v1/geo/stats",
+        "/v1/geo/assess",
+        "/v1/geo/reset",
     }
 )
 UNMATCHED_ROUTE_LABEL = "unmatched"
@@ -233,6 +246,8 @@ class _OperationalStatus:
     features_entities_count: int | None = None
     pipeline_enabled: bool | None = None
     pipeline_nodes_count: int | None = None
+    geo_enabled: bool | None = None
+    geo_entities_count: int | None = None
 
     def response_fields(self) -> dict[str, Any]:
         """Return the response fields shared by `/health` and `/ready`."""
@@ -270,6 +285,10 @@ class _OperationalStatus:
             fields["pipeline_enabled"] = self.pipeline_enabled
         if self.pipeline_nodes_count is not None:
             fields["pipeline_nodes_count"] = self.pipeline_nodes_count
+        if self.geo_enabled is not None:
+            fields["geo_enabled"] = self.geo_enabled
+        if self.geo_entities_count is not None:
+            fields["geo_entities_count"] = self.geo_entities_count
         return fields
 
 
@@ -738,6 +757,8 @@ class ReadinessResponse(BaseModel):
     canary_status: str | None = None
     pipeline_enabled: bool | None = None
     pipeline_nodes_count: int | None = None
+    geo_enabled: bool | None = None
+    geo_entities_count: int | None = None
 
 
 class RoutingStatusResponse(BaseModel):
@@ -1133,6 +1154,61 @@ class RetrainingTriggerResponse(BaseModel):
     message: str
 
 
+class GeoVelocityResponse(BaseModel):
+    """Recent trajectory and velocity calculations for a tracked entity."""
+
+    entity_id: str
+    event_count: int
+    latest_velocity: dict[str, Any] | None = None
+    trajectory: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class GeoStatsResponse(BaseModel):
+    """Operational metrics of the real-time geolocation tracking engine."""
+
+    enabled: bool
+    tracked_entities: int
+    total_events: int
+    window_seconds: float
+    max_speed_kmh: float
+
+
+class GeoAssessRequest(BaseModel):
+    """Candidate geolocation event assessment request."""
+
+    entity_id: str
+    timestamp: float
+    latitude: float = Field(ge=-90.0, le=90.0)
+    longitude: float = Field(ge=-180.0, le=180.0)
+    country_code: str | None = None
+    city: str | None = None
+    ip_address: str | None = None
+    record: bool = False
+
+
+class GeoAssessResponse(BaseModel):
+    """Velocity and impossible travel assessment outcome."""
+
+    entity_id: str
+    has_prior_location: bool
+    distance_km: float
+    time_elapsed_seconds: float
+    velocity_kmh: float
+    is_impossible_travel: bool
+    is_cross_border: bool
+    origin_country: str | None = None
+    destination_country: str | None = None
+    origin_city: str | None = None
+    destination_city: str | None = None
+
+
+class GeoResetResponse(BaseModel):
+    """Confirmation of geolocation tracker reset."""
+
+    status: str
+    message: str
+
+
 def create_app(
     *,
     model: FraudModel | None = None,
@@ -1195,6 +1271,11 @@ def create_app(
     fraud_ring_detector: FraudRingDetector | None = None,
     graph_window_seconds: float = 86400.0,
     max_graph_nodes: int = 50000,
+    geo_tracker: GeoLocationTracker | None = None,
+    ip_resolver: IPGeoResolver | None = None,
+    geo_feature_extractor: GeoFeatureExtractor | None = None,
+    geo_window_seconds: float = 86400.0,
+    geo_max_speed_kmh: float = 900.0,
 ) -> FastAPI:
     """Create an application using an injected model or a trusted artifact path.
 
@@ -1450,7 +1531,46 @@ def create_app(
     if resolved_fraud_ring_detector is None and resolved_entity_graph is not None:
         resolved_fraud_ring_detector = FraudRingDetector(resolved_entity_graph)
 
+    resolved_geo_tracker: GeoLocationTracker | None = geo_tracker
+    resolved_ip_resolver: IPGeoResolver | None = ip_resolver
+    resolved_geo_feature_extractor: GeoFeatureExtractor | None = geo_feature_extractor
+
+    if resolved_geo_tracker is None:
+        raw_geo_window = os.getenv(GEO_WINDOW_SECONDS_ENVIRONMENT_VARIABLE)
+        eff_geo_window = float(raw_geo_window) if raw_geo_window is not None else geo_window_seconds
+        raw_geo_speed = os.getenv(GEO_MAX_SPEED_KMH_ENVIRONMENT_VARIABLE)
+        eff_geo_speed = float(raw_geo_speed) if raw_geo_speed is not None else geo_max_speed_kmh
+        resolved_geo_tracker = GeoLocationTracker(
+            window_seconds=eff_geo_window,
+            max_speed_kmh=eff_geo_speed,
+        )
+
+    if resolved_ip_resolver is None:
+        resolved_ip_resolver = IPGeoResolver()
+
+    if resolved_geo_feature_extractor is None and resolved_geo_tracker is not None:
+        resolved_geo_feature_extractor = GeoFeatureExtractor(
+            tracker=resolved_geo_tracker,
+            resolver=resolved_ip_resolver,
+            config=GeoFeatureConfig(max_speed_kmh=resolved_geo_tracker.max_speed_kmh),
+        )
+
     metrics_registry = CollectorRegistry()
+    geo_impossible_travel_counter = Counter(
+        "fraud_geo_impossible_travel_total",
+        "Total impossible travel geolocation anomalies detected.",
+        registry=metrics_registry,
+    )
+    geo_events_counter = Counter(
+        "fraud_geo_events_total",
+        "Total geolocation events processed.",
+        registry=metrics_registry,
+    )
+    geo_distance_counter = Counter(
+        "fraud_geo_distance_kilometers",
+        "Total cumulative geodesic displacement tracked in kilometers.",
+        registry=metrics_registry,
+    )
     graph_nodes_gauge = Gauge(
         "fraud_graph_nodes_total",
         "Total active entity nodes in the link graph by entity type.",
@@ -1881,6 +2001,9 @@ def create_app(
                 circuit_recovery_timeout_seconds=resolved_pipeline_cb_recovery_timeout,
                 entity_graph=entity_graph,
                 fraud_ring_detector=fraud_ring_detector,
+                geo_tracker=geo_tracker,
+                ip_resolver=ip_resolver,
+                geo_feature_extractor=geo_feature_extractor,
             )
 
         resolved_pipeline_exec = pipeline_executor
@@ -1905,6 +2028,12 @@ def create_app(
         application.state.graph_edges_gauge = graph_edges_gauge
         application.state.graph_rings_counter = graph_rings_counter
         application.state.graph_ring_detection_duration = graph_ring_detection_duration
+        application.state.geo_tracker = resolved_geo_tracker
+        application.state.ip_resolver = resolved_ip_resolver
+        application.state.geo_feature_extractor = resolved_geo_feature_extractor
+        application.state.geo_impossible_travel_counter = geo_impossible_travel_counter
+        application.state.geo_events_counter = geo_events_counter
+        application.state.geo_distance_counter = geo_distance_counter
         application.state.audit_sink = resolved_audit_sink
         application.state.explanation_provider = explanation_provider
         application.state.fallback_mode = resolved_fallback_mode
@@ -3055,6 +3184,54 @@ def create_app(
                     risk_score=pred_result.fraud_probability,
                 )
 
+        geo_tracker_obj: GeoLocationTracker | None = getattr(request.app.state, "geo_tracker", None)
+        geo_extractor_obj: GeoFeatureExtractor | None = getattr(
+            request.app.state, "geo_feature_extractor", None
+        )
+        if geo_tracker_obj is not None and geo_extractor_obj is not None:
+            tx_data = payload.transaction
+            req_entities = payload.entities or {}
+            ent_val = (
+                req_entities.get("card_id")
+                or req_entities.get("user_id")
+                or req_entities.get("entity_id")
+                or request.headers.get("X-Entity-ID")
+            )
+            lat_val = req_entities.get("latitude") or tx_data.get("latitude")
+            lon_val = req_entities.get("longitude") or tx_data.get("longitude")
+            ip_val = req_entities.get("ip_address") or request.headers.get("X-Forwarded-For")
+            if ent_val and ((lat_val is not None and lon_val is not None) or ip_val is not None):
+                ts = float(tx_data.get("timestamp") or tx_data.get("Time") or time.time())
+                tx_geo: dict[str, Any] = {
+                    "card_id": str(ent_val),
+                    "entity_id": str(ent_val),
+                    "timestamp": ts,
+                    "transaction_id": str(req_entities.get("transaction_id") or uuid4().hex[:12]),
+                }
+                if lat_val is not None and lon_val is not None:
+                    tx_geo["latitude"] = float(lat_val)
+                    tx_geo["longitude"] = float(lon_val)
+                if ip_val is not None:
+                    tx_geo["ip_address"] = str(ip_val)
+                if "country_code" in req_entities:
+                    tx_geo["billing_country"] = req_entities["country_code"]
+                extracted = geo_extractor_obj.extract_features(tx_geo, mutate_tracker=True)
+                geo_ev_c: Counter | None = getattr(request.app.state, "geo_events_counter", None)
+                if geo_ev_c is not None:
+                    geo_ev_c.inc()
+                dist = extracted.get("geo_distance_km", 0.0)
+                geo_dist_c: Counter | None = getattr(
+                    request.app.state, "geo_distance_counter", None
+                )
+                if geo_dist_c is not None and dist > 0.0:
+                    geo_dist_c.inc(dist)
+                if extracted.get("geo_is_impossible_travel", 0.0) == 1.0:
+                    geo_imp_c: Counter | None = getattr(
+                        request.app.state, "geo_impossible_travel_counter", None
+                    )
+                    if geo_imp_c is not None:
+                        geo_imp_c.inc()
+
         return ScoreResponse(
             model_version=_model_version(loaded),
             threshold=applied_threshold,
@@ -3267,6 +3444,130 @@ def create_app(
         if eg is not None:
             eg.reset()
         return {"status": "ok", "message": "Entity graph reset successfully."}
+
+    @application.get(
+        "/v1/geo/velocity/{entity_id}",
+        response_model=GeoVelocityResponse,
+        responses={404: {"description": "Entity or tracker not found."}},
+        tags=["geolocation"],
+    )
+    async def geo_velocity(entity_id: str, request: Request) -> GeoVelocityResponse | JSONResponse:
+        """Query recent trajectory and travel velocity calculations for a tracked entity."""
+        tracker: GeoLocationTracker | None = getattr(request.app.state, "geo_tracker", None)
+        if tracker is None:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": "Geolocation tracking is not enabled on this service."},
+            )
+        trajectory = tracker.get_trajectory(entity_id)
+        if not trajectory:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": f"Entity '{entity_id}' has no recorded geolocation trajectory."},
+            )
+        velocity = tracker.assess_latest_velocity(entity_id)
+        return GeoVelocityResponse(
+            entity_id=entity_id,
+            event_count=len(trajectory),
+            latest_velocity=velocity.to_dict() if velocity is not None else None,
+            trajectory=[ev.to_dict() for ev in trajectory],
+        )
+
+    @application.get("/v1/geo/stats", response_model=GeoStatsResponse, tags=["geolocation"])
+    async def geo_stats(request: Request) -> GeoStatsResponse:
+        """Return operational metrics of the real-time geolocation tracking engine."""
+        tracker: GeoLocationTracker | None = getattr(request.app.state, "geo_tracker", None)
+        if tracker is None:
+            return GeoStatsResponse(
+                enabled=False,
+                tracked_entities=0,
+                total_events=0,
+                window_seconds=0.0,
+                max_speed_kmh=0.0,
+            )
+        stats = tracker.get_stats()
+        return GeoStatsResponse(
+            enabled=True,
+            tracked_entities=stats["tracked_entities"],
+            total_events=stats["total_events"],
+            window_seconds=tracker.window_seconds,
+            max_speed_kmh=tracker.max_speed_kmh,
+        )
+
+    @application.post(
+        "/v1/geo/assess",
+        response_model=GeoAssessResponse,
+        responses={404: {"description": "Geolocation tracking not enabled."}},
+        tags=["geolocation"],
+    )
+    async def geo_assess(
+        payload: GeoAssessRequest,
+        request: Request,
+    ) -> GeoAssessResponse | JSONResponse:
+        """Assess velocity, displacement, and impossible travel for a candidate event."""
+        tracker: GeoLocationTracker | None = getattr(request.app.state, "geo_tracker", None)
+        if tracker is None:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": "Geolocation tracking is not enabled on this service."},
+            )
+        coords = GeoCoordinates(
+            latitude=payload.latitude,
+            longitude=payload.longitude,
+            country_code=payload.country_code,
+            city=payload.city,
+        )
+        event = GeoLocationEvent(
+            event_id=f"assess_{uuid4().hex[:12]}",
+            entity_id=payload.entity_id,
+            timestamp=payload.timestamp,
+            coordinates=coords,
+            ip_address=payload.ip_address,
+        )
+        velocity = tracker.assess_candidate_velocity(event)
+        if payload.record:
+            tracker.record_event(event)
+            events_counter: Counter | None = getattr(request.app.state, "geo_events_counter", None)
+            if events_counter is not None:
+                events_counter.inc()
+            if velocity is not None:
+                dist_counter: Counter | None = getattr(
+                    request.app.state, "geo_distance_counter", None
+                )
+                if dist_counter is not None and velocity.distance_km > 0.0:
+                    dist_counter.inc(velocity.distance_km)
+                if velocity.is_impossible_travel:
+                    imp_counter: Counter | None = getattr(
+                        request.app.state, "geo_impossible_travel_counter", None
+                    )
+                    if imp_counter is not None:
+                        imp_counter.inc()
+
+        has_prior = velocity is not None
+        return GeoAssessResponse(
+            entity_id=payload.entity_id,
+            has_prior_location=has_prior,
+            distance_km=velocity.distance_km if velocity else 0.0,
+            time_elapsed_seconds=velocity.time_elapsed_seconds if velocity else 0.0,
+            velocity_kmh=velocity.velocity_kmh if velocity else 0.0,
+            is_impossible_travel=velocity.is_impossible_travel if velocity else False,
+            is_cross_border=velocity.is_cross_border if velocity else False,
+            origin_country=velocity.origin_country if velocity else None,
+            destination_country=velocity.destination_country if velocity else None,
+            origin_city=velocity.origin_city if velocity else None,
+            destination_city=velocity.destination_city if velocity else None,
+        )
+
+    @application.post("/v1/geo/reset", response_model=GeoResetResponse, tags=["geolocation"])
+    async def geo_reset(request: Request) -> GeoResetResponse:
+        """Reset the real-time geolocation tracker and clear tracked trajectories."""
+        tracker: GeoLocationTracker | None = getattr(request.app.state, "geo_tracker", None)
+        if tracker is not None:
+            tracker.reset()
+        return GeoResetResponse(
+            status="ok",
+            message="Geolocation tracker reset successfully.",
+        )
 
     @application.get(
         "/v1/routing/status",
@@ -4727,6 +5028,10 @@ def _operational_status(request: Request) -> _OperationalStatus:
         len(pipe_graph.nodes) if pipe_enabled and pipe_graph is not None else None
     )
 
+    geo_trk: GeoLocationTracker | None = getattr(request.app.state, "geo_tracker", None)
+    geo_enabled = True if geo_trk is not None else None
+    geo_entities_count = geo_trk.entity_count if geo_trk is not None else None
+
     return _OperationalStatus(
         fallback_mode=str(getattr(request.app.state, "fallback_mode", "raise")),
         degraded_mode=degraded_mode,
@@ -4748,6 +5053,8 @@ def _operational_status(request: Request) -> _OperationalStatus:
         features_entities_count=features_entities_count,
         pipeline_enabled=pipe_enabled,
         pipeline_nodes_count=pipe_nodes_count,
+        geo_enabled=geo_enabled,
+        geo_entities_count=geo_entities_count,
     )
 
 

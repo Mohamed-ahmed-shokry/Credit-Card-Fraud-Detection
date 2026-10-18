@@ -33,6 +33,11 @@ from fraud_detection.evaluation import (
     evaluate_tiered_policy,
 )
 from fraud_detection.features import FeatureStoreProtocol
+from fraud_detection.geolocation import (
+    GeoFeatureExtractor,
+    GeoLocationTracker,
+    IPGeoResolver,
+)
 from fraud_detection.graph import (
     EntityGraph,
     EntityType,
@@ -1053,6 +1058,45 @@ class GraphEnrichmentStageProcessor:
         }
 
 
+class GeoEnrichmentStageProcessor:
+    """Enriches transactions with real-time geolocation telemetry and speed of travel."""
+
+    def __init__(
+        self,
+        tracker: GeoLocationTracker | None = None,
+        resolver: IPGeoResolver | None = None,
+        feature_extractor: GeoFeatureExtractor | None = None,
+        update_tracker: bool = True,
+    ) -> None:
+        self.tracker = tracker if tracker is not None else GeoLocationTracker()
+        self.resolver = resolver if resolver is not None else IPGeoResolver()
+        self.feature_extractor = (
+            feature_extractor
+            if feature_extractor is not None
+            else GeoFeatureExtractor(tracker=self.tracker, resolver=self.resolver)
+        )
+        self.update_tracker = update_tracker
+
+    def __call__(self, context: PipelineContext) -> dict[str, Any]:
+        tx = dict(context.transaction)
+        geo_features = self.feature_extractor.extract_features(
+            tx,
+            mutate_tracker=self.update_tracker,
+        )
+        tx.update(geo_features)
+        context.transaction = tx
+        context.metadata["geo_features"] = list(geo_features.keys())
+        return {
+            "geo_features": geo_features,
+            "geo_is_impossible_travel": bool(
+                geo_features.get("geo_is_impossible_travel", 0.0) == 1.0
+            ),
+            "geo_is_proxy": bool(geo_features.get("geo_is_proxy", 0.0) == 1.0),
+            "geo_is_cross_border": bool(geo_features.get("geo_is_cross_border", 0.0) == 1.0),
+            "geo_country_mismatch": bool(geo_features.get("geo_country_mismatch", 0.0) == 1.0),
+        }
+
+
 GraphEnrichmentStage = GraphEnrichmentStageProcessor
 
 
@@ -1789,6 +1833,10 @@ def create_default_fraud_pipeline(
     graph_feature_extractor: GraphFeatureExtractor | None = None,
     fraud_ring_detector: FraudRingDetector | None = None,
     graph_enrichment_timeout_seconds: float | None = 0.25,
+    geo_tracker: GeoLocationTracker | None = None,
+    ip_resolver: IPGeoResolver | None = None,
+    geo_feature_extractor: GeoFeatureExtractor | None = None,
+    geo_enrichment_timeout_seconds: float | None = 0.25,
 ) -> DecisionGraph:
     """Build a standard, production-ready fraud decision execution graph."""
     applied_threshold = model.threshold if threshold is None else threshold
@@ -1862,6 +1910,26 @@ def create_default_fraud_pipeline(
             )
         )
         upstream_deps = ["graph_enrichment"]
+
+    if geo_tracker is not None or geo_feature_extractor is not None:
+        geo_proc = GeoEnrichmentStageProcessor(
+            tracker=geo_tracker,
+            resolver=ip_resolver,
+            feature_extractor=geo_feature_extractor,
+        )
+        graph.add_node(
+            PipelineNode(
+                name="geo_enrichment",
+                stage_type=StageType.ENRICHMENT,
+                processor=geo_proc,
+                dependencies=list(upstream_deps),
+                timeout_seconds=geo_enrichment_timeout_seconds,
+                fallback_value={},
+                required=False,
+                circuit_policy=circuit_policy,
+            )
+        )
+        upstream_deps = ["geo_enrichment"]
 
     rule_proc = RuleStageProcessor(rules=rules)
     graph.add_node(

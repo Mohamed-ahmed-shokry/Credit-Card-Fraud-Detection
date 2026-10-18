@@ -351,3 +351,59 @@ def build_fraud_ring_rule(
         priority=priority,
         reason=reason,
     )
+
+
+def build_impossible_travel_rule(
+    rule_id: str = "RULE_IMPOSSIBLE_TRAVEL_DENY",
+    name: str = "Impossible Travel Auto Deny",
+    action: RuleAction = RuleAction.DENY,
+    min_speed_kmh: float = 900.0,
+    priority: int = 15,
+    reason: str = "Transaction speed of travel physically impossible under airliner speeds.",
+) -> DecisionRule:
+    """Build a pre-configured DecisionRule for impossible travel mitigation."""
+    conditions = (
+        RuleCondition(
+            field="geo_is_impossible_travel",
+            operator=RuleOperator.EQUALS,
+            value=1.0,
+        ),
+        RuleCondition(
+            field="geo_speed_kmh",
+            operator=RuleOperator.GREATER_THAN,
+            value=min_speed_kmh,
+        ),
+    )
+    return DecisionRule(
+        rule_id=rule_id,
+        name=name,
+        action=action,
+        conditions=conditions,
+        priority=priority,
+        reason=reason,
+    )
+
+
+def build_geo_proxy_rule(
+    rule_id: str = "RULE_GEO_PROXY_CHALLENGE",
+    name: str = "Anonymous Proxy Challenge",
+    action: RuleAction = RuleAction.CHALLENGE,
+    priority: int = 25,
+    reason: str = "Transaction origin IP associated with anonymous VPN, Tor, or proxy.",
+) -> DecisionRule:
+    """Build a pre-configured DecisionRule for anonymous proxy and VPN mitigation."""
+    conditions = (
+        RuleCondition(
+            field="geo_is_proxy",
+            operator=RuleOperator.EQUALS,
+            value=1.0,
+        ),
+    )
+    return DecisionRule(
+        rule_id=rule_id,
+        name=name,
+        action=action,
+        conditions=conditions,
+        priority=priority,
+        reason=reason,
+    )

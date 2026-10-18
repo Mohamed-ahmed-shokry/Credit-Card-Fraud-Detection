@@ -76,6 +76,16 @@ from fraud_detection.feedback import (
     match_labels_with_audit_log,
     partition_into_cohorts,
 )
+from fraud_detection.geolocation import (
+    DEFAULT_MAX_SPEED_KMH,
+    GeoCoordinates,
+    GeoFeatureConfig,
+    GeoFeatureExtractor,
+    GeoLocationError,
+    GeoLocationEvent,
+    GeoLocationTracker,
+    IPGeoResolver,
+)
 from fraud_detection.graph import (
     EntityGraph,
     EntityType,
@@ -6816,6 +6826,347 @@ def graph_enrich(
     typer.echo(
         f"Successfully enriched {len(enriched_df)} transactions with {feature_count} "
         f"graph features -> {output_file}"
+    )
+
+
+@app.command("geo-velocity")
+def geo_velocity(
+    input_file: Annotated[
+        Path,
+        typer.Option(
+            "--input-file",
+            "-i",
+            help="Path to input transactions CSV or JSON audit log file.",
+        ),
+    ],
+    output: Annotated[
+        Path | None,
+        typer.Option(
+            "--output",
+            "-o",
+            help="Optional file path to persist velocity evaluation report as JSON.",
+        ),
+    ] = None,
+    as_json: Annotated[
+        bool,
+        typer.Option(
+            "--as-json",
+            help="Print report in structured JSON format.",
+        ),
+    ] = False,
+    speed_threshold: Annotated[
+        float,
+        typer.Option(
+            "--speed-threshold",
+            help="Velocity threshold in km/h to classify impossible travel.",
+        ),
+    ] = DEFAULT_MAX_SPEED_KMH,
+    max_events_per_entity: Annotated[
+        int,
+        typer.Option(
+            "--max-events-per-entity",
+            help="Maximum historical geolocation events retained per entity in sliding window.",
+        ),
+    ] = 1000,
+    window_seconds: Annotated[
+        float,
+        typer.Option(
+            "--window-seconds",
+            help="Sliding temporal lookback window in seconds.",
+        ),
+    ] = 86400.0,
+    fail_on_impossible: Annotated[
+        bool,
+        typer.Option(
+            "--fail-on-impossible",
+            help="Exit with return code 3 if impossible travel velocity anomalies are detected.",
+        ),
+    ] = False,
+    overwrite: Annotated[
+        bool,
+        typer.Option(
+            "--overwrite",
+            help="Overwrite existing output report if it already exists.",
+        ),
+    ] = False,
+) -> None:
+    """Evaluate consecutive geolocation events and detect impossible travel velocity anomalies."""
+    if not input_file.exists():
+        _abort(f"Input file not found: {input_file}")
+    _guard_output(output, overwrite)
+
+    records: list[dict[str, Any]] = []
+    if input_file.suffix.lower() == ".csv":
+        try:
+            df = pd.read_csv(input_file)
+        except pd.errors.EmptyDataError:
+            _abort(f"Input file contains no transactions: {input_file}")
+        if df.empty:
+            _abort(f"Input file contains no transactions: {input_file}")
+        records = [{str(k): v for k, v in r.items()} for r in df.to_dict(orient="records")]
+    else:
+        content = input_file.read_text(encoding="utf-8").strip()
+        if not content:
+            _abort(f"Input file is empty: {input_file}")
+        if content.startswith("["):
+            try:
+                parsed = json.loads(content)
+                if isinstance(parsed, list):
+                    records = [dict(item) for item in parsed if isinstance(item, dict)]
+            except (json.JSONDecodeError, ValueError) as exc:
+                _abort(f"Failed to parse JSON file {input_file}: {exc}")
+        else:
+            for line_idx, line in enumerate(content.splitlines()):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    parsed_item = json.loads(line)
+                    if isinstance(parsed_item, dict):
+                        records.append(parsed_item)
+                except (json.JSONDecodeError, ValueError) as exc:
+                    _abort(f"Failed to parse JSONL line {line_idx + 1} in {input_file}: {exc}")
+
+    if not records:
+        _abort(f"Input file contains no valid transaction records: {input_file}")
+
+    tracker = GeoLocationTracker(
+        max_entities=max_events_per_entity * 10,
+        window_seconds=window_seconds,
+        max_speed_kmh=speed_threshold,
+    )
+    ip_resolver = IPGeoResolver()
+
+    evaluated_transitions: list[dict[str, Any]] = []
+    impossible_anomalies: list[dict[str, Any]] = []
+    max_speed_kmh = 0.0
+
+    for idx, row in enumerate(records):
+        raw_entity = (
+            row.get("card_id")
+            or row.get("entity_id")
+            or row.get("user_id")
+            or row.get("customer_id")
+            or row.get("client_id")
+        )
+        if raw_entity is None:
+            continue
+        entity_id = str(raw_entity).strip()
+        if not entity_id or entity_id == "nan":
+            continue
+
+        raw_ts = row.get("timestamp") or row.get("Time") or row.get("time") or row.get("epoch")
+        try:
+            ts = float(raw_ts) if raw_ts is not None else float(idx)
+        except (ValueError, TypeError):
+            ts = float(idx)
+
+        lat_val = row.get("latitude") if row.get("latitude") is not None else row.get("lat")
+        lon_val = (
+            row.get("longitude")
+            if row.get("longitude") is not None
+            else (row.get("lon") if row.get("lon") is not None else row.get("lng"))
+        )
+        raw_ip = row.get("ip_address") or row.get("ip") or row.get("client_ip")
+        ip_str = (
+            str(raw_ip).strip()
+            if raw_ip is not None and str(raw_ip).strip() and str(raw_ip).strip() != "nan"
+            else None
+        )
+
+        country = row.get("country_code") or row.get("country")
+        country_str = (
+            str(country).strip().upper() if country is not None and str(country).strip() else None
+        )
+        city = row.get("city")
+        city_str = str(city).strip() if city is not None and str(city).strip() else None
+
+        coords: GeoCoordinates | None = None
+        if lat_val is not None and lon_val is not None:
+            try:
+                coords = GeoCoordinates(
+                    latitude=float(lat_val),
+                    longitude=float(lon_val),
+                    country_code=country_str,
+                    city=city_str,
+                )
+            except (ValueError, TypeError, GeoLocationError):
+                coords = None
+
+        if coords is None and ip_str:
+            try:
+                resolved = ip_resolver.resolve(ip_str)
+                if not resolved.is_private and resolved.coordinates.country_code != "XX":
+                    coords = resolved.coordinates
+            except GeoLocationError:
+                pass
+
+        if coords is None:
+            continue
+
+        tx_id = str(row.get("transaction_id") or row.get("tx_id") or f"tx_{idx}")
+
+        event = GeoLocationEvent(
+            event_id=tx_id,
+            entity_id=entity_id,
+            timestamp=ts,
+            coordinates=coords,
+            ip_address=ip_str,
+        )
+
+        vel = tracker.record_event(event)
+        if vel is not None:
+            v_dict = vel.to_dict()
+            v_dict["entity_id"] = entity_id
+            v_dict["event_id"] = tx_id
+            evaluated_transitions.append(v_dict)
+            if vel.velocity_kmh > max_speed_kmh:
+                max_speed_kmh = vel.velocity_kmh
+            if vel.is_impossible_travel:
+                impossible_anomalies.append(v_dict)
+
+    stats = tracker.stats()
+    report_dict: dict[str, Any] = {
+        "input_file": str(input_file),
+        "total_entities": stats["total_entities"],
+        "total_events_processed": stats["total_events"],
+        "evaluated_transitions_count": len(evaluated_transitions),
+        "impossible_travel_count": len(impossible_anomalies),
+        "speed_threshold_kmh": speed_threshold,
+        "max_speed_kmh": round(max_speed_kmh, 2),
+        "impossible_anomalies": impossible_anomalies,
+    }
+
+    report_json = json.dumps(report_dict, indent=2)
+    if output is not None:
+        _atomic_write_text(report_json + "\n", output)
+
+    if as_json:
+        typer.echo(report_json)
+    else:
+        typer.echo("Geolocation Travel Velocity Analysis Report:")
+        typer.echo(f"  Input File:                 {report_dict['input_file']}")
+        typer.echo(f"  Total Entities Tracked:     {report_dict['total_entities']}")
+        typer.echo(f"  Total Events Processed:     {report_dict['total_events_processed']}")
+        typer.echo(f"  Transitions Evaluated:      {report_dict['evaluated_transitions_count']}")
+        typer.echo(f"  Speed Threshold:            {report_dict['speed_threshold_kmh']} km/h")
+        typer.echo(f"  Max Speed Observed:         {report_dict['max_speed_kmh']} km/h")
+        typer.echo(f"  Impossible Travel Anomalies:{report_dict['impossible_travel_count']}")
+        for anomaly in impossible_anomalies:
+            typer.echo(
+                f"  [IMPOSSIBLE TRAVEL] Entity '{anomaly['entity_id']}': "
+                f"{anomaly['distance_km']:.1f} km in {anomaly['time_elapsed_seconds']:.1f}s "
+                f"({anomaly['velocity_kmh']:.1f} km/h)"
+            )
+
+    if fail_on_impossible and len(impossible_anomalies) > 0:
+        typer.echo(
+            f"Error: Impossible travel detected ({len(impossible_anomalies)} events "
+            f"exceeding {speed_threshold} km/h). Failing per --fail-on-impossible.",
+            err=True,
+        )
+        raise typer.Exit(code=3)
+
+
+@app.command("geo-enrich")
+def geo_enrich(
+    input_file: Annotated[
+        Path,
+        typer.Option(
+            "--input-file",
+            "-i",
+            help="Input CSV file containing transactions to enrich with geolocation features.",
+        ),
+    ],
+    output_file: Annotated[
+        Path,
+        typer.Option(
+            "--output-file",
+            "-o",
+            help="Output destination file for enriched transaction dataset.",
+        ),
+    ],
+    overwrite: Annotated[
+        bool,
+        typer.Option(
+            "--overwrite",
+            help="Overwrite existing output file if it exists.",
+        ),
+    ] = False,
+    speed_threshold: Annotated[
+        float,
+        typer.Option(
+            "--speed-threshold",
+            help="Velocity threshold in km/h for impossible travel classification.",
+        ),
+    ] = DEFAULT_MAX_SPEED_KMH,
+    window_seconds: Annotated[
+        float,
+        typer.Option(
+            "--window-seconds",
+            help="Sliding temporal lookback window for trajectory tracking in seconds.",
+        ),
+    ] = 86400.0,
+    max_events_per_entity: Annotated[
+        int,
+        typer.Option(
+            "--max-events-per-entity",
+            help="Max historical geolocation events retained per entity.",
+        ),
+    ] = 1000,
+    billing_country_field: Annotated[
+        str,
+        typer.Option(
+            "--billing-country-field",
+            help="Field name in input dataset containing billing/reference country.",
+        ),
+    ] = "billing_country",
+    output_format: Annotated[
+        str,
+        typer.Option(
+            "--format",
+            help="Output format: 'csv' or 'json'.",
+        ),
+    ] = "csv",
+) -> None:
+    """Enrich transactions with streaming geolocation and travel velocity features.
+
+    Features are extracted sequentially without lookahead bias.
+    """
+    if not input_file.exists():
+        _abort(f"Input file not found: {input_file}")
+    _guard_output(output_file, overwrite)
+
+    try:
+        df = pd.read_csv(input_file)
+    except pd.errors.EmptyDataError:
+        _abort(f"Input file contains no transactions: {input_file}")
+    if df.empty:
+        _abort(f"Input file contains no transactions: {input_file}")
+
+    tracker = GeoLocationTracker(
+        max_entities=max_events_per_entity * 10,
+        window_seconds=window_seconds,
+        max_speed_kmh=speed_threshold,
+    )
+    feature_config = GeoFeatureConfig(
+        max_speed_kmh=speed_threshold,
+        billing_country_field=billing_country_field,
+    )
+    extractor = GeoFeatureExtractor(tracker=tracker, config=feature_config)
+
+    enriched_df = extractor.extract_batch(df, mutate_tracker=True)
+
+    fmt = output_format.lower().strip()
+    if fmt == "json" or output_file.suffix.lower() == ".json":
+        _atomic_write_text(enriched_df.to_json(orient="records", indent=2) + "\n", output_file)
+    else:
+        _atomic_write_csv(enriched_df, output_file)
+
+    feature_count = len(enriched_df.columns) - len(df.columns)
+    typer.echo(
+        f"Successfully enriched {len(enriched_df)} transactions with {feature_count} "
+        f"geolocation features -> {output_file}"
     )
 
 

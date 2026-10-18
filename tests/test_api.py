@@ -4709,3 +4709,181 @@ def test_graph_disabled_and_environment_defaults(
         rings_resp = client.get("/v1/graph/rings")
         assert rings_resp.status_code == 200
         assert rings_resp.json()["enabled"] is False
+
+
+def test_geo_endpoints_and_telemetry(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, model, _ = api_context
+    app = create_app(model=model)
+
+    with TestClient(app) as client:
+        # 1. Initial stats
+        stats_resp = client.get("/v1/geo/stats")
+        assert stats_resp.status_code == 200
+        stats = stats_resp.json()
+        assert stats["enabled"] is True
+        assert stats["tracked_entities"] == 0
+        assert stats["total_events"] == 0
+
+        # 2. Non-existent trajectory -> 404
+        missing_resp = client.get("/v1/geo/velocity/card_unknown_123")
+        assert missing_resp.status_code == 404
+        assert "no recorded geolocation trajectory" in missing_resp.json()["detail"]
+
+        # 3. Assess without recording (read-only)
+        assess1 = client.post(
+            "/v1/geo/assess",
+            json={
+                "entity_id": "card_test_geo_api",
+                "timestamp": 1000.0,
+                "latitude": 51.5074,
+                "longitude": -0.1278,
+                "country_code": "GB",
+                "city": "London",
+                "record": False,
+            },
+        )
+        assert assess1.status_code == 200
+        data1 = assess1.json()
+        assert data1["has_prior_location"] is False
+        assert data1["is_impossible_travel"] is False
+
+        # Verify nothing was recorded
+        stats_check1 = client.get("/v1/geo/stats").json()
+        assert stats_check1["total_events"] == 0
+
+        # 4. Record first event in London
+        assess2 = client.post(
+            "/v1/geo/assess",
+            json={
+                "entity_id": "card_test_geo_api",
+                "timestamp": 1000.0,
+                "latitude": 51.5074,
+                "longitude": -0.1278,
+                "country_code": "GB",
+                "city": "London",
+                "record": True,
+            },
+        )
+        assert assess2.status_code == 200
+
+        # Check velocity endpoint with 1 event
+        vel_resp1 = client.get("/v1/geo/velocity/card_test_geo_api")
+        assert vel_resp1.status_code == 200
+        vel_data1 = vel_resp1.json()
+        assert vel_data1["event_count"] == 1
+        assert vel_data1["latest_velocity"] is None
+        assert len(vel_data1["trajectory"]) == 1
+
+        # 5. Jump to New York 900 seconds later (impossible travel)
+        assess3 = client.post(
+            "/v1/geo/assess",
+            json={
+                "entity_id": "card_test_geo_api",
+                "timestamp": 1900.0,
+                "latitude": 40.7128,
+                "longitude": -74.0060,
+                "country_code": "US",
+                "city": "New York",
+                "record": True,
+            },
+        )
+        assert assess3.status_code == 200
+        data3 = assess3.json()
+        assert data3["has_prior_location"] is True
+        assert data3["is_impossible_travel"] is True
+        assert data3["velocity_kmh"] > 900.0
+        assert data3["is_cross_border"] is True
+
+        # Check velocity endpoint with 2 events
+        vel_resp2 = client.get("/v1/geo/velocity/card_test_geo_api")
+        assert vel_resp2.status_code == 200
+        vel_data2 = vel_resp2.json()
+        assert vel_data2["event_count"] == 2
+        assert vel_data2["latest_velocity"] is not None
+        assert vel_data2["latest_velocity"]["is_impossible_travel"] is True
+
+        # 6. Verify stats after 2 events
+        stats_check2 = client.get("/v1/geo/stats").json()
+        assert stats_check2["tracked_entities"] == 1
+        assert stats_check2["total_events"] == 2
+
+        # 7. Check /metrics endpoint
+        metrics_resp = client.get("/metrics")
+        assert metrics_resp.status_code == 200
+        metrics_text = metrics_resp.text
+        assert "fraud_geo_impossible_travel_total" in metrics_text
+        assert "fraud_geo_events_total" in metrics_text
+        assert "fraud_geo_distance_kilometers" in metrics_text
+
+        # 8. Test /v1/score geo ingestion
+        sample_tx: dict[str, float] = {
+            "Time": 2500.0,
+            "Amount": 120.0,
+        }
+        for i in range(1, 29):
+            sample_tx[f"V{i}"] = 0.0
+
+        score_resp = client.post(
+            "/v1/score",
+            json={
+                "transaction": sample_tx,
+                "entities": {
+                    "card_id": "card_scored_berlin",
+                    "latitude": "52.5200",
+                    "longitude": "13.4050",
+                    "ip_address": "194.109.6.1",
+                },
+            },
+        )
+        assert score_resp.status_code == 200
+        stats_check3 = client.get("/v1/geo/stats").json()
+        assert stats_check3["tracked_entities"] == 2
+        assert stats_check3["total_events"] == 3
+
+        # 9. Test reset endpoint
+        reset_resp = client.post("/v1/geo/reset")
+        assert reset_resp.status_code == 200
+        assert reset_resp.json()["status"] == "ok"
+        stats_after_reset = client.get("/v1/geo/stats").json()
+        assert stats_after_reset["tracked_entities"] == 0
+        assert stats_after_reset["total_events"] == 0
+
+
+def test_geo_disabled_and_environment_defaults(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, model, _ = api_context
+
+    monkeypatch.setenv("FRAUD_GEO_WINDOW_SECONDS", "3600.0")
+    monkeypatch.setenv("FRAUD_GEO_MAX_SPEED_KMH", "800.0")
+
+    app = create_app(model=model)
+    with TestClient(app) as client:
+        tracker = getattr(app.state, "geo_tracker", None)
+        assert tracker is not None
+        assert tracker.window_seconds == 3600.0
+        assert tracker.max_speed_kmh == 800.0
+
+        # When geo_tracker is disabled
+        app.state.geo_tracker = None
+        stats_resp = client.get("/v1/geo/stats")
+        assert stats_resp.status_code == 200
+        assert stats_resp.json()["enabled"] is False
+
+        vel_resp = client.get("/v1/geo/velocity/foo")
+        assert vel_resp.status_code == 404
+        assert "not enabled" in vel_resp.json()["detail"]
+
+        assess_resp = client.post(
+            "/v1/geo/assess",
+            json={
+                "entity_id": "foo",
+                "timestamp": 1000.0,
+                "latitude": 0.0,
+                "longitude": 0.0,
+            },
+        )
+        assert assess_resp.status_code == 404

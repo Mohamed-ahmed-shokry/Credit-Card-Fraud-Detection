@@ -47,9 +47,10 @@ chaos fault injection, and delayed feedback ingestion with empirical label matur
 curve modeling, realized performance and financial cost surveillance, automated
 retraining triggers, automated closed-loop champion-challenger retraining with multi-dimensional
 candidate verification safety gating, cryptographic attestation signing, zero-downtime safe
-canary promotion (Phase 37), and real-time streaming bipartite entity link analysis,
+canary promotion (Phase 37), real-time streaming bipartite entity link analysis,
 Personalized PageRank risk diffusion, automated fraud ring and card-testing botnet detection,
-and graph feature aggregation (Phase 38).
+and graph feature aggregation (Phase 38), and real-time geographic geolocation anomaly detection,
+velocity speed-of-travel calculations, and in-process IP geocoding (Phase 39).
 
 ## Phase 1 — Distribution
 
@@ -1828,7 +1829,7 @@ This phase does not implement distributed graph databases (Neo4j, TigerGraph, Am
 - [x] Task 8: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate.
 
 
-## Phase 39 — Real-Time Geographic Geolocation Anomaly Detection, Velocity Speed-of-Travel & IP Geocoding (Proposed)
+## Phase 39 — Real-Time Geographic Geolocation Anomaly Detection, Velocity Speed-of-Travel & IP Geocoding (Done)
 
 ### Objective
 
@@ -1836,22 +1837,109 @@ Defend against cross-border credential stuffing, impossible travel anomalies, an
 
 ### Scope
 
-1. **Domain Data Models (`geolocation.py`)**:
-   - `GeoCoordinates`: Latitude, longitude, accuracy radius, country code, city, postal code.
-   - `GeoLocationEvent`: Transaction event with timestamp, entity ID, coordinates, IP address, and ASN.
-   - `TravelVelocity`: Distance ($d$ km), time elapsed ($\Delta t$ hours), computed velocity ($v = d / \Delta t$ km/h), and impossible travel flag ($v > 900\text{ km/h}$).
-2. **Speed-of-Travel Engine (`geolocation.py`)**:
-   - Great-circle distance calculation via spherical Haversine formula.
-   - In-memory sliding entity location tracker with thread-safe eviction.
-   - Configurable speed thresholds (e.g. ground vehicle $\le 160\text{ km/h}$, commercial aircraft $\le 900\text{ km/h}$, impossible travel $> 900\text{ km/h}$).
-3. **Pipeline & Rule Integration (`pipeline.py`, `rules.py`)**:
-   - `GeoEnrichmentStageProcessor` in the decision graph pipeline.
-   - Declarative rules for impossible speed (`travel_velocity > 900`), cross-border mismatch, and high-risk proxy IP classification.
-4. **API Serving & Operational Telemetry (`api.py`)**:
-   - `GET /v1/geo/velocity/{entity_id}`: Inspect recent geographic trajectory and calculated speed of travel.
-   - Prometheus metrics: `fraud_geo_impossible_travel_total`, `fraud_geo_distance_kilometers`.
+1. **Domain Data Models & Engine (`geolocation.py`)**:
+   - `GeoLocationError`: Dedicated exception for coordinates, tracking, and velocity computation errors.
+   - `GeoCoordinates`: Latitude, longitude, accuracy radius, country code (ISO 3166-1 alpha-2), city, and postal code.
+   - `GeoLocationEvent`: Transaction event with timestamp, entity ID, coordinates, IP address, ASN, and proxy/VPN/Tor flags.
+   - `TravelVelocity`: Distance ($d$ km), elapsed time ($\Delta t$ seconds), speed of travel ($v$ km/h), impossible travel flag, cross-border flag, and route metadata.
+   - Mathematical functions: `haversine_distance` using spherical WGS 84 mean Earth radius ($R = 6371.0088\text{ km}$), edge clipping against float domain errors; `calculate_travel_velocity` with strict temporal causality ($t_{\text{curr}} \ge t_{\text{prev}}$).
+   - In-memory streaming tracker `GeoLocationTracker`: High-throughput, thread-safe sliding window tracking entity movement trajectories, temporal TTL window eviction, capacity bounding, and read-only trajectory assessment.
+   - Zero-dependency built-in `IPGeoResolver`: High-performance subnet prefix lookup mapping IP addresses to geographic coordinates, ISO country codes, cities, and proxy/VPN classifications.
+   - `GeoFeatureExtractor`: Extracts structured geolocation features (`geo_distance_km`, `geo_speed_kmh`, `geo_time_delta_seconds`, `geo_is_impossible_travel`, `geo_is_cross_border`, `geo_is_proxy`, `geo_country_mismatch`).
+2. **Decision Pipeline & Rules Engine Integration (`pipeline.py`, `rules.py`)**:
+   - `GeoEnrichmentStageProcessor`: Pluggable stage processor for decision graphs enriching transactions with geolocation telemetry and speed-of-travel metrics.
+   - Declarative decision rules: `build_impossible_travel_rule` and condition attributes for `geo_is_impossible_travel`, `geo_speed_kmh`, `geo_is_cross_border`, and `geo_is_proxy`.
+3. **Structured Audit Trail & Redaction (`audit.py`)**:
+   - `build_impossible_travel_audit_event`: Structured audit record when impossible travel or cross-border velocity threshold is exceeded, including Luhn PAN masking for card entities.
+4. **FastAPI Serving & Operational Telemetry (`api.py`)**:
+   - Attach `GeoLocationTracker` and `IPGeoResolver` to `create_app` with configurable parameters (`geo_window_seconds`, `geo_max_speed_kmh`).
+   - Dynamic location tracking during transaction scoring and evaluation.
+   - Operational REST endpoints:
+     - `GET /v1/geo/velocity/{entity_id}`: Query recent trajectory, distance, and speed of travel for an entity.
+     - `GET /v1/geo/stats`: Summary statistics on tracked entities, recorded events, and detected impossible travel anomalies.
+     - `POST /v1/geo/assess`: Read-only velocity and impossible travel risk assessment for candidate events.
+     - `POST /v1/geo/reset`: Reset tracker state for testing and operations.
+   - Prometheus metrics:
+     - `fraud_geo_impossible_travel_total`
+     - `fraud_geo_events_total`
+     - `fraud_geo_distance_kilometers`
+5. **CLI Orchestration (`cli.py`)**:
+   - `fraud-detect geo-velocity`: Analyzes transaction files or audit logs to detect impossible travel and cross-border hops, outputting formatted tables or JSON reports with `--fail-on-impossible` exit code gating (code 3).
+   - `fraud-detect geo-enrich`: Enriches datasets with geolocation distance, speed, and anomaly features for offline training.
+6. **Testing, Quality Gates & Zero Regressions**:
+   - Comprehensive unit and integration test coverage across all new modules, preserving $\ge 97.0\%$ branch coverage, clean Ruff format/lint, and strict mypy compliance with zero issues.
+
+### Acceptance Criteria
+
+1. **AC-1 (Domain Models & Haversine Geodesic Engine)**: `GeoCoordinates`, `GeoLocationEvent`, `TravelVelocity`, and `haversine_distance` accurately compute great-circle distances across coordinate edge cases (antipodal, identical, poles) with validated inputs.
+2. **AC-2 (Streaming Geolocation Tracker & IP Resolution)**: `GeoLocationTracker` maintains thread-safe sliding window trajectories with temporal eviction, and `IPGeoResolver` performs zero-dependency prefix matching for private/public IP classification and proxy detection.
+3. **AC-3 (Geo Feature Extraction & Anomaly Detection)**: `GeoFeatureExtractor` and `calculate_travel_velocity` detect impossible travel ($v > 900\text{ km/h}$) and cross-border transitions without lookahead bias.
+4. **AC-4 (Pipeline & Decision Rule Integration)**: `GeoEnrichmentStageProcessor` integrates with `DecisionPipeline` and `build_impossible_travel_rule` evaluates geolocation conditions to trigger priority actions (`DENY`, `CHALLENGE`).
+5. **AC-5 (API Serving & Operational Telemetry)**: FastAPI exposes `/v1/geo/velocity/{entity_id}`, `/v1/geo/stats`, `/v1/geo/assess`, and `/v1/geo/reset`, while tracking Prometheus metrics on impossible travel and processed events.
+6. **AC-6 (Structured Audit Trail & Redaction)**: Structured audit events (`impossible_travel_detected`) record geolocation anomalies with PCI-DSS compliant Luhn PAN masking.
+7. **AC-7 (CLI Workflows)**: `fraud-detect geo-velocity` detects impossible travel with `--fail-on-impossible` exit code gating, and `fraud-detect geo-enrich` enriches CSV datasets with geolocation features.
+8. **AC-8 (Quality Standards & 100% Green CI)**: All local CI-parity checks and remote CI workflow runs pass 100%, branch coverage $\ge 97.0\%$, strict mypy 0 issues across all source files, Ruff format and check clean, and build/twine valid.
+
+### Validation & CI Plan
+
+- Local CI-parity commands:
+  - `python -m ruff format --check src tests`
+  - `python -m ruff check src tests`
+  - `python -m mypy src`
+  - `python -m pip_audit --skip-editable`
+  - `python -m pytest --cov=fraud_detection --cov-report=term-missing`
+  - `python -m build` & `python -m twine check dist/*`
+- Remote CI workflow runs monitored via `gh run list` and `gh run view`.
+
+### Exclusions
+
+This phase does not bundle heavy external multi-gigabyte MaxMind GeoIP binary databases or require third-party paid geolocation API services; it provides an optimized, thread-safe, zero-dependency in-process geolocation and speed-of-travel engine with built-in reference subnet resolution and extensible interface.
+
+### Micro-Task Breakdown
+
+- [x] Task 1: Create `src/fraud_detection/geolocation.py` with domain data models (`GeoLocationError`, `GeoCoordinates`, `GeoLocationEvent`, `TravelVelocity`), Haversine geodesic math, and unit tests in `tests/test_geolocation.py`.
+- [x] Task 2: Implement `GeoLocationTracker` (thread-safe sliding window trajectory tracking, temporal TTL eviction, assessment) and `IPGeoResolver` in `geolocation.py` with tests in `tests/test_geolocation.py`.
+- [x] Task 3: Implement `GeoFeatureExtractor` and anomaly detection heuristics in `geolocation.py` with tests in `tests/test_geolocation.py`.
+- [x] Task 4: Integrate geolocation enrichment with `rules.py` (`build_impossible_travel_rule`) and `pipeline.py` (`GeoEnrichmentStageProcessor`) with tests in `tests/test_rules.py` and `tests/test_pipeline.py`.
+- [x] Task 5: Implement audit event builder `build_impossible_travel_audit_event` in `audit.py` with tests in `tests/test_audit.py`.
+- [x] Task 6: Implement geolocation API endpoints (`/v1/geo/velocity/{entity_id}`, `/v1/geo/stats`, `/v1/geo/assess`, `/v1/geo/reset`) and Prometheus metrics in `api.py` with tests in `tests/test_api.py`.
+- [x] Task 7: Implement CLI commands `geo-velocity` and `geo-enrich` in `cli.py` with tests in `tests/test_cli.py`.
+- [x] Task 8: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate.
+
+
+## Phase 40 — Adaptive Device & Browser Fingerprinting with Anomaly Clustering (Proposed)
+
+### Objective
+
+Detect advanced bot attacks, emulator spoofing, and automated credential rotation by introducing an in-process, privacy-preserving device fingerprinting engine. Extract stable hardware and browser attributes (screen geometry, WebGL capabilities, audio context hashes, platform architecture, user agent consistency), compute adaptive similarity distance metrics (Jaccard and Hamming distance), cluster device identities in sliding temporal windows, and detect device spoofing anomalies (e.g. multiple distinct card numbers originating from identical hardware signatures or rapidly morphing client characteristics).
+
+### Scope
+
+1. **Domain Data Models & Fingerprinting Engine (`device.py`)**:
+   - `DeviceFingerprint`: Canonical attributes representing browser and hardware environment.
+   - `DeviceHasher`: Normalization and cryptographic fuzzy hashing of client signatures.
+   - `DeviceTracker`: Thread-safe sliding temporal window tracking card-to-device mappings, anomaly ratios, and rapid fingerprint drift.
+   - `DeviceFeatureExtractor`: Extracts structured device features (`device_seen_count`, `device_distinct_cards_24h`, `device_is_emulator`, `device_entropy_score`).
+2. **Rules & Pipeline Integration (`rules.py`, `pipeline.py`)**:
+   - `DeviceEnrichmentStageProcessor` for Decision DAG.
+   - Declarative decision rules for emulator detection and device card-cycling attacks.
+3. **Structured Audit Trail & Redaction (`audit.py`)**:
+   - `build_device_anomaly_audit_event` with sanitized hardware profiles.
+4. **FastAPI Serving & Operational Telemetry (`api.py`)**:
+   - Operational endpoints (`GET /v1/device/stats`, `GET /v1/device/profile/{device_id}`).
+   - Prometheus metrics for device anomalies and cluster sizes.
 5. **CLI Workflows (`cli.py`)**:
-   - `fraud-detect geo-velocity`: Analyze transaction logs for impossible travel anomalies.
+   - `fraud-detect device-clusters` and `fraud-detect device-enrich`.
+
+### Acceptance Criteria
+
+1. **AC-1 (Domain Models & Hash Normalization)**: `DeviceFingerprint` models client hardware/software attributes with robust fuzzy hashing and canonical normalization.
+2. **AC-2 (Streaming Device Tracker & Anomaly Heuristics)**: `DeviceTracker` tracks card-to-device linkages with sliding window TTL eviction and detects emulator/spoofing anomalies.
+3. **AC-3 (Pipeline & Decision Rule Integration)**: `DeviceEnrichmentStageProcessor` wires device risk features into decision graphs and evaluates declarative emulator/cycling rules.
+4. **AC-4 (Audit Trail & Sanitization)**: Emits structured device audit events with privacy-compliant attribute masking.
+5. **AC-5 (API Serving & Telemetry)**: FastAPI surfaces `/v1/device/*` operational endpoints and exports Prometheus counters/gauges.
+6. **AC-6 (CLI Workflows)**: `fraud-detect device-clusters` and `fraud-detect device-enrich` CLI commands with error gating.
+7. **AC-7 (Quality Standards & 100% Green CI)**: All CI parity checks pass with $\ge 97.0\%$ coverage and 0 mypy/ruff issues.
 
 
 ## Contributing to the roadmap

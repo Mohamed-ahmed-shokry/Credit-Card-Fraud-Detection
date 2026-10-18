@@ -7409,3 +7409,370 @@ def test_cli_graph_enrich_workflow(tmp_path: Path) -> None:
     )
     assert res_miss.exit_code == 2
     assert "Input file not found" in res_miss.output
+
+
+def test_cli_geo_velocity_csv_workflow(tmp_path: Path) -> None:
+    """Verify geo-velocity command evaluating CSV transactions and detecting impossible travel."""
+    runner = CliRunner()
+
+    df_in = pd.DataFrame(
+        [
+            {
+                "transaction_id": "tx1",
+                "card_id": "card_99",
+                "Time": 100.0,
+                "Amount": 50.0,
+                "latitude": 51.5074,
+                "longitude": -0.1278,
+                "country_code": "GB",
+            },
+            {
+                "transaction_id": "tx2",
+                "card_id": "card_99",
+                "Time": 200.0,
+                "Amount": 150.0,
+                "latitude": 40.7128,
+                "longitude": -74.0060,
+                "country_code": "US",
+            },
+        ]
+    )
+    in_csv = tmp_path / "geo_tx.csv"
+    df_in.to_csv(in_csv, index=False)
+    out_json = tmp_path / "velocity_report.json"
+
+    # 1. Successful evaluation with JSON output
+    res = runner.invoke(
+        app,
+        [
+            "geo-velocity",
+            "--input-file",
+            str(in_csv),
+            "--as-json",
+            "--output",
+            str(out_json),
+        ],
+    )
+    assert res.exit_code == 0
+    assert out_json.exists()
+    data = json.loads(out_json.read_text(encoding="utf-8"))
+    assert data["total_entities"] == 1
+    assert data["evaluated_transitions_count"] == 1
+    assert data["impossible_travel_count"] == 1
+    assert data["max_speed_kmh"] > 900.0
+    assert len(data["impossible_anomalies"]) == 1
+
+    # 2. Text report format
+    res_text = runner.invoke(
+        app,
+        [
+            "geo-velocity",
+            "--input-file",
+            str(in_csv),
+        ],
+    )
+    assert res_text.exit_code == 0
+    assert "Geolocation Travel Velocity Analysis Report:" in res_text.output
+    assert "IMPOSSIBLE TRAVEL" in res_text.output
+
+    # 3. Fail on impossible travel
+    res_fail = runner.invoke(
+        app,
+        [
+            "geo-velocity",
+            "--input-file",
+            str(in_csv),
+            "--fail-on-impossible",
+        ],
+    )
+    assert res_fail.exit_code == 3
+    assert "Error: Impossible travel detected" in res_fail.output
+
+    # 4. Overwrite guard
+    res_ov = runner.invoke(
+        app,
+        [
+            "geo-velocity",
+            "--input-file",
+            str(in_csv),
+            "--output",
+            str(out_json),
+        ],
+    )
+    assert res_ov.exit_code == 2
+    assert "Output already exists" in res_ov.output
+
+    # 5. Overwrite success
+    res_ov_ok = runner.invoke(
+        app,
+        [
+            "geo-velocity",
+            "--input-file",
+            str(in_csv),
+            "--output",
+            str(out_json),
+            "--overwrite",
+        ],
+    )
+    assert res_ov_ok.exit_code == 0
+
+    # 6. Missing input file
+    res_miss = runner.invoke(
+        app,
+        [
+            "geo-velocity",
+            "--input-file",
+            str(tmp_path / "missing.csv"),
+        ],
+    )
+    assert res_miss.exit_code == 2
+    assert "Input file not found" in res_miss.output
+
+    # 7. Empty CSV
+    empty_csv = tmp_path / "empty.csv"
+    pd.DataFrame().to_csv(empty_csv, index=False)
+    res_empty = runner.invoke(
+        app,
+        [
+            "geo-velocity",
+            "--input-file",
+            str(empty_csv),
+        ],
+    )
+    assert res_empty.exit_code == 2
+
+
+def test_cli_geo_velocity_json_and_ip_workflow(tmp_path: Path) -> None:
+    """Verify geo-velocity parsing JSON array and JSONL with IP address resolution."""
+    runner = CliRunner()
+
+    records = [
+        {
+            "transaction_id": "tx1",
+            "entity_id": "user_42",
+            "timestamp": 1000.0,
+            "ip_address": "185.86.151.25",
+        },
+        {
+            "transaction_id": "tx2",
+            "entity_id": "user_42",
+            "timestamp": 1500.0,
+            "ip_address": "198.51.100.12",
+        },
+    ]
+
+    # Test JSON array
+    json_path = tmp_path / "events.json"
+    json_path.write_text(json.dumps(records), encoding="utf-8")
+
+    res_json = runner.invoke(
+        app,
+        [
+            "geo-velocity",
+            "--input-file",
+            str(json_path),
+            "--as-json",
+        ],
+    )
+    assert res_json.exit_code == 0
+    report = json.loads(res_json.output)
+    assert report["total_entities"] == 1
+    assert report["impossible_travel_count"] == 1
+
+    # Test JSONL
+    jsonl_path = tmp_path / "events.jsonl"
+    jsonl_path.write_text("\n".join(json.dumps(r) for r in records), encoding="utf-8")
+
+    res_jsonl = runner.invoke(
+        app,
+        [
+            "geo-velocity",
+            "--input-file",
+            str(jsonl_path),
+            "--as-json",
+        ],
+    )
+    assert res_jsonl.exit_code == 0
+    report_jsonl = json.loads(res_jsonl.output)
+    assert report_jsonl["total_entities"] == 1
+    assert report_jsonl["impossible_travel_count"] == 1
+
+    # Test empty JSON
+    empty_json = tmp_path / "empty.json"
+    empty_json.write_text("", encoding="utf-8")
+    res_empty = runner.invoke(app, ["geo-velocity", "-i", str(empty_json)])
+    assert res_empty.exit_code == 2
+
+    # Test malformed JSON array
+    bad_json = tmp_path / "bad.json"
+    bad_json.write_text("[{invalid", encoding="utf-8")
+    res_bad_json = runner.invoke(app, ["geo-velocity", "-i", str(bad_json)])
+    assert res_bad_json.exit_code == 2
+
+    # Test malformed JSONL line
+    bad_jsonl = tmp_path / "bad.jsonl"
+    bad_jsonl.write_text('{"a": 1}\n{bad_line\n', encoding="utf-8")
+    res_bad_jsonl = runner.invoke(app, ["geo-velocity", "-i", str(bad_jsonl)])
+    assert res_bad_jsonl.exit_code == 2
+
+    # Test empty array JSON
+    empty_arr = tmp_path / "empty_arr.json"
+    empty_arr.write_text("[]", encoding="utf-8")
+    res_empty_arr = runner.invoke(app, ["geo-velocity", "-i", str(empty_arr)])
+    assert res_empty_arr.exit_code == 2
+
+
+def test_cli_geo_enrich_workflow(tmp_path: Path) -> None:
+    """Verify geo-enrich command enriching dataset with 7 geolocation features."""
+    runner = CliRunner()
+
+    df_in = pd.DataFrame(
+        [
+            {
+                "transaction_id": "tx_a",
+                "card_id": "card_10",
+                "timestamp": 1000.0,
+                "latitude": 51.5074,
+                "longitude": -0.1278,
+                "billing_country": "GB",
+                "ip_address": "185.86.151.1",
+            },
+            {
+                "transaction_id": "tx_b",
+                "card_id": "card_10",
+                "timestamp": 2000.0,
+                "latitude": 40.7128,
+                "longitude": -74.0060,
+                "billing_country": "GB",
+                "ip_address": "198.51.100.1",
+            },
+        ]
+    )
+    in_csv = tmp_path / "in.csv"
+    df_in.to_csv(in_csv, index=False)
+    out_csv = tmp_path / "out_enriched.csv"
+
+    # 1. CSV enrichment
+    res = runner.invoke(
+        app,
+        [
+            "geo-enrich",
+            "--input-file",
+            str(in_csv),
+            "--output-file",
+            str(out_csv),
+        ],
+    )
+    assert res.exit_code == 0
+    assert "Successfully enriched 2 transactions with 7 geolocation features" in res.output
+    assert out_csv.exists()
+
+    df_out = pd.read_csv(out_csv)
+    assert len(df_out) == 2
+    assert "geo_distance_km" in df_out.columns
+    assert "geo_speed_kmh" in df_out.columns
+    assert "geo_time_delta_seconds" in df_out.columns
+    assert "geo_is_impossible_travel" in df_out.columns
+    assert "geo_is_cross_border" in df_out.columns
+    assert "geo_is_proxy" in df_out.columns
+    assert "geo_country_mismatch" in df_out.columns
+
+    assert df_out["geo_is_impossible_travel"].iloc[1] == 1.0
+
+    # 2. JSON format export
+    out_json = tmp_path / "out_enriched.json"
+    res_json = runner.invoke(
+        app,
+        [
+            "geo-enrich",
+            "-i",
+            str(in_csv),
+            "-o",
+            str(out_json),
+            "--format",
+            "json",
+        ],
+    )
+    assert res_json.exit_code == 0
+    assert out_json.exists()
+    json_data = json.loads(out_json.read_text(encoding="utf-8"))
+    assert len(json_data) == 2
+    assert "geo_is_impossible_travel" in json_data[1]
+
+    # 3. Guard overwrite
+    res_ov = runner.invoke(
+        app,
+        [
+            "geo-enrich",
+            "-i",
+            str(in_csv),
+            "-o",
+            str(out_csv),
+        ],
+    )
+    assert res_ov.exit_code == 2
+    assert "Output already exists" in res_ov.output
+
+    # 4. Overwrite allowed
+    res_ov_ok = runner.invoke(
+        app,
+        [
+            "geo-enrich",
+            "-i",
+            str(in_csv),
+            "-o",
+            str(out_csv),
+            "--overwrite",
+        ],
+    )
+    assert res_ov_ok.exit_code == 0
+
+    # 5. Missing input file
+    res_miss = runner.invoke(
+        app,
+        [
+            "geo-enrich",
+            "-i",
+            str(tmp_path / "missing.csv"),
+            "-o",
+            str(tmp_path / "dummy.csv"),
+        ],
+    )
+    assert res_miss.exit_code == 2
+
+
+def test_geo_velocity_cli_empty_csv(tmp_path: Path) -> None:
+    empty_csv = tmp_path / "empty_with_headers.csv"
+    empty_csv.write_text("card_id,lat,lon,timestamp\n", encoding="utf-8")
+    res = runner.invoke(app, ["geo-velocity", "-i", str(empty_csv)])
+    assert res.exit_code == 2
+    assert "Input file contains no transactions" in res.output
+
+
+def test_geo_enrich_cli_empty_csv(tmp_path: Path) -> None:
+    empty_csv = tmp_path / "empty_with_headers.csv"
+    empty_csv.write_text("card_id,lat,lon,timestamp\n", encoding="utf-8")
+    out_csv = tmp_path / "out.csv"
+    res = runner.invoke(app, ["geo-enrich", "-i", str(empty_csv), "-o", str(out_csv)])
+    assert res.exit_code == 2
+    assert "Input file contains no transactions" in res.output
+
+
+def test_geo_velocity_cli_edge_branches(tmp_path: Path) -> None:
+    jsonl_path = tmp_path / "edges.jsonl"
+    jsonl_path.write_text(
+        "\n"
+        '{"card_id": null, "lat": 40.0, "lon": -74.0}\n'
+        '{"card_id": "nan", "lat": 40.0, "lon": -74.0}\n'
+        '{"card_id": "c1", "timestamp": "invalid_ts", "lat": 40.0, "lon": -74.0}\n'
+        '{"card_id": "c1", "timestamp": 10.0, "lat": 999.0, "lon": -74.0}\n'
+        '{"card_id": "c1", "timestamp": 20.0, "ip": "10.0.0.1"}\n'
+        '{"card_id": "c1", "timestamp": 30.0, "lat": 40.7128, "lon": -74.0060}\n'
+        '{"card_id": "c1", "timestamp": 35.0, "lat": 48.8566, "lon": 2.3522}\n',
+        encoding="utf-8",
+    )
+    res = runner.invoke(app, ["geo-velocity", "-i", str(jsonl_path), "--as-json"])
+    assert res.exit_code == 0
+    data = json.loads(res.output)
+    assert data["total_entities"] == 1
+    assert data["impossible_travel_count"] == 2
