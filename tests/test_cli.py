@@ -7739,3 +7739,40 @@ def test_cli_geo_enrich_workflow(tmp_path: Path) -> None:
         ],
     )
     assert res_miss.exit_code == 2
+
+
+def test_geo_velocity_cli_empty_csv(tmp_path: Path) -> None:
+    empty_csv = tmp_path / "empty_with_headers.csv"
+    empty_csv.write_text("card_id,lat,lon,timestamp\n", encoding="utf-8")
+    res = runner.invoke(app, ["geo-velocity", "-i", str(empty_csv)])
+    assert res.exit_code == 2
+    assert "Input file contains no transactions" in res.output
+
+
+def test_geo_enrich_cli_empty_csv(tmp_path: Path) -> None:
+    empty_csv = tmp_path / "empty_with_headers.csv"
+    empty_csv.write_text("card_id,lat,lon,timestamp\n", encoding="utf-8")
+    out_csv = tmp_path / "out.csv"
+    res = runner.invoke(app, ["geo-enrich", "-i", str(empty_csv), "-o", str(out_csv)])
+    assert res.exit_code == 2
+    assert "Input file contains no transactions" in res.output
+
+
+def test_geo_velocity_cli_edge_branches(tmp_path: Path) -> None:
+    jsonl_path = tmp_path / "edges.jsonl"
+    jsonl_path.write_text(
+        "\n"
+        '{"card_id": null, "lat": 40.0, "lon": -74.0}\n'
+        '{"card_id": "nan", "lat": 40.0, "lon": -74.0}\n'
+        '{"card_id": "c1", "timestamp": "invalid_ts", "lat": 40.0, "lon": -74.0}\n'
+        '{"card_id": "c1", "timestamp": 10.0, "lat": 999.0, "lon": -74.0}\n'
+        '{"card_id": "c1", "timestamp": 20.0, "ip": "10.0.0.1"}\n'
+        '{"card_id": "c1", "timestamp": 30.0, "lat": 40.7128, "lon": -74.0060}\n'
+        '{"card_id": "c1", "timestamp": 35.0, "lat": 48.8566, "lon": 2.3522}\n',
+        encoding="utf-8",
+    )
+    res = runner.invoke(app, ["geo-velocity", "-i", str(jsonl_path), "--as-json"])
+    assert res.exit_code == 0
+    data = json.loads(res.output)
+    assert data["total_entities"] == 1
+    assert data["impossible_travel_count"] == 2
