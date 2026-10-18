@@ -5,15 +5,19 @@ from __future__ import annotations
 import pytest
 
 from fraud_detection.device import (
+    DEVICE_FEATURE_NAMES,
+    DeviceFeatureExtractor,
     DeviceFingerprint,
     DeviceFingerprintError,
     DeviceHasher,
     DeviceTracker,
     DeviceTrackerConfig,
     ScreenGeometry,
+    calculate_fingerprint_entropy,
     calculate_fingerprint_similarity,
     calculate_hamming_distance,
     calculate_jaccard_similarity,
+    detect_emulator_signatures,
 )
 
 
@@ -379,3 +383,103 @@ def test_device_tracker_lru_capacity_and_reset() -> None:
     tracker.reset()
     assert tracker.get_stats()["tracked_devices_count"] == 0
     assert tracker.get_stats()["total_evaluations"] == 0
+
+
+def test_detect_emulator_signatures() -> None:
+    # Clean legitimate device
+    fp_clean = DeviceFingerprint(
+        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        os_platform="Windows",
+        browser_family="Chrome",
+        screen=ScreenGeometry(width=1920, height=1080),
+        hardware_concurrency=8,
+        device_memory_gb=16.0,
+        webgl_vendor="NVIDIA",
+        webgl_renderer="GeForce",
+        canvas_hash="canv_1",
+    )
+    is_emu, reasons = detect_emulator_signatures(fp_clean)
+    assert not is_emu
+    assert reasons == ()
+
+    # Headless Chrome bot
+    fp_bot = DeviceFingerprint(
+        user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 HeadlessChrome/119.0.0.0",
+        os_platform="Linux",
+        has_webdriver=True,
+    )
+    is_emu_bot, bot_reasons = detect_emulator_signatures(fp_bot)
+    assert is_emu_bot
+    assert len(bot_reasons) >= 2
+    assert any("webdriver" in r.lower() for r in bot_reasons)
+    assert any("headless" in r.lower() for r in bot_reasons)
+
+    # Suspicious screen dimensions
+    fp_tiny_screen = DeviceFingerprint(screen=ScreenGeometry(width=100, height=100))
+    is_emu_screen, screen_reasons = detect_emulator_signatures(fp_tiny_screen)
+    assert is_emu_screen
+    assert any("screen dimensions" in r.lower() for r in screen_reasons)
+
+    # 0 hardware concurrency
+    fp_zero_cores = DeviceFingerprint(hardware_concurrency=0)
+    is_emu_cores, core_reasons = detect_emulator_signatures(fp_zero_cores)
+    assert is_emu_cores
+    assert any("0 logical cores" in r.lower() for r in core_reasons)
+
+
+def test_calculate_fingerprint_entropy() -> None:
+    fp_rich = DeviceFingerprint(
+        user_agent=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/119.0"
+        ),
+        os_platform="Windows",
+        browser_family="Firefox",
+        screen=ScreenGeometry(width=2560, height=1440, color_depth=24, pixel_ratio=1.25),
+        language="en-US",
+        timezone_offset_minutes=-300,
+        hardware_concurrency=12,
+        device_memory_gb=32.0,
+        webgl_vendor="AMD",
+        webgl_renderer="Radeon RX 6800",
+        canvas_hash="hash_canvas_complex_12345",
+        audio_hash="hash_audio_complex_67890",
+    )
+    entropy = calculate_fingerprint_entropy(fp_rich)
+    assert entropy > 3.0
+
+    # Degenerate empty fingerprint has lower entropy
+    fp_empty = DeviceFingerprint()
+    empty_entropy = calculate_fingerprint_entropy(fp_empty)
+    assert 0.0 <= empty_entropy < entropy
+
+
+def test_device_feature_extractor() -> None:
+    tracker = DeviceTracker()
+    extractor = DeviceFeatureExtractor(tracker=tracker)
+
+    # Raw transaction record without fingerprint attributes
+    rec_plain = {"card_id": "c1", "timestamp": 1000.0}
+    feats_plain = extractor.extract_features(rec_plain)
+    assert set(feats_plain.keys()) == set(DEVICE_FEATURE_NAMES)
+    assert feats_plain["device_seen_count"] == 1.0
+    assert feats_plain["device_distinct_cards_24h"] == 1.0
+    assert feats_plain["device_is_emulator"] == 0.0
+
+    # Transaction with headless Chrome bot
+    rec_bot = {
+        "device_id": "bot_device",
+        "card_id": "c2",
+        "timestamp": 1010.0,
+        "user_agent": "Mozilla/5.0 HeadlessChrome/120.0",
+        "has_webdriver": True,
+    }
+    feats_bot = extractor.extract_features(rec_bot)
+    assert feats_bot["device_is_emulator"] == 1.0
+
+    # Repeat card cycling on same device
+    extractor.extract_features({"device_id": "bot_device", "card_id": "c3", "timestamp": 1020.0})
+    feats_cycle = extractor.extract_features(
+        {"device_id": "bot_device", "card_id": "c4", "timestamp": 1030.0}
+    )
+    assert feats_cycle["device_is_card_cycling"] == 1.0
+    assert feats_cycle["device_distinct_cards_24h"] == 3.0

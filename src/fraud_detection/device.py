@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import math
 import threading
+import time
 from collections import OrderedDict, deque
 from collections.abc import Mapping, Sequence, Set
 from dataclasses import dataclass, field
@@ -737,3 +738,242 @@ class DeviceTracker:
             self._card_device_events.clear()
             self._total_evaluations = 0
             self._total_anomalies = 0
+
+
+EMULATOR_USER_AGENT_PATTERNS: tuple[str, ...] = (
+    "headlesschrome",
+    "phantomjs",
+    "selenium",
+    "puppeteer",
+    "playwright",
+    "electron",
+    "nightwatch",
+    "webdriver",
+)
+
+
+def detect_emulator_signatures(fp: DeviceFingerprint) -> tuple[bool, tuple[str, ...]]:
+    """Detect bot runtime, automated webdriver, and emulator anomalies in a fingerprint."""
+    if not isinstance(fp, DeviceFingerprint):
+        raise DeviceFingerprintError("fp must be an instance of DeviceFingerprint.")
+
+    reasons: list[str] = []
+
+    if fp.has_webdriver:
+        reasons.append("Webdriver automation flag is set to true.")
+
+    ua_lower = fp.user_agent.strip().lower()
+    for pattern in EMULATOR_USER_AGENT_PATTERNS:
+        if pattern in ua_lower:
+            reasons.append(f"Automated browser/emulator signature '{pattern}' found in user-agent.")
+            break
+
+    if fp.screen is not None:
+        if fp.screen.width < 300 or fp.screen.height < 300:
+            dims = f"{fp.screen.width}x{fp.screen.height}"
+            reasons.append(f"Suspicious screen dimensions {dims} below realistic bounds.")
+        if fp.screen.pixel_ratio <= 0.0:
+            reasons.append("Invalid or zero device pixel ratio reported.")
+
+    if fp.hardware_concurrency == 0:
+        reasons.append("Hardware concurrency reported as 0 logical cores.")
+    if fp.device_memory_gb == 0.0:
+        reasons.append("Device memory reported as 0 GB RAM.")
+
+    # Mismatch check: mobile user-agent but is_touch_capable is False
+    if (
+        any(m in ua_lower for m in ("android", "iphone", "ipad", "mobile"))
+        and not fp.is_touch_capable
+    ):
+        reasons.append("Mobile user agent reported without touch capability.")
+
+    # Desktop user agent without WebGL or Canvas rendering subsystem
+    if (
+        any(d in ua_lower for d in ("windows", "macintosh", "x11", "linux"))
+        and not any(m in ua_lower for m in ("android", "iphone", "mobile"))
+        and not fp.canvas_hash
+        and not fp.webgl_vendor
+        and not fp.webgl_renderer
+    ):
+        reasons.append("Desktop browser completely missing WebGL and Canvas rendering context.")
+
+    is_emulator = len(reasons) > 0
+    return is_emulator, tuple(reasons)
+
+
+def calculate_fingerprint_entropy(fp: DeviceFingerprint) -> float:
+    """Calculate Shannon entropy over normalized fingerprint attribute representations."""
+    if not isinstance(fp, DeviceFingerprint):
+        raise DeviceFingerprintError("fp must be an instance of DeviceFingerprint.")
+
+    screen_str = f"{fp.screen.width}x{fp.screen.height}" if fp.screen is not None else "none"
+    tokens = [
+        fp.user_agent.strip().lower(),
+        fp.os_platform.strip().lower(),
+        fp.browser_family.strip().lower(),
+        screen_str,
+        str(fp.hardware_concurrency),
+        f"{fp.device_memory_gb:.1f}",
+        fp.webgl_vendor.strip().lower(),
+        fp.webgl_renderer.strip().lower(),
+        fp.canvas_hash.strip().lower(),
+        fp.audio_hash.strip().lower(),
+        fp.language.strip().lower(),
+        str(fp.timezone_offset_minutes),
+        str(int(fp.is_touch_capable)),
+        str(int(fp.has_webdriver)),
+        str(fp.plugins_count),
+    ]
+
+    combined = "|".join(tokens)
+    if not combined:
+        return 0.0
+
+    char_counts: dict[str, int] = {}
+    for ch in combined:
+        char_counts[ch] = char_counts.get(ch, 0) + 1
+
+    total = len(combined)
+    entropy = 0.0
+    for count in char_counts.values():
+        p = count / total
+        entropy -= p * math.log2(p)
+
+    return max(0.0, float(entropy))
+
+
+DEVICE_FEATURE_NAMES: tuple[str, ...] = (
+    "device_seen_count",
+    "device_distinct_cards_24h",
+    "device_card_distinct_devices_24h",
+    "device_is_emulator",
+    "device_entropy_score",
+    "device_is_card_cycling",
+    "device_is_device_cycling",
+)
+
+
+class DeviceFeatureExtractor:
+    """Extracts structured device fingerprinting and anomaly features from transactions."""
+
+    def __init__(
+        self,
+        tracker: DeviceTracker | None = None,
+        min_entropy_threshold: float = 1.5,
+    ) -> None:
+        self.tracker = tracker if tracker is not None else DeviceTracker()
+        self.min_entropy_threshold = float(min_entropy_threshold)
+
+    def extract_features(
+        self,
+        record: Mapping[str, Any],
+        mutate_tracker: bool = True,
+    ) -> dict[str, float]:
+        """Extract structured features from transaction record dictionary."""
+        fp: DeviceFingerprint | None = None
+        raw_fp = record.get("fingerprint", record.get("device_fingerprint"))
+        if isinstance(raw_fp, DeviceFingerprint):
+            fp = raw_fp
+        elif isinstance(raw_fp, Mapping):
+            fp = DeviceFingerprint.from_dict(raw_fp)
+        elif any(
+            k in record for k in ("user_agent", "os_platform", "browser_family", "screen_width")
+        ):
+            screen_obj: ScreenGeometry | None = None
+            if "screen_width" in record and "screen_height" in record:
+                try:
+                    w = int(record["screen_width"])
+                    h = int(record["screen_height"])
+                    if w > 0 and h > 0:
+                        screen_obj = ScreenGeometry(
+                            width=w,
+                            height=h,
+                            color_depth=int(record.get("screen_color_depth", 24)),
+                            pixel_ratio=float(record.get("screen_pixel_ratio", 1.0)),
+                        )
+                except (ValueError, TypeError, DeviceFingerprintError):
+                    screen_obj = None
+
+            try:
+                raw_dev_id = record.get("device_id")
+                dev_id_str = str(raw_dev_id) if raw_dev_id else None
+                fp = DeviceFingerprint(
+                    device_id=dev_id_str,
+                    user_agent=str(record.get("user_agent", "")),
+                    os_platform=str(record.get("os_platform", "")),
+                    browser_family=str(record.get("browser_family", "")),
+                    screen=screen_obj,
+                    language=str(record.get("language", "en")),
+                    timezone_offset_minutes=int(record.get("timezone_offset_minutes", 0)),
+                    hardware_concurrency=int(record.get("hardware_concurrency", 4)),
+                    device_memory_gb=float(record.get("device_memory_gb", 8.0)),
+                    webgl_vendor=str(record.get("webgl_vendor", "")),
+                    webgl_renderer=str(record.get("webgl_renderer", "")),
+                    canvas_hash=str(record.get("canvas_hash", "")),
+                    audio_hash=str(record.get("audio_hash", "")),
+                    is_touch_capable=bool(record.get("is_touch_capable", False)),
+                    has_webdriver=bool(record.get("has_webdriver", False)),
+                    plugins_count=int(record.get("plugins_count", 0)),
+                )
+            except (ValueError, TypeError, DeviceFingerprintError):
+                fp = None
+
+        device_id = str(record.get("device_id", "")).strip()
+        if not device_id and fp is not None:
+            device_id = fp.device_id or DeviceHasher.canonical_hash(fp)
+        if not device_id:
+            device_id = "device_unknown"
+
+        card_id: str | None = None
+        for key in ("card_id", "cc_num", "account_id", "user_id"):
+            val = record.get(key)
+            if val is not None and str(val).strip():
+                card_id = str(val).strip()
+                break
+
+        timestamp = time.time()
+        for t_key in ("timestamp", "trans_date_trans_time", "unix_time", "event_time"):
+            if t_key in record:
+                try:
+                    val = float(record[t_key])
+                    if not math.isnan(val) and not math.isinf(val) and val > 0:
+                        timestamp = val
+                        break
+                except (ValueError, TypeError):
+                    pass
+
+        if mutate_tracker:
+            report = self.tracker.record_event(
+                device_id=device_id,
+                card_id=card_id,
+                timestamp=timestamp,
+                fingerprint=fp,
+            )
+        else:
+            report = self.tracker.assess_event(
+                device_id=device_id,
+                card_id=card_id,
+                timestamp=timestamp,
+                fingerprint=fp,
+            )
+
+        is_emu = report.is_emulator
+        if fp is not None and not is_emu:
+            detected_emu, _ = detect_emulator_signatures(fp)
+            if detected_emu:
+                is_emu = True
+
+        entropy_score = calculate_fingerprint_entropy(fp) if fp is not None else 0.0
+
+        profile = self.tracker.get_profile(device_id)
+        seen_count = float(profile.transaction_count) if profile is not None else 1.0
+
+        return {
+            "device_seen_count": seen_count,
+            "device_distinct_cards_24h": float(report.distinct_cards_count),
+            "device_card_distinct_devices_24h": float(report.distinct_devices_count),
+            "device_is_emulator": 1.0 if is_emu else 0.0,
+            "device_entropy_score": float(entropy_score),
+            "device_is_card_cycling": 1.0 if report.is_card_cycling else 0.0,
+            "device_is_device_cycling": 1.0 if report.is_device_cycling else 0.0,
+        }
