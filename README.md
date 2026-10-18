@@ -35,6 +35,10 @@ binary target contains exactly `0` (legitimate) and `1` (fraud).
   score distributions with automated alerting webhooks.
 - **Edge explanation parity:** quantized int8 linear explanations and streaming batch scoring
   in pure Python with zero external machine-learning dependencies.
+- **Real-time geolocation anomaly detection & velocity tracking:** in-process spherical Haversine
+  geodesic displacement math ($R = 6371.0\text{ km}$), sliding-window entity trajectory tracking,
+  in-process IP geocoding with CIDR matching and proxy/VPN/Tor classification, impossible travel
+  detection ($v > 900\text{ km/h}$), and decision rule integration.
 - **Quality gates:** formatting, linting, strict type checking, branch coverage of at
   least 97%, package builds, and Python 3.12/3.14 CI.
 
@@ -1681,6 +1685,41 @@ fraud-detect simulate-drift data/demo.csv \
   --anomaly-fraction 0.05
 ```
 
+### Real-time geolocation anomaly detection & travel velocity
+
+Detect credential stuffing, account takeover, and impossible travel ($v > 900\text{ km/h}$) across consecutive transactions using thread-safe sliding-window entity trajectory tracking and spherical Haversine geodesic displacement math ($R = 6371.0\text{ km}$):
+
+```bash
+# Evaluate impossible travel velocity across sequential transactions
+fraud-detect geo-velocity \
+  --input-file transactions.csv \
+  --speed-threshold 900.0 \
+  --fail-on-impossible \
+  --as-json \
+  --output reports/geo_velocity.json
+
+# Enrich transaction datasets with 7 streaming geolocation features
+fraud-detect geo-enrich \
+  --input-file data/transactions.csv \
+  --output-file data/enriched_geo.csv \
+  --format csv
+```
+
+Enriched features include:
+- `geo_distance_km`: Spherical Haversine geodesic displacement from previous event.
+- `geo_speed_kmh`: Physical travel velocity between sequential transactions.
+- `geo_time_delta_seconds`: Elapsed time between entity transactions.
+- `geo_is_impossible_travel`: Flag indicating velocity exceeding speed threshold ($v > 900\text{ km/h}$).
+- `geo_is_cross_border`: Flag indicating destination country differing from origin country.
+- `geo_is_proxy`: Flag indicating egress through anonymous proxy, VPN, or Tor exit node.
+- `geo_country_mismatch`: Flag indicating transaction country differing from billing country.
+
+FastAPI endpoints surface real-time trajectory velocity and operational status:
+- `GET /v1/geo/velocity/{entity_id}`: Retrieve current travel velocity from entity's latest trajectory.
+- `GET /v1/geo/stats`: Return operational capacity, tracked entities, and processed events.
+- `POST /v1/geo/assess`: Evaluate candidate location event without updating entity history.
+- `POST /v1/geo/reset`: Reset tracked entity trajectories.
+
 ## Reference label-delay analysis
 
 Chargeback and fraud labels often arrive days or weeks after the transaction
@@ -1726,6 +1765,7 @@ src/fraud_detection/
 ├── explanations.py   # isolated explanation provider protocols and cost controls
 ├── features.py       # feature store contracts, point-in-time join, and skew surveillance
 ├── feedback.py       # delayed ground truth ingestion, label maturation modeling, and retraining triggers
+├── geolocation.py    # real-time geographic anomaly detection, speed-of-travel velocity, and IP geocoding
 ├── graph.py          # real-time bipartite entity link analysis, fraud ring detection, and risk diffusion
 ├── model.py          # training, model card, inference, and cryptographic attestation
 ├── pipeline.py       # decision graph execution, stage circuit breakers, and chaos simulation
