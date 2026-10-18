@@ -734,6 +734,17 @@ class GeoAnomalyReport:
     country_mismatch_events: int
     anomalous_event_ids: list[str]
 
+    def to_dict(self) -> dict[str, Any]:
+        """Convert anomaly report to a JSON-serializable dictionary."""
+        return {
+            "total_events": self.total_events,
+            "impossible_travel_events": self.impossible_travel_events,
+            "cross_border_events": self.cross_border_events,
+            "proxy_events": self.proxy_events,
+            "country_mismatch_events": self.country_mismatch_events,
+            "anomalous_event_ids": list(self.anomalous_event_ids),
+        }
+
 
 class GeoFeatureExtractor:
     """Streaming feature extractor converting transactions to geolocation velocity features."""
