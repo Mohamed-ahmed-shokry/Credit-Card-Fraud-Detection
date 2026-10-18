@@ -47,9 +47,10 @@ chaos fault injection, and delayed feedback ingestion with empirical label matur
 curve modeling, realized performance and financial cost surveillance, automated
 retraining triggers, automated closed-loop champion-challenger retraining with multi-dimensional
 candidate verification safety gating, cryptographic attestation signing, zero-downtime safe
-canary promotion (Phase 37), and real-time streaming bipartite entity link analysis,
+canary promotion (Phase 37), real-time streaming bipartite entity link analysis,
 Personalized PageRank risk diffusion, automated fraud ring and card-testing botnet detection,
-and graph feature aggregation (Phase 38).
+and graph feature aggregation (Phase 38), and real-time geographic geolocation anomaly detection,
+velocity speed-of-travel calculations, and in-process IP geocoding (Phase 39).
 
 ## Phase 1 — Distribution
 
@@ -1828,7 +1829,7 @@ This phase does not implement distributed graph databases (Neo4j, TigerGraph, Am
 - [x] Task 8: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate.
 
 
-## Phase 39 — Real-Time Geographic Geolocation Anomaly Detection, Velocity Speed-of-Travel & IP Geocoding (In progress)
+## Phase 39 — Real-Time Geographic Geolocation Anomaly Detection, Velocity Speed-of-Travel & IP Geocoding (Done)
 
 ### Objective
 
@@ -1896,14 +1897,49 @@ This phase does not bundle heavy external multi-gigabyte MaxMind GeoIP binary da
 
 ### Micro-Task Breakdown
 
-- [ ] Task 1: Create `src/fraud_detection/geolocation.py` with domain data models (`GeoLocationError`, `GeoCoordinates`, `GeoLocationEvent`, `TravelVelocity`), Haversine geodesic math, and unit tests in `tests/test_geolocation.py`.
-- [ ] Task 2: Implement `GeoLocationTracker` (thread-safe sliding window trajectory tracking, temporal TTL eviction, assessment) and `IPGeoResolver` in `geolocation.py` with tests in `tests/test_geolocation.py`.
-- [ ] Task 3: Implement `GeoFeatureExtractor` and anomaly detection heuristics in `geolocation.py` with tests in `tests/test_geolocation.py`.
-- [ ] Task 4: Integrate geolocation enrichment with `rules.py` (`build_impossible_travel_rule`) and `pipeline.py` (`GeoEnrichmentStageProcessor`) with tests in `tests/test_rules.py` and `tests/test_pipeline.py`.
-- [ ] Task 5: Implement audit event builder `build_impossible_travel_audit_event` in `audit.py` with tests in `tests/test_audit.py`.
-- [ ] Task 6: Implement geolocation API endpoints (`/v1/geo/velocity/{entity_id}`, `/v1/geo/stats`, `/v1/geo/assess`, `/v1/geo/reset`) and Prometheus metrics in `api.py` with tests in `tests/test_api.py`.
-- [ ] Task 7: Implement CLI commands `geo-velocity` and `geo-enrich` in `cli.py` with tests in `tests/test_cli.py`.
-- [ ] Task 8: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate.
+- [x] Task 1: Create `src/fraud_detection/geolocation.py` with domain data models (`GeoLocationError`, `GeoCoordinates`, `GeoLocationEvent`, `TravelVelocity`), Haversine geodesic math, and unit tests in `tests/test_geolocation.py`.
+- [x] Task 2: Implement `GeoLocationTracker` (thread-safe sliding window trajectory tracking, temporal TTL eviction, assessment) and `IPGeoResolver` in `geolocation.py` with tests in `tests/test_geolocation.py`.
+- [x] Task 3: Implement `GeoFeatureExtractor` and anomaly detection heuristics in `geolocation.py` with tests in `tests/test_geolocation.py`.
+- [x] Task 4: Integrate geolocation enrichment with `rules.py` (`build_impossible_travel_rule`) and `pipeline.py` (`GeoEnrichmentStageProcessor`) with tests in `tests/test_rules.py` and `tests/test_pipeline.py`.
+- [x] Task 5: Implement audit event builder `build_impossible_travel_audit_event` in `audit.py` with tests in `tests/test_audit.py`.
+- [x] Task 6: Implement geolocation API endpoints (`/v1/geo/velocity/{entity_id}`, `/v1/geo/stats`, `/v1/geo/assess`, `/v1/geo/reset`) and Prometheus metrics in `api.py` with tests in `tests/test_api.py`.
+- [x] Task 7: Implement CLI commands `geo-velocity` and `geo-enrich` in `cli.py` with tests in `tests/test_cli.py`.
+- [x] Task 8: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate.
+
+
+## Phase 40 — Adaptive Device & Browser Fingerprinting with Anomaly Clustering (Proposed)
+
+### Objective
+
+Detect advanced bot attacks, emulator spoofing, and automated credential rotation by introducing an in-process, privacy-preserving device fingerprinting engine. Extract stable hardware and browser attributes (screen geometry, WebGL capabilities, audio context hashes, platform architecture, user agent consistency), compute adaptive similarity distance metrics (Jaccard and Hamming distance), cluster device identities in sliding temporal windows, and detect device spoofing anomalies (e.g. multiple distinct card numbers originating from identical hardware signatures or rapidly morphing client characteristics).
+
+### Scope
+
+1. **Domain Data Models & Fingerprinting Engine (`device.py`)**:
+   - `DeviceFingerprint`: Canonical attributes representing browser and hardware environment.
+   - `DeviceHasher`: Normalization and cryptographic fuzzy hashing of client signatures.
+   - `DeviceTracker`: Thread-safe sliding temporal window tracking card-to-device mappings, anomaly ratios, and rapid fingerprint drift.
+   - `DeviceFeatureExtractor`: Extracts structured device features (`device_seen_count`, `device_distinct_cards_24h`, `device_is_emulator`, `device_entropy_score`).
+2. **Rules & Pipeline Integration (`rules.py`, `pipeline.py`)**:
+   - `DeviceEnrichmentStageProcessor` for Decision DAG.
+   - Declarative decision rules for emulator detection and device card-cycling attacks.
+3. **Structured Audit Trail & Redaction (`audit.py`)**:
+   - `build_device_anomaly_audit_event` with sanitized hardware profiles.
+4. **FastAPI Serving & Operational Telemetry (`api.py`)**:
+   - Operational endpoints (`GET /v1/device/stats`, `GET /v1/device/profile/{device_id}`).
+   - Prometheus metrics for device anomalies and cluster sizes.
+5. **CLI Workflows (`cli.py`)**:
+   - `fraud-detect device-clusters` and `fraud-detect device-enrich`.
+
+### Acceptance Criteria
+
+1. **AC-1 (Domain Models & Hash Normalization)**: `DeviceFingerprint` models client hardware/software attributes with robust fuzzy hashing and canonical normalization.
+2. **AC-2 (Streaming Device Tracker & Anomaly Heuristics)**: `DeviceTracker` tracks card-to-device linkages with sliding window TTL eviction and detects emulator/spoofing anomalies.
+3. **AC-3 (Pipeline & Decision Rule Integration)**: `DeviceEnrichmentStageProcessor` wires device risk features into decision graphs and evaluates declarative emulator/cycling rules.
+4. **AC-4 (Audit Trail & Sanitization)**: Emits structured device audit events with privacy-compliant attribute masking.
+5. **AC-5 (API Serving & Telemetry)**: FastAPI surfaces `/v1/device/*` operational endpoints and exports Prometheus counters/gauges.
+6. **AC-6 (CLI Workflows)**: `fraud-detect device-clusters` and `fraud-detect device-enrich` CLI commands with error gating.
+7. **AC-7 (Quality Standards & 100% Green CI)**: All CI parity checks pass with $\ge 97.0\%$ coverage and 0 mypy/ruff issues.
 
 
 ## Contributing to the roadmap
