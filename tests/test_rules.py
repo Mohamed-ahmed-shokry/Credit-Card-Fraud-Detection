@@ -332,3 +332,43 @@ def test_build_impossible_travel_and_geo_proxy_rules() -> None:
     assert proxy_rule.evaluate({"geo_is_proxy": 1.0}) is True
     assert proxy_rule.evaluate({"geo_is_proxy": 0.0}) is False
     assert proxy_rule.evaluate({}) is False
+
+
+def test_rule_branch_coverage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # 1. DecisionRule.from_dict validations
+    with pytest.raises(RuleError, match="must be a dictionary"):
+        DecisionRule.from_dict("not-a-dict")  # type: ignore[arg-type]
+
+    with pytest.raises(RuleError, match="conditions must be a list"):
+        DecisionRule.from_dict(
+            {"rule_id": "r", "name": "n", "action": "deny", "conditions": "not-list"}
+        )
+
+    # 2. RuleSet.from_dict validations
+    with pytest.raises(RuleError, match="must be a dictionary containing 'rules'"):
+        RuleSet.from_dict({"not_rules": []})
+
+    with pytest.raises(RuleError, match="'rules' must be a list"):
+        RuleSet.from_dict({"rules": "not-list"})
+
+    # 3. RuleEvaluationResult.to_dict and RuleSet iteration
+    cond = RuleCondition("Amount", RuleOperator.GREATER_THAN, 100.0)
+    rule = DecisionRule("R1", "High Amount", RuleAction.DENY, (cond,))
+    ruleset = RuleSet((rule,))
+    assert list(ruleset) == [rule]
+
+    res = ruleset.evaluate_record({"Amount": 200.0})
+    d = res.to_dict()
+    assert d["matched"] is True
+    assert d["action"] == "DENY"
+
+    # 4. OSError on load_file
+    fake_file = tmp_path / "rules.json"
+    fake_file.write_text("{}", encoding="utf-8")
+
+    def _raise_os_error(*args: Any, **kwargs: Any) -> str:
+        raise OSError("disk error")
+
+    monkeypatch.setattr(Path, "read_text", _raise_os_error)
+    with pytest.raises(RuleError, match="Failed to read rules file"):
+        RuleSet.load_file(fake_file)
