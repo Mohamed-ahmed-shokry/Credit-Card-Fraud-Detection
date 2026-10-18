@@ -19,6 +19,7 @@ from fraud_detection.features import (
     FeatureView,
     InMemoryFeatureStore,
 )
+from fraud_detection.geolocation import GeoLocationTracker
 from fraud_detection.graph import (
     EntityGraph,
     EntityType,
@@ -32,6 +33,7 @@ from fraud_detection.pipeline import (
     DecisionGraph,
     DecisionGraphExecutor,
     EnrichmentStageProcessor,
+    GeoEnrichmentStageProcessor,
     GraphEnrichmentStage,
     GraphEnrichmentStageProcessor,
     InferenceStageProcessor,
@@ -73,6 +75,7 @@ from fraud_detection.rules import (
     RuleOperator,
     RulePrecedence,
     RuleSet,
+    build_impossible_travel_rule,
 )
 from fraud_detection.velocity import VelocityConfig, VelocityWindow, VelocityWindowBuffer
 
@@ -2004,3 +2007,80 @@ def test_create_default_fraud_pipeline_with_entity_graph() -> None:
     assert result.decision == "DENY"
     assert result.stage_results["graph_enrichment"].status == StageStatus.SUCCESS
     assert result.stage_results["graph_enrichment"].output["in_fraud_ring"] is True
+
+
+def test_geo_enrichment_stage_processor_direct() -> None:
+    tracker = GeoLocationTracker()
+    proc = GeoEnrichmentStageProcessor(tracker=tracker)
+
+    # Initial event in London
+    ctx1 = PipelineContext(
+        transaction={
+            "transaction_id": "tx_lon_1",
+            "card_id": "card_test_geo",
+            "timestamp": 1000.0,
+            "latitude": 51.5074,
+            "longitude": -0.1278,
+            "billing_country": "GB",
+        }
+    )
+    res1 = proc(ctx1)
+    assert res1["geo_is_impossible_travel"] is False
+    assert ctx1.transaction["geo_distance_km"] == 0.0
+
+    # Event in NYC 1000 seconds later (speed > 900 km/h)
+    ctx2 = PipelineContext(
+        transaction={
+            "transaction_id": "tx_nyc_2",
+            "card_id": "card_test_geo",
+            "timestamp": 2000.0,
+            "latitude": 40.7128,
+            "longitude": -74.0060,
+            "billing_country": "GB",
+        }
+    )
+    res2 = proc(ctx2)
+    assert res2["geo_is_impossible_travel"] is True
+    assert ctx2.transaction["geo_is_impossible_travel"] == 1.0
+    assert ctx2.transaction["geo_speed_kmh"] > 900.0
+
+
+def test_create_default_fraud_pipeline_with_geolocation() -> None:
+    df = validate_frame(generate_synthetic_data(rows=300, fraud_rate=0.1, random_state=42))
+    model = train_model(df)
+    tracker = GeoLocationTracker()
+
+    geo_rule = build_impossible_travel_rule()
+    ruleset = RuleSet((geo_rule,))
+
+    pipeline = create_default_fraud_pipeline(
+        model=model,
+        rules=ruleset,
+        geo_tracker=tracker,
+    )
+
+    # 1. First event in London (ALLOW)
+    tx1: dict[str, Any] = {str(k): v for k, v in df.features.iloc[0].to_dict().items()}
+    tx1["card_id"] = "card_airline_test"
+    tx1["timestamp"] = 1000.0
+    tx1["latitude"] = 51.5074
+    tx1["longitude"] = -0.1278
+
+    executor = DecisionGraphExecutor(pipeline)
+    res1 = executor.execute_sync(tx1)
+    assert res1.stage_results["geo_enrichment"].status == StageStatus.SUCCESS
+    assert res1.stage_results["geo_enrichment"].output["geo_is_impossible_travel"] is False
+
+    # 2. Impossible jump to NYC 600s later (DENY by rule)
+    tx2: dict[str, Any] = {str(k): v for k, v in df.features.iloc[1].to_dict().items()}
+    tx2["card_id"] = "card_airline_test"
+    tx2["timestamp"] = 1600.0
+    tx2["latitude"] = 40.7128
+    tx2["longitude"] = -74.0060
+
+    res2 = executor.execute_sync(tx2)
+    assert res2.stage_results["geo_enrichment"].status == StageStatus.SUCCESS
+    assert res2.stage_results["geo_enrichment"].output["geo_is_impossible_travel"] is True
+    assert res2.decision == "DENY"
+    assert res2.rule_action == "DENY"
+    assert res2.matched_rule == "RULE_IMPOSSIBLE_TRAVEL_DENY"
