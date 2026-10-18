@@ -12,6 +12,8 @@ from fraud_detection.rules import (
     RuleOperator,
     RulePrecedence,
     RuleSet,
+    build_device_card_cycling_rule,
+    build_device_emulator_rule,
     build_fraud_ring_rule,
     build_geo_proxy_rule,
     build_impossible_travel_rule,
@@ -372,3 +374,19 @@ def test_rule_branch_coverage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setattr(Path, "read_text", _raise_os_error)
     with pytest.raises(RuleError, match="Failed to read rules file"):
         RuleSet.load_file(fake_file)
+
+
+def test_device_rules() -> None:
+    emu_rule = build_device_emulator_rule()
+    assert emu_rule.rule_id == "RULE_DEVICE_EMULATOR_DENY"
+    assert emu_rule.action == RuleAction.DENY
+    assert emu_rule.evaluate({"device_is_emulator": 1.0}) is True
+    assert emu_rule.evaluate({"device_is_emulator": 0.0}) is False
+    assert emu_rule.evaluate({}) is False
+
+    cycle_rule = build_device_card_cycling_rule()
+    assert cycle_rule.rule_id == "RULE_DEVICE_CARD_CYCLING_DENY"
+    assert cycle_rule.action == RuleAction.DENY
+    assert cycle_rule.evaluate({"device_is_card_cycling": 1.0}) is True
+    assert cycle_rule.evaluate({"device_is_card_cycling": 0.0}) is False
+    assert cycle_rule.evaluate({}) is False

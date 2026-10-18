@@ -407,3 +407,53 @@ def build_geo_proxy_rule(
         priority=priority,
         reason=reason,
     )
+
+
+def build_device_emulator_rule(
+    rule_id: str = "RULE_DEVICE_EMULATOR_DENY",
+    name: str = "Device Emulator Auto Deny",
+    action: RuleAction = RuleAction.DENY,
+    priority: int = 12,
+    reason: str = "Transaction originating from automated bot, webdriver, or emulator environment.",
+) -> DecisionRule:
+    """Build a pre-configured DecisionRule for headless and emulator device mitigation."""
+    conditions = (
+        RuleCondition(
+            field="device_is_emulator",
+            operator=RuleOperator.EQUALS,
+            value=1.0,
+        ),
+    )
+    return DecisionRule(
+        rule_id=rule_id,
+        name=name,
+        action=action,
+        conditions=conditions,
+        priority=priority,
+        reason=reason,
+    )
+
+
+def build_device_card_cycling_rule(
+    rule_id: str = "RULE_DEVICE_CARD_CYCLING_DENY",
+    name: str = "Device Card Cycling Auto Deny",
+    action: RuleAction = RuleAction.DENY,
+    priority: int = 14,
+    reason: str = "Device cycling multiple payment cards across short temporal window.",
+) -> DecisionRule:
+    """Build a pre-configured DecisionRule for device card cycling mitigation."""
+    conditions = (
+        RuleCondition(
+            field="device_is_card_cycling",
+            operator=RuleOperator.EQUALS,
+            value=1.0,
+        ),
+    )
+    return DecisionRule(
+        rule_id=rule_id,
+        name=name,
+        action=action,
+        conditions=conditions,
+        priority=priority,
+        reason=reason,
+    )
