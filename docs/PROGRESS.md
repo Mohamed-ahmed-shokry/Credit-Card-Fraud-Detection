@@ -6,7 +6,7 @@
 - **Status**: In Progress
 
 ## Task Status
-- [ ] Task 1: Create `src/fraud_detection/geolocation.py` with domain data models (`GeoLocationError`, `GeoCoordinates`, `GeoLocationEvent`, `TravelVelocity`), Haversine geodesic math, and unit tests in `tests/test_geolocation.py`.
+- [x] Task 1: Create `src/fraud_detection/geolocation.py` with domain data models (`GeoLocationError`, `GeoCoordinates`, `GeoLocationEvent`, `TravelVelocity`), Haversine geodesic math, and unit tests in `tests/test_geolocation.py`.
 - [ ] Task 2: Implement `GeoLocationTracker` (thread-safe sliding window trajectory tracking, temporal TTL eviction, assessment) and `IPGeoResolver` in `geolocation.py` with tests in `tests/test_geolocation.py`.
 - [ ] Task 3: Implement `GeoFeatureExtractor` and anomaly detection heuristics in `geolocation.py` with tests in `tests/test_geolocation.py`.
 - [ ] Task 4: Integrate geolocation enrichment with `rules.py` (`build_impossible_travel_rule`) and `pipeline.py` (`GeoEnrichmentStageProcessor`) with tests in `tests/test_rules.py` and `tests/test_pipeline.py`.
@@ -18,7 +18,7 @@
 ## Acceptance Criteria Status
 | Criterion | Status | Evidence |
 |-----------|--------|----------|
-| AC-1 (Domain Models & Haversine Geodesic Engine) | Pending | In progress |
+| AC-1 (Domain Models & Haversine Geodesic Engine) | Satisfied | `GeoCoordinates`, `haversine_distance`, `GeoLocationEvent`, `TravelVelocity`, and `calculate_travel_velocity` verified with 34 tests in `tests/test_geolocation.py`. |
 | AC-2 (Streaming Geolocation Tracker & IP Resolution) | Pending | In progress |
 | AC-3 (Geo Feature Extraction & Anomaly Detection) | Pending | In progress |
 | AC-4 (Pipeline & Decision Rule Integration) | Pending | In progress |
