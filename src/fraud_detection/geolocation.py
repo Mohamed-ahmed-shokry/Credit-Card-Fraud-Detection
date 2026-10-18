@@ -67,6 +67,17 @@ class GeoCoordinates:
         ):
             raise GeoLocationError("postal_code must be a non-empty string or None.")
 
+    def to_dict(self) -> dict[str, Any]:
+        """Convert coordinates to a serializable dictionary."""
+        return {
+            "latitude": self.latitude,
+            "longitude": self.longitude,
+            "accuracy_radius_km": self.accuracy_radius_km,
+            "country_code": self.country_code,
+            "city": self.city,
+            "postal_code": self.postal_code,
+        }
+
 
 EARTH_RADIUS_KM: float = 6371.0088
 
@@ -143,6 +154,20 @@ class GeoLocationEvent:
         if self.is_tor is not None and not isinstance(self.is_tor, bool):
             raise GeoLocationError("is_tor must be a boolean or None.")
 
+    def to_dict(self) -> dict[str, Any]:
+        """Convert geolocation event to a serializable dictionary."""
+        return {
+            "event_id": self.event_id,
+            "entity_id": self.entity_id,
+            "timestamp": self.timestamp,
+            "coordinates": self.coordinates.to_dict(),
+            "ip_address": self.ip_address,
+            "asn": self.asn,
+            "is_proxy": self.is_proxy,
+            "is_vpn": self.is_vpn,
+            "is_tor": self.is_tor,
+        }
+
 
 DEFAULT_MAX_SPEED_KMH: float = 900.0
 
@@ -189,6 +214,20 @@ class TravelVelocity:
             raise GeoLocationError("is_impossible_travel must be a boolean.")
         if not isinstance(self.is_cross_border, bool):
             raise GeoLocationError("is_cross_border must be a boolean.")
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert travel velocity to a serializable dictionary."""
+        return {
+            "distance_km": self.distance_km,
+            "time_elapsed_seconds": self.time_elapsed_seconds,
+            "velocity_kmh": self.velocity_kmh,
+            "is_impossible_travel": self.is_impossible_travel,
+            "is_cross_border": self.is_cross_border,
+            "origin_country": self.origin_country,
+            "destination_country": self.destination_country,
+            "origin_city": self.origin_city,
+            "destination_city": self.destination_city,
+        }
 
 
 def calculate_travel_velocity(

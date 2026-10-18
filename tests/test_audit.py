@@ -22,6 +22,7 @@ from fraud_detection.audit import (
     build_challenger_retrained_audit_event,
     build_delayed_label_audit_event,
     build_fraud_ring_detected_audit_event,
+    build_impossible_travel_audit_event,
     build_model_promoted_audit_event,
     build_pipeline_chaos_audit_event,
     build_pipeline_replay_audit_event,
@@ -38,6 +39,11 @@ from fraud_detection.feedback import (
     DisputeType,
     RealizedMetricsReport,
     RetrainingTriggerEvent,
+)
+from fraud_detection.geolocation import (
+    GeoCoordinates,
+    GeoLocationEvent,
+    TravelVelocity,
 )
 from fraud_detection.graph import (
     EntityType,
@@ -1230,3 +1236,91 @@ def test_build_fraud_ring_detected_audit_event_redaction() -> None:
     assert event_dict.payload["cluster_id"] == "ring_dict_456"
     assert event_dict.payload["severity"] == "critical"
     assert event_dict.payload["total_amount"] == 5000.0
+
+
+def test_build_impossible_travel_audit_event() -> None:
+    # 1. Test building from typed objects and Luhn-valid PAN masking
+    pan_entity = "4532015112830366"  # Luhn valid
+    prev_loc = GeoCoordinates(latitude=51.5074, longitude=-0.1278, country_code="GB", city="London")
+    curr_loc = GeoCoordinates(
+        latitude=40.7128, longitude=-74.0060, country_code="US", city="New York"
+    )
+
+    prev_ev = GeoLocationEvent(
+        event_id="ev_lon",
+        entity_id=pan_entity,
+        timestamp=1000.0,
+        coordinates=prev_loc,
+        ip_address="198.51.100.1",
+    )
+    curr_ev = GeoLocationEvent(
+        event_id="ev_nyc",
+        entity_id=pan_entity,
+        timestamp=1600.0,
+        coordinates=curr_loc,
+        ip_address="198.51.100.2",
+    )
+
+    velocity = TravelVelocity(
+        distance_km=5570.0,
+        time_elapsed_seconds=600.0,
+        velocity_kmh=33420.0,
+        is_impossible_travel=True,
+        is_cross_border=True,
+        origin_country="GB",
+        destination_country="US",
+        origin_city="London",
+        destination_city="New York",
+    )
+
+    event = build_impossible_travel_audit_event(
+        velocity=velocity,
+        transaction_id="tx_nyc",
+        prev_event=prev_ev,
+        curr_event=curr_ev,
+        trigger_action="DENY",
+        model_version="v2",
+        metadata={"operator": "secops", "auth_token": "secret_jwt_xyz"},
+    )
+
+    assert event.event_type == "fraud.geo.impossible_travel"
+    assert event.model_version == "v2"
+    assert event.payload["transaction_id"] == "tx_nyc"
+    assert event.payload["distance_km"] == 5570.0
+    assert event.payload["velocity_kmh"] == 33420.0
+    assert event.payload["is_impossible_travel"] is True
+    assert event.payload["is_cross_border"] is True
+    assert event.payload["trigger_action"] == "DENY"
+
+    # Redaction checks: PAN in entity_id must be redacted
+    assert event.payload["entity_id"] == "[REDACTED_PAN]"
+    # Nested event entity IDs (Luhn valid) must also be redacted
+    assert event.payload["prev_event"]["entity_id"] == "[REDACTED_PAN]"
+    assert event.payload["curr_event"]["entity_id"] == "[REDACTED_PAN]"
+
+    # Metadata token redaction
+    d = event.to_dict(redact=True)
+    assert d["payload"]["metadata"]["operator"] == "secops"
+    assert d["payload"]["metadata"]["auth_token"] == "[REDACTED]"  # noqa: S105
+
+    # 2. Test building from Mapping with non-PAN entity
+    mapping_velocity = {
+        "distance_km": 1200.0,
+        "time_elapsed_seconds": 1800.0,
+        "velocity_kmh": 2400.0,
+        "is_impossible_travel": True,
+        "is_cross_border": False,
+        "origin_country": "US",
+        "destination_country": "US",
+        "origin_city": "Chicago",
+        "destination_city": "New York",
+    }
+    mapping_event = build_impossible_travel_audit_event(
+        velocity=mapping_velocity,
+        entity_id="user_chicago_nyc_999",
+        transaction_id="tx_map_1",
+    )
+    assert mapping_event.payload["entity_id"] == "user_chicago_nyc_999"
+    assert mapping_event.payload["distance_km"] == 1200.0
+    assert mapping_event.payload["velocity_kmh"] == 2400.0
+    assert mapping_event.payload["is_impossible_travel"] is True

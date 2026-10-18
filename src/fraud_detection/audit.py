@@ -25,6 +25,7 @@ from fraud_detection.evaluation import (
 
 if TYPE_CHECKING:
     from fraud_detection.feedback import DelayedLabelRecord, RetrainingTriggerEvent
+    from fraud_detection.geolocation import GeoLocationEvent, TravelVelocity
     from fraud_detection.graph import FraudRingCluster
     from fraud_detection.pipeline import PipelineChaosReport
     from fraud_detection.retraining import (
@@ -1120,6 +1121,100 @@ def build_fraud_ring_detected_audit_event(
 
     return AuditEvent(
         event_type="fraud.graph.ring_detected",
+        model_version=model_version,
+        dataset_fingerprint=dataset_fingerprint,
+        payload=redact_data(payload),
+    )
+
+
+def build_impossible_travel_audit_event(
+    *,
+    velocity: TravelVelocity | Mapping[str, Any],
+    transaction_id: str | None = None,
+    entity_id: str | None = None,
+    prev_event: GeoLocationEvent | Mapping[str, Any] | None = None,
+    curr_event: GeoLocationEvent | Mapping[str, Any] | None = None,
+    trigger_action: str = "DENY",
+    model_version: str = "v1",
+    dataset_fingerprint: str | None = None,
+    metadata: Mapping[str, Any] | None = None,
+) -> AuditEvent:
+    """Construct a structured audit event when impossible travel is detected."""
+    if isinstance(velocity, Mapping):
+        distance_km = float(velocity.get("distance_km", 0.0))
+        time_elapsed_seconds = float(
+            velocity.get("time_elapsed_seconds", velocity.get("time_delta_seconds", 0.0))
+        )
+        velocity_kmh = float(velocity.get("velocity_kmh", velocity.get("speed_kmh", 0.0)))
+        is_impossible_travel = bool(velocity.get("is_impossible_travel", True))
+        is_cross_border = bool(velocity.get("is_cross_border", False))
+        origin_country = velocity.get("origin_country")
+        destination_country = velocity.get("destination_country")
+        origin_city = velocity.get("origin_city")
+        destination_city = velocity.get("destination_city")
+    else:
+        distance_km = float(velocity.distance_km)
+        time_elapsed_seconds = float(velocity.time_elapsed_seconds)
+        velocity_kmh = float(velocity.velocity_kmh)
+        is_impossible_travel = bool(velocity.is_impossible_travel)
+        is_cross_border = bool(velocity.is_cross_border)
+        origin_country = velocity.origin_country
+        destination_country = velocity.destination_country
+        origin_city = velocity.origin_city
+        destination_city = velocity.destination_city
+
+    target_entity = entity_id
+    if target_entity is None:
+        if curr_event is not None:
+            if hasattr(curr_event, "entity_id"):
+                target_entity = curr_event.entity_id
+            elif isinstance(curr_event, Mapping):
+                target_entity = str(curr_event.get("entity_id", ""))
+        elif prev_event is not None:
+            if hasattr(prev_event, "entity_id"):
+                target_entity = prev_event.entity_id
+            elif isinstance(prev_event, Mapping):
+                target_entity = str(prev_event.get("entity_id", ""))
+
+    masked_entity = _mask_pans_in_string(str(target_entity)) if target_entity else None
+
+    prev_payload: dict[str, Any] | None = None
+    if prev_event is not None:
+        if hasattr(prev_event, "to_dict"):
+            prev_payload = prev_event.to_dict()
+        elif isinstance(prev_event, Mapping):
+            prev_payload = dict(prev_event)
+
+    curr_payload: dict[str, Any] | None = None
+    if curr_event is not None:
+        if hasattr(curr_event, "to_dict"):
+            curr_payload = curr_event.to_dict()
+        elif isinstance(curr_event, Mapping):
+            curr_payload = dict(curr_event)
+
+    payload: dict[str, Any] = {
+        "entity_id": masked_entity,
+        "transaction_id": transaction_id,
+        "distance_km": distance_km,
+        "time_elapsed_seconds": time_elapsed_seconds,
+        "velocity_kmh": velocity_kmh,
+        "is_impossible_travel": is_impossible_travel,
+        "is_cross_border": is_cross_border,
+        "origin_country": origin_country,
+        "destination_country": destination_country,
+        "origin_city": origin_city,
+        "destination_city": destination_city,
+        "trigger_action": str(trigger_action),
+    }
+    if prev_payload is not None:
+        payload["prev_event"] = prev_payload
+    if curr_payload is not None:
+        payload["curr_event"] = curr_payload
+    if metadata:
+        payload["metadata"] = dict(metadata)
+
+    return AuditEvent(
+        event_type="fraud.geo.impossible_travel",
         model_version=model_version,
         dataset_fingerprint=dataset_fingerprint,
         payload=redact_data(payload),
