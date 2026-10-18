@@ -8,6 +8,8 @@ from fraud_detection.device import (
     DeviceFingerprint,
     DeviceFingerprintError,
     DeviceHasher,
+    DeviceTracker,
+    DeviceTrackerConfig,
     ScreenGeometry,
     calculate_fingerprint_similarity,
     calculate_hamming_distance,
@@ -256,3 +258,124 @@ def test_calculate_fingerprint_similarity() -> None:
     )
     sim_mac = calculate_fingerprint_similarity(fp1, fp_mac)
     assert sim_mac < 0.50
+
+
+def test_device_tracker_config_valid_and_invalid() -> None:
+    cfg = DeviceTrackerConfig(
+        window_seconds=3600.0,
+        max_devices=1000,
+        card_cycling_threshold=5,
+        device_cycling_threshold=4,
+        min_similarity_threshold=0.75,
+    )
+    assert cfg.window_seconds == 3600.0
+    assert cfg.max_devices == 1000
+    assert cfg.card_cycling_threshold == 5
+    assert cfg.device_cycling_threshold == 4
+    assert cfg.min_similarity_threshold == 0.75
+
+    with pytest.raises(DeviceFingerprintError, match="window_seconds must be a positive"):
+        DeviceTrackerConfig(window_seconds=0.0)
+    with pytest.raises(DeviceFingerprintError, match="max_devices must be a positive"):
+        DeviceTrackerConfig(max_devices=-1)
+    with pytest.raises(DeviceFingerprintError, match="card_cycling_threshold must be a positive"):
+        DeviceTrackerConfig(card_cycling_threshold=0)
+    with pytest.raises(DeviceFingerprintError, match="device_cycling_threshold must be a positive"):
+        DeviceTrackerConfig(device_cycling_threshold=0)
+    with pytest.raises(DeviceFingerprintError, match="min_similarity_threshold must be a finite"):
+        DeviceTrackerConfig(min_similarity_threshold=1.5)
+
+
+def test_device_tracker_card_cycling_detection() -> None:
+    cfg = DeviceTrackerConfig(card_cycling_threshold=3, window_seconds=3600.0)
+    tracker = DeviceTracker(config=cfg)
+
+    # 1st card on device-A
+    rep1 = tracker.record_event(device_id="dev-A", card_id="card-1", timestamp=1000.0)
+    assert not rep1.has_anomaly
+    assert rep1.distinct_cards_count == 1
+    assert rep1.severity == "LOW"
+
+    # 2nd card on device-A
+    rep2 = tracker.record_event(device_id="dev-A", card_id="card-2", timestamp=1010.0)
+    assert not rep2.has_anomaly
+    assert rep2.distinct_cards_count == 2
+
+    # 3rd card on device-A -> trips card cycling threshold
+    rep3 = tracker.record_event(device_id="dev-A", card_id="card-3", timestamp=1020.0)
+    assert rep3.has_anomaly
+    assert rep3.is_card_cycling
+    assert rep3.distinct_cards_count == 3
+    assert rep3.severity == "HIGH"
+    assert "Device associated with 3 cards" in rep3.reasons[0]
+
+
+def test_device_tracker_device_cycling_detection() -> None:
+    cfg = DeviceTrackerConfig(device_cycling_threshold=3, window_seconds=3600.0)
+    tracker = DeviceTracker(config=cfg)
+
+    # card-1 on dev-A
+    tracker.record_event(device_id="dev-A", card_id="card-1", timestamp=1000.0)
+    # card-1 on dev-B
+    tracker.record_event(device_id="dev-B", card_id="card-1", timestamp=1010.0)
+    # card-1 on dev-C -> trips device cycling threshold
+    rep3 = tracker.record_event(device_id="dev-C", card_id="card-1", timestamp=1020.0)
+    assert rep3.has_anomaly
+    assert rep3.is_device_cycling
+    assert rep3.distinct_devices_count == 3
+    assert rep3.severity == "HIGH"
+
+
+def test_device_tracker_webdriver_emulator_and_critical_severity() -> None:
+    cfg = DeviceTrackerConfig(card_cycling_threshold=2)
+    tracker = DeviceTracker(config=cfg)
+
+    fp_bot = DeviceFingerprint(has_webdriver=True)
+    # 1st card with bot -> emulator flagged, severity MEDIUM
+    rep1 = tracker.record_event(
+        device_id="dev-bot", card_id="card-1", timestamp=1000.0, fingerprint=fp_bot
+    )
+    assert rep1.has_anomaly
+    assert rep1.is_emulator
+    assert not rep1.is_card_cycling
+    assert rep1.severity == "MEDIUM"
+
+    # 2nd card with bot -> card cycling AND emulator -> CRITICAL
+    rep2 = tracker.record_event(
+        device_id="dev-bot", card_id="card-2", timestamp=1010.0, fingerprint=fp_bot
+    )
+    assert rep2.has_anomaly
+    assert rep2.is_card_cycling
+    assert rep2.is_emulator
+    assert rep2.severity == "CRITICAL"
+
+
+def test_device_tracker_assess_event_is_pure_read() -> None:
+    tracker = DeviceTracker()
+    rep = tracker.assess_event(device_id="dev-read", card_id="card-1", timestamp=1000.0)
+    assert not rep.has_anomaly
+    # State should remain empty
+    stats = tracker.get_stats()
+    assert stats["tracked_devices_count"] == 0
+    assert stats["total_evaluations"] == 0
+    assert tracker.get_profile("dev-read") is None
+
+
+def test_device_tracker_lru_capacity_and_reset() -> None:
+    cfg = DeviceTrackerConfig(max_devices=2)
+    tracker = DeviceTracker(config=cfg)
+
+    tracker.record_event(device_id="dev-1", card_id="card-1", timestamp=100.0)
+    tracker.record_event(device_id="dev-2", card_id="card-2", timestamp=101.0)
+    assert tracker.get_stats()["tracked_devices_count"] == 2
+
+    # dev-3 causes dev-1 to be evicted
+    tracker.record_event(device_id="dev-3", card_id="card-3", timestamp=102.0)
+    assert tracker.get_stats()["tracked_devices_count"] == 2
+    assert tracker.get_profile("dev-1") is None
+    assert tracker.get_profile("dev-2") is not None
+    assert tracker.get_profile("dev-3") is not None
+
+    tracker.reset()
+    assert tracker.get_stats()["tracked_devices_count"] == 0
+    assert tracker.get_stats()["total_evaluations"] == 0

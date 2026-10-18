@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import math
+import threading
+from collections import OrderedDict, deque
 from collections.abc import Mapping, Sequence, Set
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 
@@ -399,3 +401,339 @@ def calculate_fingerprint_similarity(fp1: DeviceFingerprint, fp2: DeviceFingerpr
     score += (env_score / env_components) * 0.15
 
     return max(0.0, min(1.0, float(score)))
+
+
+DEFAULT_DEVICE_WINDOW_SECONDS: float = 86400.0  # 24 hours
+DEFAULT_MAX_DEVICES: int = 50_000
+DEFAULT_CARD_CYCLING_THRESHOLD: int = 3
+DEFAULT_DEVICE_CYCLING_THRESHOLD: int = 3
+DEFAULT_MIN_SIMILARITY_THRESHOLD: float = 0.60
+
+
+@dataclass(frozen=True)
+class DeviceTrackerConfig:
+    """Configuration settings for streaming device tracking and anomaly clustering."""
+
+    window_seconds: float = DEFAULT_DEVICE_WINDOW_SECONDS
+    max_devices: int = DEFAULT_MAX_DEVICES
+    card_cycling_threshold: int = DEFAULT_CARD_CYCLING_THRESHOLD
+    device_cycling_threshold: int = DEFAULT_DEVICE_CYCLING_THRESHOLD
+    min_similarity_threshold: float = DEFAULT_MIN_SIMILARITY_THRESHOLD
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.window_seconds, (int, float))
+            or math.isnan(self.window_seconds)
+            or math.isinf(self.window_seconds)
+            or self.window_seconds <= 0.0
+        ):
+            raise DeviceFingerprintError("window_seconds must be a positive finite float.")
+        if (
+            not isinstance(self.max_devices, int)
+            or isinstance(self.max_devices, bool)
+            or self.max_devices <= 0
+        ):
+            raise DeviceFingerprintError("max_devices must be a positive integer.")
+        if (
+            not isinstance(self.card_cycling_threshold, int)
+            or isinstance(self.card_cycling_threshold, bool)
+            or self.card_cycling_threshold <= 0
+        ):
+            raise DeviceFingerprintError("card_cycling_threshold must be a positive integer.")
+        if (
+            not isinstance(self.device_cycling_threshold, int)
+            or isinstance(self.device_cycling_threshold, bool)
+            or self.device_cycling_threshold <= 0
+        ):
+            raise DeviceFingerprintError("device_cycling_threshold must be a positive integer.")
+        if (
+            not isinstance(self.min_similarity_threshold, (int, float))
+            or math.isnan(self.min_similarity_threshold)
+            or math.isinf(self.min_similarity_threshold)
+            or not (0.0 <= self.min_similarity_threshold <= 1.0)
+        ):
+            raise DeviceFingerprintError(
+                "min_similarity_threshold must be a finite float between 0.0 and 1.0."
+            )
+
+
+@dataclass(frozen=True)
+class DeviceAnomalyReport:
+    """Report summarizing detected device anomalies, risk scores, and attack indicators."""
+
+    device_id: str
+    card_id: str | None = None
+    is_emulator: bool = False
+    is_card_cycling: bool = False
+    is_device_cycling: bool = False
+    is_fingerprint_drift: bool = False
+    distinct_cards_count: int = 0
+    distinct_devices_count: int = 0
+    similarity_to_baseline: float = 1.0
+    severity: str = "LOW"  # LOW, MEDIUM, HIGH, CRITICAL
+    reasons: tuple[str, ...] = ()
+
+    @property
+    def has_anomaly(self) -> bool:
+        """Return True if any anomaly flag is raised."""
+        return (
+            self.is_emulator
+            or self.is_card_cycling
+            or self.is_device_cycling
+            or self.is_fingerprint_drift
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert anomaly report to dictionary."""
+        return {
+            "device_id": self.device_id,
+            "card_id": self.card_id,
+            "is_emulator": self.is_emulator,
+            "is_card_cycling": self.is_card_cycling,
+            "is_device_cycling": self.is_device_cycling,
+            "is_fingerprint_drift": self.is_fingerprint_drift,
+            "distinct_cards_count": self.distinct_cards_count,
+            "distinct_devices_count": self.distinct_devices_count,
+            "similarity_to_baseline": float(self.similarity_to_baseline),
+            "severity": self.severity,
+            "reasons": list(self.reasons),
+            "has_anomaly": self.has_anomaly,
+        }
+
+
+@dataclass
+class DeviceProfile:
+    """Aggregated historical device state within the sliding observation window."""
+
+    device_id: str
+    first_seen_timestamp: float
+    last_seen_timestamp: float
+    transaction_count: int = 0
+    cards_seen: set[str] = field(default_factory=set)
+    canonical_hashes: set[str] = field(default_factory=set)
+    baseline_fingerprint: DeviceFingerprint | None = None
+    is_emulator: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert device profile to serializable dictionary."""
+        return {
+            "device_id": self.device_id,
+            "first_seen_timestamp": self.first_seen_timestamp,
+            "last_seen_timestamp": self.last_seen_timestamp,
+            "transaction_count": self.transaction_count,
+            "distinct_cards_count": len(self.cards_seen),
+            "distinct_hashes_count": len(self.canonical_hashes),
+            "is_emulator": self.is_emulator,
+        }
+
+
+class DeviceTracker:
+    """Thread-safe streaming sliding-window device association tracker and anomaly clusterer."""
+
+    def __init__(self, config: DeviceTrackerConfig | None = None) -> None:
+        self.config = config if config is not None else DeviceTrackerConfig()
+        self._lock = threading.RLock()
+        self._device_profiles: OrderedDict[str, DeviceProfile] = OrderedDict()
+        self._device_card_events: OrderedDict[str, deque[tuple[float, str]]] = OrderedDict()
+        self._card_device_events: OrderedDict[str, deque[tuple[float, str]]] = OrderedDict()
+        self._total_evaluations: int = 0
+        self._total_anomalies: int = 0
+
+    def assess_event(
+        self,
+        device_id: str,
+        card_id: str | None,
+        timestamp: float,
+        fingerprint: DeviceFingerprint | None = None,
+    ) -> DeviceAnomalyReport:
+        """Evaluate a device/card event for anomalies without mutating tracker state."""
+        if not isinstance(device_id, str) or not device_id.strip():
+            raise DeviceFingerprintError("device_id must be a non-empty string.")
+        if card_id is not None and (not isinstance(card_id, str) or not card_id.strip()):
+            raise DeviceFingerprintError("card_id must be a non-empty string or None.")
+        if (
+            not isinstance(timestamp, (int, float))
+            or math.isnan(timestamp)
+            or math.isinf(timestamp)
+        ):
+            raise DeviceFingerprintError("timestamp must be a finite float.")
+
+        clean_device = device_id.strip()
+        clean_card = card_id.strip() if card_id is not None else None
+        cutoff = timestamp - self.config.window_seconds
+
+        with self._lock:
+            device_events = self._device_card_events.get(clean_device)
+            active_cards = {c for (t, c) in (device_events or ()) if t >= cutoff and c is not None}
+            if clean_card is not None:
+                active_cards.add(clean_card)
+            distinct_cards = len(active_cards)
+
+            distinct_devices = 0
+            if clean_card is not None:
+                card_events = self._card_device_events.get(clean_card)
+                active_devices = {d for (t, d) in (card_events or ()) if t >= cutoff}
+                active_devices.add(clean_device)
+                distinct_devices = len(active_devices)
+
+            profile = self._device_profiles.get(clean_device)
+            is_emulator = profile.is_emulator if profile is not None else False
+            similarity_to_baseline = 1.0
+            if fingerprint is not None:
+                if fingerprint.has_webdriver:
+                    is_emulator = True
+                if profile is not None and profile.baseline_fingerprint is not None:
+                    similarity_to_baseline = calculate_fingerprint_similarity(
+                        profile.baseline_fingerprint, fingerprint
+                    )
+
+            is_card_cycling = distinct_cards >= self.config.card_cycling_threshold
+            is_device_cycling = (
+                distinct_devices >= self.config.device_cycling_threshold
+                if clean_card is not None
+                else False
+            )
+            is_drift = similarity_to_baseline < self.config.min_similarity_threshold
+
+            reasons: list[str] = []
+            if is_emulator:
+                reasons.append("Device exhibits automated webdriver or emulator signatures.")
+            if is_card_cycling:
+                thresh_c = self.config.card_cycling_threshold
+                reasons.append(
+                    f"Device associated with {distinct_cards} cards (threshold: {thresh_c})."
+                )
+            if is_device_cycling:
+                thresh_d = self.config.device_cycling_threshold
+                reasons.append(
+                    f"Card associated with {distinct_devices} devices (threshold: {thresh_d})."
+                )
+            if is_drift:
+                min_sim = self.config.min_similarity_threshold
+                sim_val = f"{similarity_to_baseline:.2f}"
+                reasons.append(f"Fingerprint similarity {sim_val} regressed below {min_sim:.2f}.")
+
+            if is_card_cycling and is_emulator:
+                severity = "CRITICAL"
+            elif is_card_cycling or is_device_cycling:
+                severity = "HIGH"
+            elif is_emulator or is_drift:
+                severity = "MEDIUM"
+            else:
+                severity = "LOW"
+
+            return DeviceAnomalyReport(
+                device_id=clean_device,
+                card_id=clean_card,
+                is_emulator=is_emulator,
+                is_card_cycling=is_card_cycling,
+                is_device_cycling=is_device_cycling,
+                is_fingerprint_drift=is_drift,
+                distinct_cards_count=distinct_cards,
+                distinct_devices_count=distinct_devices,
+                similarity_to_baseline=similarity_to_baseline,
+                severity=severity,
+                reasons=tuple(reasons),
+            )
+
+    def record_event(
+        self,
+        device_id: str,
+        card_id: str | None,
+        timestamp: float,
+        fingerprint: DeviceFingerprint | None = None,
+    ) -> DeviceAnomalyReport:
+        """Record an event into sliding windows and return anomaly report."""
+        report = self.assess_event(
+            device_id=device_id,
+            card_id=card_id,
+            timestamp=timestamp,
+            fingerprint=fingerprint,
+        )
+
+        clean_device = device_id.strip()
+        clean_card = card_id.strip() if card_id is not None else None
+        cutoff = timestamp - self.config.window_seconds
+
+        with self._lock:
+            self._total_evaluations += 1
+            if report.has_anomaly:
+                self._total_anomalies += 1
+
+            profile = self._device_profiles.get(clean_device)
+            if profile is None:
+                while len(self._device_profiles) >= self.config.max_devices:
+                    self._device_profiles.popitem(last=False)
+
+                profile = DeviceProfile(
+                    device_id=clean_device,
+                    first_seen_timestamp=timestamp,
+                    last_seen_timestamp=timestamp,
+                    transaction_count=1,
+                    cards_seen={clean_card} if clean_card else set(),
+                    canonical_hashes=set(),
+                    baseline_fingerprint=fingerprint,
+                    is_emulator=report.is_emulator,
+                )
+                if fingerprint is not None:
+                    profile.canonical_hashes.add(DeviceHasher.canonical_hash(fingerprint))
+                self._device_profiles[clean_device] = profile
+            else:
+                profile.last_seen_timestamp = max(profile.last_seen_timestamp, timestamp)
+                profile.transaction_count += 1
+                if clean_card:
+                    profile.cards_seen.add(clean_card)
+                if fingerprint is not None:
+                    if profile.baseline_fingerprint is None:
+                        profile.baseline_fingerprint = fingerprint
+                    profile.canonical_hashes.add(DeviceHasher.canonical_hash(fingerprint))
+                if report.is_emulator:
+                    profile.is_emulator = True
+                self._device_profiles.move_to_end(clean_device)
+
+            if clean_device not in self._device_card_events:
+                self._device_card_events[clean_device] = deque()
+            dq_dev = self._device_card_events[clean_device]
+            if clean_card:
+                dq_dev.append((timestamp, clean_card))
+            while dq_dev and dq_dev[0][0] < cutoff:
+                dq_dev.popleft()
+            self._device_card_events.move_to_end(clean_device)
+
+            if clean_card:
+                if clean_card not in self._card_device_events:
+                    self._card_device_events[clean_card] = deque()
+                dq_card = self._card_device_events[clean_card]
+                dq_card.append((timestamp, clean_device))
+                while dq_card and dq_card[0][0] < cutoff:
+                    dq_card.popleft()
+                self._card_device_events.move_to_end(clean_card)
+
+            return report
+
+    def get_profile(self, device_id: str) -> DeviceProfile | None:
+        """Retrieve the current DeviceProfile for a device ID if known."""
+        clean = device_id.strip()
+        with self._lock:
+            return self._device_profiles.get(clean)
+
+    def get_stats(self) -> dict[str, Any]:
+        """Return operational summary metrics for monitored devices and anomalies."""
+        with self._lock:
+            return {
+                "tracked_devices_count": len(self._device_profiles),
+                "tracked_cards_count": len(self._card_device_events),
+                "total_evaluations": self._total_evaluations,
+                "total_anomalies": self._total_anomalies,
+                "max_devices_capacity": self.config.max_devices,
+                "window_seconds": self.config.window_seconds,
+            }
+
+    def reset(self) -> None:
+        """Reset all in-memory tracker state and metrics."""
+        with self._lock:
+            self._device_profiles.clear()
+            self._device_card_events.clear()
+            self._card_device_events.clear()
+            self._total_evaluations = 0
+            self._total_anomalies = 0
