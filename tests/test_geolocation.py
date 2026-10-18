@@ -774,4 +774,3 @@ def test_geo_feature_extractor_coverage_edge_cases() -> None:
     # 9. GeoLocationError
     err = GeoLocationError("test geolocation error")
     assert str(err) == "test geolocation error"
-
