@@ -7,9 +7,12 @@ from typing import Any
 import pytest
 
 from fraud_detection.geolocation import (
+    DEFAULT_MAX_SPEED_KMH,
     GeoCoordinates,
     GeoLocationError,
     GeoLocationEvent,
+    TravelVelocity,
+    calculate_travel_velocity,
     haversine_distance,
 )
 
@@ -205,4 +208,110 @@ def test_geo_location_event_invalid(
             is_proxy=proxy,
             is_vpn=vpn,
             is_tor=tor,
+        )
+
+
+def test_calculate_travel_velocity_normal() -> None:
+    assert DEFAULT_MAX_SPEED_KMH == 900.0
+    # 50 km in 1 hour (3600 seconds)
+    c1 = GeoCoordinates(latitude=51.5074, longitude=-0.1278, country_code="GB", city="London")
+    # Point ~50km away
+    c2 = GeoCoordinates(latitude=51.8500, longitude=-0.1278, country_code="GB", city="Luton")
+    ev1 = GeoLocationEvent("ev1", "card-1", 1000.0, c1)
+    ev2 = GeoLocationEvent("ev2", "card-1", 4600.0, c2)
+
+    tv = calculate_travel_velocity(ev1, ev2)
+    assert tv.time_elapsed_seconds == 3600.0
+    assert 35.0 <= tv.distance_km <= 45.0
+    assert tv.velocity_kmh == pytest.approx(tv.distance_km, rel=1e-3)
+    assert tv.is_impossible_travel is False
+    assert tv.is_cross_border is False
+    assert tv.origin_country == "GB"
+    assert tv.destination_country == "GB"
+    assert tv.origin_city == "London"
+    assert tv.destination_city == "Luton"
+
+
+def test_calculate_travel_velocity_impossible() -> None:
+    # London to NYC in 1800 seconds (30 minutes)
+    c_lon = GeoCoordinates(latitude=51.5074, longitude=-0.1278, country_code="GB", city="London")
+    c_nyc = GeoCoordinates(latitude=40.7128, longitude=-74.0060, country_code="US", city="New York")
+    ev1 = GeoLocationEvent("ev1", "card-1", 1000.0, c_lon)
+    ev2 = GeoLocationEvent("ev2", "card-1", 2800.0, c_nyc)
+
+    tv = calculate_travel_velocity(ev1, ev2)
+    assert tv.time_elapsed_seconds == 1800.0
+    assert 5560.0 <= tv.distance_km <= 5585.0
+    # ~5570 km in 0.5h = ~11140 km/h > 900 km/h
+    assert tv.velocity_kmh > 900.0
+    assert tv.is_impossible_travel is True
+    assert tv.is_cross_border is True
+    assert tv.origin_country == "GB"
+    assert tv.destination_country == "US"
+
+
+def test_calculate_travel_velocity_zero_time_elapsed() -> None:
+    c1 = GeoCoordinates(latitude=51.5074, longitude=-0.1278)
+    c2 = GeoCoordinates(latitude=40.7128, longitude=-74.0060)
+    ev1 = GeoLocationEvent("ev1", "card-1", 1000.0, c1)
+    ev2 = GeoLocationEvent("ev2", "card-1", 1000.0, c2)
+
+    # Simultaneous event at different location = instantaneous teleportation
+    tv = calculate_travel_velocity(ev1, ev2)
+    assert tv.time_elapsed_seconds == 0.0
+    assert tv.is_impossible_travel is True
+
+    # Simultaneous event at identical location = valid 0 velocity
+    ev3 = GeoLocationEvent("ev3", "card-1", 1000.0, c1)
+    tv_same = calculate_travel_velocity(ev1, ev3)
+    assert tv_same.distance_km == 0.0
+    assert tv_same.velocity_kmh == 0.0
+    assert tv_same.is_impossible_travel is False
+
+
+def test_calculate_travel_velocity_causality_violation() -> None:
+    c1 = GeoCoordinates(latitude=0.0, longitude=0.0)
+    ev1 = GeoLocationEvent("ev1", "card-1", 2000.0, c1)
+    ev2 = GeoLocationEvent("ev2", "card-1", 1000.0, c1)
+
+    with pytest.raises(GeoLocationError, match="Temporal causality violation"):
+        calculate_travel_velocity(ev1, ev2)
+
+
+def test_calculate_travel_velocity_invalid_inputs() -> None:
+    c1 = GeoCoordinates(latitude=0.0, longitude=0.0)
+    ev1 = GeoLocationEvent("ev1", "card-1", 1000.0, c1)
+
+    with pytest.raises(GeoLocationError, match="must be instances of GeoLocationEvent"):
+        calculate_travel_velocity(ev1, "not-an-event")  # type: ignore[arg-type]
+
+    with pytest.raises(GeoLocationError, match="max_speed_kmh must be a positive finite float"):
+        calculate_travel_velocity(ev1, ev1, max_speed_kmh=-10.0)
+
+
+@pytest.mark.parametrize(
+    ("dist", "t_elapsed", "vel", "impossible", "cross_border", "err_msg"),
+    [
+        (-1.0, 10.0, 0.0, False, False, "distance_km must be a non-negative"),
+        (10.0, -5.0, 0.0, False, False, "time_elapsed_seconds must be a non-negative"),
+        (10.0, 10.0, -1.0, False, False, "velocity_kmh must be a non-negative"),
+        (10.0, 10.0, 10.0, "not_bool", False, "is_impossible_travel must be a boolean"),
+        (10.0, 10.0, 10.0, False, "not_bool", "is_cross_border must be a boolean"),
+    ],
+)
+def test_travel_velocity_validation_errors(
+    dist: float,
+    t_elapsed: float,
+    vel: float,
+    impossible: Any,
+    cross_border: Any,
+    err_msg: str,
+) -> None:
+    with pytest.raises(GeoLocationError, match=err_msg):
+        TravelVelocity(
+            distance_km=dist,
+            time_elapsed_seconds=t_elapsed,
+            velocity_kmh=vel,
+            is_impossible_travel=impossible,
+            is_cross_border=cross_border,
         )

@@ -135,3 +135,106 @@ class GeoLocationEvent:
             raise GeoLocationError("is_vpn must be a boolean or None.")
         if self.is_tor is not None and not isinstance(self.is_tor, bool):
             raise GeoLocationError("is_tor must be a boolean or None.")
+
+
+DEFAULT_MAX_SPEED_KMH: float = 900.0
+
+
+@dataclass(frozen=True)
+class TravelVelocity:
+    """Calculated velocity, geodesic displacement, and impossible travel assessment
+    between two events.
+    """
+
+    distance_km: float
+    time_elapsed_seconds: float
+    velocity_kmh: float
+    is_impossible_travel: bool
+    is_cross_border: bool
+    origin_country: str | None = None
+    destination_country: str | None = None
+    origin_city: str | None = None
+    destination_city: str | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.distance_km, (int, float))
+            or math.isnan(self.distance_km)
+            or math.isinf(self.distance_km)
+            or self.distance_km < 0.0
+        ):
+            raise GeoLocationError("distance_km must be a non-negative finite float.")
+        if (
+            not isinstance(self.time_elapsed_seconds, (int, float))
+            or math.isnan(self.time_elapsed_seconds)
+            or math.isinf(self.time_elapsed_seconds)
+            or self.time_elapsed_seconds < 0.0
+        ):
+            raise GeoLocationError("time_elapsed_seconds must be a non-negative finite float.")
+        if (
+            not isinstance(self.velocity_kmh, (int, float))
+            or math.isnan(self.velocity_kmh)
+            or math.isinf(self.velocity_kmh)
+            or self.velocity_kmh < 0.0
+        ):
+            raise GeoLocationError("velocity_kmh must be a non-negative finite float.")
+        if not isinstance(self.is_impossible_travel, bool):
+            raise GeoLocationError("is_impossible_travel must be a boolean.")
+        if not isinstance(self.is_cross_border, bool):
+            raise GeoLocationError("is_cross_border must be a boolean.")
+
+
+def calculate_travel_velocity(
+    prev_event: GeoLocationEvent,
+    curr_event: GeoLocationEvent,
+    max_speed_kmh: float = DEFAULT_MAX_SPEED_KMH,
+) -> TravelVelocity:
+    """Compute displacement, elapsed time, and speed of travel between two sequential events.
+
+    Raises GeoLocationError if curr_event.timestamp < prev_event.timestamp.
+    """
+    if not isinstance(prev_event, GeoLocationEvent) or not isinstance(curr_event, GeoLocationEvent):
+        raise GeoLocationError("prev_event and curr_event must be instances of GeoLocationEvent.")
+
+    if curr_event.timestamp < prev_event.timestamp:
+        raise GeoLocationError(
+            f"Temporal causality violation: curr_event timestamp ({curr_event.timestamp}) "
+            f"is earlier than prev_event timestamp ({prev_event.timestamp})."
+        )
+
+    if (
+        not isinstance(max_speed_kmh, (int, float))
+        or math.isnan(max_speed_kmh)
+        or math.isinf(max_speed_kmh)
+        or max_speed_kmh <= 0.0
+    ):
+        raise GeoLocationError("max_speed_kmh must be a positive finite float.")
+
+    distance = haversine_distance(prev_event.coordinates, curr_event.coordinates)
+    time_elapsed = float(curr_event.timestamp - prev_event.timestamp)
+
+    if time_elapsed <= 0.0:
+        velocity = 999_999.0 if distance > 0.0 else 0.0
+        is_impossible = distance > 0.0
+    else:
+        hours = time_elapsed / 3600.0
+        velocity = distance / hours
+        is_impossible = velocity > max_speed_kmh
+
+    origin_country = prev_event.coordinates.country_code
+    dest_country = curr_event.coordinates.country_code
+    is_cross_border = (
+        origin_country is not None and dest_country is not None and origin_country != dest_country
+    )
+
+    return TravelVelocity(
+        distance_km=distance,
+        time_elapsed_seconds=time_elapsed,
+        velocity_kmh=velocity,
+        is_impossible_travel=is_impossible,
+        is_cross_border=is_cross_border,
+        origin_country=origin_country,
+        destination_country=dest_country,
+        origin_city=prev_event.coordinates.city,
+        destination_city=curr_event.coordinates.city,
+    )
