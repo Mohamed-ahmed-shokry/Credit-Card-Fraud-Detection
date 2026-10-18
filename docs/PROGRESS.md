@@ -7,12 +7,12 @@
 - **Status**: In Progress
 
 ## Task Status
-- [ ] Task 1: Create `src/fraud_detection/device.py` with domain data models (`DeviceFingerprintError`, `ScreenGeometry`, `DeviceFingerprint`) and unit tests in `tests/test_device.py`.
-- [ ] Task 2: Implement `DeviceHasher`, canonical hashing, and similarity/distance metrics (`calculate_fingerprint_similarity`, `calculate_jaccard_similarity`, `calculate_hamming_distance`) in `device.py` with tests in `tests/test_device.py`.
-- [ ] Task 3: Implement `DeviceTrackerConfig`, `DeviceProfile`, `DeviceAnomalyReport`, and `DeviceTracker` in `device.py` with tests in `tests/test_device.py`.
-- [ ] Task 4: Implement `detect_emulator_signatures`, `calculate_fingerprint_entropy`, and `DeviceFeatureExtractor` in `device.py` with tests in `tests/test_device.py`.
-- [ ] Task 5: Integrate device features with `rules.py` (`build_device_emulator_rule`, `build_device_card_cycling_rule`) and `pipeline.py` (`DeviceEnrichmentStageProcessor`) with tests in `tests/test_rules.py` and `tests/test_pipeline.py`.
-- [ ] Task 6: Implement audit event builder `build_device_anomaly_audit_event` in `audit.py` with tests in `tests/test_audit.py`.
+- [x] Task 1: Create `src/fraud_detection/device.py` with domain data models (`DeviceFingerprintError`, `ScreenGeometry`, `DeviceFingerprint`) and unit tests in `tests/test_device.py`.
+- [x] Task 2: Implement `DeviceHasher`, canonical hashing, and similarity/distance metrics (`calculate_fingerprint_similarity`, `calculate_jaccard_similarity`, `calculate_hamming_distance`) in `device.py` with tests in `tests/test_device.py`.
+- [x] Task 3: Implement `DeviceTrackerConfig`, `DeviceProfile`, `DeviceAnomalyReport`, and `DeviceTracker` in `device.py` with tests in `tests/test_device.py`.
+- [x] Task 4: Implement `detect_emulator_signatures`, `calculate_fingerprint_entropy`, and `DeviceFeatureExtractor` in `device.py` with tests in `tests/test_device.py`.
+- [x] Task 5: Integrate device features with `rules.py` (`build_device_emulator_rule`, `build_device_card_cycling_rule`) and `pipeline.py` (`DeviceEnrichmentStageProcessor`) with tests in `tests/test_rules.py` and `tests/test_pipeline.py`.
+- [x] Task 6: Implement audit event builder `build_device_anomaly_audit_event` in `audit.py` with tests in `tests/test_audit.py`.
 - [ ] Task 7: Implement device API endpoints (`/v1/device/stats`, `/v1/device/profile/{device_id}`, `/v1/device/assess`, `/v1/device/reset`) and Prometheus metrics in `api.py` with tests in `tests/test_api.py`.
 - [ ] Task 8: Implement CLI commands `device-clusters` and `device-enrich` in `cli.py` with tests in `tests/test_cli.py`.
 - [ ] Task 9: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate.
@@ -20,11 +20,11 @@
 ## Acceptance Criteria Status
 | Criterion | Status | Evidence |
 |-----------|--------|----------|
-| AC-1 (Domain Models & Hash Normalization) | Pending | In progress |
-| AC-2 (Streaming Device Tracker & Anomaly Heuristics) | Pending | In progress |
-| AC-3 (Feature Extraction & Entropy Scoring) | Pending | In progress |
-| AC-4 (Pipeline & Decision Rule Integration) | Pending | In progress |
-| AC-5 (Audit Trail & Sanitization) | Pending | In progress |
+| AC-1 (Domain Models & Hash Normalization) | PASSED | Unit tests in `test_device.py` |
+| AC-2 (Streaming Device Tracker & Anomaly Heuristics) | PASSED | Unit tests in `test_device.py` |
+| AC-3 (Feature Extraction & Entropy Scoring) | PASSED | Unit tests in `test_device.py` |
+| AC-4 (Pipeline & Decision Rule Integration) | PASSED | Unit tests in `test_rules.py` and `test_pipeline.py` |
+| AC-5 (Audit Trail & Sanitization) | PASSED | Unit tests in `test_audit.py` with PAN masking & redaction |
 | AC-6 (API Serving & Telemetry) | Pending | In progress |
 | AC-7 (CLI Workflows & Gating) | Pending | In progress |
 | AC-8 (Quality Standards & 100% Green CI) | Pending | Baseline CI run 39168277715 passed 100% |
@@ -34,6 +34,7 @@
 |------|----------|-------------------------|-----------|
 | 2026-10-19 | Select Phase 40: Adaptive Device & Browser Fingerprinting with Anomaly Clustering | Client-side JS SDK or third-party device intelligence service | Zero-dependency, in-process fingerprint normalization, similarity hashing, and anomaly clustering fulfills the reference architecture mission with zero leakage and complete auditability. |
 | 2026-10-19 | Branch `phase/device-fingerprint-clustering` with draft PR #19 | Work directly on main | Isolates phase development and enables continuous remote CI validation on every push. |
+| 2026-10-19 | Refine `redact_data` key matching to skip boolean indicator flags (`is_*`) and metric counters (`*_count`) | Treat all keys containing 'card' as secrets | Prevents false-positive redaction of audit fraud flags like `is_card_cycling` and `distinct_cards_count` while preserving PAN masking and credential protection. |
 
 ## Validation Commands & Results
 - Baseline main CI: PASSED (Run 39168277715)
