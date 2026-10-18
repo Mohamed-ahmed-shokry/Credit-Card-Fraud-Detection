@@ -6897,7 +6897,10 @@ def geo_velocity(
 
     records: list[dict[str, Any]] = []
     if input_file.suffix.lower() == ".csv":
-        df = pd.read_csv(input_file)
+        try:
+            df = pd.read_csv(input_file)
+        except pd.errors.EmptyDataError:
+            _abort(f"Input file contains no transactions: {input_file}")
         if df.empty:
             _abort(f"Input file contains no transactions: {input_file}")
         records = [{str(k): v for k, v in r.items()} for r in df.to_dict(orient="records")]
@@ -7014,6 +7017,8 @@ def geo_velocity(
         vel = tracker.record_event(event)
         if vel is not None:
             v_dict = vel.to_dict()
+            v_dict["entity_id"] = entity_id
+            v_dict["event_id"] = tx_id
             evaluated_transitions.append(v_dict)
             if vel.velocity_kmh > max_speed_kmh:
                 max_speed_kmh = vel.velocity_kmh
@@ -7132,7 +7137,10 @@ def geo_enrich(
         _abort(f"Input file not found: {input_file}")
     _guard_output(output_file, overwrite)
 
-    df = pd.read_csv(input_file)
+    try:
+        df = pd.read_csv(input_file)
+    except pd.errors.EmptyDataError:
+        _abort(f"Input file contains no transactions: {input_file}")
     if df.empty:
         _abort(f"Input file contains no transactions: {input_file}")
 
