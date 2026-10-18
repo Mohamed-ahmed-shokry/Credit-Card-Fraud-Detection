@@ -1907,7 +1907,7 @@ This phase does not bundle heavy external multi-gigabyte MaxMind GeoIP binary da
 - [x] Task 8: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate.
 
 
-## Phase 40 — Adaptive Device & Browser Fingerprinting with Anomaly Clustering (In progress)
+## Phase 40 — Adaptive Device & Browser Fingerprinting with Anomaly Clustering (Done)
 
 ### Objective
 
@@ -1976,15 +1976,16 @@ This phase does not embed client-side JavaScript injection libraries or heavy br
 
 ### Micro-Task Breakdown
 
-- [ ] Task 1: Create `src/fraud_detection/device.py` with domain data models (`DeviceFingerprintError`, `ScreenGeometry`, `DeviceFingerprint`) and unit tests in `tests/test_device.py`.
-- [ ] Task 2: Implement `DeviceHasher`, canonical hashing, and similarity/distance metrics (`calculate_fingerprint_similarity`, `calculate_jaccard_similarity`, `calculate_hamming_distance`) in `device.py` with tests in `tests/test_device.py`.
-- [ ] Task 3: Implement `DeviceTrackerConfig`, `DeviceProfile`, `DeviceAnomalyReport`, and `DeviceTracker` in `device.py` with tests in `tests/test_device.py`.
-- [ ] Task 4: Implement `detect_emulator_signatures`, `calculate_fingerprint_entropy`, and `DeviceFeatureExtractor` in `device.py` with tests in `tests/test_device.py`.
-- [ ] Task 5: Integrate device features with `rules.py` (`build_device_emulator_rule`, `build_device_card_cycling_rule`) and `pipeline.py` (`DeviceEnrichmentStageProcessor`) with tests in `tests/test_rules.py` and `tests/test_pipeline.py`.
-- [ ] Task 6: Implement audit event builder `build_device_anomaly_audit_event` in `audit.py` with tests in `tests/test_audit.py`.
-- [ ] Task 7: Implement device API endpoints (`/v1/device/stats`, `/v1/device/profile/{device_id}`, `/v1/device/assess`, `/v1/device/reset`) and Prometheus metrics in `api.py` with tests in `tests/test_api.py`.
-- [ ] Task 8: Implement CLI commands `device-clusters` and `device-enrich` in `cli.py` with tests in `tests/test_cli.py`.
-- [ ] Task 9: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate.
+- [x] Task 1: Create `src/fraud_detection/device.py` with domain data models (`DeviceFingerprintError`, `ScreenGeometry`, `DeviceFingerprint`) and unit tests in `tests/test_device.py`.
+- [x] Task 2: Implement `DeviceHasher`, canonical hashing, and similarity/distance metrics (`calculate_fingerprint_similarity`, `calculate_jaccard_similarity`, `calculate_hamming_distance`) in `device.py` with tests in `tests/test_device.py`.
+- [x] Task 3: Implement `DeviceTrackerConfig`, `DeviceProfile`, `DeviceAnomalyReport`, and `DeviceTracker` in `device.py` with tests in `tests/test_device.py`.
+- [x] Task 4: Implement `detect_emulator_signatures`, `calculate_fingerprint_entropy`, and `DeviceFeatureExtractor` in `device.py` with tests in `tests/test_device.py`.
+- [x] Task 5: Integrate device features with `rules.py` (`build_device_emulator_rule`, `build_device_card_cycling_rule`) and `pipeline.py` (`DeviceEnrichmentStageProcessor`) with tests in `tests/test_rules.py` and `tests/test_pipeline.py`.
+- [x] Task 6: Implement audit event builder `build_device_anomaly_audit_event` in `audit.py` with tests in `tests/test_audit.py`.
+- [x] Task 7: Implement device API endpoints (`/v1/device/stats`, `/v1/device/profile/{device_id}`, `/v1/device/assess`, `/v1/device/reset`) and Prometheus metrics in `api.py` with tests in `tests/test_api.py`.
+- [x] Task 8: Implement CLI commands `device-clusters` and `device-enrich` in `cli.py` with tests in `tests/test_cli.py`.
+- [x] Task 9: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate.
+
 
 
 ## Contributing to the roadmap
