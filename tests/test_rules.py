@@ -366,7 +366,7 @@ def test_rule_branch_coverage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
     fake_file = tmp_path / "rules.json"
     fake_file.write_text("{}", encoding="utf-8")
 
-    def _raise_os_error(*args: Any, **kwargs: Any) -> str:
+    def _raise_os_error(*_args: object, **_kwargs: object) -> str:
         raise OSError("disk error")
 
     monkeypatch.setattr(Path, "read_text", _raise_os_error)
