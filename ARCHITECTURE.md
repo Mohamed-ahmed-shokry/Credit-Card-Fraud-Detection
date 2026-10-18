@@ -65,6 +65,7 @@ financial-services platform.
 18. `features.py` defines typed feature store abstractions (`FeatureDefinition`, `FeatureType`, `FeatureView`, `FeatureSnapshot`), thread-safe storage engines (`InMemoryFeatureStore`, `FileFeatureStore`), point-in-time time-travel as-of joins (`point_in_time_join`) with zero lookahead bias guarantee ($t_{\text{feature}} \le t_{\text{observation}}$), and statistical training-serving skew surveillance (`FeatureSkewAnalyzer`, `FeatureSkewReport`, `FeatureSkewMetric`, `SkewStatus`) evaluating Population Stability Index (PSI), Kolmogorov-Smirnov (KS) statistic, Wasserstein distance, and null rate disparity. `audit.py` records enriched features and applied views in scoring audit events. `api.py` enriches incoming prediction requests from the feature store, exposes operational telemetry endpoints (`/v1/features/stats`, `/v1/features/lookup/{entity_key}/{entity_id}`), and exports Prometheus counters (`fraud_feature_lookups_total`). `cli.py` provides `feature-join` and `feature-check` commands and adds `--feature-store` to `serve`.
 19. `pipeline.py` defines DAG-based execution of scoring decision workflows (`DecisionPipeline`, `PipelineStage`, `StageProcessor`), organizing stage dependencies into topologically ordered parallel execution waves via `asyncio.gather()`, with per-stage latency budgets, circuit breakers, node caching, speculative model inference, and fail-soft degradation.
 20. `feedback.py` defines delayed ground truth label ingestion (`DelayedLabelRecord`, `LabelIngestionStore`), point-in-time audit log matching (`MatchedFeedbackRecord`, `match_feedback_with_audit_log`, `partition_feedback_cohorts`), empirical label maturation curve modeling (`LabelMaturationCurve`, `fit_maturation_curve`) to eliminate survivor bias and immature cohort distortions, realized performance and financial cost surveillance (`RealizedMetricsReport`, `compute_realized_metrics`), and automated retraining trigger policy evaluation (`RetrainingTriggerPolicy`, `FeedbackSurveillanceAnalyzer`). `audit.py` records structured delayed label and retraining trigger audit events. `api.py` exposes `/v1/feedback/labels`, `/v1/feedback/maturation`, and `/v1/feedback/surveillance` endpoints with Prometheus counters (`fraud_feedback_labels_ingested_total`, `fraud_feedback_matched_total`, `fraud_feedback_unmatched_total`, `fraud_feedback_retraining_triggers_total`) and gauges (`fraud_feedback_realized_recall`, `fraud_feedback_realized_pr_auc`, `fraud_feedback_realized_net_financial_loss`). `cli.py` provides `ingest-labels` and `feedback-surveillance` commands.
+21. `geolocation.py` implements real-time geographic anomaly detection, spherical Haversine geodesic displacement math ($R = 6371.0\text{ km}$), speed-of-travel calculations (`TravelVelocity`, `calculate_travel_velocity`), streaming entity trajectory tracking (`GeoLocationTracker`) with thread-safe sliding-window temporal TTL eviction and capacity bounding, and in-process IP geocoding with CIDR prefix resolution and proxy/VPN/Tor classification (`IPGeoResolver`). `GeoFeatureExtractor` extracts 7 spatial features (`geo_distance_km`, `geo_speed_kmh`, `geo_time_delta_seconds`, `geo_is_impossible_travel`, `geo_is_cross_border`, `geo_is_proxy`, `geo_country_mismatch`). `rules.py` provides declarative decision heuristics (`build_impossible_travel_rule`, `build_geo_proxy_rule`), `pipeline.py` wires `GeoEnrichmentStageProcessor` into the decision DAG, `audit.py` captures structured PCI-DSS masked audit events (`build_impossible_travel_audit_event`), `api.py` exposes `/v1/geo/velocity/{entity_id}`, `/v1/geo/stats`, `/v1/geo/assess`, and `/v1/geo/reset` endpoints with Prometheus metrics (`fraud_geo_impossible_travel_total`, `fraud_geo_events_total`, `fraud_geo_distance_kilometers`), and `cli.py` provides `geo-velocity` and `geo-enrich` workflows.
 
 ## Artifact contract
 
@@ -279,6 +280,61 @@ the request and response, while the tuned artifact threshold remains visible as
 - Pipeline integration (`GraphEnrichmentStageProcessor`) enriches real-time decision graph transactions with 26+ link features, enabling downstream rules (`build_fraud_ring_rule`) to trigger immediate challenges or denies.
 - Redacted audit trail logging (`build_fraud_ring_detected_audit_event`) emits structured audit records with automated PCI-DSS compliant PAN masking for all credit card identifiers.
 - Prometheus graph telemetry tracks active entity counts by type (`fraud_graph_nodes_total`), total edges (`fraud_graph_edges_total`), detected syndicate counts by severity (`fraud_graph_rings_detected_total`), and ring detection latency histograms (`fraud_graph_ring_detection_seconds`).
+- Real-time geographic geolocation anomaly detection and velocity speed-of-travel tracking (`GeoLocationTracker`, `calculate_travel_velocity`) enforces zero-lookahead temporal causality and spherical Haversine geodesic displacement math, detecting impossible physical travel anomalies ($v > 900\text{ km/h}$) and high-risk proxy/VPN/Tor egress nodes.
+- Thread-safe sliding temporal window trajectory tracking evicts stale locations beyond the configured TTL window (default 24h) and bounds maximum entity capacity, preventing memory leaks in high-throughput streaming environments.
+- In-process IP geocoding (`IPGeoResolver`) performs deterministic longest-prefix CIDR matching against registered subnets without external network calls or binary database dependencies, resolving geographic coordinates and threat flags (`is_proxy`, `is_vpn`, `is_tor`).
+- Structured audit event emission (`build_impossible_travel_audit_event`) guarantees PCI-DSS compliant Luhn-validated PAN masking and sensitive data redaction across impossible travel incident records.
+- Pipeline integration (`GeoEnrichmentStageProcessor`) enriches real-time decision graph transactions with 7 spatial features, allowing downstream rules (`build_impossible_travel_rule`, `build_geo_proxy_rule`) to trigger immediate transaction challenges or denies.
+- Prometheus geolocation metrics track impossible travel incidents (`fraud_geo_impossible_travel_total`), processed spatial events (`fraud_geo_events_total`), and geodesic displacement histograms (`fraud_geo_distance_kilometers`).
+
+
+## Real-Time Geolocation & Velocity Travel Subsystem
+
+```mermaid
+flowchart TD
+    subgraph Ingestion ["Transaction Ingestion"]
+        TX["Transaction Record\n(lat, lon, IP, card_id, ts)"]
+    end
+
+    subgraph Resolver ["In-Process IP Geocoding"]
+        IPR["IPGeoResolver\n(CIDR Longest-Prefix Matching)"]
+        SUBNET["Registered Subnets &\nThreat Flags (Proxy/VPN/Tor)"]
+        IPR --> SUBNET
+    end
+
+    subgraph Tracker ["Trajectory Tracking Engine"]
+        GLT["GeoLocationTracker\n(Thread-Safe Sliding Window)"]
+        HIST["Entity Trajectory History\n(Bounded Capacity & 24h TTL)"]
+        GLT --> HIST
+    end
+
+    subgraph Velocity ["Geodesic Math Engine"]
+        HAV["Haversine Geodesic Math\n(R = 6371.0 km)"]
+        VEL["calculate_travel_velocity()\n(Distance, dt, Velocity km/h)"]
+        HAV --> VEL
+    end
+
+    subgraph Features ["Feature Extraction & Rules"]
+        GFE["GeoFeatureExtractor\n(7 Spatial Features)"]
+        RULES["Rules Engine\n(Impossible Travel & Proxy Rules)"]
+        GFE --> RULES
+    end
+
+    subgraph Serving ["Decision Serving & Telemetry"]
+        PIPE["Decision Pipeline DAG\n(GeoEnrichmentStageProcessor)"]
+        AUDIT["Structured Audit Trail\n(PCI-DSS Luhn Masked)"]
+        PROM["Prometheus Telemetry\n(Travel Metrics & Counters)"]
+    end
+
+    TX --> IPR
+    TX --> GLT
+    IPR --> GFE
+    GLT --> VEL
+    VEL --> GFE
+    GFE --> PIPE
+    RULES --> AUDIT
+    PIPE --> PROM
+```
 
 
 ## Extension guidance
