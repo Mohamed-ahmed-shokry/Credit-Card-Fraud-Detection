@@ -92,3 +92,46 @@ def haversine_distance(coord1: GeoCoordinates, coord2: GeoCoordinates) -> float:
     c = 2.0 * math.atan2(math.sqrt(a), math.sqrt(max(0.0, 1.0 - a)))
 
     return EARTH_RADIUS_KM * c
+
+
+@dataclass(frozen=True)
+class GeoLocationEvent:
+    """Represents a timestamped geolocation event tied to a transaction or entity."""
+
+    event_id: str
+    entity_id: str
+    timestamp: float
+    coordinates: GeoCoordinates
+    ip_address: str | None = None
+    asn: int | None = None
+    is_proxy: bool | None = None
+    is_vpn: bool | None = None
+    is_tor: bool | None = None
+
+    def __post_init__(self) -> None:
+        if not self.event_id or not isinstance(self.event_id, str):
+            raise GeoLocationError("event_id must be a non-empty string.")
+        if not self.entity_id or not isinstance(self.entity_id, str):
+            raise GeoLocationError("entity_id must be a non-empty string.")
+        if (
+            not isinstance(self.timestamp, (int, float))
+            or math.isnan(self.timestamp)
+            or math.isinf(self.timestamp)
+        ):
+            raise GeoLocationError("timestamp must be a finite float.")
+        if not isinstance(self.coordinates, GeoCoordinates):
+            raise GeoLocationError("coordinates must be an instance of GeoCoordinates.")
+        if self.ip_address is not None and (
+            not isinstance(self.ip_address, str) or not self.ip_address.strip()
+        ):
+            raise GeoLocationError("ip_address must be a non-empty string or None.")
+        if self.asn is not None and (
+            not isinstance(self.asn, int) or isinstance(self.asn, bool) or self.asn < 0
+        ):
+            raise GeoLocationError("asn must be a non-negative integer or None.")
+        if self.is_proxy is not None and not isinstance(self.is_proxy, bool):
+            raise GeoLocationError("is_proxy must be a boolean or None.")
+        if self.is_vpn is not None and not isinstance(self.is_vpn, bool):
+            raise GeoLocationError("is_vpn must be a boolean or None.")
+        if self.is_tor is not None and not isinstance(self.is_tor, bool):
+            raise GeoLocationError("is_tor must be a boolean or None.")

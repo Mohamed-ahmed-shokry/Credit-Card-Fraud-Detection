@@ -2,9 +2,16 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
-from fraud_detection.geolocation import GeoCoordinates, GeoLocationError, haversine_distance
+from fraud_detection.geolocation import (
+    GeoCoordinates,
+    GeoLocationError,
+    GeoLocationEvent,
+    haversine_distance,
+)
 
 
 def test_geo_coordinates_valid() -> None:
@@ -91,3 +98,111 @@ def test_haversine_distance_invalid_type() -> None:
     pt = GeoCoordinates(latitude=0.0, longitude=0.0)
     with pytest.raises(GeoLocationError, match="must be instances of GeoCoordinates"):
         haversine_distance(pt, "not-a-coord")  # type: ignore[arg-type]
+
+
+def test_geo_location_event_valid() -> None:
+    coord = GeoCoordinates(latitude=51.5074, longitude=-0.1278, country_code="GB")
+    event = GeoLocationEvent(
+        event_id="evt-101",
+        entity_id="card-999",
+        timestamp=1000.0,
+        coordinates=coord,
+        ip_address="198.51.100.1",
+        asn=13335,
+        is_proxy=False,
+        is_vpn=False,
+        is_tor=False,
+    )
+    assert event.event_id == "evt-101"
+    assert event.entity_id == "card-999"
+    assert event.timestamp == 1000.0
+    assert event.coordinates == coord
+    assert event.ip_address == "198.51.100.1"
+    assert event.asn == 13335
+    assert event.is_proxy is False
+    assert event.is_vpn is False
+    assert event.is_tor is False
+
+
+@pytest.mark.parametrize(
+    ("evt_id", "ent_id", "ts", "coords", "ip", "asn", "proxy", "vpn", "tor", "err_msg"),
+    [
+        ("", "e1", 100.0, GeoCoordinates(0.0, 0.0), None, None, None, None, None, "event_id"),
+        ("ev1", "", 100.0, GeoCoordinates(0.0, 0.0), None, None, None, None, None, "entity_id"),
+        (
+            "ev1",
+            "e1",
+            float("nan"),
+            GeoCoordinates(0.0, 0.0),
+            None,
+            None,
+            None,
+            None,
+            None,
+            "timestamp",
+        ),
+        ("ev1", "e1", 100.0, "not_coord", None, None, None, None, None, "coordinates"),
+        ("ev1", "e1", 100.0, GeoCoordinates(0.0, 0.0), "", None, None, None, None, "ip_address"),
+        ("ev1", "e1", 100.0, GeoCoordinates(0.0, 0.0), None, -5, None, None, None, "asn"),
+        (
+            "ev1",
+            "e1",
+            100.0,
+            GeoCoordinates(0.0, 0.0),
+            None,
+            None,
+            "not_bool",
+            None,
+            None,
+            "is_proxy",
+        ),
+        (
+            "ev1",
+            "e1",
+            100.0,
+            GeoCoordinates(0.0, 0.0),
+            None,
+            None,
+            None,
+            "not_bool",
+            None,
+            "is_vpn",
+        ),
+        (
+            "ev1",
+            "e1",
+            100.0,
+            GeoCoordinates(0.0, 0.0),
+            None,
+            None,
+            None,
+            None,
+            "not_bool",
+            "is_tor",
+        ),
+    ],
+)
+def test_geo_location_event_invalid(
+    evt_id: str,
+    ent_id: str,
+    ts: float,
+    coords: Any,
+    ip: str | None,
+    asn: int | None,
+    proxy: Any,
+    vpn: Any,
+    tor: Any,
+    err_msg: str,
+) -> None:
+    with pytest.raises(GeoLocationError, match=err_msg):
+        GeoLocationEvent(
+            event_id=evt_id,
+            entity_id=ent_id,
+            timestamp=ts,
+            coordinates=coords,
+            ip_address=ip,
+            asn=asn,
+            is_proxy=proxy,
+            is_vpn=vpn,
+            is_tor=tor,
+        )
