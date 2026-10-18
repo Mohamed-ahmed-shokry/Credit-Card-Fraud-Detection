@@ -1720,7 +1720,45 @@ FastAPI endpoints surface real-time trajectory velocity and operational status:
 - `POST /v1/geo/assess`: Evaluate candidate location event without updating entity history.
 - `POST /v1/geo/reset`: Reset tracked entity trajectories.
 
+## Adaptive device and browser fingerprinting with anomaly clustering
+
+Online payments and account takeovers frequently involve credential stuffing, automated bots, card cycling, and device spoofing. The adaptive device fingerprinting subsystem captures client hardware attributes (screen geometry, concurrency, memory), rendering contexts (Canvas and WebGL hashes), audio contexts, and platform metadata without storing raw identifiers. It computes deterministic canonical SHA-256 hashes for identity and 64/128-bit SimHash bit-vectors for fuzzy clustering and device drift detection:
+
+```bash
+# Analyze transaction datasets for device card cycling, emulator bots, and fingerprint drift
+fraud-detect device-clusters \
+  --input-file data/transactions.csv \
+  --output reports/device_clusters.json \
+  --card-cycling-threshold 3 \
+  --device-cycling-threshold 3 \
+  --window-seconds 86400 \
+  --fail-on-anomaly \
+  --json
+
+# Enrich transaction datasets with 7 streaming device features sequentially without lookahead bias
+fraud-detect device-enrich \
+  --input-file data/transactions.csv \
+  --output-file data/enriched_device.csv \
+  --format csv
+```
+
+Enriched features include:
+- `device_seen_count`: Cumulative transactions recorded for this device profile.
+- `device_distinct_cards_24h`: Number of distinct payment cards associated with this device in the sliding window.
+- `device_card_distinct_devices_24h`: Number of distinct devices associated with this card in the sliding window.
+- `device_is_emulator`: Binary indicator for automated webdriver or headless emulator runtime signatures.
+- `device_entropy_score`: Shannon entropy metric measuring the information diversity of client attributes.
+- `device_is_card_cycling`: Flag indicating distinct cards exceeding the threshold on a single device.
+- `device_is_device_cycling`: Flag indicating distinct devices exceeding the threshold on a single card.
+
+FastAPI endpoints surface real-time device tracking and anomaly assessment:
+- `GET /v1/device/stats`: Return operational capacity, tracked devices, cards, and detected anomalies.
+- `GET /v1/device/profile/{device_id}`: Retrieve current device profile, baseline fingerprint, and card associations.
+- `POST /v1/device/assess`: Evaluate candidate transaction fingerprint without updating tracker state.
+- `POST /v1/device/reset`: Reset tracked device profiles and sliding windows.
+
 ## Reference label-delay analysis
+
 
 Chargeback and fraud labels often arrive days or weeks after the transaction
 date. If a hold-out evaluation uses a naive random split, late-arriving labels
@@ -1759,7 +1797,9 @@ src/fraud_detection/
 ├── audit.py          # structured JSONL audit logs with Luhn PAN redaction and log replay
 ├── cli.py            # training, comparison, surveillance, profiling, simulation, and serving CLI
 ├── data.py           # ingestion, schema validation, and synthetic data
+├── device.py         # adaptive browser/device fingerprinting, simhash clustering, and bot detection
 ├── drift.py          # multi-window drift surveillance and streaming quantile profiler
+
 ├── edge.py           # dependency-light quantized logistic runtime
 ├── evaluation.py     # threshold tuning, imbalance-aware metrics, and calibration reports
 ├── explanations.py   # isolated explanation provider protocols and cost controls
