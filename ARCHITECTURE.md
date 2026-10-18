@@ -286,6 +286,15 @@ the request and response, while the tuned artifact threshold remains visible as
 - Structured audit event emission (`build_impossible_travel_audit_event`) guarantees PCI-DSS compliant Luhn-validated PAN masking and sensitive data redaction across impossible travel incident records.
 - Pipeline integration (`GeoEnrichmentStageProcessor`) enriches real-time decision graph transactions with 7 spatial features, allowing downstream rules (`build_impossible_travel_rule`, `build_geo_proxy_rule`) to trigger immediate transaction challenges or denies.
 - Prometheus geolocation metrics track impossible travel incidents (`fraud_geo_impossible_travel_total`), processed spatial events (`fraud_geo_events_total`), and geodesic displacement histograms (`fraud_geo_distance_kilometers`).
+- Real-time adaptive device and browser fingerprinting subsystem (`DeviceFingerprint`, `ScreenGeometry`, `DeviceHasher`, `DeviceTracker`) provides deterministic canonical SHA-256 and locality-sensitive SimHash computation for fuzzy device clustering and drift detection.
+- Multi-attribute composite similarity calculation (`calculate_fingerprint_similarity`) weights hardware concurrency, memory ratios, screen dimensions, WebGL vendor/renderer strings, Canvas/Audio hashes, and OS/browser families into a calibrated stability score in $[0.0, 1.0]$.
+- Thread-safe sliding temporal window device tracking (`DeviceTracker`) detects card cycling (multiple cards on one device) and device cycling (multiple devices on one card) across a configurable lookback window with bounded LRU eviction.
+- Automated emulator and bot detection heuristics (`detect_emulator_signatures`) inspect user agents for headless automation frameworks (HeadlessChrome, Puppeteer, Selenium, Playwright), explicit webdriver flags, unrealistic hardware configurations, and desktop environments lacking WebGL/Canvas contexts.
+- Shannon entropy scoring (`calculate_fingerprint_entropy`) calculates information-theoretic diversity scores over normalized attribute distributions, identifying low-entropy synthetic or automated browser profiles.
+- Pipeline graph integration (`DeviceEnrichmentStageProcessor`) enriches real-time decision graph transactions with 7 device features, enabling downstream rules (`build_device_emulator_rule`, `build_device_card_cycling_rule`) to trigger immediate challenges or denies.
+- Redacted audit trail logging (`build_device_anomaly_audit_event`) emits structured audit records with automated PCI-DSS compliant PAN masking for all credit card numbers.
+- Prometheus device telemetry tracks total device evaluations (`fraud_device_evaluations_total`), detected anomalies by severity (`fraud_device_anomalies_total`), and composite fingerprint similarity histograms (`fraud_device_similarity_score`).
+
 
 
 ## Real-Time Geolocation & Velocity Travel Subsystem
@@ -337,7 +346,57 @@ flowchart TD
 ```
 
 
+## Adaptive Device & Browser Fingerprinting Subsystem
+
+```mermaid
+flowchart TD
+    subgraph Ingestion ["Client Ingestion"]
+        FP_IN["Transaction & Device Payload\n(UA, Canvas, WebGL, Screen, Audio, Cores, Memory)"]
+    end
+
+    subgraph Hasher ["Hashing & Normalization Engine"]
+        DH["DeviceHasher\n(SHA-256 Canonical & 64/128-bit SimHash)"]
+        ENTROPY["calculate_fingerprint_entropy()\n(Shannon Diversity Metric)"]
+        EMU["detect_emulator_signatures()\n(Automation & Bot Heuristics)"]
+        FP_IN --> DH
+        FP_IN --> ENTROPY
+        FP_IN --> EMU
+    end
+
+    subgraph Tracker ["Streaming Device & Cycling Tracker"]
+        DT["DeviceTracker\n(Thread-Safe Sliding Windows)"]
+        PROF["DeviceProfile & Baselines\n(Multi-Attribute Similarity Scoring)"]
+        DEV_WIN["Device-to-Card Sliding Window\n(Card-Cycling Ring Detection)"]
+        CARD_WIN["Card-to-Device Sliding Window\n(Device-Cycling Detection)"]
+        DT --> PROF
+        DT --> DEV_WIN
+        DT --> CARD_WIN
+    end
+
+    subgraph Pipeline ["Decision Pipeline DAG"]
+        STAGE["DeviceEnrichmentStageProcessor\n(7 Structured Device Features)"]
+        RULES["Rules Engine\n(Emulator & Card-Cycling Rules)"]
+        STAGE --> RULES
+    end
+
+    subgraph Telemetry ["Observability & Serving"]
+        API["REST API\n(/v1/device/stats, /assess, /profile)"]
+        AUDIT["Structured Audit Trail\n(PCI-DSS Redacted PANs)"]
+        PROM["Prometheus Telemetry\n(Evaluations, Anomalies, Drift Scores)"]
+    end
+
+    DH --> DT
+    ENTROPY --> STAGE
+    EMU --> DT
+    DT --> STAGE
+    STAGE --> API
+    RULES --> AUDIT
+    DT --> PROM
+```
+
+
 ## Extension guidance
+
 
 New estimators should be added through `EstimatorType` and `_build_base_estimator`
 so calibration, splitting, evaluation, artifact validation, and explanations
