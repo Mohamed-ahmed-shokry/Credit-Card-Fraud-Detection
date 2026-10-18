@@ -59,3 +59,36 @@ class GeoCoordinates:
             not isinstance(self.postal_code, str) or not self.postal_code.strip()
         ):
             raise GeoLocationError("postal_code must be a non-empty string or None.")
+
+
+EARTH_RADIUS_KM: float = 6371.0088
+
+
+def haversine_distance(coord1: GeoCoordinates, coord2: GeoCoordinates) -> float:
+    """Calculate the great-circle distance between two geographic coordinates in kilometers.
+
+    Uses the spherical law of haversines with WGS 84 mean Earth radius (6,371.0088 km).
+    Numerically bounded to prevent domain errors on antipodal or identical coordinates.
+    """
+    if not isinstance(coord1, GeoCoordinates) or not isinstance(coord2, GeoCoordinates):
+        raise GeoLocationError("coord1 and coord2 must be instances of GeoCoordinates.")
+
+    if coord1.latitude == coord2.latitude and coord1.longitude == coord2.longitude:
+        return 0.0
+
+    lat1_rad = math.radians(coord1.latitude)
+    lat2_rad = math.radians(coord2.latitude)
+    dlat_rad = math.radians(coord2.latitude - coord1.latitude)
+    dlon_rad = math.radians(coord2.longitude - coord1.longitude)
+
+    sin_half_dlat = math.sin(dlat_rad / 2.0)
+    sin_half_dlon = math.sin(dlon_rad / 2.0)
+
+    a = sin_half_dlat * sin_half_dlat + math.cos(lat1_rad) * math.cos(lat2_rad) * (
+        sin_half_dlon * sin_half_dlon
+    )
+    # Clip numerical precision drift to strictly valid domain [0.0, 1.0]
+    a = max(0.0, min(1.0, a))
+    c = 2.0 * math.atan2(math.sqrt(a), math.sqrt(max(0.0, 1.0 - a)))
+
+    return EARTH_RADIUS_KM * c

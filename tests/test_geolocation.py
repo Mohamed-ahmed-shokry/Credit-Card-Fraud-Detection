@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from fraud_detection.geolocation import GeoCoordinates, GeoLocationError
+from fraud_detection.geolocation import GeoCoordinates, GeoLocationError, haversine_distance
 
 
 def test_geo_coordinates_valid() -> None:
@@ -57,3 +57,37 @@ def test_geo_coordinates_validation_errors(
             city=city,
             postal_code=postal,
         )
+
+
+def test_haversine_distance_identical_points() -> None:
+    pt = GeoCoordinates(latitude=40.7128, longitude=-74.0060)
+    assert haversine_distance(pt, pt) == 0.0
+
+
+def test_haversine_distance_known_routes() -> None:
+    # London (51.5074, -0.1278) to New York (40.7128, -74.0060) ~ 5570 km
+    london = GeoCoordinates(latitude=51.5074, longitude=-0.1278)
+    nyc = GeoCoordinates(latitude=40.7128, longitude=-74.0060)
+    dist_lon_nyc = haversine_distance(london, nyc)
+    assert 5560.0 <= dist_lon_nyc <= 5585.0
+
+    # Symmetry check: d(A, B) == d(B, A)
+    assert haversine_distance(nyc, london) == pytest.approx(dist_lon_nyc, rel=1e-6)
+
+    # North Pole to South Pole ~ 20015 km
+    north_pole = GeoCoordinates(latitude=90.0, longitude=0.0)
+    south_pole = GeoCoordinates(latitude=-90.0, longitude=0.0)
+    dist_poles = haversine_distance(north_pole, south_pole)
+    assert 20000.0 <= dist_poles <= 20030.0
+
+    # Antipodal points on equator
+    eq1 = GeoCoordinates(latitude=0.0, longitude=0.0)
+    eq2 = GeoCoordinates(latitude=0.0, longitude=180.0)
+    dist_anti = haversine_distance(eq1, eq2)
+    assert 20000.0 <= dist_anti <= 20030.0
+
+
+def test_haversine_distance_invalid_type() -> None:
+    pt = GeoCoordinates(latitude=0.0, longitude=0.0)
+    with pytest.raises(GeoLocationError, match="must be instances of GeoCoordinates"):
+        haversine_distance(pt, "not-a-coord")  # type: ignore[arg-type]
