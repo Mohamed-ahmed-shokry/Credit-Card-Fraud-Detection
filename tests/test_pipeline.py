@@ -11,6 +11,7 @@ from typing import Any
 import pytest
 
 from fraud_detection.data import generate_synthetic_data, validate_frame
+from fraud_detection.device import DeviceTracker
 from fraud_detection.evaluation import TieredThresholds
 from fraud_detection.features import (
     FeatureDefinition,
@@ -32,6 +33,7 @@ from fraud_detection.pipeline import (
     CalibrationStageProcessor,
     DecisionGraph,
     DecisionGraphExecutor,
+    DeviceEnrichmentStageProcessor,
     EnrichmentStageProcessor,
     GeoEnrichmentStageProcessor,
     GraphEnrichmentStage,
@@ -75,6 +77,7 @@ from fraud_detection.rules import (
     RuleOperator,
     RulePrecedence,
     RuleSet,
+    build_device_emulator_rule,
     build_impossible_travel_rule,
 )
 from fraud_detection.velocity import VelocityConfig, VelocityWindow, VelocityWindowBuffer
@@ -2084,3 +2087,55 @@ def test_create_default_fraud_pipeline_with_geolocation() -> None:
     assert res2.decision == "DENY"
     assert res2.rule_action == "DENY"
     assert res2.matched_rule == "RULE_IMPOSSIBLE_TRAVEL_DENY"
+
+
+def test_device_enrichment_stage_in_pipeline() -> None:
+    df = validate_frame(generate_synthetic_data(rows=300, fraud_rate=0.1, random_state=42))
+    model = train_model(df)
+    tracker = DeviceTracker()
+
+    device_rule = build_device_emulator_rule()
+    ruleset = RuleSet((device_rule,))
+
+    pipeline = create_default_fraud_pipeline(
+        model=model,
+        rules=ruleset,
+        device_tracker=tracker,
+    )
+
+    # 1. Normal clean transaction
+    tx1: dict[str, Any] = {str(k): v for k, v in df.features.iloc[0].to_dict().items()}
+    tx1["device_id"] = "dev_human_user"
+    tx1["card_id"] = "card_device_test"
+    tx1["user_agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/119.0"
+
+    executor = DecisionGraphExecutor(pipeline)
+    res1 = executor.execute_sync(tx1)
+    assert res1.stage_results["device_enrichment"].status == StageStatus.SUCCESS
+    assert res1.stage_results["device_enrichment"].output["device_is_emulator"] is False
+
+    # 2. Headless webdriver bot transaction -> DENY by rule
+    tx2: dict[str, Any] = {str(k): v for k, v in df.features.iloc[1].to_dict().items()}
+    tx2["device_id"] = "dev_bot_user"
+    tx2["card_id"] = "card_device_test_2"
+    tx2["user_agent"] = "Mozilla/5.0 HeadlessChrome/120.0"
+    tx2["has_webdriver"] = True
+
+    res2 = executor.execute_sync(tx2)
+    assert res2.stage_results["device_enrichment"].status == StageStatus.SUCCESS
+    assert res2.stage_results["device_enrichment"].output["device_is_emulator"] is True
+    assert res2.decision == "DENY"
+    assert res2.rule_action == "DENY"
+    assert res2.matched_rule == "RULE_DEVICE_EMULATOR_DENY"
+
+
+def test_device_enrichment_stage_processor_direct() -> None:
+    tracker = DeviceTracker()
+    proc = DeviceEnrichmentStageProcessor(tracker=tracker)
+    ctx = PipelineContext(
+        transaction={"transaction_id": "tx_dev_1", "device_id": "d1", "card_id": "c1"},
+    )
+    output = proc(ctx)
+    assert "device_features" in output
+    assert "device_features" in ctx.metadata
+    assert ctx.transaction["device_seen_count"] == 1.0

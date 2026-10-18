@@ -787,9 +787,10 @@ def detect_emulator_signatures(fp: DeviceFingerprint) -> tuple[bool, tuple[str, 
     ):
         reasons.append("Mobile user agent reported without touch capability.")
 
-    # Desktop user agent without WebGL or Canvas rendering subsystem
+    # Desktop client with reported screen but completely missing WebGL and Canvas
     if (
-        any(d in ua_lower for d in ("windows", "macintosh", "x11", "linux"))
+        fp.screen is not None
+        and any(d in ua_lower for d in ("windows", "macintosh", "x11", "linux"))
         and not any(m in ua_lower for m in ("android", "iphone", "mobile"))
         and not fp.canvas_hash
         and not fp.webgl_vendor
