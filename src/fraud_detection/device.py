@@ -268,14 +268,17 @@ def calculate_jaccard_similarity(
     items2: Sequence[str] | Set[str],
 ) -> float:
     """Calculate Jaccard similarity coefficient between two token collections in [0.0, 1.0]."""
-    set1 = set(items1)
-    set2 = set(items2)
+    try:
+        set1 = set(items1)
+        set2 = set(items2)
+    except (TypeError, ValueError) as exc:
+        raise DeviceFingerprintError(
+            f"items1 and items2 must be iterable collections: {exc}"
+        ) from exc
     if not set1 and not set2:
         return 1.0
     intersection = len(set1 & set2)
     union = len(set1 | set2)
-    if union == 0:
-        return 1.0
     return float(intersection / union)
 
 
@@ -773,12 +776,9 @@ def detect_emulator_signatures(fp: DeviceFingerprint) -> tuple[bool, tuple[str, 
             reasons.append(f"Automated browser/emulator signature '{pattern}' found in user-agent.")
             break
 
-    if fp.screen is not None:
-        if fp.screen.width < 300 or fp.screen.height < 300:
-            dims = f"{fp.screen.width}x{fp.screen.height}"
-            reasons.append(f"Suspicious screen dimensions {dims} below realistic bounds.")
-        if fp.screen.pixel_ratio <= 0.0:
-            reasons.append("Invalid or zero device pixel ratio reported.")
+    if fp.screen is not None and (fp.screen.width < 300 or fp.screen.height < 300):
+        dims = f"{fp.screen.width}x{fp.screen.height}"
+        reasons.append(f"Suspicious screen dimensions {dims} below realistic bounds.")
 
     if fp.hardware_concurrency == 0:
         reasons.append("Hardware concurrency reported as 0 logical cores.")
@@ -832,10 +832,8 @@ def calculate_fingerprint_entropy(fp: DeviceFingerprint) -> float:
     ]
 
     combined = "|".join(tokens)
-    if not combined:
-        return 0.0
-
     char_counts: dict[str, int] = {}
+
     for ch in combined:
         char_counts[ch] = char_counts.get(ch, 0) + 1
 
@@ -876,6 +874,9 @@ class DeviceFeatureExtractor:
         mutate_tracker: bool = True,
     ) -> dict[str, float]:
         """Extract structured features from transaction record dictionary."""
+        if not isinstance(record, Mapping):
+            raise DeviceFingerprintError("record must be a Mapping.")
+
         fp: DeviceFingerprint | None = None
         raw_fp = record.get("fingerprint", record.get("device_fingerprint"))
         if isinstance(raw_fp, DeviceFingerprint):
@@ -983,3 +984,11 @@ class DeviceFeatureExtractor:
             "device_is_card_cycling": 1.0 if report.is_card_cycling else 0.0,
             "device_is_device_cycling": 1.0 if report.is_device_cycling else 0.0,
         }
+
+    def extract_batch(
+        self,
+        records: Sequence[Mapping[str, Any]],
+        mutate_tracker: bool = True,
+    ) -> list[dict[str, float]]:
+        """Extract structured device features for a sequence of transaction records."""
+        return [self.extract_features(r, mutate_tracker=mutate_tracker) for r in records]

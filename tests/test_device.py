@@ -483,3 +483,367 @@ def test_device_feature_extractor() -> None:
     )
     assert feats_cycle["device_is_card_cycling"] == 1.0
     assert feats_cycle["device_distinct_cards_24h"] == 3.0
+
+
+def test_device_validation_and_edge_cases() -> None:
+    # ScreenGeometry from_dict with ScreenGeometry instance
+    sg = ScreenGeometry(1920, 1080)
+    fp_with_sg = DeviceFingerprint.from_dict({"device_id": "d1", "screen": sg})
+    assert fp_with_sg.screen == sg
+
+    # DeviceFingerprint invalid types
+    with pytest.raises(
+        DeviceFingerprintError, match="device_id must be a non-empty string or None"
+    ):
+        DeviceFingerprint(device_id="")
+    with pytest.raises(DeviceFingerprintError, match="user_agent must be a string"):
+        DeviceFingerprint(user_agent=123)  # type: ignore[arg-type]
+    with pytest.raises(DeviceFingerprintError, match="os_platform must be a string"):
+        DeviceFingerprint(os_platform=123)  # type: ignore[arg-type]
+    with pytest.raises(DeviceFingerprintError, match="browser_family must be a string"):
+        DeviceFingerprint(browser_family=123)  # type: ignore[arg-type]
+    with pytest.raises(
+        DeviceFingerprintError, match="screen must be a ScreenGeometry instance or None"
+    ):
+        DeviceFingerprint(screen="invalid")  # type: ignore[arg-type]
+    with pytest.raises(DeviceFingerprintError, match="language must be a string"):
+        DeviceFingerprint(language=123)  # type: ignore[arg-type]
+    with pytest.raises(DeviceFingerprintError, match="webgl_vendor must be a string"):
+        DeviceFingerprint(webgl_vendor=123)  # type: ignore[arg-type]
+    with pytest.raises(DeviceFingerprintError, match="webgl_renderer must be a string"):
+        DeviceFingerprint(webgl_renderer=123)  # type: ignore[arg-type]
+    with pytest.raises(DeviceFingerprintError, match="canvas_hash must be a string"):
+        DeviceFingerprint(canvas_hash=123)  # type: ignore[arg-type]
+    with pytest.raises(DeviceFingerprintError, match="audio_hash must be a string"):
+        DeviceFingerprint(audio_hash=123)  # type: ignore[arg-type]
+    with pytest.raises(DeviceFingerprintError, match="is_touch_capable must be a boolean"):
+        DeviceFingerprint(is_touch_capable="yes")  # type: ignore[arg-type]
+    with pytest.raises(DeviceFingerprintError, match="has_webdriver must be a boolean"):
+        DeviceFingerprint(has_webdriver="yes")  # type: ignore[arg-type]
+
+    # DeviceHasher type checks
+    with pytest.raises(DeviceFingerprintError, match="fp must be an instance of DeviceFingerprint"):
+        DeviceHasher.canonical_hash("not_fp")  # type: ignore[arg-type]
+    with pytest.raises(DeviceFingerprintError, match="fp must be an instance of DeviceFingerprint"):
+        DeviceHasher.simhash("not_fp")  # type: ignore[arg-type]
+    with pytest.raises(DeviceFingerprintError, match="hash_bits must be either 64 or 128"):
+        DeviceHasher.simhash(DeviceFingerprint(), hash_bits=32)
+
+    # Jaccard / similarity / hamming type checks
+    with pytest.raises(DeviceFingerprintError, match="hex1 and hex2 must be strings"):
+        calculate_hamming_distance(123, "abc")  # type: ignore[arg-type]
+    with pytest.raises(DeviceFingerprintError, match="items1 and items2 must be iterable"):
+        calculate_jaccard_similarity(123, "abc")  # type: ignore[arg-type]
+    with pytest.raises(
+        DeviceFingerprintError, match="fp1 and fp2 must be instances of DeviceFingerprint"
+    ):
+        calculate_fingerprint_similarity("fp1", DeviceFingerprint())  # type: ignore[arg-type]
+
+
+def test_device_similarity_branch_coverage() -> None:
+    # 1. Both screens None
+    fp1 = DeviceFingerprint(
+        hardware_concurrency=4,
+        device_memory_gb=8.0,
+        screen=None,
+        webgl_vendor="Google Inc.",
+        webgl_renderer="ANGLE",
+        canvas_hash="canvas_1",
+        audio_hash="audio_1",
+        language="en-US",
+        timezone_offset_minutes=-300,
+    )
+    fp2 = DeviceFingerprint(
+        hardware_concurrency=8,
+        device_memory_gb=16.0,
+        screen=None,
+        webgl_vendor="Google Inc.",
+        webgl_renderer="ANGLE",
+        canvas_hash="canvas_1",
+        audio_hash="audio_1",
+        language="en-GB",
+        timezone_offset_minutes=-360,
+    )
+    sim1 = calculate_fingerprint_similarity(fp1, fp2)
+    assert 0.0 < sim1 < 1.0
+
+    # 2. Timezone diff between 60 and 180
+    fp3 = DeviceFingerprint(timezone_offset_minutes=0)
+    fp4 = DeviceFingerprint(timezone_offset_minutes=120)
+    sim_tz = calculate_fingerprint_similarity(fp3, fp4)
+    assert sim_tz > 0.0
+
+    # 3. Differing canvas/audio/renderer
+    fp5 = DeviceFingerprint(
+        webgl_vendor="VendorA",
+        webgl_renderer="RendererA",
+        canvas_hash="canvas_A",
+        audio_hash="audio_A",
+    )
+    fp6 = DeviceFingerprint(
+        webgl_vendor="VendorB",
+        webgl_renderer="RendererB",
+        canvas_hash="canvas_B",
+        audio_hash="audio_B",
+    )
+    sim_diff = calculate_fingerprint_similarity(fp5, fp6)
+    assert sim_diff <= 0.70
+
+
+def test_device_tracker_eviction_and_drift() -> None:
+    cfg = DeviceTrackerConfig(
+        window_seconds=10.0,
+        card_cycling_threshold=2,
+        device_cycling_threshold=2,
+        min_similarity_threshold=0.8,
+    )
+    tracker = DeviceTracker(config=cfg)
+
+    # Invalid input arguments
+    with pytest.raises(DeviceFingerprintError, match="device_id must be a non-empty string"):
+        tracker.assess_event("  ", "card1", 100.0)
+    with pytest.raises(DeviceFingerprintError, match="card_id must be a non-empty string or None"):
+        tracker.assess_event("dev1", "  ", 100.0)
+    with pytest.raises(DeviceFingerprintError, match="timestamp must be a finite float"):
+        tracker.assess_event("dev1", "card1", float("nan"))
+
+    # Initial record without card
+    fp_base = DeviceFingerprint(
+        device_id="dev_drift",
+        hardware_concurrency=8,
+        device_memory_gb=16.0,
+        canvas_hash="canvas_orig",
+        audio_hash="audio_orig",
+    )
+    r1 = tracker.record_event("dev_drift", None, 100.0, fp_base)
+    assert r1.severity == "LOW"
+
+    # Profile to_dict and AnomalyReport to_dict
+    prof = tracker.get_profile("dev_drift")
+    assert prof is not None
+    p_dict = prof.to_dict()
+    assert p_dict["device_id"] == "dev_drift"
+    rep_dict = r1.to_dict()
+    assert rep_dict["device_id"] == "dev_drift"
+
+    # Second event with radically different fingerprint -> drift
+    fp_drifted = DeviceFingerprint(
+        device_id="dev_drift",
+        hardware_concurrency=2,
+        device_memory_gb=2.0,
+        canvas_hash="canvas_other",
+        audio_hash="audio_other",
+        os_platform="FreeBSD",
+        language="zh-CN",
+    )
+    r2 = tracker.record_event("dev_drift", "c1", 105.0, fp_drifted)
+    assert r2.is_fingerprint_drift is True
+    assert "regressed below" in r2.reasons[0]
+
+    # Time expiration outside window_seconds (t=125 > 105 + 10)
+    r3 = tracker.record_event("dev_drift", "c2", 125.0)
+    assert r3.distinct_cards_count == 1  # previous card expired from sliding window
+
+
+def test_emulator_heuristics_all_branches() -> None:
+    # Invalid argument
+    with pytest.raises(DeviceFingerprintError, match="fp must be an instance of DeviceFingerprint"):
+        detect_emulator_signatures("not_a_fp")  # type: ignore[arg-type]
+
+    # 1. Screen size suspicious
+    fp_zero_screen = DeviceFingerprint(
+        user_agent="Mozilla/5.0",
+        screen=ScreenGeometry(width=10, height=10),
+    )
+    is_emu, reasons = detect_emulator_signatures(fp_zero_screen)
+    assert is_emu is True
+    assert any("Suspicious screen dimensions" in r for r in reasons)
+
+    # 2. Concurrency == 0
+    fp_concurr = DeviceFingerprint(
+        user_agent="Mozilla/5.0",
+        hardware_concurrency=0,
+    )
+    is_emu, reasons = detect_emulator_signatures(fp_concurr)
+    assert is_emu is True
+    assert any("Hardware concurrency reported as 0" in r for r in reasons)
+
+    # 3. Memory == 0.0 GB
+    fp_mem = DeviceFingerprint(
+        user_agent="Mozilla/5.0",
+        device_memory_gb=0.0,
+    )
+    is_emu, reasons = detect_emulator_signatures(fp_mem)
+    assert is_emu is True
+    assert any("Device memory reported as 0 GB RAM" in r for r in reasons)
+
+    # 4. Known automation keywords in UA
+    for kw in (
+        "phantomjs",
+        "selenium",
+        "puppeteer",
+        "playwright",
+        "electron",
+        "nightwatch",
+    ):
+        fp_kw = DeviceFingerprint(user_agent=f"Mozilla/5.0 ({kw}/1.0)")
+        is_emu, reasons = detect_emulator_signatures(fp_kw)
+        assert is_emu is True
+        assert any("Automated browser/emulator signature" in r for r in reasons)
+
+    # 5. Mobile user agent without touch
+    fp_mob = DeviceFingerprint(
+        user_agent="Mozilla/5.0 (Android 12; Mobile; rv:68.0)",
+        is_touch_capable=False,
+    )
+    is_emu, reasons = detect_emulator_signatures(fp_mob)
+    assert is_emu is True
+    assert any("Mobile user agent reported without touch capability" in r for r in reasons)
+
+    # 6. Missing WebGL / Canvas with Desktop UA and screen
+    fp_missing_render = DeviceFingerprint(
+        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        screen=ScreenGeometry(width=1920, height=1080),
+        canvas_hash="",
+        webgl_vendor="",
+        webgl_renderer="",
+    )
+    is_emu, reasons = detect_emulator_signatures(fp_missing_render)
+    assert is_emu is True
+    assert any("Desktop browser completely missing WebGL and Canvas" in r for r in reasons)
+
+
+def test_device_entropy_and_extractor_branches() -> None:
+    # Entropy type check
+    with pytest.raises(DeviceFingerprintError, match="fp must be an instance of DeviceFingerprint"):
+        calculate_fingerprint_entropy("not_fp")  # type: ignore[arg-type]
+
+    # Extractor invalid record
+    extractor = DeviceFeatureExtractor()
+    with pytest.raises(DeviceFingerprintError, match="record must be a Mapping"):
+        extractor.extract_features("not_a_mapping")  # type: ignore[arg-type]
+
+    # Extractor with corrupted device subdict
+    rec_bad_dev = {"device": "not_a_dict", "timestamp": 1000.0}
+    feats = extractor.extract_features(rec_bad_dev)
+    assert feats["device_seen_count"] == 1.0
+
+    # Batch extraction
+    records = [
+        {"device_id": "d1", "card_id": "c1", "timestamp": 1000.0},
+        {"device_id": "d2", "card_id": "c2", "timestamp": 1005.0},
+    ]
+    batch_feats = extractor.extract_batch(records)
+    assert len(batch_feats) == 2
+
+
+def test_device_comprehensive_branch_coverage() -> None:
+    # 1. from_dict with no screen / screen None
+    fp_no_screen = DeviceFingerprint.from_dict({"device_id": "dev_no_screen", "screen": None})
+    assert fp_no_screen.screen is None
+
+    # 2. simhash with screen
+    fp_with_screen = DeviceFingerprint(
+        device_id="dev_scr",
+        screen=ScreenGeometry(1920, 1080),
+    )
+    sh = DeviceHasher.simhash(fp_with_screen)
+    assert len(sh) == 16
+
+    # 3. calculate_fingerprint_similarity branches
+    # 3a. device_memory_gb == 0 for both
+    fp_mem0_a = DeviceFingerprint(device_memory_gb=0.0, screen=ScreenGeometry(1920, 1080))
+    fp_mem0_b = DeviceFingerprint(device_memory_gb=0.0, screen=None)
+    sim_mem0 = calculate_fingerprint_similarity(fp_mem0_a, fp_mem0_b)
+    assert 0.0 < sim_mem0 < 1.0
+
+    # 3b. Differing webgl_vendor, webgl_renderer, canvas, audio, os, browser, touch
+    fp_mismatch_a = DeviceFingerprint(
+        webgl_vendor="Vendor1",
+        webgl_renderer="Renderer1",
+        canvas_hash="canvas1",
+        audio_hash="audio1",
+        os_platform="Windows",
+        browser_family="Chrome",
+        is_touch_capable=True,
+    )
+    fp_mismatch_b = DeviceFingerprint(
+        webgl_vendor="",
+        webgl_renderer="",
+        canvas_hash="",
+        audio_hash="",
+        os_platform="",
+        browser_family="",
+        is_touch_capable=False,
+    )
+    sim_mismatch = calculate_fingerprint_similarity(fp_mismatch_a, fp_mismatch_b)
+    assert sim_mismatch < 0.5
+
+    # 4. Tracker baseline update & card deque expiration & tracked device count
+    tracker = DeviceTracker(config=DeviceTrackerConfig(window_seconds=10.0))
+    assert tracker.get_tracked_device_count() == 0
+    # First record without fingerprint
+    tracker.record_event(device_id="d_base", card_id="c_base", timestamp=100.0, fingerprint=None)
+    assert tracker.get_tracked_device_count() == 1
+    # Second record with fingerprint -> baseline set
+    tracker.record_event(
+        device_id="d_base", card_id="c_base", timestamp=105.0, fingerprint=fp_with_screen
+    )
+    prof = tracker.get_profile("d_base")
+    assert prof is not None and prof.baseline_fingerprint is not None
+
+    # Card deque expiration (t=120 > 100 + 10)
+    tracker.record_event(device_id="d_other", card_id="c_base", timestamp=120.0)
+
+    # 5. DeviceFeatureExtractor branches
+    ext = DeviceFeatureExtractor(tracker=tracker)
+    # 5a. raw_fp is DeviceFingerprint instance
+    f_fp = ext.extract_features({"fingerprint": fp_with_screen, "timestamp": 130.0})
+    assert f_fp["device_seen_count"] >= 1.0
+
+    # 5b. raw_fp is Mapping
+    f_map = ext.extract_features(
+        {"device_fingerprint": {"user_agent": "Mozilla/5.0"}, "timestamp": 131.0}
+    )
+    assert "device_is_emulator" in f_map
+
+    # 5c. Flat screen dimensions in record
+    f_flat_screen = ext.extract_features(
+        {
+            "screen_width": 1920,
+            "screen_height": 1080,
+            "screen_color_depth": 24,
+            "screen_pixel_ratio": 1.0,
+            "user_agent": "Mozilla/5.0",
+            "unix_time": 132.0,
+        }
+    )
+    assert f_flat_screen["device_seen_count"] >= 1.0
+
+    # 5d. Malformed screen dimensions & malformed fp fields
+    f_bad_scr = ext.extract_features(
+        {
+            "screen_width": -10,
+            "screen_height": "not_int",
+            "user_agent": 123,
+            "trans_date_trans_time": "invalid_date_format",
+        }
+    )
+    assert f_bad_scr["device_seen_count"] >= 1.0
+
+    # 5e. mutate_tracker=False
+    f_readonly = ext.extract_features(
+        {"device_id": "d_readonly", "card_id": "c_ro", "timestamp": 140.0},
+        mutate_tracker=False,
+    )
+    assert f_readonly["device_seen_count"] == 1.0
+
+    # 5f. Auto-generated device_id from canonical hash
+    fp_auto_id = DeviceFingerprint(user_agent="AutoID/1.0")
+    f_auto = ext.extract_features({"fingerprint": fp_auto_id, "timestamp": 150.0})
+    assert f_auto["device_seen_count"] >= 1.0
+
+    # 5g. Emulator signature detected by extractor check
+    fp_emu = DeviceFingerprint(user_agent="HeadlessChrome/90.0", device_id="d_emu_test")
+    f_emu = ext.extract_features({"fingerprint": fp_emu, "timestamp": 160.0})
+    assert f_emu["device_is_emulator"] == 1.0
