@@ -619,6 +619,36 @@ class GeoLocationTracker:
                 del self._trajectories[k]
         return evicted_count
 
+    @property
+    def entity_count(self) -> int:
+        """Number of active entities tracked in the sliding window."""
+        with self._lock:
+            return len(self._trajectories)
+
+    def assess_latest_velocity(self, entity_id: str) -> TravelVelocity | None:
+        """Compute the velocity between the two most recent events for an entity."""
+        if not isinstance(entity_id, str) or not entity_id.strip():
+            raise GeoLocationError("entity_id must be a non-empty string.")
+
+        with self._lock:
+            history = self._trajectories.get(entity_id)
+            if not history or len(history) < 2:
+                return None
+            return calculate_travel_velocity(
+                prev_event=history[-2],
+                curr_event=history[-1],
+                max_speed_kmh=self.max_speed_kmh,
+            )
+
+    def assess_candidate_velocity(
+        self,
+        candidate_event: GeoLocationEvent,
+    ) -> TravelVelocity | None:
+        """Compute velocity of candidate event against entity history without mutation."""
+        if not isinstance(candidate_event, GeoLocationEvent):
+            raise GeoLocationError("candidate_event must be an instance of GeoLocationEvent.")
+        return self.assess_travel(candidate_event.entity_id, candidate_event)
+
     def reset(self) -> None:
         """Clear all tracked trajectories."""
         with self._lock:
@@ -630,11 +660,16 @@ class GeoLocationTracker:
             total_events = sum(len(h) for h in self._trajectories.values())
             return {
                 "total_entities": len(self._trajectories),
+                "tracked_entities": len(self._trajectories),
                 "total_events": total_events,
                 "window_seconds": self.window_seconds,
                 "max_entities": self.max_entities,
                 "max_speed_kmh": self.max_speed_kmh,
             }
+
+    def get_stats(self) -> dict[str, Any]:
+        """Alias for stats() returning operational capacity and usage telemetry."""
+        return self.stats()
 
     def _trim_entity_history(self, history: deque[GeoLocationEvent], current_ts: float) -> None:
         cutoff = current_ts - self.window_seconds
@@ -722,11 +757,15 @@ class GeoFeatureExtractor:
         features: dict[str, float] = dict.fromkeys(GEO_FEATURE_NAMES, 0.0)
 
         raw_entity = record.get(self.config.entity_id_field)
+        if raw_entity is None:
+            raw_entity = record.get("entity_id") or record.get("card_id") or record.get("user_id")
         entity_id = str(raw_entity) if raw_entity is not None else ""
         if not entity_id or entity_id == "nan":
             return features
 
         raw_ts = record.get(self.config.timestamp_field)
+        if raw_ts is None:
+            raw_ts = record.get("timestamp") or record.get("Time")
         if raw_ts is None:
             return features
         try:
