@@ -21,6 +21,7 @@ from fraud_detection.audit import (
     backtest_audit_policy,
     build_challenger_retrained_audit_event,
     build_delayed_label_audit_event,
+    build_fraud_ring_detected_audit_event,
     build_model_promoted_audit_event,
     build_pipeline_chaos_audit_event,
     build_pipeline_replay_audit_event,
@@ -37,6 +38,13 @@ from fraud_detection.feedback import (
     DisputeType,
     RealizedMetricsReport,
     RetrainingTriggerEvent,
+)
+from fraud_detection.graph import (
+    EntityType,
+    FraudRingCluster,
+    RingAction,
+    RingPatternType,
+    RingSeverity,
 )
 
 
@@ -1156,3 +1164,69 @@ def test_build_model_promoted_audit_event_full_and_canary() -> None:
     assert event_canary.event_type == "fraud.canary.updated"
     assert event_canary.payload["promotion_type"] == "canary"
     assert event_canary.payload["canary_percentage"] == 20.0
+
+
+def test_build_fraud_ring_detected_audit_event_redaction() -> None:
+    # 1. Cluster object with Luhn-valid PANs
+    cluster = FraudRingCluster(
+        cluster_id="ring_star_123",
+        pattern_type=RingPatternType.STAR_CARD_TESTING,
+        severity=RingSeverity.HIGH,
+        recommended_action=RingAction.DENY,
+        entities={
+            EntityType.CARD_ID: ("4111111111111111", "5500000000000004"),
+            EntityType.DEVICE_ID: ("dev_botnet_1",),
+        },
+        transaction_ids=("tx_1", "tx_2"),
+        transaction_count=2,
+        total_amount=150.0,
+        density=1.0,
+        risk_score=0.88,
+        description="High velocity card testing on dev_botnet_1",
+    )
+
+    event = build_fraud_ring_detected_audit_event(
+        cluster=cluster,
+        transaction_id="tx_test_trigger",
+        trigger_action="DENY",
+        model_version="v2",
+        metadata={"operator": "secops", "api_key": "secret_key_123"},
+    )
+
+    assert event.event_type == "fraud.graph.ring_detected"
+    assert event.model_version == "v2"
+    assert event.payload["cluster_id"] == "ring_star_123"
+    assert event.payload["severity"] == "high"
+    assert event.payload["recommended_action"] == "deny"
+    assert event.payload["trigger_action"] == "DENY"
+    assert event.payload["transaction_id"] == "tx_test_trigger"
+
+    # Redaction checks: sensitive card entities and api_key must be masked
+    d = event.to_dict(redact=True)
+    assert d["payload"]["metadata"]["operator"] == "secops"
+    assert d["payload"]["metadata"]["api_key"] == "[REDACTED]"
+    # Card entities under 'card_id' key should be redacted
+    assert d["payload"]["entities"]["card_id"] == "[REDACTED]"
+    assert d["payload"]["entities"]["device_id"] == ["dev_botnet_1"]
+
+    # 2. Test building from Mapping
+    mapping_cluster = {
+        "cluster_id": "ring_dict_456",
+        "pattern_type": "biclique",
+        "severity": "critical",
+        "recommended_action": "deny",
+        "entities": {"device_id": ["d1", "d2"]},
+        "transaction_ids": ["tx_a", "tx_b"],
+        "transaction_count": 2,
+        "total_amount": 5000.0,
+        "density": 0.9,
+        "risk_score": 0.95,
+        "description": "Dense syndicate ring",
+    }
+    event_dict = build_fraud_ring_detected_audit_event(
+        cluster=mapping_cluster,
+        transaction_id="tx_a",
+    )
+    assert event_dict.payload["cluster_id"] == "ring_dict_456"
+    assert event_dict.payload["severity"] == "critical"
+    assert event_dict.payload["total_amount"] == 5000.0

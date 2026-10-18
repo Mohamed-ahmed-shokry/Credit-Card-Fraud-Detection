@@ -45,9 +45,11 @@ dynamic decision graph replay with counterfactual policy optimization,
 per-stage circuit breakers with zero-latency fast-fail isolation, deterministic
 chaos fault injection, and delayed feedback ingestion with empirical label maturation
 curve modeling, realized performance and financial cost surveillance, automated
-retraining triggers, and automated closed-loop champion-challenger retraining, multi-dimensional
-candidate verification safety gating, cryptographic attestation signing, and zero-downtime safe
-canary promotion (Phase 37).
+retraining triggers, automated closed-loop champion-challenger retraining with multi-dimensional
+candidate verification safety gating, cryptographic attestation signing, zero-downtime safe
+canary promotion (Phase 37), and real-time streaming bipartite entity link analysis,
+Personalized PageRank risk diffusion, automated fraud ring and card-testing botnet detection,
+and graph feature aggregation (Phase 38).
 
 ## Phase 1 — Distribution
 
@@ -1737,10 +1739,126 @@ Close the autonomous continuous learning and model adaptation lifecycle by imple
 - [x] Task 8: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate.
 
 
+## Phase 38 — Real-Time Entity Link Analysis, Fraud Ring Detection & Graph Feature Aggregation (Done)
+
+### Objective
+
+Detect coordinated fraud syndicates, card-testing botnets, and synthetic identity rings by introducing a real-time in-memory bipartite Entity-Transaction Link Graph (`EntityGraph`), structural graph feature extraction (`GraphFeatureExtractor`), and automated graph community / fraud ring detection algorithms (`FraudRingDetector`, `FraudRingCluster`, `FraudRingReport`). By tracking relationships across cards, devices, IP addresses, merchants, and user identifiers with bounded temporal memory and zero future-data leakage, this phase empowers the scoring pipeline and declarative rules engine to identify multi-entity collusion patterns that evade single-entity velocity thresholds.
+
+### Scope
+
+1. **Domain Data Models & Bipartite Graph Engine (`graph.py`)**:
+   - `EntityType` enum: `CARD_ID`, `DEVICE_ID`, `IP_ADDRESS`, `MERCHANT_ID`, `USER_ID`.
+   - Typed dataclasses: `EntityNode`, `TransactionNode`, `GraphEdge`, `GraphMetrics`.
+   - `EntityGraph`: High-throughput, thread-safe in-memory bipartite transaction-entity graph with temporal sliding window eviction (TTL-based cleanup), edge weights, and strict temporal causality ($t_{\text{link}} \le t_{\text{transaction}}$ without lookahead bias).
+   - Inverted adjacency indexing: $O(1)$ amortized lookup from entity to linked transactions and from transaction to linked entities.
+2. **Graph Feature Extractor (`graph.py`)**:
+   - `GraphFeatureConfig`: configuration for graph feature computation (window durations, target entity types, max hops).
+   - Structural graph features for scoring requests:
+     - Entity degree centrality: `graph_device_card_count_1h`, `graph_ip_distinct_cards_24h`.
+     - 2-hop entity sharing: distinct peer cards sharing any device/IP within window.
+     - Graph risk diffusion score: localized personal PageRank / risk score propagation diffusing known fraud risk from chargebacks/historical flags to connected neighborhood nodes.
+3. **Automated Fraud Ring & Attack Syndicate Detector (`graph.py`)**:
+   - `FraudRingCluster`: detected syndicate ring dataclass with entity cluster members, transaction count, total monetary volume, link density, and ring risk severity (`LOW`, `MEDIUM`, `HIGH`, `CRITICAL`).
+   - `FraudRingDetector`:
+     - Detects dense bipartite subgraphs (card-device clusters).
+     - Detects rapid star-topology card-testing attacks (single device/IP hitting many distinct cards/merchants within seconds).
+     - Detects circular transaction cycles (closed payment loops).
+     - Generates `FraudRingReport` with detected rings, summary statistics, and recommended actions (`ALLOW`, `CHALLENGE`, `DENY`).
+4. **Integration with Decision Pipeline & Rules Engine (`pipeline.py`, `rules.py`)**:
+   - Graph feature enrichment integrated with `DecisionPipeline` stage execution (`GraphEnrichmentStageProcessor`).
+   - Declarative decision rule condition support for graph attributes (e.g. `graph_ring_size >= 5`, `graph_device_card_count > 10`, `graph_risk_diffusion >= 0.75`).
+5. **FastAPI Serving & Operational Telemetry (`api.py`)**:
+   - Attach `EntityGraph` and `FraudRingDetector` to `create_app` with configurable parameters (`graph_window_seconds`, `max_graph_nodes`).
+   - Dynamic graph updates on transaction ingestion and scoring.
+   - Operational endpoints:
+     - `GET /v1/graph/stats`: total nodes, edges, active entities, memory footprints.
+     - `GET /v1/graph/entity/{entity_type}/{entity_id}`: query entity neighborhood and linked transactions.
+     - `GET /v1/graph/rings`: inspect currently detected active fraud rings and severity.
+     - `POST /v1/graph/reset`: operational reset for testing/maintenance.
+   - Prometheus metrics:
+     - `fraud_graph_nodes_total{entity_type=...}`
+     - `fraud_graph_edges_total`
+     - `fraud_graph_rings_detected_total{severity=...}`
+     - `fraud_graph_ring_detection_seconds`
+6. **Structured Audit Trail (`audit.py`)**:
+   - `build_fraud_ring_detected_audit_event`: audit record when a transaction triggers or belongs to a detected fraud ring.
+   - Redaction guarantees (PAN masking for card numbers in graph audit logs).
+7. **CLI Orchestration (`cli.py`)**:
+   - `fraud-detect graph-rings`: analyzes transaction files or live audit logs to detect fraud rings and card-testing botnets, outputting structured JSON reports or table views.
+   - `fraud-detect graph-enrich`: enriches offline datasets with graph-based features for training and evaluation.
+8. **Testing, Quality Gates & Zero Regressions**:
+   - Full test suite passes 100%, branch coverage remains $\ge 97.0\%$, Ruff format and check pass cleanly, strict mypy reports 0 errors in all source files, and build/twine checks pass.
+
+### Acceptance Criteria
+
+1. **AC-1 (Bipartite Entity-Transaction Graph Engine)**: `EntityGraph` stores and queries bipartite relationships between transactions and heterogeneous entity types (`card_id`, `device_id`, `ip_address`, `merchant_id`, `user_id`) with $O(1)$ indexed neighbor lookups, TTL temporal window eviction, and zero future-data leakage.
+2. **AC-2 (Graph Feature Extraction & Risk Diffusion)**: `GraphFeatureExtractor` computes degree centrality, 2-hop shared entity counts, and localized fraud risk diffusion scores without lookahead bias.
+3. **AC-3 (Automated Fraud Ring & Attack Detection)**: `FraudRingDetector` detects dense card-device clusters, rapid star-topology card-testing attacks, and circular payment loops, classifying severity and generating structured `FraudRingReport`s.
+4. **AC-4 (Pipeline & Decision Rule Integration)**: `DecisionPipeline` supports graph enrichment stage and `RuleSet` conditions evaluate graph metrics (`graph_ring_size`, `graph_device_card_count`, `graph_risk_diffusion`) to drive priority actions.
+5. **AC-5 (API Serving & Operational Telemetry)**: FastAPI exposes `/v1/graph/stats`, `/v1/graph/entity/{entity_type}/{entity_id}`, `/v1/graph/rings`, and `/v1/graph/reset` with Prometheus metrics tracking nodes, edges, detected rings, and detection latency.
+6. **AC-6 (Structured Audit Trail & Redaction)**: Structured audit events (`fraud_ring_detected`) record detected rings with Luhn-validated PAN masking for card entities.
+7. **AC-7 (CLI Workflows)**: `fraud-detect graph-rings` detects fraud rings from transaction data/audit logs with exit code gating, and `fraud-detect graph-enrich` enriches CSV datasets with graph features.
+8. **AC-8 (Quality Standards & 100% Green CI)**: All local CI-parity checks and remote CI workflow runs pass 100%, branch coverage $\ge 97.0\%$, strict mypy 0 issues across all source files, Ruff format and check clean, and build/twine valid.
+
+### Validation & CI Plan
+
+- Local CI-parity commands:
+  - `python -m ruff format --check src tests`
+  - `python -m ruff check src tests`
+  - `python -m mypy src`
+  - `python -m pip_audit --skip-editable`
+  - `python -m pytest --cov=fraud_detection --cov-report=term-missing`
+  - `python -m build` & `python -m twine check dist/*`
+- Remote CI workflow runs monitored via `gh run list` and `gh run view`.
+
+### Exclusions
+
+This phase does not implement distributed graph databases (Neo4j, TigerGraph, Amazon Neptune) or distributed graph neural networks (PyG/DGL); it provides an optimized, thread-safe, in-memory streaming bipartite graph engine and feature extractor suitable for real-time scoring and batch evaluation.
+
+### Micro-Task Breakdown
+
+- [x] Task 1: Create `src/fraud_detection/graph.py` with domain data models (`EntityType`, `EntityNode`, `TransactionNode`, `GraphEdge`, `GraphMetrics`) and `EntityGraph` bipartite engine with unit tests in `tests/test_graph.py`.
+- [x] Task 2: Implement `GraphFeatureConfig` and `GraphFeatureExtractor` (degree centrality, 2-hop entity sharing, risk diffusion) in `graph.py` with tests in `tests/test_graph.py`.
+- [x] Task 3: Implement `FraudRingCluster`, `FraudRingReport`, and `FraudRingDetector` (bicliques, star card-testing, cycles) in `graph.py` with tests in `tests/test_graph.py`.
+- [x] Task 4: Integrate graph features with `rules.py` and `pipeline.py` (`GraphEnrichmentStageProcessor`) with tests in `tests/test_rules.py` and `tests/test_pipeline.py`.
+- [x] Task 5: Implement audit event builder `build_fraud_ring_detected_audit_event` in `audit.py` with tests in `tests/test_audit.py`.
+- [x] Task 6: Implement graph API endpoints (`/v1/graph/stats`, `/v1/graph/entity/{entity_type}/{entity_id}`, `/v1/graph/rings`, `/v1/graph/reset`) and Prometheus metrics in `api.py` with tests in `tests/test_api.py`.
+- [x] Task 7: Implement CLI commands `graph-rings` and `graph-enrich` in `cli.py` with tests in `tests/test_cli.py`.
+- [x] Task 8: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate.
+
+
+## Phase 39 — Real-Time Geographic Geolocation Anomaly Detection, Velocity Speed-of-Travel & IP Geocoding (Proposed)
+
+### Objective
+
+Defend against cross-border credential stuffing, impossible travel anomalies, and anonymous proxy masking by introducing an in-process, zero-dependency streaming geolocation engine. Calculate geodesic distances (Haversine formula) and apparent physical speed of travel (km/h) between consecutive card or user events, detect physically impossible transit events (e.g. card used in London and New York within 30 minutes), and enrich decision pipelines with geolocation risk factors, proxy detection heuristics, and autonomous mitigation rules.
+
+### Scope
+
+1. **Domain Data Models (`geolocation.py`)**:
+   - `GeoCoordinates`: Latitude, longitude, accuracy radius, country code, city, postal code.
+   - `GeoLocationEvent`: Transaction event with timestamp, entity ID, coordinates, IP address, and ASN.
+   - `TravelVelocity`: Distance ($d$ km), time elapsed ($\Delta t$ hours), computed velocity ($v = d / \Delta t$ km/h), and impossible travel flag ($v > 900\text{ km/h}$).
+2. **Speed-of-Travel Engine (`geolocation.py`)**:
+   - Great-circle distance calculation via spherical Haversine formula.
+   - In-memory sliding entity location tracker with thread-safe eviction.
+   - Configurable speed thresholds (e.g. ground vehicle $\le 160\text{ km/h}$, commercial aircraft $\le 900\text{ km/h}$, impossible travel $> 900\text{ km/h}$).
+3. **Pipeline & Rule Integration (`pipeline.py`, `rules.py`)**:
+   - `GeoEnrichmentStageProcessor` in the decision graph pipeline.
+   - Declarative rules for impossible speed (`travel_velocity > 900`), cross-border mismatch, and high-risk proxy IP classification.
+4. **API Serving & Operational Telemetry (`api.py`)**:
+   - `GET /v1/geo/velocity/{entity_id}`: Inspect recent geographic trajectory and calculated speed of travel.
+   - Prometheus metrics: `fraud_geo_impossible_travel_total`, `fraud_geo_distance_kilometers`.
+5. **CLI Workflows (`cli.py`)**:
+   - `fraud-detect geo-velocity`: Analyze transaction logs for impossible travel anomalies.
+
+
 ## Contributing to the roadmap
 
 Open an issue or a pull request that references the relevant phase item.
 Proposing a new item is welcome; keep it scoped to this project's stated
 mission rather than general production-readiness concerns already assigned
 to the deploying operator in SECURITY.md.
+
 

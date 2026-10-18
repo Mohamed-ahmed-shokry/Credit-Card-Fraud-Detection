@@ -25,6 +25,7 @@ from fraud_detection.evaluation import (
 
 if TYPE_CHECKING:
     from fraud_detection.feedback import DelayedLabelRecord, RetrainingTriggerEvent
+    from fraud_detection.graph import FraudRingCluster
     from fraud_detection.pipeline import PipelineChaosReport
     from fraud_detection.retraining import (
         ChallengerTrainingResult,
@@ -1048,4 +1049,78 @@ def build_model_promoted_audit_event(
         model_version=new_champion_version,
         dataset_fingerprint=dataset_fingerprint,
         payload=payload,
+    )
+
+
+def build_fraud_ring_detected_audit_event(
+    *,
+    cluster: FraudRingCluster | Mapping[str, Any],
+    transaction_id: str | None = None,
+    trigger_action: str = "DENY",
+    model_version: str = "v1",
+    dataset_fingerprint: str | None = None,
+    metadata: Mapping[str, Any] | None = None,
+) -> AuditEvent:
+    """Construct a structured audit event when a transaction triggers or belongs to a fraud ring."""
+    if isinstance(cluster, Mapping):
+        cluster_id = str(cluster.get("cluster_id", ""))
+        pattern_type = str(cluster.get("pattern_type", ""))
+        severity = str(cluster.get("severity", ""))
+        recommended_action = str(cluster.get("recommended_action", ""))
+        raw_entities = dict(cluster.get("entities", {}))
+        transaction_ids = tuple(cluster.get("transaction_ids", ()))
+        transaction_count = int(cluster.get("transaction_count", len(transaction_ids)))
+        total_amount = float(cluster.get("total_amount", 0.0))
+        density = float(cluster.get("density", 0.0))
+        risk_score = float(cluster.get("risk_score", 0.0))
+        description = str(cluster.get("description", ""))
+    else:
+        cluster_id = cluster.cluster_id
+        pattern_type = (
+            cluster.pattern_type.value
+            if hasattr(cluster.pattern_type, "value")
+            else str(cluster.pattern_type)
+        )
+        severity = (
+            cluster.severity.value if hasattr(cluster.severity, "value") else str(cluster.severity)
+        )
+        recommended_action = (
+            cluster.recommended_action.value
+            if hasattr(cluster.recommended_action, "value")
+            else str(cluster.recommended_action)
+        )
+        raw_entities = {
+            (k.value if hasattr(k, "value") else str(k)): list(v)
+            for k, v in cluster.entities.items()
+        }
+        transaction_ids = cluster.transaction_ids
+        transaction_count = cluster.transaction_count
+        total_amount = cluster.total_amount
+        density = cluster.density
+        risk_score = cluster.risk_score
+        description = cluster.description
+
+    payload: dict[str, Any] = {
+        "cluster_id": cluster_id,
+        "pattern_type": pattern_type,
+        "severity": severity,
+        "recommended_action": recommended_action,
+        "trigger_action": str(trigger_action),
+        "transaction_id": transaction_id,
+        "entities": raw_entities,
+        "transaction_count": transaction_count,
+        "transaction_ids": list(transaction_ids),
+        "total_amount": total_amount,
+        "density": density,
+        "risk_score": risk_score,
+        "description": description,
+    }
+    if metadata:
+        payload["metadata"] = dict(metadata)
+
+    return AuditEvent(
+        event_type="fraud.graph.ring_detected",
+        model_version=model_version,
+        dataset_fingerprint=dataset_fingerprint,
+        payload=redact_data(payload),
     )
