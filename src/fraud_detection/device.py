@@ -718,6 +718,11 @@ class DeviceTracker:
         with self._lock:
             return self._device_profiles.get(clean)
 
+    def get_tracked_device_count(self) -> int:
+        """Return the number of currently tracked devices."""
+        with self._lock:
+            return len(self._device_profiles)
+
     def get_stats(self) -> dict[str, Any]:
         """Return operational summary metrics for monitored devices and anomalies."""
         with self._lock:
