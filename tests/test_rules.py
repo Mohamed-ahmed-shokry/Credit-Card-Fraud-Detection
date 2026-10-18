@@ -13,6 +13,8 @@ from fraud_detection.rules import (
     RulePrecedence,
     RuleSet,
     build_fraud_ring_rule,
+    build_geo_proxy_rule,
+    build_impossible_travel_rule,
 )
 
 
@@ -307,3 +309,26 @@ def test_build_fraud_ring_rule_and_graph_evaluation() -> None:
     assert rule.evaluate({"graph_ring_size": 2, "graph_risk_diffusion": 0.9}) is False
     assert rule.evaluate({"graph_ring_size": 6, "graph_risk_diffusion": 0.5}) is False
     assert rule.evaluate({"Amount": 500.0}) is False
+
+
+def test_build_impossible_travel_and_geo_proxy_rules() -> None:
+    imp_rule = build_impossible_travel_rule(min_speed_kmh=800.0)
+    assert imp_rule.rule_id == "RULE_IMPOSSIBLE_TRAVEL_DENY"
+    assert imp_rule.action == RuleAction.DENY
+    assert imp_rule.priority == 15
+
+    # Impossible speed match
+    assert imp_rule.evaluate({"geo_is_impossible_travel": 1.0, "geo_speed_kmh": 850.0}) is True
+    # Sub-threshold speed
+    assert imp_rule.evaluate({"geo_is_impossible_travel": 1.0, "geo_speed_kmh": 750.0}) is False
+    # Not impossible travel
+    assert imp_rule.evaluate({"geo_is_impossible_travel": 0.0, "geo_speed_kmh": 950.0}) is False
+
+    proxy_rule = build_geo_proxy_rule()
+    assert proxy_rule.rule_id == "RULE_GEO_PROXY_CHALLENGE"
+    assert proxy_rule.action == RuleAction.CHALLENGE
+    assert proxy_rule.priority == 25
+
+    assert proxy_rule.evaluate({"geo_is_proxy": 1.0}) is True
+    assert proxy_rule.evaluate({"geo_is_proxy": 0.0}) is False
+    assert proxy_rule.evaluate({}) is False
