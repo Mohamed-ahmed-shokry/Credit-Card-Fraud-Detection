@@ -44,4 +44,5 @@
 - Baseline local tests: 980 passed
 - Remote CI run 39171855653: PASSED (100% green across all 4 matrix jobs)
 - Remote CI run 39172815238: PASSED (100% green across all 4 matrix jobs)
-- Local branch coverage verification: PASSED (1028 passed, >=97.0% branch coverage)
+- Remote CI run 39174435775: PASSED (100% green across all 4 matrix jobs: Python 3.12, Python 3.14, Container, Signed artifact admission)
+- Local branch coverage verification: PASSED (1030 passed, 97.00% branch coverage)
