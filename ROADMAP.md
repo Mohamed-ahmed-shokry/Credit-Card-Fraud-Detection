@@ -1907,39 +1907,84 @@ This phase does not bundle heavy external multi-gigabyte MaxMind GeoIP binary da
 - [x] Task 8: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate.
 
 
-## Phase 40 — Adaptive Device & Browser Fingerprinting with Anomaly Clustering (Proposed)
+## Phase 40 — Adaptive Device & Browser Fingerprinting with Anomaly Clustering (In progress)
 
 ### Objective
 
-Detect advanced bot attacks, emulator spoofing, and automated credential rotation by introducing an in-process, privacy-preserving device fingerprinting engine. Extract stable hardware and browser attributes (screen geometry, WebGL capabilities, audio context hashes, platform architecture, user agent consistency), compute adaptive similarity distance metrics (Jaccard and Hamming distance), cluster device identities in sliding temporal windows, and detect device spoofing anomalies (e.g. multiple distinct card numbers originating from identical hardware signatures or rapidly morphing client characteristics).
+Detect advanced bot attacks, automated credential testing, emulator spoofing, and card-cycling fraud syndicates by introducing an in-process, zero-dependency streaming device and browser fingerprinting engine. Extract stable hardware and browser attributes (screen geometry, WebGL capabilities, audio context hashes, platform architecture, user agent consistency), compute adaptive similarity distance metrics (fuzzy hashing, component stability weights, and Jaccard distance), track card-device bipartite associations in thread-safe sliding temporal windows, and detect device spoofing anomalies (headless browsers, emulator environments, high-frequency card cycling across identical hardware, and rapid device cycling on single accounts).
 
 ### Scope
 
 1. **Domain Data Models & Fingerprinting Engine (`device.py`)**:
-   - `DeviceFingerprint`: Canonical attributes representing browser and hardware environment.
-   - `DeviceHasher`: Normalization and cryptographic fuzzy hashing of client signatures.
-   - `DeviceTracker`: Thread-safe sliding temporal window tracking card-to-device mappings, anomaly ratios, and rapid fingerprint drift.
-   - `DeviceFeatureExtractor`: Extracts structured device features (`device_seen_count`, `device_distinct_cards_24h`, `device_is_emulator`, `device_entropy_score`).
-2. **Rules & Pipeline Integration (`rules.py`, `pipeline.py`)**:
-   - `DeviceEnrichmentStageProcessor` for Decision DAG.
-   - Declarative decision rules for emulator detection and device card-cycling attacks.
-3. **Structured Audit Trail & Redaction (`audit.py`)**:
-   - `build_device_anomaly_audit_event` with sanitized hardware profiles.
-4. **FastAPI Serving & Operational Telemetry (`api.py`)**:
-   - Operational endpoints (`GET /v1/device/stats`, `GET /v1/device/profile/{device_id}`).
-   - Prometheus metrics for device anomalies and cluster sizes.
-5. **CLI Workflows (`cli.py`)**:
-   - `fraud-detect device-clusters` and `fraud-detect device-enrich`.
+   - `DeviceFingerprintError`: Dedicated exception hierarchy for fingerprint validation, parsing, and tracking errors.
+   - `ScreenGeometry`: Normalized screen resolution, color depth, and device pixel ratio dataclass.
+   - `DeviceFingerprint`: Canonical attributes representing browser and hardware environment (device ID, user agent, OS platform, browser family, screen geometry, language, timezone offset, hardware concurrency, device memory, WebGL vendor/renderer, canvas hash, audio hash, touch capability, webdriver flag, plugins count).
+   - `DeviceHasher`: Normalization and cryptographic fuzzy hashing of client signatures (canonical SHA-256 fingerprint hash and stability-weighted bit-vectors).
+   - `calculate_fingerprint_similarity`: Composite similarity score $[0.0, 1.0]$ weighted by attribute stability (hardware > screen > browser/UA).
+   - `calculate_jaccard_similarity` & `calculate_hamming_distance`.
+2. **In-Memory Streaming Device Tracker & Anomaly Heuristics (`device.py`)**:
+   - `DeviceTrackerConfig`: Configurable parameters (`window_seconds`, `max_devices`, `card_cycling_threshold`, `device_cycling_threshold`, `min_entropy_threshold`).
+   - `DeviceProfile`: Thread-safe tracking of observed cards, transaction count, first/last seen timestamps, known fingerprints, and emulator flags.
+   - `DeviceTracker`: Thread-safe sliding temporal window tracking card-to-device and device-to-card mappings with TTL eviction and bounded capacity.
+   - `DeviceAnomalyReport`: Structure holding anomaly classification (`is_emulator`, `is_card_cycling`, `is_device_cycling`, `is_spoofed`), severity (`LOW`, `MEDIUM`, `HIGH`, `CRITICAL`), and risk details.
+   - `detect_emulator_signatures`: Heuristics checking webdriver presence, headless user-agents, impossible screen geometry, unrealistic concurrency/memory, and missing canvas/WebGL with desktop UA.
+   - `calculate_fingerprint_entropy`: Shannon entropy calculation across discrete fingerprint components.
+   - `DeviceFeatureExtractor`: Extracts structured device features (`device_seen_count`, `device_distinct_cards_24h`, `device_card_distinct_devices_24h`, `device_is_emulator`, `device_entropy_score`, `device_is_card_cycling`, `device_is_device_cycling`).
+3. **Decision Pipeline & Rules Engine Integration (`rules.py`, `pipeline.py`)**:
+   - `build_device_emulator_rule`: Declarative rule denying or challenging transactions from headless/emulator devices.
+   - `build_device_card_cycling_rule`: Declarative rule denying transactions originating from devices with $\ge N$ distinct cards.
+   - `DeviceEnrichmentStageProcessor`: Stage processor in `pipeline.py` executing device enrichment within the Decision DAG.
+   - Integration into `create_default_fraud_pipeline`.
+4. **Structured Audit Trail & Redaction (`audit.py`)**:
+   - `build_device_anomaly_audit_event`: Structured audit record with sanitized hardware profiles (redacting raw PII/card numbers with Luhn PAN masking, hashing sensitive identifiers).
+5. **FastAPI Serving & Operational Telemetry (`api.py`)**:
+   - Wire `DeviceTracker` and `DeviceFeatureExtractor` into `create_app`.
+   - Operational endpoints (`GET /v1/device/stats`, `GET /v1/device/profile/{device_id}`, `POST /v1/device/assess`, `POST /v1/device/reset`).
+   - Prometheus metrics (`fraud_device_anomalies_total`, `fraud_device_tracked_devices_total`, `fraud_device_evaluations_total`).
+6. **CLI Workflows (`cli.py`)**:
+   - `fraud-detect device-clusters`: Analyzes transactions/audit logs to detect device clusters, emulator bot attacks, and card-cycling rings with `--fail-on-anomaly` exit code gating (code 3).
+   - `fraud-detect device-enrich`: Enriches transaction datasets with device fingerprinting features for offline training and evaluation.
+7. **Testing, Quality Gates & Zero Regressions**:
+   - Comprehensive unit and integration test coverage across `tests/test_device.py`, `tests/test_rules.py`, `tests/test_pipeline.py`, `tests/test_audit.py`, `tests/test_api.py`, `tests/test_cli.py`.
+   - 100% test pass rate, branch coverage $\ge 97.0\%$, Ruff format and check clean, strict mypy 0 issues across all source files, build and twine valid.
 
 ### Acceptance Criteria
 
-1. **AC-1 (Domain Models & Hash Normalization)**: `DeviceFingerprint` models client hardware/software attributes with robust fuzzy hashing and canonical normalization.
-2. **AC-2 (Streaming Device Tracker & Anomaly Heuristics)**: `DeviceTracker` tracks card-to-device linkages with sliding window TTL eviction and detects emulator/spoofing anomalies.
-3. **AC-3 (Pipeline & Decision Rule Integration)**: `DeviceEnrichmentStageProcessor` wires device risk features into decision graphs and evaluates declarative emulator/cycling rules.
-4. **AC-4 (Audit Trail & Sanitization)**: Emits structured device audit events with privacy-compliant attribute masking.
-5. **AC-5 (API Serving & Telemetry)**: FastAPI surfaces `/v1/device/*` operational endpoints and exports Prometheus counters/gauges.
-6. **AC-6 (CLI Workflows)**: `fraud-detect device-clusters` and `fraud-detect device-enrich` CLI commands with error gating.
-7. **AC-7 (Quality Standards & 100% Green CI)**: All CI parity checks pass with $\ge 97.0\%$ coverage and 0 mypy/ruff issues.
+1. **AC-1 (Domain Models & Hash Normalization)**: `DeviceFingerprint` models client hardware/software attributes with robust fuzzy hashing, canonical normalization, and bounded similarity metrics.
+2. **AC-2 (Streaming Device Tracker & Anomaly Heuristics)**: `DeviceTracker` tracks card-to-device and device-to-card linkages with sliding window TTL eviction and detects emulator, card-cycling, and device-cycling anomalies.
+3. **AC-3 (Feature Extraction & Entropy Scoring)**: `DeviceFeatureExtractor` computes 7 structured features (`device_seen_count`, `device_distinct_cards_24h`, `device_card_distinct_devices_24h`, `device_is_emulator`, `device_entropy_score`, `device_is_card_cycling`, `device_is_device_cycling`) and Shannon entropy without lookahead bias.
+4. **AC-4 (Pipeline & Decision Rule Integration)**: `DeviceEnrichmentStageProcessor` wires device risk features into decision graphs and evaluates declarative emulator and card-cycling rules (`build_device_emulator_rule`, `build_device_card_cycling_rule`).
+5. **AC-5 (Audit Trail & Sanitization)**: Emits structured device audit events (`build_device_anomaly_audit_event`) with privacy-compliant Luhn PAN masking.
+6. **AC-6 (API Serving & Telemetry)**: FastAPI surfaces `/v1/device/*` operational endpoints and exports Prometheus counters/gauges tracking tracked devices, evaluations, and anomaly types.
+7. **AC-7 (CLI Workflows & Gating)**: `fraud-detect device-clusters` and `fraud-detect device-enrich` CLI commands execute with CSV/JSON support and `--fail-on-anomaly` exit code 3 gating.
+8. **AC-8 (Quality Standards & 100% Green CI)**: All local CI-parity checks and remote CI workflow runs pass 100%, branch coverage $\ge 97.0\%$, strict mypy 0 issues across all source files, Ruff format and check clean, and build/twine valid.
+
+### Validation & CI Plan
+
+- Local CI-parity commands:
+  - `python -m ruff format --check src tests`
+  - `python -m ruff check src tests`
+  - `python -m mypy src`
+  - `python -m pip_audit --skip-editable`
+  - `python -m pytest --cov=fraud_detection --cov-report=term-missing`
+  - `python -m build` & `python -m twine check dist/*`
+- Remote CI workflow runs monitored via `gh run list` and `gh run view`.
+
+### Exclusions
+
+This phase does not embed client-side JavaScript injection libraries or heavy browser automation frameworks (e.g. Playwright / Selenium); it provides an optimized, thread-safe, zero-dependency in-process device fingerprint normalization, similarity clustering, and anomaly detection engine.
+
+### Micro-Task Breakdown
+
+- [ ] Task 1: Create `src/fraud_detection/device.py` with domain data models (`DeviceFingerprintError`, `ScreenGeometry`, `DeviceFingerprint`) and unit tests in `tests/test_device.py`.
+- [ ] Task 2: Implement `DeviceHasher`, canonical hashing, and similarity/distance metrics (`calculate_fingerprint_similarity`, `calculate_jaccard_similarity`, `calculate_hamming_distance`) in `device.py` with tests in `tests/test_device.py`.
+- [ ] Task 3: Implement `DeviceTrackerConfig`, `DeviceProfile`, `DeviceAnomalyReport`, and `DeviceTracker` in `device.py` with tests in `tests/test_device.py`.
+- [ ] Task 4: Implement `detect_emulator_signatures`, `calculate_fingerprint_entropy`, and `DeviceFeatureExtractor` in `device.py` with tests in `tests/test_device.py`.
+- [ ] Task 5: Integrate device features with `rules.py` (`build_device_emulator_rule`, `build_device_card_cycling_rule`) and `pipeline.py` (`DeviceEnrichmentStageProcessor`) with tests in `tests/test_rules.py` and `tests/test_pipeline.py`.
+- [ ] Task 6: Implement audit event builder `build_device_anomaly_audit_event` in `audit.py` with tests in `tests/test_audit.py`.
+- [ ] Task 7: Implement device API endpoints (`/v1/device/stats`, `/v1/device/profile/{device_id}`, `/v1/device/assess`, `/v1/device/reset`) and Prometheus metrics in `api.py` with tests in `tests/test_api.py`.
+- [ ] Task 8: Implement CLI commands `device-clusters` and `device-enrich` in `cli.py` with tests in `tests/test_cli.py`.
+- [ ] Task 9: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate.
 
 
 ## Contributing to the roadmap
