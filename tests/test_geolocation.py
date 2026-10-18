@@ -635,3 +635,143 @@ def test_geo_feature_extractor_batch_and_anomalies() -> None:
     assert report.proxy_events == 1
     assert "tx-11" in report.anomalous_event_ids
     assert "tx-12" in report.anomalous_event_ids
+
+
+def test_geo_tracker_advanced_branches() -> None:
+    tracker = GeoLocationTracker(window_seconds=100.0, max_entities=5)
+    c1 = GeoCoordinates(51.5074, -0.1278)
+    c2 = GeoCoordinates(40.7128, -74.0060)
+
+    # 1. Insertion out of order (all within window_seconds=100)
+    ev_first = GeoLocationEvent("ev1", "card-out-of-order", 650.0, c1)
+    ev_third = GeoLocationEvent("ev3", "card-out-of-order", 700.0, c2)
+    ev_second = GeoLocationEvent("ev2", "card-out-of-order", 680.0, c1)
+
+    assert tracker.record_event(ev_first) is None
+    assert tracker.record_event(ev_third) is not None
+    # This triggers lines 540-545 (inserting event between existing events)
+    tracker.record_event(ev_second)
+    traj = tracker.get_trajectory("card-out-of-order")
+    assert len(traj) == 3
+    assert [e.event_id for e in traj] == ["ev1", "ev2", "ev3"]
+
+    # 2. Check property and velocity inspection
+    assert tracker.entity_count == 1
+    assert tracker.get_stats()["total_events"] == 3
+    latest_vel = tracker.assess_latest_velocity("card-out-of-order")
+    assert latest_vel is not None
+    vel_dict = latest_vel.to_dict()
+    assert vel_dict["distance_km"] > 0.0
+
+    ev_dict = ev_first.to_dict()
+    assert ev_dict["event_id"] == "ev1"
+
+    # 3. assess_travel when candidate timestamp is before all history events (prev_event is None)
+    ev_early = GeoLocationEvent("ev0", "card-out-of-order", 100.0, c1)
+    assert tracker.assess_travel("card-out-of-order", ev_early) is None
+    cand_vel = tracker.assess_candidate_velocity(ev_early)
+    assert cand_vel is None
+
+    # 4. Validation errors
+    with pytest.raises(GeoLocationError, match="candidate_event must be an instance"):
+        tracker.assess_candidate_velocity("not-event")  # type: ignore[arg-type]
+
+    with pytest.raises(GeoLocationError, match="entity_id must be a non-empty string"):
+        tracker.assess_latest_velocity("")
+
+    with pytest.raises(GeoLocationError, match="current_timestamp must be a finite float"):
+        tracker.evict_expired(float("nan"))
+
+    with pytest.raises(GeoLocationError, match="entity_id must be a non-empty string"):
+        tracker.get_trajectory("   ")
+
+    with pytest.raises(GeoLocationError, match="entity_id must be a non-empty string"):
+        tracker.get_last_known_event("")
+
+    # 5. Trimming and full eviction (lines 617-619 and 677)
+    evict_tracker = GeoLocationTracker(window_seconds=50.0)
+    evict_tracker.record_event(GeoLocationEvent("ev_old", "card_evict", 10.0, c1))
+    evict_tracker.record_event(GeoLocationEvent("ev_new", "card_evict", 70.0, c2))
+    assert len(evict_tracker.get_trajectory("card_evict")) == 1
+
+    evicted = evict_tracker.evict_expired(current_timestamp=200.0)
+    assert evicted == 1
+    assert evict_tracker.entity_count == 0
+
+
+def test_geo_feature_extractor_coverage_edge_cases() -> None:
+    extractor = GeoFeatureExtractor()
+
+    # 1. Invalid timestamp (NaN / infinite / string)
+    res_nan = extractor.extract_features({"card_id": "c1", "timestamp": float("nan")})
+    assert res_nan["geo_distance_km"] == 0.0
+
+    res_str = extractor.extract_features({"card_id": "c1", "timestamp": "not-numeric"})
+    assert res_str["geo_distance_km"] == 0.0
+
+    res_no_ts = extractor.extract_features({"card_id": "c1"})
+    assert res_no_ts["geo_distance_km"] == 0.0
+
+    # 2. Coordinates error handling (latitude out of bounds)
+    res_bad_lat = extractor.extract_features(
+        {"card_id": "c1", "timestamp": 100.0, "latitude": 999.0, "longitude": 0.0}
+    )
+    assert res_bad_lat["geo_distance_km"] == 0.0
+
+    # 3. IP resolver error handling
+    res_bad_ip = extractor.extract_features(
+        {"card_id": "c1", "timestamp": 100.0, "ip_address": "invalid-ip"}
+    )
+    assert res_bad_ip["geo_distance_km"] == 0.0
+
+    # 4. Non-mutating feature extraction (mutate_tracker=False)
+    rec1 = {"card_id": "c_nomutate", "timestamp": 100.0, "latitude": 51.5074, "longitude": -0.1278}
+    rec2 = {"card_id": "c_nomutate", "timestamp": 200.0, "latitude": 40.7128, "longitude": -74.0060}
+    extractor.extract_features(rec1, mutate_tracker=True)
+    res_nomut = extractor.extract_features(rec2, mutate_tracker=False)
+    assert res_nomut["geo_is_impossible_travel"] == 1.0
+    assert len(extractor.tracker.get_trajectory("c_nomutate")) == 1
+
+    # 5. extract_batch without timestamp column (else branch)
+    no_ts_df = pd.DataFrame(
+        [
+            {"card_id": "c_nots", "latitude": 51.5074, "longitude": -0.1278},
+            {"card_id": "c_nots", "latitude": 40.7128, "longitude": -74.0060},
+        ]
+    )
+    batch_res = extractor.extract_batch(no_ts_df)
+    assert "geo_distance_km" in batch_res.columns
+
+    # 6. analyze_anomalies with reset_tracker=False and without transaction_id column
+    anom_records = [
+        {"card_id": "c_anom", "timestamp": 100.0, "latitude": 51.5074, "longitude": -0.1278},
+        {"card_id": "c_anom", "timestamp": 200.0, "latitude": 40.7128, "longitude": -74.0060},
+    ]
+    anom_rep = extractor.analyze_anomalies(anom_records, reset_tracker=False)
+    assert anom_rep.impossible_travel_events == 1
+    assert "1" in anom_rep.anomalous_event_ids
+    rep_dict = anom_rep.to_dict()
+    assert rep_dict["impossible_travel_events"] == 1
+
+    # 7. Coordinates without country enriched from IP subnet (lines 830-840)
+    rec_ip_enrich = {
+        "entity_id": "ent_ip_enrich",
+        "Time": 100.0,
+        "latitude": 51.5074,
+        "longitude": -0.1278,
+        "ip_address": "185.86.151.10",
+        "billing_country": "US",
+    }
+    feats_enriched = extractor.extract_features(rec_ip_enrich)
+    assert feats_enriched["geo_country_mismatch"] == 1.0
+
+    # 8. User ID fallback
+    feats_user = extractor.extract_features(
+        {"user_id": "user_fallback", "Time": 500.0, "latitude": 40.7128, "longitude": -74.0060}
+    )
+    assert "geo_distance_km" in feats_user
+
+    # 9. GeoLocationError
+    err = GeoLocationError("test geolocation error")
+    assert str(err) == "test geolocation error"
+
