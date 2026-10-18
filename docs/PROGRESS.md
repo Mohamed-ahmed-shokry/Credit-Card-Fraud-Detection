@@ -12,7 +12,7 @@
 - [x] Task 4: Integrate geolocation enrichment with `rules.py` (`build_impossible_travel_rule`, `build_geo_proxy_rule`) and `pipeline.py` (`GeoEnrichmentStageProcessor`) with tests in `tests/test_rules.py` and `tests/test_pipeline.py`.
 - [x] Task 5: Implement audit event builder `build_impossible_travel_audit_event` in `audit.py` with tests in `tests/test_audit.py`.
 - [x] Task 6: Implement geolocation API endpoints (`/v1/geo/velocity/{entity_id}`, `/v1/geo/stats`, `/v1/geo/assess`, `/v1/geo/reset`) and Prometheus metrics in `api.py` with tests in `tests/test_api.py`.
-- [ ] Task 7: Implement CLI commands `geo-velocity` and `geo-enrich` in `cli.py` with tests in `tests/test_cli.py`.
+- [x] Task 7: Implement CLI commands `geo-velocity` and `geo-enrich` in `cli.py` with tests in `tests/test_cli.py`.
 - [ ] Task 8: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate.
 
 ## Acceptance Criteria Status
@@ -24,7 +24,7 @@
 | AC-4 (Pipeline & Decision Rule Integration) | Satisfied | `build_impossible_travel_rule`, `build_geo_proxy_rule`, and `GeoEnrichmentStageProcessor` wired into `create_default_fraud_pipeline` verified with tests in `tests/test_rules.py` and `tests/test_pipeline.py`. |
 | AC-5 (API Serving & Operational Telemetry) | Satisfied | `GET /v1/geo/velocity/{entity_id}`, `GET /v1/geo/stats`, `POST /v1/geo/assess`, `POST /v1/geo/reset`, and Prometheus metrics `fraud_geo_impossible_travel_total`, `fraud_geo_events_total`, `fraud_geo_distance_kilometers` verified in `tests/test_api.py`. |
 | AC-6 (Structured Audit Trail & Redaction) | Satisfied | `build_impossible_travel_audit_event` structured audit records with PCI-DSS compliant Luhn PAN masking and metadata redaction verified in `tests/test_audit.py`. |
-| AC-7 (CLI Workflows) | Pending | In progress |
+| AC-7 (CLI Workflows) | Satisfied | Typer commands `geo-velocity` and `geo-enrich` implemented with CSV/JSON support, overwrite guards, impossible travel detection, and `--fail-on-impossible` error gating verified with 186 CLI tests in `tests/test_cli.py`. |
 | AC-8 (Quality Standards & 100% Green CI) | Pending | In progress |
 
 ## Decision Log
