@@ -7,7 +7,7 @@
 
 ## Task Status
 - [x] Task 1: Create `src/fraud_detection/geolocation.py` with domain data models (`GeoLocationError`, `GeoCoordinates`, `GeoLocationEvent`, `TravelVelocity`), Haversine geodesic math, and unit tests in `tests/test_geolocation.py`.
-- [ ] Task 2: Implement `GeoLocationTracker` (thread-safe sliding window trajectory tracking, temporal TTL eviction, assessment) and `IPGeoResolver` in `geolocation.py` with tests in `tests/test_geolocation.py`.
+- [x] Task 2: Implement `GeoLocationTracker` (thread-safe sliding window trajectory tracking, temporal TTL eviction, assessment) and `IPGeoResolver` in `geolocation.py` with tests in `tests/test_geolocation.py`.
 - [ ] Task 3: Implement `GeoFeatureExtractor` and anomaly detection heuristics in `geolocation.py` with tests in `tests/test_geolocation.py`.
 - [ ] Task 4: Integrate geolocation enrichment with `rules.py` (`build_impossible_travel_rule`) and `pipeline.py` (`GeoEnrichmentStageProcessor`) with tests in `tests/test_rules.py` and `tests/test_pipeline.py`.
 - [ ] Task 5: Implement audit event builder `build_impossible_travel_audit_event` in `audit.py` with tests in `tests/test_audit.py`.
@@ -19,7 +19,7 @@
 | Criterion | Status | Evidence |
 |-----------|--------|----------|
 | AC-1 (Domain Models & Haversine Geodesic Engine) | Satisfied | `GeoCoordinates`, `haversine_distance`, `GeoLocationEvent`, `TravelVelocity`, and `calculate_travel_velocity` verified with 34 tests in `tests/test_geolocation.py`. |
-| AC-2 (Streaming Geolocation Tracker & IP Resolution) | Pending | In progress |
+| AC-2 (Streaming Geolocation Tracker & IP Resolution) | Satisfied | `IPGeoResolver` (private/public classification, reference subnets) and `GeoLocationTracker` (sliding window, capacity bounds, eviction, assessment) verified with 41 tests in `tests/test_geolocation.py`. |
 | AC-3 (Geo Feature Extraction & Anomaly Detection) | Pending | In progress |
 | AC-4 (Pipeline & Decision Rule Integration) | Pending | In progress |
 | AC-5 (API Serving & Operational Telemetry) | Pending | In progress |
