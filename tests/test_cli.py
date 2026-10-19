@@ -7776,3 +7776,240 @@ def test_geo_velocity_cli_edge_branches(tmp_path: Path) -> None:
     data = json.loads(res.output)
     assert data["total_entities"] == 1
     assert data["impossible_travel_count"] == 2
+
+
+def test_device_clusters_cli_happy_path(tmp_path: Path) -> None:
+    csv_path = tmp_path / "transactions.csv"
+    csv_path.write_text(
+        "device_id,card_id,timestamp,user_agent,screen_width,screen_height\n"
+        "d_normal,c1,1000.0,Mozilla/5.0,1920,1080\n"
+        "d_normal,c1,1010.0,Mozilla/5.0,1920,1080\n"
+        "d_cycling,c2,1020.0,Mozilla/5.0,1920,1080\n"
+        "d_cycling,c3,1030.0,Mozilla/5.0,1920,1080\n"
+        "d_cycling,c4,1040.0,Mozilla/5.0,1920,1080\n"
+        "d_emu,c5,1050.0,HeadlessChrome/91.0,1920,1080\n",
+        encoding="utf-8",
+    )
+    rep_path = tmp_path / "report.json"
+
+    # 1. JSON output and file emission
+    res_json = runner.invoke(
+        app,
+        [
+            "device-clusters",
+            "-i",
+            str(csv_path),
+            "-o",
+            str(rep_path),
+            "--json",
+            "--card-cycling-threshold",
+            "2",
+        ],
+    )
+    assert res_json.exit_code == 0, res_json.output
+    data = json.loads(res_json.output)
+    assert data["total_events_processed"] == 6
+    assert data["total_devices_tracked"] == 3
+    assert data["card_cycling_anomalies_count"] >= 1
+    assert data["emulator_anomalies_count"] >= 1
+    assert rep_path.exists()
+    file_data = json.loads(rep_path.read_text(encoding="utf-8"))
+    assert file_data["total_devices_tracked"] == 3
+
+    # 2. Human readable summary output
+    res_text = runner.invoke(
+        app,
+        [
+            "device-clusters",
+            "-i",
+            str(csv_path),
+            "--card-cycling-threshold",
+            "2",
+        ],
+    )
+    assert res_text.exit_code == 0, res_text.output
+    assert "Device Fingerprinting & Anomaly Clustering Report:" in res_text.output
+    assert "Total Devices Tracked:" in res_text.output
+
+
+def test_device_clusters_cli_fail_on_anomaly(tmp_path: Path) -> None:
+    csv_path = tmp_path / "transactions_emu.csv"
+    csv_path.write_text(
+        "device_id,card_id,timestamp,user_agent\n"
+        "d_bot,c1,1000.0,HeadlessChrome/91.0\n"
+        "d_bot,c2,1010.0,HeadlessChrome/91.0\n",
+        encoding="utf-8",
+    )
+    res = runner.invoke(
+        app,
+        [
+            "device-clusters",
+            "-i",
+            str(csv_path),
+            "--fail-on-anomaly",
+            "--card-cycling-threshold",
+            "2",
+        ],
+    )
+    assert res.exit_code == 3
+    assert "Failing per --fail-on-anomaly" in res.output
+
+
+def test_device_clusters_cli_guard_and_errors(tmp_path: Path) -> None:
+    # 1. Missing input file
+    res_miss = runner.invoke(app, ["device-clusters", "-i", str(tmp_path / "missing.csv")])
+    assert res_miss.exit_code == 2
+
+    # 2. Empty CSV
+    empty_csv = tmp_path / "empty.csv"
+    empty_csv.write_text("device_id,card_id,timestamp\n", encoding="utf-8")
+    res_empty = runner.invoke(app, ["device-clusters", "-i", str(empty_csv)])
+    assert res_empty.exit_code == 2
+    assert "Input file contains no transactions" in res_empty.output
+
+    # 3. Output exists without overwrite
+    in_csv = tmp_path / "in.csv"
+    in_csv.write_text("device_id,card_id,timestamp\nd1,c1,1000.0\n", encoding="utf-8")
+    out_rep = tmp_path / "rep.json"
+    out_rep.write_text("{}", encoding="utf-8")
+
+    res_ov = runner.invoke(app, ["device-clusters", "-i", str(in_csv), "-o", str(out_rep)])
+    assert res_ov.exit_code == 2
+    assert "Output already exists" in res_ov.output
+
+    # 4. Output exists with overwrite
+    res_ov_ok = runner.invoke(
+        app, ["device-clusters", "-i", str(in_csv), "-o", str(out_rep), "--overwrite"]
+    )
+    assert res_ov_ok.exit_code == 0
+
+
+def test_device_enrich_cli_happy_path(tmp_path: Path) -> None:
+    in_csv = tmp_path / "tx_enrich.csv"
+    in_csv.write_text(
+        "device_id,card_id,timestamp,screen_width,screen_height,user_agent\n"
+        "d1,c1,1000.0,1920,1080,Mozilla/5.0\n"
+        "d1,c2,1010.0,1920,1080,Mozilla/5.0\n",
+        encoding="utf-8",
+    )
+    out_csv = tmp_path / "tx_enriched.csv"
+
+    # CSV output
+    res = runner.invoke(
+        app,
+        [
+            "device-enrich",
+            "-i",
+            str(in_csv),
+            "-o",
+            str(out_csv),
+        ],
+    )
+    assert res.exit_code == 0, res.output
+    assert "Successfully enriched" in res.output
+    df_res = pd.read_csv(out_csv)
+    for col in (
+        "device_seen_count",
+        "device_distinct_cards_24h",
+        "device_card_distinct_devices_24h",
+        "device_is_emulator",
+        "device_entropy_score",
+        "device_is_card_cycling",
+        "device_is_device_cycling",
+    ):
+        assert col in df_res.columns
+
+    # JSON output format
+    out_json = tmp_path / "tx_enriched.json"
+    res_json = runner.invoke(
+        app,
+        [
+            "device-enrich",
+            "-i",
+            str(in_csv),
+            "-o",
+            str(out_json),
+            "--format",
+            "json",
+        ],
+    )
+    assert res_json.exit_code == 0, res_json.output
+    json_data = json.loads(out_json.read_text(encoding="utf-8"))
+    assert len(json_data) == 2
+    assert "device_distinct_cards_24h" in json_data[0]
+
+
+def test_device_enrich_cli_guard_and_errors(tmp_path: Path) -> None:
+    # 1. Missing input file
+    res_miss = runner.invoke(
+        app,
+        ["device-enrich", "-i", str(tmp_path / "missing.csv"), "-o", str(tmp_path / "out.csv")],
+    )
+    assert res_miss.exit_code == 2
+
+    # 2. Empty CSV
+    empty_csv = tmp_path / "empty.csv"
+    empty_csv.write_text("device_id,card_id,timestamp\n", encoding="utf-8")
+    res_empty = runner.invoke(
+        app, ["device-enrich", "-i", str(empty_csv), "-o", str(tmp_path / "out.csv")]
+    )
+    assert res_empty.exit_code == 2
+
+    # 3. Output exists without overwrite
+    in_csv = tmp_path / "in.csv"
+    in_csv.write_text("device_id,card_id,timestamp\nd1,c1,1000.0\n", encoding="utf-8")
+    out_file = tmp_path / "out.csv"
+    out_file.write_text("dummy", encoding="utf-8")
+
+    res_ov = runner.invoke(app, ["device-enrich", "-i", str(in_csv), "-o", str(out_file)])
+    assert res_ov.exit_code == 2
+    assert "Output already exists" in res_ov.output
+
+    # 4. Output exists with overwrite
+    res_ov_ok = runner.invoke(
+        app, ["device-enrich", "-i", str(in_csv), "-o", str(out_file), "--overwrite"]
+    )
+    assert res_ov_ok.exit_code == 0
+
+
+def test_device_clusters_and_enrich_advanced_branches(tmp_path: Path) -> None:
+    csv_path = tmp_path / "advanced.csv"
+    csv_path.write_text(
+        "device_id,card_id,timestamp,user_agent,screen_width,screen_height,hardware_concurrency,device_memory_gb,canvas_hash,audio_hash\n"
+        "d_base,c_shared,1000.0,Mozilla/5.0,1920,1080,8,16.0,c1,a1\n"
+        "d_other,c_shared,1005.0,Mozilla/5.0,1920,1080,8,16.0,c1,a1\n"
+        "d_drift,c_drift,1010.0,Mozilla/5.0,1920,1080,8,16.0,c1,a1\n"
+        "d_drift,c_drift,1015.0,DifferentUA/2.0,100,100,2,2.0,c2,a2\n"
+        ",c_auto,1020.0,AutoDevice/1.0,1920,1080,4,8.0,,\n"
+        ",,1025.0,,,,,,,\n"
+        "d_bad_scr,c_bad,1030.0,Mozilla/5.0,-10,not_int,4,8.0,,\n",
+        encoding="utf-8",
+    )
+    res = runner.invoke(
+        app,
+        [
+            "device-clusters",
+            "-i",
+            str(csv_path),
+            "--device-cycling-threshold",
+            "2",
+            "--similarity-threshold",
+            "0.8",
+            "--json",
+        ],
+    )
+    assert res.exit_code == 0
+    data = json.loads(res.output)
+    assert data["device_cycling_anomalies_count"] >= 1
+    assert data["drift_anomalies_count"] >= 1
+
+    # EmptyDataError check (completely empty file without headers)
+    zero_file = tmp_path / "zero.csv"
+    zero_file.write_text("", encoding="utf-8")
+    res_zero_clusters = runner.invoke(app, ["device-clusters", "-i", str(zero_file)])
+    assert res_zero_clusters.exit_code == 2
+
+    res_zero_enrich = runner.invoke(
+        app, ["device-enrich", "-i", str(zero_file), "-o", str(tmp_path / "out.csv")]
+    )
+    assert res_zero_enrich.exit_code == 2

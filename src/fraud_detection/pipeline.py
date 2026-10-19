@@ -24,6 +24,10 @@ from uuid import uuid4
 import numpy as np
 import pandas as pd
 
+from fraud_detection.device import (
+    DeviceFeatureExtractor,
+    DeviceTracker,
+)
 from fraud_detection.evaluation import (
     DecisionAction,
     PolicyTransitionMatrix,
@@ -1097,6 +1101,46 @@ class GeoEnrichmentStageProcessor:
         }
 
 
+class DeviceEnrichmentStageProcessor:
+    """Enriches transactions with real-time adaptive device fingerprinting."""
+
+    def __init__(
+        self,
+        tracker: DeviceTracker | None = None,
+        feature_extractor: DeviceFeatureExtractor | None = None,
+        update_tracker: bool = True,
+    ) -> None:
+        self.tracker = tracker if tracker is not None else DeviceTracker()
+        self.feature_extractor = (
+            feature_extractor
+            if feature_extractor is not None
+            else DeviceFeatureExtractor(tracker=self.tracker)
+        )
+        self.update_tracker = update_tracker
+
+    def __call__(self, context: PipelineContext) -> dict[str, Any]:
+        tx = dict(context.transaction)
+        device_features = self.feature_extractor.extract_features(
+            tx,
+            mutate_tracker=self.update_tracker,
+        )
+        tx.update(device_features)
+        context.transaction = tx
+        context.metadata["device_features"] = list(device_features.keys())
+        return {
+            "device_features": device_features,
+            "device_is_emulator": bool(device_features.get("device_is_emulator", 0.0) == 1.0),
+            "device_is_card_cycling": bool(
+                device_features.get("device_is_card_cycling", 0.0) == 1.0
+            ),
+            "device_is_device_cycling": bool(
+                device_features.get("device_is_device_cycling", 0.0) == 1.0
+            ),
+        }
+
+
+DeviceEnrichmentStage = DeviceEnrichmentStageProcessor
+GeoEnrichmentStage = GeoEnrichmentStageProcessor
 GraphEnrichmentStage = GraphEnrichmentStageProcessor
 
 
@@ -1837,6 +1881,9 @@ def create_default_fraud_pipeline(
     ip_resolver: IPGeoResolver | None = None,
     geo_feature_extractor: GeoFeatureExtractor | None = None,
     geo_enrichment_timeout_seconds: float | None = 0.25,
+    device_tracker: DeviceTracker | None = None,
+    device_feature_extractor: DeviceFeatureExtractor | None = None,
+    device_enrichment_timeout_seconds: float | None = 0.25,
 ) -> DecisionGraph:
     """Build a standard, production-ready fraud decision execution graph."""
     applied_threshold = model.threshold if threshold is None else threshold
@@ -1930,6 +1977,25 @@ def create_default_fraud_pipeline(
             )
         )
         upstream_deps = ["geo_enrichment"]
+
+    if device_tracker is not None or device_feature_extractor is not None:
+        device_proc = DeviceEnrichmentStageProcessor(
+            tracker=device_tracker,
+            feature_extractor=device_feature_extractor,
+        )
+        graph.add_node(
+            PipelineNode(
+                name="device_enrichment",
+                stage_type=StageType.ENRICHMENT,
+                processor=device_proc,
+                dependencies=list(upstream_deps),
+                timeout_seconds=device_enrichment_timeout_seconds,
+                fallback_value={},
+                required=False,
+                circuit_policy=circuit_policy,
+            )
+        )
+        upstream_deps = ["device_enrichment"]
 
     rule_proc = RuleStageProcessor(rules=rules)
     graph.add_node(

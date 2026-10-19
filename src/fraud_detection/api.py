@@ -42,14 +42,24 @@ from fraud_detection.audit import (
     AuditSink,
     JsonlAuditSink,
     NullAuditSink,
+    _mask_pans_in_string,
     build_challenger_retrained_audit_event,
     build_delayed_label_audit_event,
+    build_device_anomaly_audit_event,
     build_model_promoted_audit_event,
     build_pipeline_chaos_audit_event,
     build_pipeline_replay_audit_event,
     build_retraining_trigger_audit_event,
     build_scoring_audit_event,
     build_shadow_scoring_audit_event,
+)
+from fraud_detection.device import (
+    DeviceFeatureExtractor,
+    DeviceFingerprint,
+    DeviceFingerprintError,
+    DeviceHasher,
+    DeviceTracker,
+    DeviceTrackerConfig,
 )
 from fraud_detection.evaluation import DecisionAction, TieredThresholds
 from fraud_detection.explanations import ExplanationProvider
@@ -178,6 +188,10 @@ GRAPH_WINDOW_SECONDS_ENVIRONMENT_VARIABLE = "FRAUD_GRAPH_WINDOW_SECONDS"
 MAX_GRAPH_NODES_ENVIRONMENT_VARIABLE = "FRAUD_MAX_GRAPH_NODES"
 GEO_WINDOW_SECONDS_ENVIRONMENT_VARIABLE = "FRAUD_GEO_WINDOW_SECONDS"
 GEO_MAX_SPEED_KMH_ENVIRONMENT_VARIABLE = "FRAUD_GEO_MAX_SPEED_KMH"
+DEVICE_WINDOW_SECONDS_ENVIRONMENT_VARIABLE = "FRAUD_DEVICE_WINDOW_SECONDS"
+DEVICE_CARD_CYCLING_THRESHOLD_ENVIRONMENT_VARIABLE = "FRAUD_DEVICE_CARD_CYCLING_THRESHOLD"
+DEVICE_CYCLING_THRESHOLD_ENVIRONMENT_VARIABLE = "FRAUD_DEVICE_CYCLING_THRESHOLD"
+DEVICE_MAX_DEVICES_ENVIRONMENT_VARIABLE = "FRAUD_DEVICE_MAX_DEVICES"
 REQUEST_ID_HEADER = "X-Request-ID"
 PROCESS_TIME_HEADER = "X-Process-Time-Ms"
 MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024
@@ -205,6 +219,9 @@ OPERATIONAL_PATHS = frozenset(
         "/v1/geo/stats",
         "/v1/geo/assess",
         "/v1/geo/reset",
+        "/v1/device/stats",
+        "/v1/device/assess",
+        "/v1/device/reset",
     }
 )
 UNMATCHED_ROUTE_LABEL = "unmatched"
@@ -1209,6 +1226,65 @@ class GeoResetResponse(BaseModel):
     message: str
 
 
+class DeviceProfileResponse(BaseModel):
+    """Profile and card associations for a tracked device."""
+
+    device_id: str
+    first_seen_timestamp: float
+    last_seen_timestamp: float
+    transaction_count: int
+    distinct_cards_count: int
+    cards: list[str] = Field(default_factory=list)
+    has_emulator_signatures: bool
+    active_fingerprint: dict[str, Any] | None = None
+    known_fingerprints_count: int = 1
+
+
+class DeviceStatsResponse(BaseModel):
+    """Operational metrics of the real-time device fingerprint tracker."""
+
+    enabled: bool
+    tracked_devices: int
+    window_seconds: float
+    card_cycling_threshold: int
+    device_cycling_threshold: int
+    max_devices: int
+
+
+class DeviceAssessRequest(BaseModel):
+    """Candidate device fingerprint anomaly assessment request."""
+
+    device: dict[str, Any]
+    card_id: str | None = None
+    timestamp: float | None = None
+    record: bool = False
+
+
+class DeviceAssessResponse(BaseModel):
+    """Device anomaly, emulator signatures, and entropy assessment outcome."""
+
+    device_id: str
+    fingerprint_hash: str
+    is_emulator: bool
+    is_card_cycling: bool
+    is_device_cycling: bool
+    is_fingerprint_drift: bool
+    distinct_cards_count: int
+    distinct_devices_count: int
+    similarity_to_baseline: float
+    severity: str
+    reasons: list[str] = Field(default_factory=list)
+    entropy_score: float
+    features: dict[str, float] = Field(default_factory=dict)
+
+
+class DeviceResetResponse(BaseModel):
+    """Device tracker reset acknowledgement."""
+
+    status: str = "ok"
+    message: str = "Device tracker reset successfully."
+
+
 def create_app(
     *,
     model: FraudModel | None = None,
@@ -1276,6 +1352,12 @@ def create_app(
     geo_feature_extractor: GeoFeatureExtractor | None = None,
     geo_window_seconds: float = 86400.0,
     geo_max_speed_kmh: float = 900.0,
+    device_tracker: DeviceTracker | None = None,
+    device_feature_extractor: DeviceFeatureExtractor | None = None,
+    device_window_seconds: float = 86400.0,
+    device_card_cycling_threshold: int = 3,
+    device_cycling_threshold: int = 3,
+    device_max_devices: int = 50000,
 ) -> FastAPI:
     """Create an application using an injected model or a trusted artifact path.
 
@@ -1555,7 +1637,55 @@ def create_app(
             config=GeoFeatureConfig(max_speed_kmh=resolved_geo_tracker.max_speed_kmh),
         )
 
+    resolved_device_tracker: DeviceTracker | None = device_tracker
+    resolved_device_feature_extractor: DeviceFeatureExtractor | None = device_feature_extractor
+
+    if resolved_device_tracker is None:
+        raw_dev_window = os.getenv(DEVICE_WINDOW_SECONDS_ENVIRONMENT_VARIABLE)
+        eff_dev_window = (
+            float(raw_dev_window) if raw_dev_window is not None else device_window_seconds
+        )
+        raw_card_thresh = os.getenv(DEVICE_CARD_CYCLING_THRESHOLD_ENVIRONMENT_VARIABLE)
+        eff_card_thresh = (
+            int(raw_card_thresh) if raw_card_thresh is not None else device_card_cycling_threshold
+        )
+        raw_dev_thresh = os.getenv(DEVICE_CYCLING_THRESHOLD_ENVIRONMENT_VARIABLE)
+        eff_dev_thresh = (
+            int(raw_dev_thresh) if raw_dev_thresh is not None else device_cycling_threshold
+        )
+        raw_max_dev = os.getenv(DEVICE_MAX_DEVICES_ENVIRONMENT_VARIABLE)
+        eff_max_dev = int(raw_max_dev) if raw_max_dev is not None else device_max_devices
+        resolved_device_tracker = DeviceTracker(
+            config=DeviceTrackerConfig(
+                window_seconds=eff_dev_window,
+                max_devices=eff_max_dev,
+                card_cycling_threshold=eff_card_thresh,
+                device_cycling_threshold=eff_dev_thresh,
+            )
+        )
+
+    if resolved_device_feature_extractor is None and resolved_device_tracker is not None:
+        resolved_device_feature_extractor = DeviceFeatureExtractor(
+            tracker=resolved_device_tracker,
+        )
+
     metrics_registry = CollectorRegistry()
+    device_anomalies_counter = Counter(
+        "fraud_device_anomalies_total",
+        "Total device and browser anomalies detected by anomaly type.",
+        ["anomaly_type"],
+        registry=metrics_registry,
+    )
+    device_evaluations_counter = Counter(
+        "fraud_device_evaluations_total",
+        "Total device fingerprint evaluations performed.",
+        registry=metrics_registry,
+    )
+    device_tracked_gauge = Gauge(
+        "fraud_device_tracked_devices_total",
+        "Total active tracked devices in sliding temporal window.",
+        registry=metrics_registry,
+    )
     geo_impossible_travel_counter = Counter(
         "fraud_geo_impossible_travel_total",
         "Total impossible travel geolocation anomalies detected.",
@@ -2004,6 +2134,8 @@ def create_app(
                 geo_tracker=geo_tracker,
                 ip_resolver=ip_resolver,
                 geo_feature_extractor=geo_feature_extractor,
+                device_tracker=device_tracker,
+                device_feature_extractor=device_feature_extractor,
             )
 
         resolved_pipeline_exec = pipeline_executor
@@ -2034,6 +2166,11 @@ def create_app(
         application.state.geo_impossible_travel_counter = geo_impossible_travel_counter
         application.state.geo_events_counter = geo_events_counter
         application.state.geo_distance_counter = geo_distance_counter
+        application.state.device_tracker = resolved_device_tracker
+        application.state.device_feature_extractor = resolved_device_feature_extractor
+        application.state.device_anomalies_counter = device_anomalies_counter
+        application.state.device_evaluations_counter = device_evaluations_counter
+        application.state.device_tracked_gauge = device_tracked_gauge
         application.state.audit_sink = resolved_audit_sink
         application.state.explanation_provider = explanation_provider
         application.state.fallback_mode = resolved_fallback_mode
@@ -2131,9 +2268,12 @@ def create_app(
         request: Request,
         call_next: RequestResponseEndpoint,
     ) -> Response:
+        is_operational = request.url.path in OPERATIONAL_PATHS or request.url.path.startswith(
+            ("/v1/device/profile/", "/v1/geo/velocity/")
+        )
         if (
             api_key_set is not None
-            and request.url.path not in OPERATIONAL_PATHS
+            and not is_operational
             and not _api_key_is_valid(request.headers.get("X-API-Key"), api_key_set)
         ):
             return JSONResponse(
@@ -2149,7 +2289,10 @@ def create_app(
     ) -> Response:
         # Registered after the API-key middleware, so it runs outside it: unauthenticated
         # traffic has to consume the client budget, otherwise key guessing is unmetered.
-        if rate_limiter is None or request.url.path in OPERATIONAL_PATHS:
+        is_operational = request.url.path in OPERATIONAL_PATHS or request.url.path.startswith(
+            ("/v1/device/profile/", "/v1/geo/velocity/")
+        )
+        if rate_limiter is None or is_operational:
             return await call_next(request)
         client_ip = request.client.host if request.client else "unknown"
         decision = rate_limiter.check(client_ip)
@@ -3232,6 +3375,48 @@ def create_app(
                     if geo_imp_c is not None:
                         geo_imp_c.inc()
 
+        device_tracker_obj: DeviceTracker | None = getattr(
+            request.app.state, "device_tracker", None
+        )
+        device_extractor_obj: DeviceFeatureExtractor | None = getattr(
+            request.app.state, "device_feature_extractor", None
+        )
+        if device_tracker_obj is not None and device_extractor_obj is not None:
+            req_entities = payload.entities or {}
+            card_val = (
+                req_entities.get("card_id")
+                or req_entities.get("user_id")
+                or req_entities.get("entity_id")
+            )
+            device_val = req_entities.get("device_id") or req_entities.get("device")
+            if device_val:
+                ts = float(
+                    payload.transaction.get("timestamp")
+                    or payload.transaction.get("Time")
+                    or time.time()
+                )
+                dev_tx: dict[str, Any] = {
+                    "card_id": str(card_val) if card_val else None,
+                    "timestamp": ts,
+                    "device_id": str(device_val),
+                }
+                dev_feats = device_extractor_obj.extract_features(dev_tx, mutate_tracker=True)
+                dev_eval_c: Counter | None = getattr(
+                    request.app.state, "device_evaluations_counter", None
+                )
+                if dev_eval_c is not None:
+                    dev_eval_c.inc()
+                dev_anom_c: Counter | None = getattr(
+                    request.app.state, "device_anomalies_counter", None
+                )
+                if dev_anom_c is not None:
+                    if dev_feats.get("device_is_emulator") == 1.0:
+                        dev_anom_c.labels(anomaly_type="emulator").inc()
+                    if dev_feats.get("device_is_card_cycling") == 1.0:
+                        dev_anom_c.labels(anomaly_type="card_cycling").inc()
+                    if dev_feats.get("device_is_device_cycling") == 1.0:
+                        dev_anom_c.labels(anomaly_type="device_cycling").inc()
+
         return ScoreResponse(
             model_version=_model_version(loaded),
             threshold=applied_threshold,
@@ -3567,6 +3752,177 @@ def create_app(
         return GeoResetResponse(
             status="ok",
             message="Geolocation tracker reset successfully.",
+        )
+
+    @application.get(
+        "/v1/device/profile/{device_id}",
+        response_model=DeviceProfileResponse,
+        responses={404: {"description": "Device profile or tracker not found."}},
+        tags=["device"],
+    )
+    async def device_profile(
+        device_id: str, request: Request
+    ) -> DeviceProfileResponse | JSONResponse:
+        """Query profile, active fingerprint, and card associations for a tracked device."""
+        tracker: DeviceTracker | None = getattr(request.app.state, "device_tracker", None)
+        if tracker is None:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": "Device tracking is not enabled on this service."},
+            )
+        prof = tracker.get_profile(device_id)
+        if prof is None:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": f"Device '{device_id}' has no recorded profile."},
+            )
+        masked_cards = [_mask_pans_in_string(c) for c in prof.cards_seen]
+        return DeviceProfileResponse(
+            device_id=prof.device_id,
+            first_seen_timestamp=prof.first_seen_timestamp,
+            last_seen_timestamp=prof.last_seen_timestamp,
+            transaction_count=prof.transaction_count,
+            distinct_cards_count=len(prof.cards_seen),
+            cards=masked_cards,
+            has_emulator_signatures=prof.is_emulator,
+            active_fingerprint=prof.baseline_fingerprint.to_dict()
+            if prof.baseline_fingerprint
+            else None,
+            known_fingerprints_count=len(prof.canonical_hashes),
+        )
+
+    @application.get("/v1/device/stats", response_model=DeviceStatsResponse, tags=["device"])
+    async def device_stats(request: Request) -> DeviceStatsResponse:
+        """Return operational metrics of the real-time device fingerprint tracker."""
+        tracker: DeviceTracker | None = getattr(request.app.state, "device_tracker", None)
+        if tracker is None:
+            return DeviceStatsResponse(
+                enabled=False,
+                tracked_devices=0,
+                window_seconds=0.0,
+                card_cycling_threshold=0,
+                device_cycling_threshold=0,
+                max_devices=0,
+            )
+        return DeviceStatsResponse(
+            enabled=True,
+            tracked_devices=tracker.get_tracked_device_count(),
+            window_seconds=tracker.config.window_seconds,
+            card_cycling_threshold=tracker.config.card_cycling_threshold,
+            device_cycling_threshold=tracker.config.device_cycling_threshold,
+            max_devices=tracker.config.max_devices,
+        )
+
+    @application.post(
+        "/v1/device/assess",
+        response_model=DeviceAssessResponse,
+        responses={404: {"description": "Device tracking not enabled."}},
+        tags=["device"],
+    )
+    async def device_assess(
+        payload: DeviceAssessRequest,
+        request: Request,
+    ) -> DeviceAssessResponse | JSONResponse:
+        """Assess emulator signatures, card cycling, drift, and entropy for a device fingerprint."""
+        tracker: DeviceTracker | None = getattr(request.app.state, "device_tracker", None)
+        extractor: DeviceFeatureExtractor | None = getattr(
+            request.app.state, "device_feature_extractor", None
+        )
+        if tracker is None or extractor is None:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": "Device tracking is not enabled on this service."},
+            )
+
+        ts = payload.timestamp if payload.timestamp is not None else time.time()
+        try:
+            fp = DeviceFingerprint.from_dict(payload.device)
+        except (DeviceFingerprintError, ValueError, TypeError, KeyError) as e:
+            return JSONResponse(
+                status_code=422,
+                content={"detail": f"Invalid device fingerprint payload: {e}"},
+            )
+
+        dev_id = str(fp.device_id or "unknown")
+        clean_card = payload.card_id.strip() if payload.card_id is not None else None
+
+        if payload.record:
+            report = tracker.record_event(
+                device_id=dev_id,
+                card_id=clean_card,
+                timestamp=ts,
+                fingerprint=fp,
+            )
+        else:
+            report = tracker.assess_event(
+                device_id=dev_id,
+                card_id=clean_card,
+                timestamp=ts,
+                fingerprint=fp,
+            )
+
+        dev_tx: dict[str, Any] = {
+            "device": fp.to_dict(),
+            "card_id": clean_card,
+            "timestamp": ts,
+        }
+        features = extractor.extract_features(dev_tx, mutate_tracker=False)
+
+        eval_counter: Counter | None = getattr(
+            request.app.state, "device_evaluations_counter", None
+        )
+        if eval_counter is not None:
+            eval_counter.inc()
+
+        anom_counter: Counter | None = getattr(request.app.state, "device_anomalies_counter", None)
+        if anom_counter is not None:
+            if report.is_emulator:
+                anom_counter.labels(anomaly_type="emulator").inc()
+            if report.is_card_cycling:
+                anom_counter.labels(anomaly_type="card_cycling").inc()
+            if report.is_device_cycling:
+                anom_counter.labels(anomaly_type="device_cycling").inc()
+            if report.is_fingerprint_drift:
+                anom_counter.labels(anomaly_type="fingerprint_drift").inc()
+
+        if report.severity in ("HIGH", "CRITICAL"):
+            audit_sink_obj: AuditSink | None = getattr(request.app.state, "audit_sink", None)
+            if audit_sink_obj is not None:
+                audit_sink_obj.emit(
+                    build_device_anomaly_audit_event(
+                        report=report,
+                        device_id=dev_id,
+                        card_id=clean_card,
+                        trigger_action="DENY" if report.severity == "CRITICAL" else "CHALLENGE",
+                    )
+                )
+
+        fp_hash = DeviceHasher.canonical_hash(fp)
+        return DeviceAssessResponse(
+            device_id=dev_id,
+            fingerprint_hash=fp_hash,
+            is_emulator=report.is_emulator,
+            is_card_cycling=report.is_card_cycling,
+            is_device_cycling=report.is_device_cycling,
+            is_fingerprint_drift=report.is_fingerprint_drift,
+            distinct_cards_count=report.distinct_cards_count,
+            distinct_devices_count=report.distinct_devices_count,
+            similarity_to_baseline=report.similarity_to_baseline,
+            severity=report.severity,
+            reasons=list(report.reasons),
+            entropy_score=features.get("device_entropy_score", 0.0),
+            features=features,
+        )
+
+    @application.post("/v1/device/reset", response_model=DeviceResetResponse, tags=["device"])
+    async def device_reset(request: Request) -> DeviceResetResponse:
+        """Reset the real-time device fingerprint tracker and clear active profiles."""
+        tracker: DeviceTracker | None = getattr(request.app.state, "device_tracker", None)
+        if tracker is not None:
+            tracker.reset()
+        return DeviceResetResponse(
+            status="ok",
+            message="Device tracker reset successfully.",
         )
 
     @application.get(
@@ -4795,6 +5151,12 @@ def create_app(
                     g_nodes_gauge.labels(entity_type=et.value).set(
                         float(g_metrics.entities_by_type.get(et.value, 0))
                     )
+
+        dev_trk: DeviceTracker | None = getattr(application.state, "device_tracker", None)
+        if dev_trk is not None:
+            dev_gauge: Gauge | None = getattr(application.state, "device_tracked_gauge", None)
+            if dev_gauge is not None:
+                dev_gauge.set(float(dev_trk.get_tracked_device_count()))
 
         return Response(
             content=generate_latest(metrics_registry),

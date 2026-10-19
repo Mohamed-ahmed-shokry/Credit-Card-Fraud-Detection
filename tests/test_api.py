@@ -4887,3 +4887,268 @@ def test_geo_disabled_and_environment_defaults(
             },
         )
         assert assess_resp.status_code == 404
+
+
+def test_device_api_endpoints_and_telemetry(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+    tmp_path: Path,
+) -> None:
+    _, model, _ = api_context
+    audit_file = tmp_path / "device_api_audit.jsonl"
+    sink = JsonlAuditSink(audit_file)
+    app = create_app(model=model, audit_sink=sink)
+
+    with TestClient(app) as client:
+        # 1. Initial stats check
+        stats_resp = client.get("/v1/device/stats")
+        assert stats_resp.status_code == 200
+        stats = stats_resp.json()
+        assert stats["enabled"] is True
+        assert stats["tracked_devices"] == 0
+        assert stats["card_cycling_threshold"] == 3
+        assert stats["device_cycling_threshold"] == 3
+
+        # 2. Query unknown profile returns 404
+        prof_404 = client.get("/v1/device/profile/dev_unknown_999")
+        assert prof_404.status_code == 404
+        assert "no recorded profile" in prof_404.json()["detail"]
+
+        # 3. Invalid payload schema returns 422
+        bad_assess = client.post("/v1/device/assess", json={"device": "not_a_dict"})
+        assert bad_assess.status_code == 422
+
+        # 4. Clean assessment with record=True
+        clean_dev = {
+            "device_id": "dev_phone_123",
+            "user_agent": (
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15"
+            ),
+            "os_platform": "iOS",
+            "browser_family": "Mobile Safari",
+            "screen": {"width": 390, "height": 844, "pixel_ratio": 3.0},
+            "language": "en-US",
+            "timezone_offset_minutes": -300,
+            "hardware_concurrency": 6,
+            "device_memory_gb": 6,
+            "webgl_vendor": "Apple Inc.",
+            "webgl_renderer": "Apple GPU",
+            "canvas_hash": "canvas_apple_ok_123",
+            "audio_hash": "audio_apple_ok_123",
+            "is_touch_capable": True,
+            "has_webdriver": False,
+        }
+        pan_card1 = "4532015112830366"  # Luhn valid PAN
+        assess1 = client.post(
+            "/v1/device/assess",
+            json={
+                "device": clean_dev,
+                "card_id": pan_card1,
+                "timestamp": 1000.0,
+                "record": True,
+            },
+        )
+        assert assess1.status_code == 200
+        data1 = assess1.json()
+        assert data1["device_id"] == "dev_phone_123"
+        assert len(data1["fingerprint_hash"]) == 64
+        assert data1["is_emulator"] is False
+        assert data1["is_card_cycling"] is False
+        assert data1["distinct_cards_count"] == 1
+        assert data1["severity"] == "LOW"
+        assert data1["features"]["device_is_emulator"] == 0.0
+
+        # Verify profile is now available with PAN masked
+        prof_resp = client.get("/v1/device/profile/dev_phone_123")
+        assert prof_resp.status_code == 200
+        prof = prof_resp.json()
+        assert prof["device_id"] == "dev_phone_123"
+        assert prof["transaction_count"] == 1
+        assert prof["distinct_cards_count"] == 1
+        assert prof["has_emulator_signatures"] is False
+        assert prof["cards"] == ["[REDACTED_PAN]"]
+        assert prof["active_fingerprint"] is not None
+
+        # 5. Card cycling attack: add card 2 and card 3 to reach threshold=3
+        client.post(
+            "/v1/device/assess",
+            json={
+                "device": clean_dev,
+                "card_id": "card_user_two",
+                "timestamp": 1050.0,
+                "record": True,
+            },
+        )
+        assess3 = client.post(
+            "/v1/device/assess",
+            json={
+                "device": clean_dev,
+                "card_id": "card_user_three",
+                "timestamp": 1100.0,
+                "record": True,
+            },
+        )
+        assert assess3.status_code == 200
+        data3 = assess3.json()
+        assert data3["is_card_cycling"] is True
+        assert data3["distinct_cards_count"] == 3
+        assert data3["severity"] == "HIGH"
+
+        # 6. Emulator attack: headless Chrome with webdriver
+        bot_dev = {
+            "device_id": "dev_botnet_999",
+            "user_agent": "Mozilla/5.0 HeadlessChrome/120.0.0.0 Safari/537.36",
+            "os_platform": "Linux",
+            "browser_family": "HeadlessChrome",
+            "screen": {"width": 800, "height": 600, "pixel_ratio": 1.0},
+            "language": "en-US",
+            "timezone_offset_minutes": 0,
+            "hardware_concurrency": 128,
+            "device_memory_gb": 0.5,
+            "webgl_vendor": "",
+            "webgl_renderer": "",
+            "canvas_hash": "",
+            "audio_hash": "",
+            "is_touch_capable": False,
+            "has_webdriver": True,
+        }
+        for i in range(3):
+            client.post(
+                "/v1/device/assess",
+                json={
+                    "device": bot_dev,
+                    "card_id": f"card_bot_{i}",
+                    "timestamp": 1200.0 + i,
+                    "record": True,
+                },
+            )
+        assess_bot = client.post(
+            "/v1/device/assess",
+            json={
+                "device": bot_dev,
+                "card_id": "card_bot_trigger",
+                "timestamp": 1205.0,
+                "record": True,
+            },
+        )
+        assert assess_bot.status_code == 200
+        bot_data = assess_bot.json()
+        assert bot_data["is_emulator"] is True
+        assert bot_data["is_card_cycling"] is True
+        assert bot_data["severity"] == "CRITICAL"
+
+        # 7. Check Prometheus metrics
+        metrics_resp = client.get("/metrics")
+        assert metrics_resp.status_code == 200
+        metrics_text = metrics_resp.text
+        assert "fraud_device_anomalies_total" in metrics_text
+        assert "fraud_device_evaluations_total" in metrics_text
+        assert "fraud_device_tracked_devices_total" in metrics_text
+
+        # 8. Check audit log event emitted for CRITICAL anomaly
+        sink.close()
+        assert audit_file.exists()
+        lines = [
+            json.loads(line) for line in audit_file.read_text(encoding="utf-8").splitlines() if line
+        ]
+        device_events = [
+            ev for ev in lines if ev.get("event_type") == "fraud.device.anomaly_detected"
+        ]
+        assert len(device_events) >= 1
+        assert device_events[-1]["payload"]["device_id"] == "dev_botnet_999"
+        assert device_events[-1]["payload"]["is_emulator"] is True
+        assert device_events[-1]["payload"]["is_card_cycling"] is True
+
+        # 9. Test /v1/score integration with device metadata
+        sample_row = model.feature_names
+        sample_dict = dict.fromkeys(sample_row, 0.1)
+        pred_resp = client.post(
+            "/v1/score",
+            json={
+                "transaction": sample_dict,
+                "entities": {"device_id": "dev_predict_test", "card_id": "card_pred_1"},
+            },
+        )
+        assert pred_resp.status_code == 200
+        stats_pred = client.get("/v1/device/stats").json()
+        assert stats_pred["tracked_devices"] >= 3
+
+        # 10. Test reset endpoint
+        reset_resp = client.post("/v1/device/reset")
+        assert reset_resp.status_code == 200
+        assert reset_resp.json()["status"] == "ok"
+        stats_after_reset = client.get("/v1/device/stats").json()
+        assert stats_after_reset["tracked_devices"] == 0
+
+
+def test_device_api_disabled_and_environment_defaults(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, model, _ = api_context
+
+    monkeypatch.setenv("FRAUD_DEVICE_WINDOW_SECONDS", "7200.0")
+    monkeypatch.setenv("FRAUD_DEVICE_CARD_CYCLING_THRESHOLD", "5")
+    monkeypatch.setenv("FRAUD_DEVICE_CYCLING_THRESHOLD", "4")
+    monkeypatch.setenv("FRAUD_DEVICE_MAX_DEVICES", "1000")
+
+    app = create_app(model=model)
+    with TestClient(app) as client:
+        tracker = getattr(app.state, "device_tracker", None)
+        assert tracker is not None
+        assert tracker.config.window_seconds == 7200.0
+        assert tracker.config.card_cycling_threshold == 5
+        assert tracker.config.device_cycling_threshold == 4
+        assert tracker.config.max_devices == 1000
+
+        # When device_tracker is disabled
+        app.state.device_tracker = None
+        stats_resp = client.get("/v1/device/stats")
+        assert stats_resp.status_code == 200
+        assert stats_resp.json()["enabled"] is False
+
+        prof_resp = client.get("/v1/device/profile/foo")
+        assert prof_resp.status_code == 404
+        assert "not enabled" in prof_resp.json()["detail"]
+
+        assess_resp = client.post(
+            "/v1/device/assess",
+            json={
+                "device": {
+                    "device_id": "foo",
+                    "user_agent": "test",
+                    "os_platform": "Linux",
+                    "browser_family": "Chrome",
+                },
+            },
+        )
+        assert assess_resp.status_code == 404
+        assert "not enabled" in assess_resp.json()["detail"]
+
+
+def test_device_api_metrics_and_reset_branches(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    _, model, _ = api_context
+    app = create_app(model=model)
+    with TestClient(app) as client:
+        # Populate a device event
+        client.post(
+            "/v1/device/assess",
+            json={
+                "device": {
+                    "device_id": "metrics_dev",
+                    "user_agent": "Mozilla/5.0",
+                },
+                "card_id": "c_metrics",
+            },
+        )
+        # 1. /metrics with device_tracker active
+        metrics_resp = client.get("/metrics")
+        assert metrics_resp.status_code == 200
+        assert "fraud_device_evaluations_total" in metrics_resp.text
+
+        # 2. Reset when disabled
+        app.state.device_tracker = None
+        reset_resp = client.post("/v1/device/reset")
+        assert reset_resp.status_code == 200
+        assert reset_resp.json()["status"] == "ok"

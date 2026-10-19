@@ -24,6 +24,7 @@ from fraud_detection.evaluation import (
 )
 
 if TYPE_CHECKING:
+    from fraud_detection.device import DeviceAnomalyReport
     from fraud_detection.feedback import DelayedLabelRecord, RetrainingTriggerEvent
     from fraud_detection.geolocation import GeoLocationEvent, TravelVelocity
     from fraud_detection.graph import FraudRingCluster
@@ -110,7 +111,16 @@ def redact_data(
         for key, value in data.items():
             str_key = str(key)
             normalized_key = str_key.lower().replace("-", "_").strip()
-            is_sensitive = any(sensitive in normalized_key for sensitive in sensitive_keys)
+            is_sensitive = False
+            for sensitive in sensitive_keys:
+                if sensitive in normalized_key:
+                    if normalized_key.startswith(("is_", "has_")) or normalized_key.endswith(
+                        ("_count", "_total", "_rate", "_ratio")
+                    ):
+                        continue
+                    is_sensitive = True
+                    break
+
             if is_sensitive:
                 redacted_dict[str_key] = mask_value
             else:
@@ -1218,4 +1228,70 @@ def build_impossible_travel_audit_event(
         model_version=model_version,
         dataset_fingerprint=dataset_fingerprint,
         payload=redact_data(payload),
+    )
+
+
+def build_device_anomaly_audit_event(
+    *,
+    report: DeviceAnomalyReport | Mapping[str, Any],
+    device_id: str | None = None,
+    card_id: str | None = None,
+    transaction_id: str | None = None,
+    trigger_action: str = "DENY",
+    model_version: str = "v1",
+    dataset_fingerprint: str | None = None,
+    metadata: Mapping[str, Any] | None = None,
+) -> AuditEvent:
+    """Construct a structured audit event when a device or browser anomaly is detected."""
+    if isinstance(report, Mapping):
+        dev_id = str(report.get("device_id", device_id or "unknown"))
+        c_id = report.get("card_id", card_id)
+        is_emulator = bool(report.get("is_emulator", False))
+        is_card_cycling = bool(report.get("is_card_cycling", False))
+        is_device_cycling = bool(report.get("is_device_cycling", False))
+        is_drift = bool(report.get("is_fingerprint_drift", False))
+        distinct_cards = int(report.get("distinct_cards_count", 0))
+        distinct_devices = int(report.get("distinct_devices_count", 0))
+        similarity = float(report.get("similarity_to_baseline", 1.0))
+        severity = str(report.get("severity", "LOW"))
+        raw_reasons = report.get("reasons", ())
+    else:
+        dev_id = str(report.device_id or device_id or "unknown")
+        c_id = report.card_id or card_id
+        is_emulator = bool(report.is_emulator)
+        is_card_cycling = bool(report.is_card_cycling)
+        is_device_cycling = bool(report.is_device_cycling)
+        is_drift = bool(report.is_fingerprint_drift)
+        distinct_cards = int(report.distinct_cards_count)
+        distinct_devices = int(report.distinct_devices_count)
+        similarity = float(report.similarity_to_baseline)
+        severity = str(report.severity)
+        raw_reasons = report.reasons
+
+    masked_card = _mask_pans_in_string(str(c_id)) if c_id else None
+    sanitized_reasons = [_mask_pans_in_string(str(r)) for r in raw_reasons]
+
+    payload: dict[str, Any] = {
+        "device_id": dev_id,
+        "card_id": masked_card,
+        "transaction_id": transaction_id,
+        "is_emulator": is_emulator,
+        "is_card_cycling": is_card_cycling,
+        "is_device_cycling": is_device_cycling,
+        "is_fingerprint_drift": is_drift,
+        "distinct_cards_count": distinct_cards,
+        "distinct_devices_count": distinct_devices,
+        "similarity_to_baseline": similarity,
+        "severity": severity,
+        "reasons": sanitized_reasons,
+        "trigger_action": str(trigger_action),
+    }
+    if metadata:
+        payload["metadata"] = dict(metadata)
+
+    return AuditEvent(
+        event_type="fraud.device.anomaly_detected",
+        model_version=model_version,
+        dataset_fingerprint=dataset_fingerprint,
+        payload=payload,
     )

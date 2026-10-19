@@ -35,6 +35,15 @@ from fraud_detection.data import (
     inject_drift,
     load_csv,
 )
+from fraud_detection.device import (
+    DeviceFeatureExtractor,
+    DeviceFingerprint,
+    DeviceFingerprintError,
+    DeviceHasher,
+    DeviceTracker,
+    DeviceTrackerConfig,
+    ScreenGeometry,
+)
 from fraud_detection.drift import (
     DriftError,
     DriftReport,
@@ -7170,7 +7179,390 @@ def geo_enrich(
     )
 
 
+@app.command("device-clusters")
+def device_clusters(
+    input_file: Annotated[
+        Path,
+        typer.Option(
+            "--input-file",
+            "-i",
+            help="Input CSV dataset with device identifiers and fingerprints.",
+        ),
+    ],
+    output: Annotated[
+        Path | None,
+        typer.Option(
+            "--output",
+            "-o",
+            help="Destination file path for anomaly detection and clustering report.",
+        ),
+    ] = None,
+    overwrite: Annotated[
+        bool,
+        typer.Option(
+            "--overwrite",
+            help="Overwrite existing output file if it exists.",
+        ),
+    ] = False,
+    window_seconds: Annotated[
+        float,
+        typer.Option(
+            "--window-seconds",
+            help="Sliding temporal lookback window for velocity and cycling tracking in seconds.",
+        ),
+    ] = 86400.0,
+    card_cycling_threshold: Annotated[
+        int,
+        typer.Option(
+            "--card-cycling-threshold",
+            help="Threshold for distinct credit cards seen on a single device.",
+        ),
+    ] = 3,
+    device_cycling_threshold: Annotated[
+        int,
+        typer.Option(
+            "--device-cycling-threshold",
+            help="Threshold for distinct devices seen on a single card.",
+        ),
+    ] = 3,
+    similarity_threshold: Annotated[
+        float,
+        typer.Option(
+            "--similarity-threshold",
+            help="Minimum similarity score below which device drift anomaly is flagged.",
+        ),
+    ] = 0.8,
+    fail_on_anomaly: Annotated[
+        bool,
+        typer.Option(
+            "--fail-on-anomaly",
+            help="Exit with code 3 if any HIGH or CRITICAL device anomalies are detected.",
+        ),
+    ] = False,
+    as_json: Annotated[
+        bool,
+        typer.Option(
+            "--json",
+            "-j",
+            help="Output report formatted as JSON.",
+        ),
+    ] = False,
+) -> None:
+    """Analyze transaction dataset for device card cycling, emulator bots, and fingerprint drift."""
+    if not input_file.exists():
+        _abort(f"Input file not found: {input_file}")
+    _guard_output(output, overwrite)
+
+    try:
+        df = pd.read_csv(input_file)
+    except pd.errors.EmptyDataError:
+        _abort(f"Input file contains no transactions: {input_file}")
+    if df.empty:
+        _abort(f"Input file contains no transactions: {input_file}")
+
+    tracker = DeviceTracker(
+        config=DeviceTrackerConfig(
+            window_seconds=window_seconds,
+            card_cycling_threshold=card_cycling_threshold,
+            device_cycling_threshold=device_cycling_threshold,
+            min_similarity_threshold=similarity_threshold,
+        )
+    )
+
+    card_cycling_anomalies: list[dict[str, Any]] = []
+    device_cycling_anomalies: list[dict[str, Any]] = []
+    emulator_anomalies: list[dict[str, Any]] = []
+    drift_anomalies: list[dict[str, Any]] = []
+    high_critical_anomalies: list[dict[str, Any]] = []
+    all_anomalies: list[dict[str, Any]] = []
+
+    records: list[dict[str, Any]] = [
+        {str(k): v for k, v in r.items()} for r in df.to_dict(orient="records")
+    ]
+
+    for idx, raw_row in enumerate(records):
+        raw_ts = (
+            raw_row.get("timestamp")
+            if raw_row.get("timestamp") is not None
+            else (
+                raw_row.get("trans_date_trans_time")
+                if raw_row.get("trans_date_trans_time") is not None
+                else (
+                    raw_row.get("unix_time")
+                    if raw_row.get("unix_time") is not None
+                    else raw_row.get("event_time")
+                )
+            )
+        )
+        try:
+            ts = float(raw_ts) if raw_ts is not None else float(idx)
+        except (ValueError, TypeError):
+            ts = float(idx)
+
+        screen_obj: ScreenGeometry | None = None
+        if "screen_width" in raw_row and "screen_height" in raw_row:
+            try:
+                w = int(raw_row["screen_width"])
+                h = int(raw_row["screen_height"])
+                if w > 0 and h > 0:
+                    screen_obj = ScreenGeometry(
+                        width=w,
+                        height=h,
+                        color_depth=int(raw_row.get("screen_color_depth", 24)),
+                        pixel_ratio=float(raw_row.get("screen_pixel_ratio", 1.0)),
+                    )
+            except (ValueError, TypeError, DeviceFingerprintError):
+                screen_obj = None
+
+        fp: DeviceFingerprint | None = None
+        raw_fp = raw_row.get("fingerprint", raw_row.get("device_fingerprint"))
+        if isinstance(raw_fp, DeviceFingerprint):
+            fp = raw_fp
+        elif isinstance(raw_fp, dict):
+            try:
+                fp = DeviceFingerprint.from_dict(raw_fp)
+            except (ValueError, TypeError, DeviceFingerprintError):
+                fp = None
+        elif any(
+            k in raw_row for k in ("user_agent", "os_platform", "browser_family", "screen_width")
+        ):
+            try:
+                raw_dev = raw_row.get("device_id")
+                dev_str = (
+                    str(raw_dev).strip()
+                    if raw_dev is not None
+                    and str(raw_dev).strip()
+                    and str(raw_dev).strip() != "nan"
+                    else None
+                )
+                fp = DeviceFingerprint(
+                    device_id=dev_str,
+                    user_agent=str(raw_row.get("user_agent", "")),
+                    os_platform=str(raw_row.get("os_platform", "")),
+                    browser_family=str(raw_row.get("browser_family", "")),
+                    screen=screen_obj,
+                    language=str(raw_row.get("language", "en")),
+                    timezone_offset_minutes=int(raw_row.get("timezone_offset_minutes", 0)),
+                    hardware_concurrency=int(raw_row.get("hardware_concurrency", 4)),
+                    device_memory_gb=float(raw_row.get("device_memory_gb", 8.0)),
+                    webgl_vendor=str(raw_row.get("webgl_vendor", "")),
+                    webgl_renderer=str(raw_row.get("webgl_renderer", "")),
+                    canvas_hash=str(raw_row.get("canvas_hash", "")),
+                    audio_hash=str(raw_row.get("audio_hash", "")),
+                    is_touch_capable=bool(raw_row.get("is_touch_capable", False)),
+                    has_webdriver=bool(raw_row.get("has_webdriver", False)),
+                    plugins_count=int(raw_row.get("plugins_count", 0)),
+                )
+            except (ValueError, TypeError, DeviceFingerprintError):
+                fp = None
+
+        raw_device = raw_row.get("device_id") or raw_row.get("device")
+        device_id = (
+            str(raw_device).strip()
+            if raw_device is not None
+            and str(raw_device).strip()
+            and str(raw_device).strip() != "nan"
+            else ""
+        )
+        if not device_id and fp is not None:
+            device_id = fp.device_id or DeviceHasher.canonical_hash(fp)
+        if not device_id:
+            device_id = f"device_{idx}"
+
+        card_id: str | None = None
+        for key in ("card_id", "cc_num", "account_id", "user_id"):
+            val = raw_row.get(key)
+            if val is not None and str(val).strip() and str(val).strip() != "nan":
+                card_id = str(val).strip()
+                break
+
+        report = tracker.record_event(
+            device_id=device_id,
+            card_id=card_id,
+            timestamp=ts,
+            fingerprint=fp,
+        )
+
+        if report.has_anomaly:
+            rep_dict = report.to_dict()
+            rep_dict["event_index"] = idx
+            rep_dict["card_id"] = card_id
+
+            all_anomalies.append(rep_dict)
+            if report.is_card_cycling:
+                card_cycling_anomalies.append(rep_dict)
+            if report.is_device_cycling:
+                device_cycling_anomalies.append(rep_dict)
+            if report.is_emulator:
+                emulator_anomalies.append(rep_dict)
+            if report.is_fingerprint_drift:
+                drift_anomalies.append(rep_dict)
+            if report.severity in ("HIGH", "CRITICAL"):
+                high_critical_anomalies.append(rep_dict)
+
+    stats = tracker.get_stats()
+    report_dict: dict[str, Any] = {
+        "input_file": str(input_file),
+        "total_events_processed": len(df),
+        "total_devices_tracked": stats["tracked_devices_count"],
+        "total_cards_tracked": stats["tracked_cards_count"],
+        "total_anomalies_detected": len(all_anomalies),
+        "card_cycling_anomalies_count": len(card_cycling_anomalies),
+        "device_cycling_anomalies_count": len(device_cycling_anomalies),
+        "emulator_anomalies_count": len(emulator_anomalies),
+        "drift_anomalies_count": len(drift_anomalies),
+        "high_critical_anomalies_count": len(high_critical_anomalies),
+        "anomalies": all_anomalies,
+    }
+
+    report_json = json.dumps(report_dict, indent=2)
+    if output is not None:
+        _atomic_write_text(report_json + "\n", output)
+
+    if as_json:
+        typer.echo(report_json)
+    else:
+        typer.echo("Device Fingerprinting & Anomaly Clustering Report:")
+        typer.echo(f"  Input File:                    {report_dict['input_file']}")
+        typer.echo(f"  Total Events Processed:        {report_dict['total_events_processed']}")
+        typer.echo(f"  Total Devices Tracked:         {report_dict['total_devices_tracked']}")
+        typer.echo(f"  Total Cards Tracked:           {report_dict['total_cards_tracked']}")
+        typer.echo(f"  Total Anomalies Detected:      {report_dict['total_anomalies_detected']}")
+        typer.echo(
+            f"  Card-Cycling Anomalies:        {report_dict['card_cycling_anomalies_count']}"
+        )
+        typer.echo(
+            f"  Device-Cycling Anomalies:      {report_dict['device_cycling_anomalies_count']}"
+        )
+        typer.echo(f"  Emulator Anomalies:            {report_dict['emulator_anomalies_count']}")
+        typer.echo(f"  Fingerprint Drift Anomalies:   {report_dict['drift_anomalies_count']}")
+        typer.echo(
+            f"  High/Critical Severity Count:  {report_dict['high_critical_anomalies_count']}"
+        )
+        for anomaly in high_critical_anomalies[:10]:
+            reasons_str = "; ".join(anomaly.get("reasons", []))
+            typer.echo(
+                f"  [{anomaly.get('severity')}] Device '{anomaly.get('device_id')}': {reasons_str}"
+            )
+
+    if fail_on_anomaly and len(high_critical_anomalies) > 0:
+        typer.echo(
+            f"Error: High/critical device anomalies detected "
+            f"({len(high_critical_anomalies)} events). Failing per --fail-on-anomaly.",
+            err=True,
+        )
+        raise typer.Exit(code=3)
+
+
+@app.command("device-enrich")
+def device_enrich(
+    input_file: Annotated[
+        Path,
+        typer.Option(
+            "--input-file",
+            "-i",
+            help="Input CSV file to enrich with device fingerprint features.",
+        ),
+    ],
+    output_file: Annotated[
+        Path,
+        typer.Option(
+            "--output-file",
+            "-o",
+            help="Output destination file for enriched transaction dataset.",
+        ),
+    ],
+    overwrite: Annotated[
+        bool,
+        typer.Option(
+            "--overwrite",
+            help="Overwrite existing output file if it exists.",
+        ),
+    ] = False,
+    window_seconds: Annotated[
+        float,
+        typer.Option(
+            "--window-seconds",
+            help="Sliding temporal lookback window for velocity and cycling tracking in seconds.",
+        ),
+    ] = 86400.0,
+    card_cycling_threshold: Annotated[
+        int,
+        typer.Option(
+            "--card-cycling-threshold",
+            help="Threshold for distinct credit cards seen on a single device.",
+        ),
+    ] = 3,
+    device_cycling_threshold: Annotated[
+        int,
+        typer.Option(
+            "--device-cycling-threshold",
+            help="Threshold for distinct devices seen on a single card.",
+        ),
+    ] = 3,
+    similarity_threshold: Annotated[
+        float,
+        typer.Option(
+            "--similarity-threshold",
+            help="Minimum similarity score below which device drift anomaly is flagged.",
+        ),
+    ] = 0.8,
+    output_format: Annotated[
+        str,
+        typer.Option(
+            "--format",
+            help="Output format: 'csv' or 'json'.",
+        ),
+    ] = "csv",
+) -> None:
+    """Enrich transactions with streaming device fingerprint and anomaly clustering features.
+
+    Features are extracted sequentially without lookahead bias.
+    """
+    if not input_file.exists():
+        _abort(f"Input file not found: {input_file}")
+    _guard_output(output_file, overwrite)
+
+    try:
+        df = pd.read_csv(input_file)
+    except pd.errors.EmptyDataError:
+        _abort(f"Input file contains no transactions: {input_file}")
+    if df.empty:
+        _abort(f"Input file contains no transactions: {input_file}")
+
+    tracker = DeviceTracker(
+        config=DeviceTrackerConfig(
+            window_seconds=window_seconds,
+            card_cycling_threshold=card_cycling_threshold,
+            device_cycling_threshold=device_cycling_threshold,
+            min_similarity_threshold=similarity_threshold,
+        )
+    )
+    extractor = DeviceFeatureExtractor(tracker=tracker)
+
+    records: list[dict[str, Any]] = [
+        {str(k): v for k, v in r.items()} for r in df.to_dict(orient="records")
+    ]
+    extracted_features = extractor.extract_batch(records, mutate_tracker=True)
+
+    features_df = pd.DataFrame(extracted_features)
+    enriched_df = pd.concat([df.reset_index(drop=True), features_df.reset_index(drop=True)], axis=1)
+
+    fmt = output_format.lower().strip()
+    if fmt == "json" or output_file.suffix.lower() == ".json":
+        _atomic_write_text(enriched_df.to_json(orient="records", indent=2) + "\n", output_file)
+    else:
+        _atomic_write_csv(enriched_df, output_file)
+
+    feature_count = len(extracted_features[0]) if extracted_features else 0
+    typer.echo(
+        f"Successfully enriched {len(enriched_df)} transactions with {feature_count} "
+        f"device features -> {output_file}"
+    )
+
+
 def _abort(message: str) -> NoReturn:
+
     typer.echo(f"Error: {message}", err=True)
     raise typer.Exit(code=2)
 

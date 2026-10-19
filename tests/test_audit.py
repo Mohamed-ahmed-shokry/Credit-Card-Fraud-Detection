@@ -21,6 +21,7 @@ from fraud_detection.audit import (
     backtest_audit_policy,
     build_challenger_retrained_audit_event,
     build_delayed_label_audit_event,
+    build_device_anomaly_audit_event,
     build_fraud_ring_detected_audit_event,
     build_impossible_travel_audit_event,
     build_model_promoted_audit_event,
@@ -33,6 +34,7 @@ from fraud_detection.audit import (
     redact_data,
     replay_audit_log,
 )
+from fraud_detection.device import DeviceAnomalyReport
 from fraud_detection.evaluation import TieredThresholds
 from fraud_detection.feedback import (
     DelayedLabelRecord,
@@ -1324,3 +1326,70 @@ def test_build_impossible_travel_audit_event() -> None:
     assert mapping_event.payload["distance_km"] == 1200.0
     assert mapping_event.payload["velocity_kmh"] == 2400.0
     assert mapping_event.payload["is_impossible_travel"] is True
+
+
+def test_build_device_anomaly_audit_event() -> None:
+    pan_card = "4532015112830366"  # Luhn-valid PAN
+    rep = DeviceAnomalyReport(
+        device_id="device_attack_cluster_99",
+        card_id=pan_card,
+        is_emulator=True,
+        is_card_cycling=True,
+        is_device_cycling=False,
+        is_fingerprint_drift=False,
+        distinct_cards_count=4,
+        distinct_devices_count=1,
+        similarity_to_baseline=1.0,
+        severity="CRITICAL",
+        reasons=(
+            "Device exhibits automated webdriver or emulator signatures.",
+            f"Device associated with card {pan_card}.",
+        ),
+    )
+
+    event = build_device_anomaly_audit_event(
+        report=rep,
+        transaction_id="tx_dev_anomaly_1",
+        trigger_action="DENY",
+        model_version="v2",
+        metadata={"operator": "fraud_ops", "api_key": "secret_key_123"},
+    )
+
+    assert event.event_type == "fraud.device.anomaly_detected"
+    assert event.model_version == "v2"
+    assert event.payload["device_id"] == "device_attack_cluster_99"
+    assert event.payload["transaction_id"] == "tx_dev_anomaly_1"
+    assert event.payload["is_emulator"] is True
+    assert event.payload["is_card_cycling"] is True
+    assert event.payload["distinct_cards_count"] == 4
+    assert event.payload["severity"] == "CRITICAL"
+    assert event.payload["trigger_action"] == "DENY"
+
+    # Redaction checks: PAN in card_id and reasons must be masked
+    assert event.payload["card_id"] == "[REDACTED_PAN]"
+    assert "[REDACTED_PAN]" in event.payload["reasons"][1]
+    assert pan_card not in event.payload["reasons"][1]
+
+    # Redaction of secret api_key in metadata
+    d = event.to_dict(redact=True)
+    assert d["payload"]["metadata"]["api_key"] == "[REDACTED]"
+    assert d["payload"]["metadata"]["operator"] == "fraud_ops"
+
+    # Mapping report test
+    mapping_rep = {
+        "device_id": "dev_map",
+        "card_id": "plain_user_1",
+        "is_emulator": False,
+        "is_card_cycling": True,
+        "distinct_cards_count": 5,
+        "severity": "HIGH",
+    }
+    mapping_event = build_device_anomaly_audit_event(
+        report=mapping_rep,
+        transaction_id="tx_map_dev",
+    )
+    assert mapping_event.payload["device_id"] == "dev_map"
+    assert mapping_event.payload["card_id"] == "plain_user_1"
+    assert mapping_event.payload["is_card_cycling"] is True
+    assert mapping_event.payload["distinct_cards_count"] == 5
+    assert mapping_event.payload["severity"] == "HIGH"
