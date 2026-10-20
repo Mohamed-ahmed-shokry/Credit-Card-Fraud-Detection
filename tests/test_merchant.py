@@ -5,9 +5,11 @@ from __future__ import annotations
 import pytest
 
 from fraud_detection.merchant import (
+    MERCHANT_FEATURE_NAMES,
     MCCCategory,
     MCCRiskProfile,
     MerchantAnomalyReport,
+    MerchantFeatureExtractor,
     MerchantProfile,
     MerchantRiskError,
     MerchantTracker,
@@ -249,3 +251,62 @@ def test_merchant_tracker_lifecycle_welford_and_anomalies() -> None:
     cleared = tracker.reset()
     assert cleared == 2
     assert tracker.get_tracked_merchant_count() == 0
+
+
+def test_merchant_feature_extractor_single_and_batch() -> None:
+    extractor = MerchantFeatureExtractor()
+    with pytest.raises(MerchantRiskError, match="record must be a Mapping"):
+        extractor.extract_features("not-a-dict")  # type: ignore[arg-type]
+
+    # Test fallback defaults with malformed fields and mutate_tracker=False
+    f_readonly = extractor.extract_features(
+        {
+            "mcc": "bad_mcc",
+            "amount": "not_num",
+            "timestamp": "not_ts",
+            "is_fraud": "0",
+            "is_chargeback": "false",
+        },
+        mutate_tracker=False,
+    )
+    assert set(f_readonly.keys()) == set(MERCHANT_FEATURE_NAMES)
+    assert f_readonly["merchant_tx_count_24h"] == 1.0
+    assert extractor.tracker.get_tracked_merchant_count() == 0
+
+    records = [
+        {
+            "merchant": "m_casino",
+            "merchant_category_code": "7995",
+            "amt": 25.0,
+            "unix_time": 1000.0,
+            "cc_num": "card_a",
+            "Class": 1,
+            "is_chargeback": True,
+        },
+        {
+            "merch_id": "m_casino",
+            "category_code": "7995",
+            "Amount": 35.0,
+            "Time": 1010.0,
+            "account_id": "card_b",
+            "is_fraud": True,
+            "is_chargeback": True,
+        },
+        {
+            "merchant_id": "m_casino",
+            "mcc": "7995",
+            "amount": 500.0,
+            "event_time": 1020.0,
+            "user_id": "card_c",
+            "is_fraud": True,
+            "is_chargeback": True,
+        },
+    ]
+    batch_features = extractor.extract_batch(records, mutate_tracker=True)
+    assert len(batch_features) == 3
+    assert batch_features[0]["merchant_tx_count_24h"] == 1.0
+    assert batch_features[1]["merchant_tx_count_24h"] == 2.0
+    assert batch_features[2]["merchant_tx_count_24h"] == 3.0
+    assert batch_features[2]["merchant_distinct_cards_24h"] == 3.0
+    assert batch_features[2]["merchant_mcc_risk_score"] == 0.9
+    assert batch_features[2]["merchant_is_high_chargeback"] == 1.0
