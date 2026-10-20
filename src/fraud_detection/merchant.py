@@ -604,7 +604,7 @@ class MerchantTracker:
         return cleared
 
     def assess_event(self, event: MerchantTransactionEvent) -> MerchantAnomalyReport:
-        """Evaluate a merchant transaction event against chargeback and bust-out heuristics without mutating state."""
+        """Evaluate a merchant transaction event without mutating state."""
         state = self._merchants.get(event.merchant_id)
         cutoff = event.timestamp - self.config.window_seconds
 
@@ -707,7 +707,7 @@ class MerchantTracker:
     def record_event(
         self, event: MerchantTransactionEvent
     ) -> tuple[MerchantProfile, MerchantAnomalyReport]:
-        """Evaluate and record a merchant transaction event, updating sliding window and Welford state."""
+        """Evaluate and record a merchant transaction event into sliding-window state."""
         report = self.assess_event(event)
         self._total_evaluations += 1
         if report.has_anomaly:
