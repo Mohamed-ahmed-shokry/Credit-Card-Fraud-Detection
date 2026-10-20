@@ -310,3 +310,87 @@ class MerchantTransactionEvent:
             if isinstance(exc, MerchantRiskError):
                 raise
             raise MerchantRiskError(f"Invalid MerchantTransactionEvent data: {exc}") from exc
+
+
+@dataclass(frozen=True)
+class MerchantTrackerConfig:
+    """Configuration for sliding-window merchant risk tracking and anomaly thresholds."""
+
+    window_seconds: float = 86400.0
+    max_merchants: int = 50000
+    prior_strength: float = 20.0
+    chargeback_rate_threshold: float = 0.015
+    min_chargeback_count: int = 3
+    bust_out_zscore_threshold: float = 3.0
+    min_history_for_zscore: int = 5
+    micro_tx_amount_cutoff: float = 5.0
+    micro_tx_ratio_threshold: float = 0.50
+    min_distinct_cards_for_testing: int = 5
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.window_seconds, bool)
+            or not isinstance(self.window_seconds, (int, float))
+            or not math.isfinite(self.window_seconds)
+            or self.window_seconds <= 0.0
+        ):
+            raise MerchantRiskError("window_seconds must be a positive finite float.")
+        if (
+            isinstance(self.max_merchants, bool)
+            or not isinstance(self.max_merchants, int)
+            or self.max_merchants <= 0
+        ):
+            raise MerchantRiskError("max_merchants must be a positive integer.")
+        if (
+            isinstance(self.prior_strength, bool)
+            or not isinstance(self.prior_strength, (int, float))
+            or not math.isfinite(self.prior_strength)
+            or self.prior_strength <= 0.0
+        ):
+            raise MerchantRiskError("prior_strength must be a positive finite float.")
+        if (
+            isinstance(self.chargeback_rate_threshold, bool)
+            or not isinstance(self.chargeback_rate_threshold, (int, float))
+            or not math.isfinite(self.chargeback_rate_threshold)
+            or not (0.0 < self.chargeback_rate_threshold <= 1.0)
+        ):
+            raise MerchantRiskError("chargeback_rate_threshold must be in (0.0, 1.0].")
+        if (
+            isinstance(self.min_chargeback_count, bool)
+            or not isinstance(self.min_chargeback_count, int)
+            or self.min_chargeback_count <= 0
+        ):
+            raise MerchantRiskError("min_chargeback_count must be a positive integer.")
+        if (
+            isinstance(self.bust_out_zscore_threshold, bool)
+            or not isinstance(self.bust_out_zscore_threshold, (int, float))
+            or not math.isfinite(self.bust_out_zscore_threshold)
+            or self.bust_out_zscore_threshold <= 0.0
+        ):
+            raise MerchantRiskError("bust_out_zscore_threshold must be a positive finite float.")
+        if (
+            isinstance(self.min_history_for_zscore, bool)
+            or not isinstance(self.min_history_for_zscore, int)
+            or self.min_history_for_zscore < 2
+        ):
+            raise MerchantRiskError("min_history_for_zscore must be an integer >= 2.")
+        if (
+            isinstance(self.micro_tx_amount_cutoff, bool)
+            or not isinstance(self.micro_tx_amount_cutoff, (int, float))
+            or not math.isfinite(self.micro_tx_amount_cutoff)
+            or self.micro_tx_amount_cutoff < 0.0
+        ):
+            raise MerchantRiskError("micro_tx_amount_cutoff must be a non-negative finite float.")
+        if (
+            isinstance(self.micro_tx_ratio_threshold, bool)
+            or not isinstance(self.micro_tx_ratio_threshold, (int, float))
+            or not math.isfinite(self.micro_tx_ratio_threshold)
+            or not (0.0 < self.micro_tx_ratio_threshold <= 1.0)
+        ):
+            raise MerchantRiskError("micro_tx_ratio_threshold must be in (0.0, 1.0].")
+        if (
+            isinstance(self.min_distinct_cards_for_testing, bool)
+            or not isinstance(self.min_distinct_cards_for_testing, int)
+            or self.min_distinct_cards_for_testing <= 0
+        ):
+            raise MerchantRiskError("min_distinct_cards_for_testing must be a positive integer.")
