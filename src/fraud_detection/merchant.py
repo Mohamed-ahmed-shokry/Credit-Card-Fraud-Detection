@@ -230,3 +230,83 @@ def calculate_wilson_upper_bound(
     margin = float(z_value) * math.sqrt((p * (1.0 - p) + z2 / (4.0 * n)) / n)
     denom = 1.0 + z2 / n
     return min(1.0, max(0.0, (center + margin) / denom))
+
+
+@dataclass(frozen=True)
+class MerchantTransactionEvent:
+    """Single merchant transaction observation for sliding-window risk tracking."""
+
+    merchant_id: str
+    timestamp: float
+    amount: float
+    mcc: str = "0000"
+    card_id: str | None = None
+    is_fraud: bool = False
+    is_chargeback: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.merchant_id, str) or not self.merchant_id.strip():
+            raise MerchantRiskError("merchant_id must be a non-empty string.")
+        object.__setattr__(self, "merchant_id", self.merchant_id.strip())
+        if (
+            isinstance(self.timestamp, bool)
+            or not isinstance(self.timestamp, (int, float))
+            or not math.isfinite(self.timestamp)
+        ):
+            raise MerchantRiskError("timestamp must be a finite number.")
+        if (
+            isinstance(self.amount, bool)
+            or not isinstance(self.amount, (int, float))
+            or not math.isfinite(self.amount)
+            or self.amount < 0.0
+        ):
+            raise MerchantRiskError("amount must be a non-negative finite number.")
+
+        mcc_prof = resolve_mcc_profile(self.mcc)
+        object.__setattr__(self, "mcc", mcc_prof.mcc)
+
+        if self.card_id is not None:
+            if not isinstance(self.card_id, str) or not self.card_id.strip():
+                raise MerchantRiskError("card_id must be a non-empty string or None.")
+            object.__setattr__(self, "card_id", self.card_id.strip())
+
+        if not isinstance(self.is_fraud, bool):
+            raise MerchantRiskError("is_fraud must be a boolean.")
+        if not isinstance(self.is_chargeback, bool):
+            raise MerchantRiskError("is_chargeback must be a boolean.")
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize MerchantTransactionEvent to dictionary."""
+        return {
+            "merchant_id": self.merchant_id,
+            "timestamp": float(self.timestamp),
+            "amount": float(self.amount),
+            "mcc": self.mcc,
+            "card_id": self.card_id,
+            "is_fraud": self.is_fraud,
+            "is_chargeback": self.is_chargeback,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> MerchantTransactionEvent:
+        """Construct MerchantTransactionEvent from mapping."""
+        if not isinstance(data, Mapping):
+            raise MerchantRiskError("MerchantTransactionEvent data must be a mapping.")
+        try:
+            raw_card = data.get("card_id")
+            card_str = (
+                str(raw_card).strip() if raw_card is not None and str(raw_card).strip() else None
+            )
+            return cls(
+                merchant_id=str(data["merchant_id"]),
+                timestamp=float(data.get("timestamp", 0.0)),
+                amount=float(data.get("amount", 0.0)),
+                mcc=str(data.get("mcc", "0000")),
+                card_id=card_str,
+                is_fraud=bool(data.get("is_fraud", False)),
+                is_chargeback=bool(data.get("is_chargeback", False)),
+            )
+        except (KeyError, ValueError, TypeError) as exc:
+            if isinstance(exc, MerchantRiskError):
+                raise
+            raise MerchantRiskError(f"Invalid MerchantTransactionEvent data: {exc}") from exc
