@@ -48,6 +48,10 @@ from fraud_detection.graph import (
     FraudRingDetector,
     GraphFeatureExtractor,
 )
+from fraud_detection.merchant import (
+    MerchantFeatureExtractor,
+    MerchantTracker,
+)
 from fraud_detection.model import FraudModel
 from fraud_detection.recalibration import BaseRecalibrator
 from fraud_detection.rules import RuleAction, RulePrecedence, RuleSet
@@ -1139,9 +1143,47 @@ class DeviceEnrichmentStageProcessor:
         }
 
 
+class MerchantEnrichmentStageProcessor:
+    """Enriches transactions with real-time merchant risk and chargeback features."""
+
+    def __init__(
+        self,
+        tracker: MerchantTracker | None = None,
+        feature_extractor: MerchantFeatureExtractor | None = None,
+        update_tracker: bool = True,
+    ) -> None:
+        self.tracker = tracker if tracker is not None else MerchantTracker()
+        self.feature_extractor = (
+            feature_extractor
+            if feature_extractor is not None
+            else MerchantFeatureExtractor(tracker=self.tracker)
+        )
+        self.update_tracker = update_tracker
+
+    def __call__(self, context: PipelineContext) -> dict[str, Any]:
+        tx = dict(context.transaction)
+        merchant_features = self.feature_extractor.extract_features(
+            tx,
+            mutate_tracker=self.update_tracker,
+        )
+        tx.update(merchant_features)
+        context.transaction = tx
+        context.metadata["merchant_features"] = list(merchant_features.keys())
+        return {
+            "merchant_features": merchant_features,
+            "merchant_is_high_chargeback": bool(
+                merchant_features.get("merchant_is_high_chargeback", 0.0) == 1.0
+            ),
+            "merchant_is_bust_out_surge": bool(
+                merchant_features.get("merchant_is_bust_out_surge", 0.0) == 1.0
+            ),
+        }
+
+
 DeviceEnrichmentStage = DeviceEnrichmentStageProcessor
 GeoEnrichmentStage = GeoEnrichmentStageProcessor
 GraphEnrichmentStage = GraphEnrichmentStageProcessor
+MerchantEnrichmentStage = MerchantEnrichmentStageProcessor
 
 
 class RuleStageProcessor:
@@ -1884,6 +1926,9 @@ def create_default_fraud_pipeline(
     device_tracker: DeviceTracker | None = None,
     device_feature_extractor: DeviceFeatureExtractor | None = None,
     device_enrichment_timeout_seconds: float | None = 0.25,
+    merchant_tracker: MerchantTracker | None = None,
+    merchant_feature_extractor: MerchantFeatureExtractor | None = None,
+    merchant_enrichment_timeout_seconds: float | None = 0.25,
 ) -> DecisionGraph:
     """Build a standard, production-ready fraud decision execution graph."""
     applied_threshold = model.threshold if threshold is None else threshold
@@ -1996,6 +2041,25 @@ def create_default_fraud_pipeline(
             )
         )
         upstream_deps = ["device_enrichment"]
+
+    if merchant_tracker is not None or merchant_feature_extractor is not None:
+        merchant_proc = MerchantEnrichmentStageProcessor(
+            tracker=merchant_tracker,
+            feature_extractor=merchant_feature_extractor,
+        )
+        graph.add_node(
+            PipelineNode(
+                name="merchant_enrichment",
+                stage_type=StageType.ENRICHMENT,
+                processor=merchant_proc,
+                dependencies=list(upstream_deps),
+                timeout_seconds=merchant_enrichment_timeout_seconds,
+                fallback_value={},
+                required=False,
+                circuit_policy=circuit_policy,
+            )
+        )
+        upstream_deps = ["merchant_enrichment"]
 
     rule_proc = RuleStageProcessor(rules=rules)
     graph.add_node(
