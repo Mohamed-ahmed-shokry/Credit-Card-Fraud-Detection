@@ -602,3 +602,141 @@ class MerchantTracker:
         self._total_evaluations = 0
         self._total_anomalies = 0
         return cleared
+
+    def assess_event(self, event: MerchantTransactionEvent) -> MerchantAnomalyReport:
+        """Evaluate a merchant transaction event against chargeback and bust-out heuristics without mutating state."""
+        state = self._merchants.get(event.merchant_id)
+        cutoff = event.timestamp - self.config.window_seconds
+
+        if state is not None:
+            active_events = [ev for ev in state.events if ev.timestamp >= cutoff]
+            prior_tx_count = state.transaction_count
+            prior_fraud_count = state.fraud_count
+            prior_cb_count = state.chargeback_count
+        else:
+            active_events = []
+            prior_tx_count = 0
+            prior_fraud_count = 0
+            prior_cb_count = 0
+
+        amount_zscore = 0.0
+        if state is not None and prior_tx_count >= self.config.min_history_for_zscore:
+            if state.std_amount > 1e-6:
+                amount_zscore = (event.amount - state.mean_amount) / state.std_amount
+            elif state.mean_amount > 0.0 and event.amount > state.mean_amount:
+                denom = max(state.mean_amount * 0.1, 1.0)
+                amount_zscore = (event.amount - state.mean_amount) / denom
+
+        window_tx_count = len(active_events) + 1
+        card_set = {ev.card_id for ev in active_events if ev.card_id}
+        if event.card_id:
+            card_set.add(event.card_id)
+        distinct_cards_count = len(card_set)
+
+        micro_tx_count = sum(
+            1 for ev in active_events if ev.amount <= self.config.micro_tx_amount_cutoff
+        ) + (1 if event.amount <= self.config.micro_tx_amount_cutoff else 0)
+        micro_tx_ratio = float(micro_tx_count) / float(window_tx_count)
+
+        total_tx = prior_tx_count + 1
+        total_fraud = prior_fraud_count + (1 if event.is_fraud else 0)
+        total_cb = prior_cb_count + (1 if event.is_chargeback else 0)
+        adverse_count = max(total_fraud, total_cb)
+
+        mcc_profile = resolve_mcc_profile(event.mcc)
+        smoothed_fraud_rate = calculate_empirical_bayes_fraud_rate(
+            fraud_count=adverse_count,
+            total_count=total_tx,
+            prior_rate=mcc_profile.baseline_fraud_rate,
+            prior_strength=self.config.prior_strength,
+        )
+
+        is_high_chargeback = (
+            adverse_count >= self.config.min_chargeback_count
+            and smoothed_fraud_rate >= self.config.chargeback_rate_threshold
+        )
+        is_ticket_outlier = amount_zscore >= self.config.bust_out_zscore_threshold
+        is_card_testing = (
+            distinct_cards_count >= self.config.min_distinct_cards_for_testing
+            and micro_tx_ratio >= self.config.micro_tx_ratio_threshold
+        )
+        is_bust_out_surge = is_ticket_outlier and (
+            distinct_cards_count >= 3 or is_high_chargeback or mcc_profile.risk_score >= 0.70
+        )
+
+        reasons: list[str] = []
+        if is_high_chargeback:
+            reasons.append(f"high_chargeback_rate:{smoothed_fraud_rate:.4f}")
+        if is_bust_out_surge:
+            reasons.append(f"bust_out_surge:zscore={amount_zscore:.2f}")
+        if is_card_testing:
+            reasons.append(
+                f"card_testing_micro_tx:cards={distinct_cards_count},ratio={micro_tx_ratio:.2f}"
+            )
+        if is_ticket_outlier and not is_bust_out_surge:
+            reasons.append(f"ticket_size_outlier:zscore={amount_zscore:.2f}")
+
+        flag_count = sum(
+            [is_high_chargeback, is_bust_out_surge, is_card_testing, is_ticket_outlier]
+        )
+        if flag_count == 0:
+            severity = "LOW"
+        elif (is_high_chargeback and is_bust_out_surge) or flag_count >= 3:
+            severity = "CRITICAL"
+        elif is_high_chargeback or is_bust_out_surge or is_card_testing:
+            severity = "HIGH"
+        else:
+            severity = "MEDIUM"
+
+        return MerchantAnomalyReport(
+            merchant_id=event.merchant_id,
+            mcc=mcc_profile.mcc,
+            is_high_chargeback=is_high_chargeback,
+            is_bust_out_surge=is_bust_out_surge,
+            is_card_testing=is_card_testing,
+            is_ticket_outlier=is_ticket_outlier,
+            smoothed_fraud_rate=smoothed_fraud_rate,
+            amount_zscore=amount_zscore,
+            micro_tx_ratio=micro_tx_ratio,
+            distinct_cards_count=distinct_cards_count,
+            transaction_count=total_tx,
+            severity=severity,
+            reasons=tuple(reasons),
+        )
+
+    def record_event(
+        self, event: MerchantTransactionEvent
+    ) -> tuple[MerchantProfile, MerchantAnomalyReport]:
+        """Evaluate and record a merchant transaction event, updating sliding window and Welford state."""
+        report = self.assess_event(event)
+        self._total_evaluations += 1
+        if report.has_anomaly:
+            self._total_anomalies += 1
+
+        state = self._merchants.get(event.merchant_id)
+        if state is None:
+            if len(self._merchants) >= self.config.max_merchants:
+                self._merchants.popitem(last=False)
+            state = _MerchantState(
+                merchant_id=event.merchant_id,
+                mcc=event.mcc,
+                first_seen_timestamp=event.timestamp,
+                last_seen_timestamp=event.timestamp,
+            )
+            self._merchants[event.merchant_id] = state
+        else:
+            self._merchants.move_to_end(event.merchant_id)
+            state.mcc = event.mcc
+            state.first_seen_timestamp = min(state.first_seen_timestamp, event.timestamp)
+            state.last_seen_timestamp = max(state.last_seen_timestamp, event.timestamp)
+
+        self._evict_expired(state, state.last_seen_timestamp)
+        state.events.append(event)
+        self._update_welford(state, event.amount)
+        if event.is_fraud:
+            state.fraud_count += 1
+        if event.is_chargeback:
+            state.chargeback_count += 1
+
+        profile = self._build_profile(state)
+        return profile, report
