@@ -7,7 +7,11 @@ import pytest
 from fraud_detection.merchant import (
     MCCCategory,
     MCCRiskProfile,
+    MerchantAnomalyReport,
+    MerchantProfile,
     MerchantRiskError,
+    MerchantTracker,
+    MerchantTrackerConfig,
     MerchantTransactionEvent,
     calculate_empirical_bayes_fraud_rate,
     calculate_wilson_upper_bound,
@@ -128,3 +132,120 @@ def test_merchant_transaction_event_validation_and_serialization() -> None:
         MerchantTransactionEvent.from_dict(123)  # type: ignore[arg-type]
     with pytest.raises(MerchantRiskError, match="Invalid MerchantTransactionEvent"):
         MerchantTransactionEvent.from_dict({})
+
+
+def test_merchant_tracker_config_validation() -> None:
+    cfg = MerchantTrackerConfig()
+    assert cfg.window_seconds == 86400.0
+    assert cfg.max_merchants == 50000
+
+    invalid_kwargs = [
+        {"window_seconds": 0.0},
+        {"window_seconds": True},
+        {"max_merchants": 0},
+        {"max_merchants": False},
+        {"prior_strength": -1.0},
+        {"prior_strength": True},
+        {"chargeback_rate_threshold": 0.0},
+        {"chargeback_rate_threshold": 1.5},
+        {"min_chargeback_count": 0},
+        {"bust_out_zscore_threshold": 0.0},
+        {"min_history_for_zscore": 1},
+        {"micro_tx_amount_cutoff": -0.1},
+        {"micro_tx_ratio_threshold": 0.0},
+        {"min_distinct_cards_for_testing": 0},
+    ]
+    for kwargs in invalid_kwargs:
+        with pytest.raises(MerchantRiskError):
+            MerchantTrackerConfig(**kwargs)  # type: ignore[arg-type]
+
+
+def test_merchant_tracker_lifecycle_welford_and_anomalies() -> None:
+    cfg = MerchantTrackerConfig(
+        window_seconds=3600.0,
+        max_merchants=2,
+        prior_strength=5.0,
+        chargeback_rate_threshold=0.10,
+        min_chargeback_count=2,
+        bust_out_zscore_threshold=2.5,
+        min_history_for_zscore=3,
+        micro_tx_amount_cutoff=5.0,
+        micro_tx_ratio_threshold=0.60,
+        min_distinct_cards_for_testing=3,
+    )
+    tracker = MerchantTracker(cfg)
+    assert tracker.get_profile("m_missing") is None
+    assert tracker.get_tracked_merchant_count() == 0
+
+    # Record 3 baseline identical-amount transactions
+    for i in range(3):
+        prof, rep = tracker.record_event(
+            MerchantTransactionEvent("m1", 1000.0 + i * 10, 20.0, mcc="5411", card_id=f"c{i}")
+        )
+        assert isinstance(prof, MerchantProfile)
+        assert isinstance(rep, MerchantAnomalyReport)
+        assert not rep.has_anomaly
+        assert rep.severity == "LOW"
+
+    # Test MEDIUM ticket outlier with zero-std fallback
+    tracker2 = MerchantTracker(cfg)
+    for i in range(3):
+        tracker2.record_event(
+            MerchantTransactionEvent("m_med", 100.0 + i, 20.0, mcc="5411", card_id="c1")
+        )
+    _, rep_med = tracker2.record_event(
+        MerchantTransactionEvent("m_med", 105.0, 50.0, mcc="5411", card_id="c1")
+    )
+    assert rep_med.is_ticket_outlier
+    assert not rep_med.is_bust_out_surge
+    assert rep_med.severity == "MEDIUM"
+    assert any("ticket_size_outlier" in r for r in rep_med.reasons)
+
+    # Now test variably sized transactions on m1 + chargebacks + bust-out surge -> CRITICAL
+    tracker.record_event(
+        MerchantTransactionEvent(
+            "m1", 1050.0, 25.0, mcc="7995", card_id="c3", is_fraud=True, is_chargeback=True
+        )
+    )
+    prof_crit, rep_crit = tracker.record_event(
+        MerchantTransactionEvent(
+            "m1", 1060.0, 500.0, mcc="7995", card_id="c4", is_fraud=True, is_chargeback=True
+        )
+    )
+    assert rep_crit.is_high_chargeback
+    assert rep_crit.is_bust_out_surge
+    assert rep_crit.severity == "CRITICAL"
+    assert prof_crit.to_dict()["merchant_id"] == "m1"
+    assert rep_crit.to_dict()["has_anomaly"] is True
+
+    # Test card testing micro-tx ratio (HIGH severity) and window eviction
+    for idx in range(3):
+        _, rep_ct = tracker.record_event(
+            MerchantTransactionEvent(
+                "m2", 5000.0 + idx * 5, 1.00, mcc="5817", card_id=f"card_{idx}"
+            )
+        )
+    assert rep_ct.is_card_testing
+    assert rep_ct.severity == "HIGH"
+
+    # Advance timestamp past window_seconds (3600s) for m2
+    prof_evicted, _ = tracker.record_event(
+        MerchantTransactionEvent("m2", 9500.0, 15.0, mcc="5817", card_id="card_new")
+    )
+    assert prof_evicted.distinct_cards_count == 1
+
+    # Test LRU eviction when adding m3 (max_merchants=2 -> m1 evicted)
+    tracker.record_event(MerchantTransactionEvent("m3", 9600.0, 10.0, mcc="5411"))
+    assert tracker.get_tracked_merchant_count() == 2
+    assert tracker.get_profile("m1") is None
+    assert tracker.get_profile("m2") is not None
+    assert tracker.get_profile("m3") is not None
+
+    stats = tracker.get_stats()
+    assert stats["tracked_merchants"] == 2
+    assert stats["total_evaluations"] > 0
+    assert stats["total_anomalies"] > 0
+
+    cleared = tracker.reset()
+    assert cleared == 2
+    assert tracker.get_tracked_merchant_count() == 0
