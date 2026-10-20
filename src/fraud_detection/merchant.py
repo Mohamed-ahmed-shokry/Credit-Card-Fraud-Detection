@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import math
+from collections import OrderedDict, deque
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
@@ -485,3 +486,119 @@ class MerchantAnomalyReport:
             "severity": self.severity,
             "reasons": list(self.reasons),
         }
+
+
+@dataclass
+class _MerchantState:
+    """Internal mutable state for a tracked merchant."""
+
+    merchant_id: str
+    mcc: str
+    first_seen_timestamp: float
+    last_seen_timestamp: float
+    transaction_count: int = 0
+    fraud_count: int = 0
+    chargeback_count: int = 0
+    total_amount: float = 0.0
+    mean_amount: float = 0.0
+    m2_amount: float = 0.0
+    events: deque[MerchantTransactionEvent] = field(default_factory=deque)
+
+    @property
+    def std_amount(self) -> float:
+        """Population standard deviation of observed transaction amounts."""
+        if self.transaction_count < 2 or self.m2_amount <= 0.0:
+            return 0.0
+        return math.sqrt(self.m2_amount / float(self.transaction_count))
+
+
+class MerchantTracker:
+    """Stateful merchant risk and chargeback surveillance tracker with LRU bounding."""
+
+    def __init__(self, config: MerchantTrackerConfig | None = None) -> None:
+        self.config = config or MerchantTrackerConfig()
+        self._merchants: OrderedDict[str, _MerchantState] = OrderedDict()
+        self._total_evaluations: int = 0
+        self._total_anomalies: int = 0
+
+    def _evict_expired(self, state: _MerchantState, current_timestamp: float) -> None:
+        """Remove events outside the sliding window."""
+        cutoff = current_timestamp - self.config.window_seconds
+        while state.events and state.events[0].timestamp < cutoff:
+            state.events.popleft()
+
+    def _update_welford(self, state: _MerchantState, amount: float) -> None:
+        """Update running Welford mean and variance accumulator for ticket sizes."""
+        state.transaction_count += 1
+        state.total_amount += amount
+        delta = amount - state.mean_amount
+        state.mean_amount += delta / float(state.transaction_count)
+        delta2 = amount - state.mean_amount
+        state.m2_amount += delta * delta2
+
+    def _build_profile(self, state: _MerchantState) -> MerchantProfile:
+        """Construct an immutable MerchantProfile snapshot from internal state."""
+        mcc_profile = resolve_mcc_profile(state.mcc)
+        distinct_cards = len({ev.card_id for ev in state.events if ev.card_id})
+        micro_count = sum(
+            1 for ev in state.events if ev.amount <= self.config.micro_tx_amount_cutoff
+        )
+        adverse_count = max(state.fraud_count, state.chargeback_count)
+        smoothed_rate = calculate_empirical_bayes_fraud_rate(
+            fraud_count=adverse_count,
+            total_count=state.transaction_count,
+            prior_rate=mcc_profile.baseline_fraud_rate,
+            prior_strength=self.config.prior_strength,
+        )
+        wilson_upper = calculate_wilson_upper_bound(
+            fraud_count=adverse_count,
+            total_count=state.transaction_count,
+        )
+        return MerchantProfile(
+            merchant_id=state.merchant_id,
+            mcc=mcc_profile.mcc,
+            mcc_category=str(mcc_profile.category),
+            first_seen_timestamp=state.first_seen_timestamp,
+            last_seen_timestamp=state.last_seen_timestamp,
+            transaction_count=state.transaction_count,
+            fraud_count=state.fraud_count,
+            chargeback_count=state.chargeback_count,
+            total_amount=state.total_amount,
+            mean_amount=state.mean_amount,
+            std_amount=state.std_amount,
+            distinct_cards_count=distinct_cards,
+            micro_tx_count=micro_count,
+            smoothed_fraud_rate=smoothed_rate,
+            wilson_upper_bound=wilson_upper,
+            mcc_risk_score=mcc_profile.risk_score,
+        )
+
+    def get_profile(self, merchant_id: str) -> MerchantProfile | None:
+        """Return the current profile for merchant_id, or None if not tracked."""
+        normalized_id = str(merchant_id).strip()
+        state = self._merchants.get(normalized_id)
+        if state is None:
+            return None
+        return self._build_profile(state)
+
+    def get_tracked_merchant_count(self) -> int:
+        """Return the number of currently tracked merchants."""
+        return len(self._merchants)
+
+    def get_stats(self) -> dict[str, Any]:
+        """Return operational telemetry statistics for the merchant tracker."""
+        return {
+            "tracked_merchants": len(self._merchants),
+            "max_merchants": self.config.max_merchants,
+            "window_seconds": self.config.window_seconds,
+            "total_evaluations": self._total_evaluations,
+            "total_anomalies": self._total_anomalies,
+        }
+
+    def reset(self) -> int:
+        """Clear all tracked merchant state and return the count of cleared merchants."""
+        cleared = len(self._merchants)
+        self._merchants.clear()
+        self._total_evaluations = 0
+        self._total_anomalies = 0
+        return cleared
