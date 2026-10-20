@@ -166,3 +166,67 @@ def resolve_mcc_profile(mcc: str | int | None) -> MCCRiskProfile:
     if 7800 <= code_num <= 7999:
         return MCCRiskProfile(raw, MCCCategory.GAMBLING_CRYPTO, 0.035, 0.80, "Amusement & Gaming")
     return MCCRiskProfile(raw, MCCCategory.UNKNOWN, 0.008, 0.25, "General Commercial Services")
+
+
+def calculate_empirical_bayes_fraud_rate(
+    fraud_count: int,
+    total_count: int,
+    prior_rate: float = 0.01,
+    prior_strength: float = 20.0,
+) -> float:
+    """Compute Beta-Binomial Empirical Bayes credibility-smoothed merchant fraud rate."""
+    if isinstance(fraud_count, bool) or not isinstance(fraud_count, int) or fraud_count < 0:
+        raise MerchantRiskError("fraud_count must be a non-negative integer.")
+    if isinstance(total_count, bool) or not isinstance(total_count, int) or total_count < 0:
+        raise MerchantRiskError("total_count must be a non-negative integer.")
+    if fraud_count > total_count:
+        raise MerchantRiskError("fraud_count cannot exceed total_count.")
+    if (
+        isinstance(prior_rate, bool)
+        or not isinstance(prior_rate, (int, float))
+        or not math.isfinite(prior_rate)
+        or not (0.0 <= prior_rate <= 1.0)
+    ):
+        raise MerchantRiskError("prior_rate must be a finite float in [0.0, 1.0].")
+    if (
+        isinstance(prior_strength, bool)
+        or not isinstance(prior_strength, (int, float))
+        or not math.isfinite(prior_strength)
+        or prior_strength <= 0.0
+    ):
+        raise MerchantRiskError("prior_strength must be a positive finite float.")
+
+    numerator = float(fraud_count) + float(prior_strength) * float(prior_rate)
+    denominator = float(total_count) + float(prior_strength)
+    return min(1.0, max(0.0, numerator / denominator))
+
+
+def calculate_wilson_upper_bound(
+    fraud_count: int,
+    total_count: int,
+    z_value: float = 1.96,
+) -> float:
+    """Compute the Wilson score upper confidence bound for merchant chargeback rate."""
+    if isinstance(fraud_count, bool) or not isinstance(fraud_count, int) or fraud_count < 0:
+        raise MerchantRiskError("fraud_count must be a non-negative integer.")
+    if isinstance(total_count, bool) or not isinstance(total_count, int) or total_count < 0:
+        raise MerchantRiskError("total_count must be a non-negative integer.")
+    if fraud_count > total_count:
+        raise MerchantRiskError("fraud_count cannot exceed total_count.")
+    if (
+        isinstance(z_value, bool)
+        or not isinstance(z_value, (int, float))
+        or not math.isfinite(z_value)
+        or z_value <= 0.0
+    ):
+        raise MerchantRiskError("z_value must be a positive finite float.")
+    if total_count == 0:
+        return 0.0
+
+    n = float(total_count)
+    p = float(fraud_count) / n
+    z2 = float(z_value) ** 2
+    center = p + z2 / (2.0 * n)
+    margin = float(z_value) * math.sqrt((p * (1.0 - p) + z2 / (4.0 * n)) / n)
+    denom = 1.0 + z2 / n
+    return min(1.0, max(0.0, (center + margin) / denom))
