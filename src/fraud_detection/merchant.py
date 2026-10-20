@@ -97,3 +97,58 @@ class MCCRiskProfile:
             if isinstance(exc, MerchantRiskError):
                 raise
             raise MerchantRiskError(f"Invalid MCCRiskProfile data: {exc}") from exc
+
+
+DEFAULT_MCC_PROFILES: dict[str, MCCRiskProfile] = {
+    "7995": MCCRiskProfile(
+        "7995", MCCCategory.GAMBLING_CRYPTO, 0.045, 0.90, "Betting and Casino Gambling"
+    ),
+    "6051": MCCRiskProfile(
+        "6051", MCCCategory.GAMBLING_CRYPTO, 0.040, 0.85, "Quasi-Cash and Cryptocurrency"
+    ),
+    "4829": MCCRiskProfile("4829", MCCCategory.MONEY_TRANSFER, 0.035, 0.80, "Wire Money Orders"),
+    "6012": MCCRiskProfile("6012", MCCCategory.MONEY_TRANSFER, 0.025, 0.70, "Financial Merchandise"),
+    "5816": MCCRiskProfile("5816", MCCCategory.DIGITAL_GOODS, 0.028, 0.75, "Digital Games"),
+    "5815": MCCRiskProfile("5815", MCCCategory.DIGITAL_GOODS, 0.022, 0.65, "Digital Media"),
+    "5944": MCCRiskProfile(
+        "5944", MCCCategory.LUXURY_ELECTRONICS, 0.020, 0.60, "Jewelry and Watches"
+    ),
+    "5732": MCCRiskProfile("5732", MCCCategory.LUXURY_ELECTRONICS, 0.018, 0.55, "Electronics Stores"),
+    "4511": MCCRiskProfile("4511", MCCCategory.TRAVEL_HOSPITALITY, 0.012, 0.40, "Airlines"),
+    "7011": MCCRiskProfile("7011", MCCCategory.TRAVEL_HOSPITALITY, 0.010, 0.35, "Hotels and Lodging"),
+    "5311": MCCRiskProfile("5311", MCCCategory.RETAIL_COMMERCE, 0.005, 0.20, "Department Stores"),
+    "5812": MCCRiskProfile("5812", MCCCategory.RETAIL_COMMERCE, 0.004, 0.15, "Restaurants"),
+    "5411": MCCRiskProfile("5411", MCCCategory.GROCERY_UTILITIES, 0.002, 0.08, "Grocery Stores"),
+    "4900": MCCRiskProfile("4900", MCCCategory.GROCERY_UTILITIES, 0.001, 0.05, "Electric Utilities"),
+}
+
+
+def resolve_mcc_profile(mcc: str | int | None) -> MCCRiskProfile:
+    """Resolve an ISO 18245 4-digit MCC to a risk profile using known codes or range heuristics."""
+    if mcc is None or isinstance(mcc, bool):
+        return MCCRiskProfile("0000", MCCCategory.UNKNOWN, 0.010, 0.30, "Unknown or Unspecified MCC")
+    raw = str(mcc).strip()
+    if raw.endswith(".0"):
+        raw = raw[:-2]
+    if not raw:
+        return MCCRiskProfile("0000", MCCCategory.UNKNOWN, 0.010, 0.30, "Unknown or Unspecified MCC")
+    if raw.isdigit() and len(raw) < 4:
+        raw = raw.zfill(4)
+    if not (raw.isdigit() and len(raw) == 4):
+        return MCCRiskProfile("0000", MCCCategory.UNKNOWN, 0.010, 0.30, "Unknown or Unspecified MCC")
+
+    if raw in DEFAULT_MCC_PROFILES:
+        return DEFAULT_MCC_PROFILES[raw]
+
+    code_num = int(raw)
+    if 3000 <= code_num <= 4799 or 7000 <= code_num <= 7099:
+        return MCCRiskProfile(raw, MCCCategory.TRAVEL_HOSPITALITY, 0.010, 0.35, "Travel & Lodging")
+    if 4800 <= code_num <= 4999:
+        return MCCRiskProfile(raw, MCCCategory.GROCERY_UTILITIES, 0.002, 0.10, "Utilities & Telecom")
+    if 5000 <= code_num <= 5999:
+        return MCCRiskProfile(raw, MCCCategory.RETAIL_COMMERCE, 0.005, 0.20, "Retail & Wholesale")
+    if 6000 <= code_num <= 6999:
+        return MCCRiskProfile(raw, MCCCategory.MONEY_TRANSFER, 0.025, 0.70, "Financial Services")
+    if 7800 <= code_num <= 7999:
+        return MCCRiskProfile(raw, MCCCategory.GAMBLING_CRYPTO, 0.035, 0.80, "Amusement & Gaming")
+    return MCCRiskProfile(raw, MCCCategory.UNKNOWN, 0.008, 0.25, "General Commercial Services")
