@@ -394,3 +394,94 @@ class MerchantTrackerConfig:
             or self.min_distinct_cards_for_testing <= 0
         ):
             raise MerchantRiskError("min_distinct_cards_for_testing must be a positive integer.")
+
+
+@dataclass(frozen=True)
+class MerchantProfile:
+    """Snapshot of a merchant's sliding-window risk and ticket statistics."""
+
+    merchant_id: str
+    mcc: str
+    mcc_category: str
+    first_seen_timestamp: float
+    last_seen_timestamp: float
+    transaction_count: int
+    fraud_count: int
+    chargeback_count: int
+    total_amount: float
+    mean_amount: float
+    std_amount: float
+    distinct_cards_count: int
+    micro_tx_count: int
+    smoothed_fraud_rate: float
+    wilson_upper_bound: float
+    mcc_risk_score: float
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize MerchantProfile to dictionary."""
+        return {
+            "merchant_id": self.merchant_id,
+            "mcc": self.mcc,
+            "mcc_category": self.mcc_category,
+            "first_seen_timestamp": float(self.first_seen_timestamp),
+            "last_seen_timestamp": float(self.last_seen_timestamp),
+            "transaction_count": int(self.transaction_count),
+            "fraud_count": int(self.fraud_count),
+            "chargeback_count": int(self.chargeback_count),
+            "total_amount": round(float(self.total_amount), 4),
+            "mean_amount": round(float(self.mean_amount), 4),
+            "std_amount": round(float(self.std_amount), 4),
+            "distinct_cards_count": int(self.distinct_cards_count),
+            "micro_tx_count": int(self.micro_tx_count),
+            "smoothed_fraud_rate": round(float(self.smoothed_fraud_rate), 6),
+            "wilson_upper_bound": round(float(self.wilson_upper_bound), 6),
+            "mcc_risk_score": round(float(self.mcc_risk_score), 4),
+        }
+
+
+@dataclass(frozen=True)
+class MerchantAnomalyReport:
+    """Result of evaluating a merchant transaction against chargeback and bust-out heuristics."""
+
+    merchant_id: str
+    mcc: str
+    is_high_chargeback: bool
+    is_bust_out_surge: bool
+    is_card_testing: bool
+    is_ticket_outlier: bool
+    smoothed_fraud_rate: float
+    amount_zscore: float
+    micro_tx_ratio: float
+    distinct_cards_count: int
+    transaction_count: int
+    severity: str
+    reasons: tuple[str, ...] = ()
+
+    @property
+    def has_anomaly(self) -> bool:
+        """Return True if any merchant anomaly heuristic fired."""
+        return (
+            self.is_high_chargeback
+            or self.is_bust_out_surge
+            or self.is_card_testing
+            or self.is_ticket_outlier
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize MerchantAnomalyReport to dictionary."""
+        return {
+            "merchant_id": self.merchant_id,
+            "mcc": self.mcc,
+            "has_anomaly": self.has_anomaly,
+            "is_high_chargeback": self.is_high_chargeback,
+            "is_bust_out_surge": self.is_bust_out_surge,
+            "is_card_testing": self.is_card_testing,
+            "is_ticket_outlier": self.is_ticket_outlier,
+            "smoothed_fraud_rate": round(float(self.smoothed_fraud_rate), 6),
+            "amount_zscore": round(float(self.amount_zscore), 4),
+            "micro_tx_ratio": round(float(self.micro_tx_ratio), 4),
+            "distinct_cards_count": int(self.distinct_cards_count),
+            "transaction_count": int(self.transaction_count),
+            "severity": self.severity,
+            "reasons": list(self.reasons),
+        }
