@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from collections import OrderedDict, deque
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
@@ -740,3 +740,118 @@ class MerchantTracker:
 
         profile = self._build_profile(state)
         return profile, report
+
+
+MERCHANT_FEATURE_NAMES: tuple[str, ...] = (
+    "merchant_tx_count_24h",
+    "merchant_smoothed_fraud_rate",
+    "merchant_mcc_risk_score",
+    "merchant_amount_zscore",
+    "merchant_distinct_cards_24h",
+    "merchant_micro_tx_ratio",
+    "merchant_is_high_chargeback",
+    "merchant_is_bust_out_surge",
+)
+
+
+class MerchantFeatureExtractor:
+    """Sequential zero-lookahead extractor for merchant risk and chargeback features."""
+
+    def __init__(self, tracker: MerchantTracker | None = None) -> None:
+        self.tracker = tracker if tracker is not None else MerchantTracker()
+
+    def extract_features(
+        self,
+        record: Mapping[str, Any],
+        mutate_tracker: bool = True,
+    ) -> dict[str, float]:
+        """Extract 8 structured merchant risk features from a single transaction record."""
+        if not isinstance(record, Mapping):
+            raise MerchantRiskError("record must be a Mapping.")
+
+        merchant_id = "merchant_unknown"
+        for m_key in ("merchant_id", "merchant", "merch_id"):
+            raw_m = record.get(m_key)
+            if raw_m is not None and str(raw_m).strip():
+                merchant_id = str(raw_m).strip()
+                break
+
+        raw_mcc = "0000"
+        for mcc_key in ("mcc", "merchant_category_code", "category_code"):
+            val_mcc = record.get(mcc_key)
+            if val_mcc is not None and str(val_mcc).strip():
+                raw_mcc = str(val_mcc).strip()
+                break
+
+        try:
+            mcc_profile = resolve_mcc_profile(raw_mcc)
+        except MerchantRiskError:
+            mcc_profile = resolve_mcc_profile("0000")
+
+        amount = 0.0
+        for a_key in ("amount", "amt", "Amount"):
+            if a_key in record and record[a_key] is not None:
+                try:
+                    parsed_amt = float(record[a_key])
+                    if math.isfinite(parsed_amt) and parsed_amt >= 0.0:
+                        amount = parsed_amt
+                        break
+                except (ValueError, TypeError):
+                    pass
+
+        timestamp = 0.0
+        for t_key in ("timestamp", "unix_time", "Time", "event_time"):
+            if t_key in record and record[t_key] is not None:
+                try:
+                    parsed_ts = float(record[t_key])
+                    if math.isfinite(parsed_ts):
+                        timestamp = parsed_ts
+                        break
+                except (ValueError, TypeError):
+                    pass
+
+        card_id: str | None = None
+        for c_key in ("card_id", "cc_num", "account_id", "user_id"):
+            raw_c = record.get(c_key)
+            if raw_c is not None and str(raw_c).strip():
+                card_id = str(raw_c).strip()
+                break
+
+        raw_fraud = record.get("is_fraud", record.get("Class", False))
+        is_fraud = bool(raw_fraud) and str(raw_fraud).strip().lower() not in ("0", "false", "")
+        raw_cb = record.get("is_chargeback", False)
+        is_chargeback = bool(raw_cb) and str(raw_cb).strip().lower() not in ("0", "false", "")
+
+        event = MerchantTransactionEvent(
+            merchant_id=merchant_id,
+            timestamp=timestamp,
+            amount=amount,
+            mcc=mcc_profile.mcc,
+            card_id=card_id,
+            is_fraud=is_fraud,
+            is_chargeback=is_chargeback,
+        )
+
+        if mutate_tracker:
+            _, report = self.tracker.record_event(event)
+        else:
+            report = self.tracker.assess_event(event)
+
+        return {
+            "merchant_tx_count_24h": float(report.transaction_count),
+            "merchant_smoothed_fraud_rate": round(float(report.smoothed_fraud_rate), 6),
+            "merchant_mcc_risk_score": round(float(mcc_profile.risk_score), 4),
+            "merchant_amount_zscore": round(float(report.amount_zscore), 4),
+            "merchant_distinct_cards_24h": float(report.distinct_cards_count),
+            "merchant_micro_tx_ratio": round(float(report.micro_tx_ratio), 4),
+            "merchant_is_high_chargeback": 1.0 if report.is_high_chargeback else 0.0,
+            "merchant_is_bust_out_surge": 1.0 if report.is_bust_out_surge else 0.0,
+        }
+
+    def extract_batch(
+        self,
+        records: Sequence[Mapping[str, Any]],
+        mutate_tracker: bool = True,
+    ) -> list[dict[str, float]]:
+        """Sequentially extract structured merchant features for a batch of records."""
+        return [self.extract_features(r, mutate_tracker=mutate_tracker) for r in records]
