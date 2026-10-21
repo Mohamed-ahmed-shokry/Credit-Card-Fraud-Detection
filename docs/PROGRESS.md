@@ -11,7 +11,7 @@
 - [x] Task 3: Implement `MerchantTrackerConfig`, `MerchantProfile`, `MerchantAnomalyReport`, and `MerchantTracker` in `merchant.py` with tests in `tests/test_merchant.py`.
 - [x] Task 4: Implement `MerchantFeatureExtractor` in `merchant.py` with sequential batch/single extraction and tests in `tests/test_merchant.py`.
 - [x] Task 5: Integrate merchant rules (`build_merchant_chargeback_rule`, `build_merchant_bust_out_rule`) in `rules.py` and `MerchantEnrichmentStageProcessor` in `pipeline.py` with tests.
-- [ ] Task 6: Implement `build_merchant_anomaly_audit_event` in `audit.py` with tests in `tests/test_audit.py`.
+- [x] Task 6: Implement `build_merchant_anomaly_audit_event` in `audit.py` with tests in `tests/test_audit.py`.
 - [ ] Task 7: Implement `/v1/merchant/*` API endpoints and Prometheus telemetry in `api.py` with tests in `tests/test_api.py`.
 - [ ] Task 8: Implement `merchant-surveillance` and `merchant-enrich` CLI commands in `cli.py` with tests in `tests/test_cli.py`.
 - [ ] Task 9: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate.
@@ -23,7 +23,7 @@
 | AC-2 (Streaming Merchant Tracker & Anomaly Heuristics) | PASSED | Unit tests in `tests/test_merchant.py` (6 passed) |
 | AC-3 (Zero-Lookahead Feature Extraction) | PASSED | Unit tests in `tests/test_merchant.py` (7 passed, 98.29% branch coverage) |
 | AC-4 (Pipeline & Decision Rule Integration) | PASSED | Unit tests in `tests/test_rules.py` and `tests/test_pipeline.py` |
-| AC-5 (Structured Audit Trail & Redaction) | PENDING | |
+| AC-5 (Structured Audit Trail & Redaction) | PASSED | Unit tests in `tests/test_audit.py` |
 | AC-6 (API Serving & Operational Telemetry) | PENDING | |
 | AC-7 (CLI Workflows & Gating) | PENDING | |
 | AC-8 (Quality Standards & 100% Green CI) | PENDING | |
