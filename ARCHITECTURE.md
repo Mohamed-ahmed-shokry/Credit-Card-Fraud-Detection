@@ -294,6 +294,10 @@ the request and response, while the tuned artifact threshold remains visible as
 - Pipeline graph integration (`DeviceEnrichmentStageProcessor`) enriches real-time decision graph transactions with 7 device features, enabling downstream rules (`build_device_emulator_rule`, `build_device_card_cycling_rule`) to trigger immediate challenges or denies.
 - Redacted audit trail logging (`build_device_anomaly_audit_event`) emits structured audit records with automated PCI-DSS compliant PAN masking for all credit card numbers.
 - Prometheus device telemetry tracks total device evaluations (`fraud_device_evaluations_total`), detected anomalies by severity (`fraud_device_anomalies_total`), and composite fingerprint similarity histograms (`fraud_device_similarity_score`).
+- Real-time merchant and ISO 18245 MCC risk profiling (`MCCRiskProfile`, `resolve_mcc_profile`, `MerchantTracker`) computes Empirical Bayes (Beta-Binomial) credibility-smoothed fraud rates ($\hat{p} = \frac{f + m \cdot p_0}{n + m}$) and Wilson score upper confidence bounds, preventing zero-volume division variance on newly onboarded terminals while rapidly escalating established high-chargeback merchants.
+- Online Welford ticket-size statistics (`_update_welford`) maintain running mean and variance accumulators per merchant in $O(1)$ space, detecting sudden terminal bust-out surges ($Z > 3.0$) and micro-transaction card-testing enumeration ($\ge 50\%$ micro-transactions across $\ge 5$ distinct cards).
+- Pipeline graph integration (`MerchantEnrichmentStageProcessor`) enriches real-time decision graph transactions with 8 merchant features (`merchant_tx_count_24h`, `merchant_smoothed_fraud_rate`, `merchant_mcc_risk_score`, `merchant_amount_zscore`, `merchant_distinct_cards_24h`, `merchant_micro_tx_ratio`, `merchant_is_high_chargeback`, `merchant_is_bust_out_surge`), enabling downstream rules (`build_merchant_chargeback_rule`, `build_merchant_bust_out_rule`) to trigger immediate challenges or denies.
+- Redacted audit trail logging (`build_merchant_anomaly_audit_event`) emits structured `fraud.merchant.anomaly_detected` records with automated PCI-DSS compliant Luhn PAN masking, and Prometheus merchant telemetry tracks evaluations (`fraud_merchant_evaluations_total`), anomalies (`fraud_merchant_anomalies_total`), and active tracked merchants (`fraud_merchant_tracked_merchants_total`).
 
 
 
@@ -392,6 +396,49 @@ flowchart TD
     STAGE --> API
     RULES --> AUDIT
     DT --> PROM
+```
+
+
+## Real-Time Merchant & MCC Risk Profiling Subsystem
+
+```mermaid
+flowchart TD
+    subgraph Ingestion ["Transaction & Merchant Ingestion"]
+        M_IN["Transaction Event\n(merchant_id, mcc, amount, card_id, is_fraud, is_chargeback)"]
+    end
+
+    subgraph Taxonomy ["ISO 18245 MCC Risk Taxonomy & Bayes Prior"]
+        MCC_RES["resolve_mcc_profile()\n(High-Risk Gambling/Crypto/Wire vs Retail/Grocery)"]
+        EB["Empirical Bayes Beta-Binomial Smoothing\n& Wilson Upper Confidence Bound"]
+        M_IN --> MCC_RES
+        MCC_RES --> EB
+    end
+
+    subgraph Tracker ["Streaming Merchant Surveillance Tracker"]
+        MT["MerchantTracker\n(Sliding 24h Window & Bounded LRU)"]
+        WEL["Online Welford Ticket Statistics\n(Running Mean, Std, Z-Score)"]
+        CB["Chargeback Breach & Micro-Tx\nCard-Testing Heuristics"]
+        MT --> WEL
+        MT --> CB
+    end
+
+    subgraph Pipeline ["Decision Pipeline DAG"]
+        M_STAGE["MerchantEnrichmentStageProcessor\n(8 Structured Merchant Features)"]
+        M_RULES["Rules Engine\n(Chargeback Breach & Bust-Out Surge Rules)"]
+        M_STAGE --> M_RULES
+    end
+
+    subgraph Telemetry ["Observability & Serving"]
+        M_API["REST API\n(/v1/merchant/stats, /assess, /profile, /reset)"]
+        M_AUDIT["Structured Audit Trail\n(PCI-DSS Luhn Redacted PANs)"]
+        M_PROM["Prometheus Telemetry\n(Evaluations, Anomalies, Tracked Merchants)"]
+    end
+
+    EB --> MT
+    MT --> M_STAGE
+    M_STAGE --> M_API
+    M_RULES --> M_AUDIT
+    MT --> M_PROM
 ```
 
 
