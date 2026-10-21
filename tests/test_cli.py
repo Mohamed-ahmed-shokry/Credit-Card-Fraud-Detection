@@ -8013,3 +8013,140 @@ def test_device_clusters_and_enrich_advanced_branches(tmp_path: Path) -> None:
         app, ["device-enrich", "-i", str(zero_file), "-o", str(tmp_path / "out.csv")]
     )
     assert res_zero_enrich.exit_code == 2
+
+
+def test_merchant_surveillance_cli_happy_path_and_fail_on_anomaly(tmp_path: Path) -> None:
+    csv_path = tmp_path / "merchant_tx.csv"
+    csv_path.write_text(
+        "merchant_id,mcc,amount,timestamp,card_id,is_fraud,is_chargeback\n"
+        "m_cb,7995,20.0,1000.0,c1,true,true\n"
+        "m_cb,7995,21.0,1010.0,c2,true,true\n"
+        "m_cb,7995,22.0,1020.0,c3,true,true\n"
+        "m_cb,7995,23.0,1030.0,c4,false,false\n"
+        "m_cb,7995,24.0,1040.0,c5,false,false\n"
+        "m_cb,7995,5000.0,1050.0,c6,false,false\n"
+        "m_test,5734,1.0,2000.0,tc1,false,false\n"
+        "m_test,5734,1.5,2010.0,tc2,false,false\n"
+        "m_test,5734,2.0,2020.0,tc3,false,false\n",
+        encoding="utf-8",
+    )
+    rep_path = tmp_path / "merchant_report.json"
+
+    # 1. JSON output + report file
+    res_json = runner.invoke(
+        app,
+        [
+            "merchant-surveillance",
+            "-i",
+            str(csv_path),
+            "-o",
+            str(rep_path),
+            "--json",
+            "--min-chargeback-count",
+            "2",
+            "--min-distinct-cards-for-testing",
+            "3",
+        ],
+    )
+    assert res_json.exit_code == 0, res_json.output
+    data = json.loads(res_json.output)
+    assert data["total_events_processed"] == 9
+    assert data["total_merchants_tracked"] == 2
+    assert data["chargeback_anomalies_count"] >= 1
+    assert data["bust_out_anomalies_count"] >= 1
+    assert data["card_testing_anomalies_count"] >= 1
+    assert data["ticket_outlier_anomalies_count"] >= 1
+    assert rep_path.exists()
+
+    # 2. Human-readable summary + --fail-on-anomaly exit code 3
+    res_fail = runner.invoke(
+        app,
+        [
+            "merchant-surveillance",
+            "-i",
+            str(csv_path),
+            "--min-chargeback-count",
+            "2",
+            "--fail-on-anomaly",
+        ],
+    )
+    assert res_fail.exit_code == 3
+    assert "Merchant Risk Profiling & Chargeback Surveillance Report:" in res_fail.output
+    assert "Failing per --fail-on-anomaly" in res_fail.output
+
+
+def test_merchant_enrich_and_input_validation_branches(tmp_path: Path) -> None:
+    # 1. JSON input file for merchant-enrich -> CSV and JSON outputs
+    json_in = tmp_path / "merchant_in.json"
+    json_in.write_text(
+        json.dumps(
+            [
+                {
+                    "merchant": "m_json",
+                    "merchant_category_code": "5411",
+                    "amt": 15.0,
+                    "unix_time": 1000.0,
+                    "cc_num": "card_a",
+                },
+                {
+                    "merchant": "m_json",
+                    "merchant_category_code": "invalid_mcc",
+                    "amt": "bad_amt",
+                    "unix_time": "bad_ts",
+                },
+            ]
+        ),
+        encoding="utf-8",
+    )
+    out_csv = tmp_path / "merchant_enriched.csv"
+    res_csv = runner.invoke(
+        app,
+        ["merchant-enrich", "-i", str(json_in), "-o", str(out_csv)],
+    )
+    assert res_csv.exit_code == 0, res_csv.output
+    assert "Successfully enriched 2 transactions with 8 merchant features" in res_csv.output
+    df_out = pd.read_csv(out_csv)
+    assert "merchant_smoothed_fraud_rate" in df_out.columns
+    assert "merchant_is_high_chargeback" in df_out.columns
+
+    out_json = tmp_path / "merchant_enriched.json"
+    res_json = runner.invoke(
+        app,
+        ["merchant-enrich", "-i", str(json_in), "-o", str(out_json), "--format", "json"],
+    )
+    assert res_json.exit_code == 0, res_json.output
+    parsed_json = json.loads(out_json.read_text(encoding="utf-8"))
+    assert len(parsed_json) == 2
+    assert "merchant_mcc_risk_score" in parsed_json[0]
+
+    # 2. Missing file, non-list JSON, and empty CSV error branches
+    res_missing = runner.invoke(
+        app, ["merchant-surveillance", "-i", str(tmp_path / "does_not_exist.csv")]
+    )
+    assert res_missing.exit_code == 2
+
+    non_list_json = tmp_path / "non_list.json"
+    non_list_json.write_text('{"not": "a list"}', encoding="utf-8")
+    res_non_list = runner.invoke(app, ["merchant-surveillance", "-i", str(non_list_json)])
+    assert res_non_list.exit_code == 2
+    assert "must contain a list of records" in res_non_list.output
+
+    bad_json = tmp_path / "bad.json"
+    bad_json.write_text("{corrupt", encoding="utf-8")
+    res_bad_json = runner.invoke(app, ["merchant-surveillance", "-i", str(bad_json)])
+    assert res_bad_json.exit_code == 2
+
+    empty_csv = tmp_path / "empty_merch.csv"
+    empty_csv.write_text("merchant_id,amount\n", encoding="utf-8")
+    res_empty = runner.invoke(app, ["merchant-surveillance", "-i", str(empty_csv)])
+    assert res_empty.exit_code == 2
+    assert "Input file contains no transactions" in res_empty.output
+
+    # 3. Also exercise _row_to_merchant_event fallback branches via merchant-surveillance
+    fallback_csv = tmp_path / "fallback.csv"
+    fallback_csv.write_text(
+        "merchant,category_code,Amount,Time,account_id\n,bad_mcc,bad_amt,bad_ts,\n",
+        encoding="utf-8",
+    )
+    res_fb = runner.invoke(app, ["merchant-surveillance", "-i", str(fallback_csv), "--json"])
+    assert res_fb.exit_code == 0, res_fb.output
