@@ -2037,7 +2037,7 @@ Does not integrate external commercial merchant onboarding KYB APIs or card-netw
 - [x] Task 2: Implement `calculate_empirical_bayes_fraud_rate`, `calculate_wilson_upper_bound`, and `MerchantTransactionEvent` in `merchant.py` with tests in `tests/test_merchant.py`.
 - [x] Task 3: Implement `MerchantTrackerConfig`, `MerchantProfile`, `MerchantAnomalyReport`, and `MerchantTracker` in `merchant.py` with tests in `tests/test_merchant.py`.
 - [x] Task 4: Implement `MerchantFeatureExtractor` in `merchant.py` with sequential batch/single extraction and tests in `tests/test_merchant.py`.
-- [ ] Task 5: Integrate merchant rules (`build_merchant_chargeback_rule`, `build_merchant_bust_out_rule`) in `rules.py` and `MerchantEnrichmentStageProcessor` in `pipeline.py` with tests.
+- [x] Task 5: Integrate merchant rules (`build_merchant_chargeback_rule`, `build_merchant_bust_out_rule`) in `rules.py` and `MerchantEnrichmentStageProcessor` in `pipeline.py` with tests.
 - [ ] Task 6: Implement `build_merchant_anomaly_audit_event` in `audit.py` with tests in `tests/test_audit.py`.
 - [ ] Task 7: Implement `/v1/merchant/*` API endpoints and Prometheus telemetry in `api.py` with tests in `tests/test_api.py`.
 - [ ] Task 8: Implement `merchant-surveillance` and `merchant-enrich` CLI commands in `cli.py` with tests in `tests/test_cli.py`.
