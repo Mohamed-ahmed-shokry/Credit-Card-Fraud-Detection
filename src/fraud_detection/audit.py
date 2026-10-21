@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     from fraud_detection.feedback import DelayedLabelRecord, RetrainingTriggerEvent
     from fraud_detection.geolocation import GeoLocationEvent, TravelVelocity
     from fraud_detection.graph import FraudRingCluster
+    from fraud_detection.merchant import MerchantAnomalyReport
     from fraud_detection.pipeline import PipelineChaosReport
     from fraud_detection.retraining import (
         ChallengerTrainingResult,
@@ -1291,6 +1292,79 @@ def build_device_anomaly_audit_event(
 
     return AuditEvent(
         event_type="fraud.device.anomaly_detected",
+        model_version=model_version,
+        dataset_fingerprint=dataset_fingerprint,
+        payload=payload,
+    )
+
+
+def build_merchant_anomaly_audit_event(
+    *,
+    report: MerchantAnomalyReport | Mapping[str, Any],
+    merchant_id: str | None = None,
+    card_id: str | None = None,
+    transaction_id: str | None = None,
+    trigger_action: str = "DENY",
+    model_version: str = "v1",
+    dataset_fingerprint: str | None = None,
+    metadata: Mapping[str, Any] | None = None,
+) -> AuditEvent:
+    """Construct a structured audit event when a merchant risk or chargeback anomaly is detected."""
+    if isinstance(report, Mapping):
+        m_id = str(report.get("merchant_id", merchant_id or "unknown"))
+        mcc = str(report.get("mcc", "0000"))
+        is_high_cb = bool(report.get("is_high_chargeback", False))
+        is_bust_out = bool(report.get("is_bust_out_surge", False))
+        is_card_testing = bool(report.get("is_card_testing", False))
+        is_ticket_outlier = bool(report.get("is_ticket_outlier", False))
+        smoothed_rate = float(report.get("smoothed_fraud_rate", 0.0))
+        amount_zscore = float(report.get("amount_zscore", 0.0))
+        micro_ratio = float(report.get("micro_tx_ratio", 0.0))
+        distinct_cards = int(report.get("distinct_cards_count", 0))
+        tx_count = int(report.get("transaction_count", 0))
+        severity = str(report.get("severity", "LOW"))
+        raw_reasons = report.get("reasons", ())
+    else:
+        m_id = str(report.merchant_id or merchant_id or "unknown")
+        mcc = str(report.mcc)
+        is_high_cb = bool(report.is_high_chargeback)
+        is_bust_out = bool(report.is_bust_out_surge)
+        is_card_testing = bool(report.is_card_testing)
+        is_ticket_outlier = bool(report.is_ticket_outlier)
+        smoothed_rate = float(report.smoothed_fraud_rate)
+        amount_zscore = float(report.amount_zscore)
+        micro_ratio = float(report.micro_tx_ratio)
+        distinct_cards = int(report.distinct_cards_count)
+        tx_count = int(report.transaction_count)
+        severity = str(report.severity)
+        raw_reasons = report.reasons
+
+    masked_card = _mask_pans_in_string(str(card_id)) if card_id else None
+    sanitized_reasons = [_mask_pans_in_string(str(r)) for r in raw_reasons]
+
+    payload: dict[str, Any] = {
+        "merchant_id": m_id,
+        "mcc": mcc,
+        "card_id": masked_card,
+        "transaction_id": transaction_id,
+        "is_high_chargeback": is_high_cb,
+        "is_bust_out_surge": is_bust_out,
+        "is_card_testing": is_card_testing,
+        "is_ticket_outlier": is_ticket_outlier,
+        "smoothed_fraud_rate": smoothed_rate,
+        "amount_zscore": amount_zscore,
+        "micro_tx_ratio": micro_ratio,
+        "distinct_cards_count": distinct_cards,
+        "transaction_count": tx_count,
+        "severity": severity,
+        "reasons": sanitized_reasons,
+        "trigger_action": str(trigger_action),
+    }
+    if metadata:
+        payload["metadata"] = dict(metadata)
+
+    return AuditEvent(
+        event_type="fraud.merchant.anomaly_detected",
         model_version=model_version,
         dataset_fingerprint=dataset_fingerprint,
         payload=payload,
