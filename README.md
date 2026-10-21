@@ -1757,6 +1757,45 @@ FastAPI endpoints surface real-time device tracking and anomaly assessment:
 - `POST /v1/device/assess`: Evaluate candidate transaction fingerprint without updating tracker state.
 - `POST /v1/device/reset`: Reset tracked device profiles and sliding windows.
 
+## Real-time merchant & MCC risk profiling, chargeback surveillance & bust-out detection
+
+Acquirers and payment processors face merchant collusion, high-chargeback rogue terminals, sudden bust-out ticket surges, and micro-transaction card-testing enumeration. The merchant surveillance subsystem maps ISO 18245 Merchant Category Codes (`MCC`) to baseline prior fraud rates and computes Empirical Bayes (Beta-Binomial) credibility-smoothed fraud rates ($\hat{p} = \frac{f + m \cdot p_0}{n + m}$), 95% Wilson score upper confidence bounds, and online Welford ticket-size Z-scores across sliding temporal windows:
+
+```bash
+# Analyze transaction datasets for merchant chargeback breaches, bust-outs, and card testing
+fraud-detect merchant-surveillance \
+  --input-file data/transactions.csv \
+  --output reports/merchant_surveillance.json \
+  --chargeback-rate-threshold 0.015 \
+  --min-chargeback-count 3 \
+  --bust-out-zscore-threshold 3.0 \
+  --window-seconds 86400 \
+  --fail-on-anomaly \
+  --json
+
+# Enrich transaction datasets with 8 streaming merchant risk features sequentially without lookahead bias
+fraud-detect merchant-enrich \
+  --input-file data/transactions.csv \
+  --output-file data/enriched_merchant.csv \
+  --format csv
+```
+
+Enriched features include:
+- `merchant_tx_count_24h`: Sliding-window transaction count for the merchant over the lookback window.
+- `merchant_smoothed_fraud_rate`: Empirical Bayes (Beta-Binomial) credibility-smoothed merchant fraud/chargeback rate anchored on the MCC prior.
+- `merchant_mcc_risk_score`: Intrinsic ISO 18245 Merchant Category Code risk score in $[0.0, 1.0]$.
+- `merchant_amount_zscore`: Online Welford ticket-size Z-score comparing the transaction amount against the merchant's historical mean and standard deviation.
+- `merchant_distinct_cards_24h`: Distinct payment cards transacting at the merchant within the sliding window.
+- `merchant_micro_tx_ratio`: Fraction of sliding-window transactions below the micro-transaction cutoff ($\le \$5.00$).
+- `merchant_is_high_chargeback`: Binary flag indicating merchant chargeback count and smoothed fraud rate breaching network monitoring thresholds.
+- `merchant_is_bust_out_surge`: Binary flag indicating a sudden ticket-size Z-score surge combined with elevated velocity.
+
+FastAPI endpoints surface real-time merchant risk profiling and surveillance:
+- `GET /v1/merchant/stats`: Return operational capacity, tracked merchants, total evaluations, and detected anomalies.
+- `GET /v1/merchant/profile/{merchant_id}`: Retrieve current merchant profile, Empirical Bayes smoothed fraud rate, Wilson upper bound, and Welford ticket statistics.
+- `POST /v1/merchant/assess`: Evaluate candidate merchant transaction event (optionally recording state via `"record": true` and emitting redacted audit events on anomaly).
+- `POST /v1/merchant/reset`: Reset tracked merchant profiles and sliding windows.
+
 ## Reference label-delay analysis
 
 
@@ -1807,6 +1846,7 @@ src/fraud_detection/
 ├── feedback.py       # delayed ground truth ingestion, label maturation modeling, and retraining triggers
 ├── geolocation.py    # real-time geographic anomaly detection, speed-of-travel velocity, and IP geocoding
 ├── graph.py          # real-time bipartite entity link analysis, fraud ring detection, and risk diffusion
+├── merchant.py       # real-time merchant & MCC risk profiling, Empirical Bayes smoothing, and bust-out detection
 ├── model.py          # training, model card, inference, and cryptographic attestation
 ├── pipeline.py       # decision graph execution, stage circuit breakers, and chaos simulation
 ├── recalibration.py  # ECE diagnostics, reliability curves, and post-hoc recalibration
