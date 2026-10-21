@@ -105,6 +105,14 @@ from fraud_detection.graph import (
     GraphFeatureExtractor,
     RingSeverity,
 )
+from fraud_detection.merchant import (
+    MerchantFeatureExtractor,
+    MerchantRiskError,
+    MerchantTracker,
+    MerchantTrackerConfig,
+    MerchantTransactionEvent,
+    resolve_mcc_profile,
+)
 from fraud_detection.model import (
     MANIFEST_FILENAME,
     CalibrationMethod,
@@ -7558,6 +7566,376 @@ def device_enrich(
     typer.echo(
         f"Successfully enriched {len(enriched_df)} transactions with {feature_count} "
         f"device features -> {output_file}"
+    )
+
+
+def _load_transaction_dataframe(input_file: Path) -> pd.DataFrame:
+    """Load CSV or JSON transaction records into a DataFrame or abort on error."""
+    if not input_file.exists():
+        _abort(f"Input file not found: {input_file}")
+    try:
+        if input_file.suffix.lower() == ".json":
+            raw_json = json.loads(input_file.read_text(encoding="utf-8"))
+            if not isinstance(raw_json, list):
+                _abort(f"Input JSON file must contain a list of records: {input_file}")
+            df = pd.DataFrame(raw_json)
+        else:
+            df = pd.read_csv(input_file)
+    except (pd.errors.EmptyDataError, json.JSONDecodeError, ValueError) as exc:
+        _abort(f"Input file contains no valid transactions ({exc}): {input_file}")
+    if df.empty:
+        _abort(f"Input file contains no transactions: {input_file}")
+    return df
+
+
+def _row_to_merchant_event(
+    record: dict[str, Any],
+    default_ts: float,
+) -> MerchantTransactionEvent:
+    """Convert a raw transaction dictionary into a validated MerchantTransactionEvent."""
+    merchant_id = "merchant_unknown"
+    for m_key in ("merchant_id", "merchant", "merch_id"):
+        raw_m = record.get(m_key)
+        if raw_m is not None and str(raw_m).strip() and str(raw_m).strip() != "nan":
+            merchant_id = str(raw_m).strip()
+            break
+
+    raw_mcc = "0000"
+    for mcc_key in ("mcc", "merchant_category_code", "category_code"):
+        val_mcc = record.get(mcc_key)
+        if val_mcc is not None and str(val_mcc).strip() and str(val_mcc).strip() != "nan":
+            raw_mcc = str(val_mcc).strip()
+            break
+
+    try:
+        mcc_profile = resolve_mcc_profile(raw_mcc)
+    except MerchantRiskError:
+        mcc_profile = resolve_mcc_profile("0000")
+
+    amount = 0.0
+    for a_key in ("amount", "amt", "Amount"):
+        if a_key in record and record[a_key] is not None:
+            try:
+                parsed_amt = float(record[a_key])
+                if np.isfinite(parsed_amt) and parsed_amt >= 0.0:
+                    amount = parsed_amt
+                    break
+            except (ValueError, TypeError):
+                pass
+
+    timestamp = default_ts
+    for t_key in ("timestamp", "unix_time", "Time", "event_time"):
+        if t_key in record and record[t_key] is not None:
+            try:
+                parsed_ts = float(record[t_key])
+                if np.isfinite(parsed_ts):
+                    timestamp = parsed_ts
+                    break
+            except (ValueError, TypeError):
+                pass
+
+    card_id: str | None = None
+    for c_key in ("card_id", "cc_num", "account_id", "user_id"):
+        raw_c = record.get(c_key)
+        if raw_c is not None and str(raw_c).strip() and str(raw_c).strip() != "nan":
+            card_id = str(raw_c).strip()
+            break
+
+    raw_fraud = record.get("is_fraud", record.get("Class", False))
+    is_fraud = bool(raw_fraud) and str(raw_fraud).strip().lower() not in ("0", "false", "", "nan")
+    raw_cb = record.get("is_chargeback", False)
+    is_chargeback = bool(raw_cb) and str(raw_cb).strip().lower() not in ("0", "false", "", "nan")
+
+    return MerchantTransactionEvent(
+        merchant_id=merchant_id,
+        timestamp=timestamp,
+        amount=amount,
+        mcc=mcc_profile.mcc,
+        card_id=card_id,
+        is_fraud=is_fraud,
+        is_chargeback=is_chargeback,
+    )
+
+
+@app.command("merchant-surveillance")
+def merchant_surveillance(
+    input_file: Annotated[
+        Path,
+        typer.Option(
+            "--input-file",
+            "-i",
+            help="Input CSV or JSON file containing transaction records with merchant telemetry.",
+        ),
+    ],
+    output: Annotated[
+        Path | None,
+        typer.Option(
+            "--output",
+            "-o",
+            help="Optional JSON report output file.",
+        ),
+    ] = None,
+    overwrite: Annotated[
+        bool,
+        typer.Option(
+            "--overwrite",
+            help="Overwrite existing output file if it exists.",
+        ),
+    ] = False,
+    window_seconds: Annotated[
+        float,
+        typer.Option(
+            "--window-seconds",
+            help="Sliding temporal lookback window for merchant velocity tracking in seconds.",
+        ),
+    ] = 86400.0,
+    chargeback_rate_threshold: Annotated[
+        float,
+        typer.Option(
+            "--chargeback-rate-threshold",
+            help="Maximum allowed chargeback ratio before high-chargeback anomaly triggers.",
+        ),
+    ] = 0.015,
+    min_chargeback_count: Annotated[
+        int,
+        typer.Option(
+            "--min-chargeback-count",
+            help="Minimum chargebacks in window required to trigger chargeback breach.",
+        ),
+    ] = 3,
+    bust_out_zscore_threshold: Annotated[
+        float,
+        typer.Option(
+            "--bust-out-zscore-threshold",
+            help="Ticket amount Z-score threshold for terminal bust-out surge detection.",
+        ),
+    ] = 3.0,
+    min_distinct_cards_for_testing: Annotated[
+        int,
+        typer.Option(
+            "--min-distinct-cards-for-testing",
+            help="Minimum distinct cards in window for micro-transaction card-testing detection.",
+        ),
+    ] = 5,
+    fail_on_anomaly: Annotated[
+        bool,
+        typer.Option(
+            "--fail-on-anomaly",
+            help="Exit with code 3 if any HIGH or CRITICAL merchant anomalies are detected.",
+        ),
+    ] = False,
+    as_json: Annotated[
+        bool,
+        typer.Option(
+            "--json",
+            "-j",
+            help="Output report formatted as JSON.",
+        ),
+    ] = False,
+) -> None:
+    """Analyze transaction dataset for merchant chargeback breaches, bust-outs, and card testing."""
+    _guard_output(output, overwrite)
+    df = _load_transaction_dataframe(input_file)
+
+    tracker = MerchantTracker(
+        config=MerchantTrackerConfig(
+            window_seconds=window_seconds,
+            chargeback_rate_threshold=chargeback_rate_threshold,
+            min_chargeback_count=min_chargeback_count,
+            bust_out_zscore_threshold=bust_out_zscore_threshold,
+            min_distinct_cards_for_testing=min_distinct_cards_for_testing,
+        )
+    )
+
+    chargeback_anomalies: list[dict[str, Any]] = []
+    bust_out_anomalies: list[dict[str, Any]] = []
+    card_testing_anomalies: list[dict[str, Any]] = []
+    ticket_outlier_anomalies: list[dict[str, Any]] = []
+    high_critical_anomalies: list[dict[str, Any]] = []
+    all_anomalies: list[dict[str, Any]] = []
+
+    records: list[dict[str, Any]] = [
+        {str(k): v for k, v in r.items()} for r in df.to_dict(orient="records")
+    ]
+
+    for idx, raw_row in enumerate(records):
+        event = _row_to_merchant_event(raw_row, default_ts=float(idx))
+        _, report = tracker.record_event(event)
+
+        if report.has_anomaly:
+            rep_dict = report.to_dict()
+            rep_dict["event_index"] = idx
+            rep_dict["card_id"] = event.card_id
+
+            all_anomalies.append(rep_dict)
+            if report.is_high_chargeback:
+                chargeback_anomalies.append(rep_dict)
+            if report.is_bust_out_surge:
+                bust_out_anomalies.append(rep_dict)
+            if report.is_card_testing:
+                card_testing_anomalies.append(rep_dict)
+            if report.is_ticket_outlier:
+                ticket_outlier_anomalies.append(rep_dict)
+            if report.severity in ("HIGH", "CRITICAL"):
+                high_critical_anomalies.append(rep_dict)
+
+    stats = tracker.get_stats()
+    report_dict: dict[str, Any] = {
+        "input_file": str(input_file),
+        "total_events_processed": len(df),
+        "total_merchants_tracked": stats["tracked_merchants"],
+        "total_anomalies_detected": len(all_anomalies),
+        "chargeback_anomalies_count": len(chargeback_anomalies),
+        "bust_out_anomalies_count": len(bust_out_anomalies),
+        "card_testing_anomalies_count": len(card_testing_anomalies),
+        "ticket_outlier_anomalies_count": len(ticket_outlier_anomalies),
+        "high_critical_anomalies_count": len(high_critical_anomalies),
+        "anomalies": all_anomalies,
+    }
+
+    report_json = json.dumps(report_dict, indent=2)
+    if output is not None:
+        _atomic_write_text(report_json + "\n", output)
+
+    if as_json:
+        typer.echo(report_json)
+    else:
+        typer.echo("Merchant Risk Profiling & Chargeback Surveillance Report:")
+        typer.echo(f"  Input File:                    {report_dict['input_file']}")
+        typer.echo(f"  Total Events Processed:        {report_dict['total_events_processed']}")
+        typer.echo(f"  Total Merchants Tracked:       {report_dict['total_merchants_tracked']}")
+        typer.echo(f"  Total Anomalies Detected:      {report_dict['total_anomalies_detected']}")
+        typer.echo(f"  Chargeback Breach Anomalies:   {report_dict['chargeback_anomalies_count']}")
+        typer.echo(f"  Bust-Out Surge Anomalies:      {report_dict['bust_out_anomalies_count']}")
+        typer.echo(
+            f"  Card-Testing Anomalies:        {report_dict['card_testing_anomalies_count']}"
+        )
+        typer.echo(
+            f"  Ticket Outlier Anomalies:      {report_dict['ticket_outlier_anomalies_count']}"
+        )
+        typer.echo(
+            f"  High/Critical Severity Count:  {report_dict['high_critical_anomalies_count']}"
+        )
+        for anomaly in high_critical_anomalies[:10]:
+            reasons_str = "; ".join(anomaly.get("reasons", []))
+            typer.echo(
+                f"  [{anomaly.get('severity')}] Merchant "
+                f"'{anomaly.get('merchant_id')}': {reasons_str}"
+            )
+
+    if fail_on_anomaly and len(high_critical_anomalies) > 0:
+        typer.echo(
+            f"Error: High/critical merchant anomalies detected "
+            f"({len(high_critical_anomalies)} events). Failing per --fail-on-anomaly.",
+            err=True,
+        )
+        raise typer.Exit(code=3)
+
+
+@app.command("merchant-enrich")
+def merchant_enrich(
+    input_file: Annotated[
+        Path,
+        typer.Option(
+            "--input-file",
+            "-i",
+            help="Input CSV or JSON file to enrich with merchant risk features.",
+        ),
+    ],
+    output_file: Annotated[
+        Path,
+        typer.Option(
+            "--output-file",
+            "-o",
+            help="Output destination file for enriched transaction dataset.",
+        ),
+    ],
+    overwrite: Annotated[
+        bool,
+        typer.Option(
+            "--overwrite",
+            help="Overwrite existing output file if it exists.",
+        ),
+    ] = False,
+    window_seconds: Annotated[
+        float,
+        typer.Option(
+            "--window-seconds",
+            help="Sliding temporal lookback window for merchant velocity tracking in seconds.",
+        ),
+    ] = 86400.0,
+    chargeback_rate_threshold: Annotated[
+        float,
+        typer.Option(
+            "--chargeback-rate-threshold",
+            help="Maximum allowed chargeback ratio before high-chargeback anomaly triggers.",
+        ),
+    ] = 0.015,
+    min_chargeback_count: Annotated[
+        int,
+        typer.Option(
+            "--min-chargeback-count",
+            help="Minimum chargebacks in window required to trigger chargeback breach.",
+        ),
+    ] = 3,
+    bust_out_zscore_threshold: Annotated[
+        float,
+        typer.Option(
+            "--bust-out-zscore-threshold",
+            help="Ticket amount Z-score threshold for terminal bust-out surge detection.",
+        ),
+    ] = 3.0,
+    min_distinct_cards_for_testing: Annotated[
+        int,
+        typer.Option(
+            "--min-distinct-cards-for-testing",
+            help="Minimum distinct cards in window for micro-transaction card-testing detection.",
+        ),
+    ] = 5,
+    output_format: Annotated[
+        str,
+        typer.Option(
+            "--format",
+            help="Output format: 'csv' or 'json'.",
+        ),
+    ] = "csv",
+) -> None:
+    """Enrich transactions with streaming merchant risk, MCC, and chargeback features.
+
+    Features are extracted sequentially without lookahead bias.
+    """
+    _guard_output(output_file, overwrite)
+    df = _load_transaction_dataframe(input_file)
+
+    tracker = MerchantTracker(
+        config=MerchantTrackerConfig(
+            window_seconds=window_seconds,
+            chargeback_rate_threshold=chargeback_rate_threshold,
+            min_chargeback_count=min_chargeback_count,
+            bust_out_zscore_threshold=bust_out_zscore_threshold,
+            min_distinct_cards_for_testing=min_distinct_cards_for_testing,
+        )
+    )
+    extractor = MerchantFeatureExtractor(tracker=tracker)
+
+    records: list[dict[str, Any]] = [
+        {str(k): v for k, v in r.items()} for r in df.to_dict(orient="records")
+    ]
+    extracted_features = extractor.extract_batch(records, mutate_tracker=True)
+
+    features_df = pd.DataFrame(extracted_features)
+    enriched_df = pd.concat([df.reset_index(drop=True), features_df.reset_index(drop=True)], axis=1)
+
+    fmt = output_format.lower().strip()
+    if fmt == "json" or output_file.suffix.lower() == ".json":
+        _atomic_write_text(enriched_df.to_json(orient="records", indent=2) + "\n", output_file)
+    else:
+        _atomic_write_csv(enriched_df, output_file)
+
+    feature_count = len(extracted_features[0]) if extracted_features else 0
+    typer.echo(
+        f"Successfully enriched {len(enriched_df)} transactions with {feature_count} "
+        f"merchant features -> {output_file}"
     )
 
 
