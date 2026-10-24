@@ -3,7 +3,7 @@
 ### Overview
 - **Phase**: Phase 41 — Real-Time Merchant & MCC Risk Profiling, Chargeback Surveillance & Bust-Out Anomaly Detection
 - **Branch**: `phase/merchant-risk-surveillance`
-- **Status**: In Progress
+- **Status**: Complete (100% Green CI)
 
 ## Task Status
 - [x] Task 1: Create `src/fraud_detection/merchant.py` with `MerchantRiskError`, `MCCCategory`, `MCCRiskProfile`, `resolve_mcc_profile`, and unit tests in `tests/test_merchant.py`.
@@ -14,7 +14,7 @@
 - [x] Task 6: Implement `build_merchant_anomaly_audit_event` in `audit.py` with tests in `tests/test_audit.py`.
 - [x] Task 7: Implement `/v1/merchant/*` API endpoints and Prometheus telemetry in `api.py` with tests in `tests/test_api.py`.
 - [x] Task 8: Implement `merchant-surveillance` and `merchant-enrich` CLI commands in `cli.py` with tests in `tests/test_cli.py`.
-- [ ] Task 9: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate.
+- [x] Task 9: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate.
 
 ## Acceptance Criteria Status
 | Criterion | Status | Evidence |
@@ -26,7 +26,7 @@
 | AC-5 (Structured Audit Trail & Redaction) | PASSED | Unit tests in `tests/test_audit.py` |
 | AC-6 (API Serving & Operational Telemetry) | PASSED | Integration tests in `tests/test_api.py` |
 | AC-7 (CLI Workflows & Gating) | PASSED | Integration tests in `tests/test_cli.py` |
-| AC-8 (Quality Standards & 100% Green CI) | PENDING | |
+| AC-8 (Quality Standards & 100% Green CI) | PASSED | 1,045 unit & integration tests passing with 97.04% branch coverage, Ruff format/lint clean, strict mypy 0 issues, pip-audit 0 vulnerabilities, build/twine valid, remote CI green (run ID 39845931127). |
 
 ## Decision Log
 | Date | Decision | Alternatives Considered | Rationale |
@@ -35,7 +35,12 @@
 | 2026-10-21 | Create branch `phase/merchant-risk-surveillance` from `origin/main` | Reuse old merged branch `phase/device-fingerprint-clustering` | Starts cleanly from merged `origin/main` (`1cc7812`) and isolates Phase 41 changes for continuous remote CI and PR delivery. |
 
 ## Validation Commands & Results
-- Baseline `ruff format --check src tests`: PASSED (49 files formatted)
-- Baseline `ruff check src tests`: PASSED
-- Baseline `mypy src`: PASSED (0 issues in 25 source files)
-- Baseline `build` & `twine check dist/*`: PASSED
+- `python -m ruff format --check src tests`: PASSED (51 files verified)
+- `python -m ruff check src tests`: PASSED (0 issues found)
+- `python -m mypy src`: PASSED (0 issues in 26 source files)
+- `python -m pytest --cov=fraud_detection --cov-report=term-missing`: PASSED (1,045 passed, 97.04% branch coverage)
+- `python -m pip_audit --skip-editable`: PASSED (0 vulnerabilities found)
+- `python -m build`: PASSED (wheel and sdist built cleanly)
+- `python -m twine check dist/*`: PASSED (PASSED metadata check)
+- `smoke test installed wheel`: PASSED (CLI entry point returned 0.1.0 in isolated venv)
+- `signed artifact admission & key rotation verification`: PASSED (ed25519 signing, verification, and revocation enforcement validated)
