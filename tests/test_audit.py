@@ -24,6 +24,7 @@ from fraud_detection.audit import (
     build_device_anomaly_audit_event,
     build_fraud_ring_detected_audit_event,
     build_impossible_travel_audit_event,
+    build_merchant_anomaly_audit_event,
     build_model_promoted_audit_event,
     build_pipeline_chaos_audit_event,
     build_pipeline_replay_audit_event,
@@ -54,6 +55,7 @@ from fraud_detection.graph import (
     RingPatternType,
     RingSeverity,
 )
+from fraud_detection.merchant import MerchantAnomalyReport
 
 
 def test_is_luhn_valid() -> None:
@@ -1392,4 +1394,78 @@ def test_build_device_anomaly_audit_event() -> None:
     assert mapping_event.payload["card_id"] == "plain_user_1"
     assert mapping_event.payload["is_card_cycling"] is True
     assert mapping_event.payload["distinct_cards_count"] == 5
+    assert mapping_event.payload["severity"] == "HIGH"
+
+
+def test_build_merchant_anomaly_audit_event() -> None:
+    pan_card = "4532015112830366"  # Luhn-valid PAN
+    rep = MerchantAnomalyReport(
+        merchant_id="m_collusion_99",
+        mcc="7995",
+        is_high_chargeback=True,
+        is_bust_out_surge=True,
+        is_card_testing=False,
+        is_ticket_outlier=True,
+        smoothed_fraud_rate=0.085,
+        amount_zscore=4.25,
+        micro_tx_ratio=0.10,
+        distinct_cards_count=6,
+        transaction_count=12,
+        severity="CRITICAL",
+        reasons=(
+            "high_chargeback_rate:0.0850",
+            f"bust_out_surge on card {pan_card}",
+        ),
+    )
+
+    event = build_merchant_anomaly_audit_event(
+        report=rep,
+        card_id=pan_card,
+        transaction_id="tx_merch_anomaly_1",
+        trigger_action="DENY",
+        model_version="v2",
+        metadata={"operator": "fraud_ops", "api_key": "secret_key_123"},
+    )
+
+    assert event.event_type == "fraud.merchant.anomaly_detected"
+    assert event.model_version == "v2"
+    assert event.payload["merchant_id"] == "m_collusion_99"
+    assert event.payload["mcc"] == "7995"
+    assert event.payload["transaction_id"] == "tx_merch_anomaly_1"
+    assert event.payload["is_high_chargeback"] is True
+    assert event.payload["is_bust_out_surge"] is True
+    assert event.payload["distinct_cards_count"] == 6
+    assert event.payload["severity"] == "CRITICAL"
+    assert event.payload["trigger_action"] == "DENY"
+
+    # Redaction checks: PAN in card_id and reasons must be masked
+    assert event.payload["card_id"] == "[REDACTED_PAN]"
+    assert "[REDACTED_PAN]" in event.payload["reasons"][1]
+    assert pan_card not in event.payload["reasons"][1]
+
+    # Redaction of secret api_key in metadata
+    d = event.to_dict(redact=True)
+    assert d["payload"]["metadata"]["api_key"] == "[REDACTED]"
+    assert d["payload"]["metadata"]["operator"] == "fraud_ops"
+
+    # Mapping report test
+    mapping_rep = {
+        "merchant_id": "m_map",
+        "mcc": "5817",
+        "is_high_chargeback": False,
+        "is_card_testing": True,
+        "distinct_cards_count": 7,
+        "transaction_count": 8,
+        "severity": "HIGH",
+    }
+    mapping_event = build_merchant_anomaly_audit_event(
+        report=mapping_rep,
+        card_id="plain_user_1",
+        transaction_id="tx_map_merch",
+    )
+    assert mapping_event.payload["merchant_id"] == "m_map"
+    assert mapping_event.payload["mcc"] == "5817"
+    assert mapping_event.payload["card_id"] == "plain_user_1"
+    assert mapping_event.payload["is_card_testing"] is True
+    assert mapping_event.payload["distinct_cards_count"] == 7
     assert mapping_event.payload["severity"] == "HIGH"

@@ -17,6 +17,8 @@ from fraud_detection.rules import (
     build_fraud_ring_rule,
     build_geo_proxy_rule,
     build_impossible_travel_rule,
+    build_merchant_bust_out_rule,
+    build_merchant_chargeback_rule,
 )
 
 
@@ -390,3 +392,19 @@ def test_device_rules() -> None:
     assert cycle_rule.evaluate({"device_is_card_cycling": 1.0}) is True
     assert cycle_rule.evaluate({"device_is_card_cycling": 0.0}) is False
     assert cycle_rule.evaluate({}) is False
+
+
+def test_merchant_rules() -> None:
+    cb_rule = build_merchant_chargeback_rule()
+    assert cb_rule.rule_id == "RULE_MERCHANT_CHARGEBACK_DENY"
+    assert cb_rule.action == RuleAction.DENY
+    assert cb_rule.evaluate({"merchant_is_high_chargeback": 1.0}) is True
+    assert cb_rule.evaluate({"merchant_is_high_chargeback": 0.0}) is False
+    assert cb_rule.evaluate({}) is False
+
+    bo_rule = build_merchant_bust_out_rule()
+    assert bo_rule.rule_id == "RULE_MERCHANT_BUST_OUT_DENY"
+    assert bo_rule.action == RuleAction.DENY
+    assert bo_rule.evaluate({"merchant_is_bust_out_surge": 1.0}) is True
+    assert bo_rule.evaluate({"merchant_is_bust_out_surge": 0.0}) is False
+    assert bo_rule.evaluate({}) is False

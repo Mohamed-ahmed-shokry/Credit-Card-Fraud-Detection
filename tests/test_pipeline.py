@@ -27,6 +27,7 @@ from fraud_detection.graph import (
     FraudRingDetector,
     FraudRingDetectorConfig,
 )
+from fraud_detection.merchant import MerchantTracker, MerchantTrackerConfig
 from fraud_detection.model import train_model
 from fraud_detection.pipeline import (
     ActionAggregatorStageProcessor,
@@ -39,6 +40,8 @@ from fraud_detection.pipeline import (
     GraphEnrichmentStage,
     GraphEnrichmentStageProcessor,
     InferenceStageProcessor,
+    MerchantEnrichmentStage,
+    MerchantEnrichmentStageProcessor,
     NodeCachePolicy,
     NodeCacheStats,
     PipelineChaosReport,
@@ -79,6 +82,7 @@ from fraud_detection.rules import (
     RuleSet,
     build_device_emulator_rule,
     build_impossible_travel_rule,
+    build_merchant_chargeback_rule,
 )
 from fraud_detection.velocity import VelocityConfig, VelocityWindow, VelocityWindowBuffer
 
@@ -2139,3 +2143,67 @@ def test_device_enrichment_stage_processor_direct() -> None:
     assert "device_features" in output
     assert "device_features" in ctx.metadata
     assert ctx.transaction["device_seen_count"] == 1.0
+
+
+def test_merchant_enrichment_stage_processor_direct() -> None:
+    assert MerchantEnrichmentStage is MerchantEnrichmentStageProcessor
+    tracker = MerchantTracker()
+    proc = MerchantEnrichmentStageProcessor(tracker=tracker)
+    ctx = PipelineContext(
+        transaction={
+            "transaction_id": "tx_m_1",
+            "merchant_id": "m_direct",
+            "mcc": "5411",
+            "amount": 35.0,
+            "card_id": "c1",
+        },
+    )
+    output = proc(ctx)
+    assert "merchant_features" in output
+    assert "merchant_features" in ctx.metadata
+    assert ctx.transaction["merchant_tx_count_24h"] == 1.0
+    assert output["merchant_is_high_chargeback"] is False
+    assert output["merchant_is_bust_out_surge"] is False
+
+
+def test_merchant_enrichment_stage_in_pipeline() -> None:
+    df = validate_frame(generate_synthetic_data(rows=300, fraud_rate=0.1, random_state=42))
+    model = train_model(df)
+    tracker = MerchantTracker(
+        MerchantTrackerConfig(
+            prior_strength=2.0,
+            chargeback_rate_threshold=0.15,
+            min_chargeback_count=2,
+        )
+    )
+    cb_rule = build_merchant_chargeback_rule()
+    ruleset = RuleSet((cb_rule,))
+
+    pipeline = create_default_fraud_pipeline(
+        model=model,
+        rules=ruleset,
+        merchant_tracker=tracker,
+    )
+    executor = DecisionGraphExecutor(pipeline)
+
+    # 1. First transaction on clean merchant
+    tx1: dict[str, Any] = {str(k): v for k, v in df.features.iloc[0].to_dict().items()}
+    tx1["merchant_id"] = "m_pipeline_test"
+    tx1["mcc"] = "5411"
+    tx1["amount"] = 25.0
+    tx1["is_chargeback"] = True
+    res1 = executor.execute_sync(tx1)
+    assert res1.stage_results["merchant_enrichment"].status == StageStatus.SUCCESS
+    assert res1.stage_results["merchant_enrichment"].output["merchant_is_high_chargeback"] is False
+
+    # 2. Second chargeback triggers high chargeback threshold -> DENY by rule
+    tx2: dict[str, Any] = {str(k): v for k, v in df.features.iloc[1].to_dict().items()}
+    tx2["merchant_id"] = "m_pipeline_test"
+    tx2["mcc"] = "7995"
+    tx2["amount"] = 50.0
+    tx2["is_chargeback"] = True
+    res2 = executor.execute_sync(tx2)
+    assert res2.stage_results["merchant_enrichment"].status == StageStatus.SUCCESS
+    assert res2.stage_results["merchant_enrichment"].output["merchant_is_high_chargeback"] is True
+    assert res2.decision == "DENY"
+    assert res2.matched_rule == "RULE_MERCHANT_CHARGEBACK_DENY"

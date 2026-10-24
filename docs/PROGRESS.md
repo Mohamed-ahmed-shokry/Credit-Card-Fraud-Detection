@@ -1,48 +1,41 @@
-# Phase 40 Progress Record
+# Phase 41 Progress Record
 
 ### Overview
-- **Phase**: Phase 40 — Adaptive Device & Browser Fingerprinting with Anomaly Clustering
-- **Branch**: `phase/device-fingerprint-clustering`
-- **Draft PR**: [#19](https://github.com/Mohamed-ahmed-shokry/Credit-Card-Fraud-Detection/pull/19)
-- **Status**: Complete
+- **Phase**: Phase 41 — Real-Time Merchant & MCC Risk Profiling, Chargeback Surveillance & Bust-Out Anomaly Detection
+- **Branch**: `phase/merchant-risk-surveillance`
+- **Status**: In Progress
 
 ## Task Status
-- [x] Task 1: Create `src/fraud_detection/device.py` with domain data models (`DeviceFingerprintError`, `ScreenGeometry`, `DeviceFingerprint`) and unit tests in `tests/test_device.py`.
-- [x] Task 2: Implement `DeviceHasher`, canonical hashing, and similarity/distance metrics (`calculate_fingerprint_similarity`, `calculate_jaccard_similarity`, `calculate_hamming_distance`) in `device.py` with tests in `tests/test_device.py`.
-- [x] Task 3: Implement `DeviceTrackerConfig`, `DeviceProfile`, `DeviceAnomalyReport`, and `DeviceTracker` in `device.py` with tests in `tests/test_device.py`.
-- [x] Task 4: Implement `detect_emulator_signatures`, `calculate_fingerprint_entropy`, and `DeviceFeatureExtractor` in `device.py` with tests in `tests/test_device.py`.
-- [x] Task 5: Integrate device features with `rules.py` (`build_device_emulator_rule`, `build_device_card_cycling_rule`) and `pipeline.py` (`DeviceEnrichmentStageProcessor`) with tests in `tests/test_rules.py` and `tests/test_pipeline.py`.
-- [x] Task 6: Implement audit event builder `build_device_anomaly_audit_event` in `audit.py` with tests in `tests/test_audit.py`.
-- [x] Task 7: Implement device API endpoints (`/v1/device/stats`, `/v1/device/profile/{device_id}`, `/v1/device/assess`, `/v1/device/reset`) and Prometheus metrics in `api.py` with tests in `tests/test_api.py`.
-- [x] Task 8: Implement CLI commands `device-clusters` and `device-enrich` in `cli.py` with tests in `tests/test_cli.py`.
-- [x] Task 9: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate.
+- [x] Task 1: Create `src/fraud_detection/merchant.py` with `MerchantRiskError`, `MCCCategory`, `MCCRiskProfile`, `resolve_mcc_profile`, and unit tests in `tests/test_merchant.py`.
+- [x] Task 2: Implement `calculate_empirical_bayes_fraud_rate`, `calculate_wilson_upper_bound`, and `MerchantTransactionEvent` in `merchant.py` with tests in `tests/test_merchant.py`.
+- [x] Task 3: Implement `MerchantTrackerConfig`, `MerchantProfile`, `MerchantAnomalyReport`, and `MerchantTracker` in `merchant.py` with tests in `tests/test_merchant.py`.
+- [x] Task 4: Implement `MerchantFeatureExtractor` in `merchant.py` with sequential batch/single extraction and tests in `tests/test_merchant.py`.
+- [x] Task 5: Integrate merchant rules (`build_merchant_chargeback_rule`, `build_merchant_bust_out_rule`) in `rules.py` and `MerchantEnrichmentStageProcessor` in `pipeline.py` with tests.
+- [x] Task 6: Implement `build_merchant_anomaly_audit_event` in `audit.py` with tests in `tests/test_audit.py`.
+- [x] Task 7: Implement `/v1/merchant/*` API endpoints and Prometheus telemetry in `api.py` with tests in `tests/test_api.py`.
+- [x] Task 8: Implement `merchant-surveillance` and `merchant-enrich` CLI commands in `cli.py` with tests in `tests/test_cli.py`.
+- [ ] Task 9: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate.
 
 ## Acceptance Criteria Status
 | Criterion | Status | Evidence |
 |-----------|--------|----------|
-| AC-1 (Domain Models & Hash Normalization) | PASSED | Unit tests in `test_device.py` |
-| AC-2 (Streaming Device Tracker & Anomaly Heuristics) | PASSED | Unit tests in `test_device.py` |
-| AC-3 (Feature Extraction & Entropy Scoring) | PASSED | Unit tests in `test_device.py` |
-| AC-4 (Pipeline & Decision Rule Integration) | PASSED | Unit tests in `test_rules.py` and `test_pipeline.py` |
-| AC-5 (Audit Trail & Sanitization) | PASSED | Unit tests in `test_audit.py` with PAN masking & redaction |
-| AC-6 (API Serving & Telemetry) | PASSED | Integration tests in `test_api.py` (157 passed) |
-| AC-7 (CLI Workflows & Gating) | PASSED | Integration tests in `test_cli.py` (5 passed) |
-| AC-8 (Quality Standards & 100% Green CI) | PASSED | Remote CI runs 39171855653 & 39172511478 passed 100% |
-
+| AC-1 (MCC Taxonomy & Empirical Bayes Smoothing) | PASSED | Unit tests in `tests/test_merchant.py` (4 passed) |
+| AC-2 (Streaming Merchant Tracker & Anomaly Heuristics) | PASSED | Unit tests in `tests/test_merchant.py` (6 passed) |
+| AC-3 (Zero-Lookahead Feature Extraction) | PASSED | Unit tests in `tests/test_merchant.py` (7 passed, 98.29% branch coverage) |
+| AC-4 (Pipeline & Decision Rule Integration) | PASSED | Unit tests in `tests/test_rules.py` and `tests/test_pipeline.py` |
+| AC-5 (Structured Audit Trail & Redaction) | PASSED | Unit tests in `tests/test_audit.py` |
+| AC-6 (API Serving & Operational Telemetry) | PASSED | Integration tests in `tests/test_api.py` |
+| AC-7 (CLI Workflows & Gating) | PASSED | Integration tests in `tests/test_cli.py` |
+| AC-8 (Quality Standards & 100% Green CI) | PENDING | |
 
 ## Decision Log
 | Date | Decision | Alternatives Considered | Rationale |
 |------|----------|-------------------------|-----------|
-| 2026-10-19 | Select Phase 40: Adaptive Device & Browser Fingerprinting with Anomaly Clustering | Client-side JS SDK or third-party device intelligence service | Zero-dependency, in-process fingerprint normalization, similarity hashing, and anomaly clustering fulfills the reference architecture mission with zero leakage and complete auditability. |
-| 2026-10-19 | Branch `phase/device-fingerprint-clustering` with draft PR #19 | Work directly on main | Isolates phase development and enables continuous remote CI validation on every push. |
-| 2026-10-19 | Refine `redact_data` key matching to skip boolean indicator flags (`is_*`) and metric counters (`*_count`) | Treat all keys containing 'card' as secrets | Prevents false-positive redaction of audit fraud flags like `is_card_cycling` and `distinct_cards_count` while preserving PAN masking and credential protection. |
-| 2026-10-19 | Wire device endpoints into OPERATIONAL_PATHS and api_key/rate-limit middleware; pass device_tracker kwargs to create_default_fraud_pipeline only when provided to preserve standard 5-node pipeline contract | Always attach device enrichment stage to default pipeline | Prevents regression of existing default 5-stage pipeline tests while enabling seamless device stage processor opt-in. |
-| 2026-10-19 | Implement CLI commands `device-clusters` and `device-enrich` with sequential non-lookahead extraction and exit code 3 on `--fail-on-anomaly` | Ad-hoc script execution | Provides reproducible operational tooling for offline auditing and feature preprocessing matching existing `geo-*` patterns. |
+| 2026-10-21 | Select Phase 41: Real-Time Merchant & MCC Risk Profiling, Chargeback Surveillance & Bust-Out Anomaly Detection | External commercial KYB/merchant risk APIs | Self-contained, zero-dependency Empirical Bayes smoothing, ISO 18245 MCC risk taxonomy, Welford ticket-size Z-scores, and sliding-window velocity surveillance fit the leakage-safe reference architecture. |
+| 2026-10-21 | Create branch `phase/merchant-risk-surveillance` from `origin/main` | Reuse old merged branch `phase/device-fingerprint-clustering` | Starts cleanly from merged `origin/main` (`1cc7812`) and isolates Phase 41 changes for continuous remote CI and PR delivery. |
 
 ## Validation Commands & Results
-- Baseline main CI: PASSED (Run 39168277715)
-- Baseline local tests: 980 passed
-- Remote CI run 39171855653: PASSED (100% green across all 4 matrix jobs)
-- Remote CI run 39172815238: PASSED (100% green across all 4 matrix jobs)
-- Remote CI run 39174435775: PASSED (100% green across all 4 matrix jobs: Python 3.12, Python 3.14, Container, Signed artifact admission)
-- Local branch coverage verification: PASSED (1030 passed, 97.00% branch coverage)
+- Baseline `ruff format --check src tests`: PASSED (49 files formatted)
+- Baseline `ruff check src tests`: PASSED
+- Baseline `mypy src`: PASSED (0 issues in 25 source files)
+- Baseline `build` & `twine check dist/*`: PASSED

@@ -46,6 +46,7 @@ from fraud_detection.audit import (
     build_challenger_retrained_audit_event,
     build_delayed_label_audit_event,
     build_device_anomaly_audit_event,
+    build_merchant_anomaly_audit_event,
     build_model_promoted_audit_event,
     build_pipeline_chaos_audit_event,
     build_pipeline_replay_audit_event,
@@ -90,6 +91,14 @@ from fraud_detection.graph import (
     EntityType,
     FraudRingDetector,
     GraphConfig,
+)
+from fraud_detection.merchant import (
+    MerchantFeatureExtractor,
+    MerchantRiskError,
+    MerchantTracker,
+    MerchantTrackerConfig,
+    MerchantTransactionEvent,
+    resolve_mcc_profile,
 )
 from fraud_detection.model import FraudModel, ModelArtifactError, load_model
 from fraud_detection.pipeline import (
@@ -192,6 +201,9 @@ DEVICE_WINDOW_SECONDS_ENVIRONMENT_VARIABLE = "FRAUD_DEVICE_WINDOW_SECONDS"
 DEVICE_CARD_CYCLING_THRESHOLD_ENVIRONMENT_VARIABLE = "FRAUD_DEVICE_CARD_CYCLING_THRESHOLD"
 DEVICE_CYCLING_THRESHOLD_ENVIRONMENT_VARIABLE = "FRAUD_DEVICE_CYCLING_THRESHOLD"
 DEVICE_MAX_DEVICES_ENVIRONMENT_VARIABLE = "FRAUD_DEVICE_MAX_DEVICES"
+MERCHANT_WINDOW_SECONDS_ENVIRONMENT_VARIABLE = "FRAUD_MERCHANT_WINDOW_SECONDS"
+MERCHANT_MAX_MERCHANTS_ENVIRONMENT_VARIABLE = "FRAUD_MERCHANT_MAX_MERCHANTS"
+MERCHANT_CHARGEBACK_RATE_THRESHOLD_ENVIRONMENT_VARIABLE = "FRAUD_MERCHANT_CHARGEBACK_RATE_THRESHOLD"
 REQUEST_ID_HEADER = "X-Request-ID"
 PROCESS_TIME_HEADER = "X-Process-Time-Ms"
 MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024
@@ -222,6 +234,9 @@ OPERATIONAL_PATHS = frozenset(
         "/v1/device/stats",
         "/v1/device/assess",
         "/v1/device/reset",
+        "/v1/merchant/stats",
+        "/v1/merchant/assess",
+        "/v1/merchant/reset",
     }
 )
 UNMATCHED_ROUTE_LABEL = "unmatched"
@@ -1285,6 +1300,81 @@ class DeviceResetResponse(BaseModel):
     message: str = "Device tracker reset successfully."
 
 
+class MerchantProfileResponse(BaseModel):
+    """Sliding-window risk and chargeback profile for a tracked merchant."""
+
+    merchant_id: str
+    mcc: str
+    mcc_category: str
+    first_seen_timestamp: float
+    last_seen_timestamp: float
+    transaction_count: int
+    fraud_count: int
+    chargeback_count: int
+    total_amount: float
+    mean_amount: float
+    std_amount: float
+    distinct_cards_count: int
+    micro_tx_count: int
+    smoothed_fraud_rate: float
+    wilson_upper_bound: float
+    mcc_risk_score: float
+
+
+class MerchantStatsResponse(BaseModel):
+    """Operational metrics of the real-time merchant risk tracker."""
+
+    enabled: bool
+    tracked_merchants: int
+    max_merchants: int
+    window_seconds: float
+    total_evaluations: int
+    total_anomalies: int
+
+
+class MerchantAssessRequest(BaseModel):
+    """Candidate merchant transaction anomaly assessment request."""
+
+    merchant_id: str
+    mcc: str = "0000"
+    amount: float
+    timestamp: float | None = None
+    card_id: str | None = None
+    is_fraud: bool = False
+    is_chargeback: bool = False
+    record: bool = False
+
+
+class MerchantAssessResponse(BaseModel):
+    """Merchant chargeback and bust-out anomaly assessment outcome."""
+
+    merchant_id: str
+    mcc: str
+    mcc_category: str
+    mcc_risk_score: float
+    has_anomaly: bool
+    is_high_chargeback: bool
+    is_bust_out_surge: bool
+    is_card_testing: bool
+    is_ticket_outlier: bool
+    smoothed_fraud_rate: float
+    amount_zscore: float
+    micro_tx_ratio: float
+    distinct_cards_count: int
+    transaction_count: int
+    severity: str
+    reasons: list[str] = Field(default_factory=list)
+    features: dict[str, float] = Field(default_factory=dict)
+
+
+class MerchantResetResponse(BaseModel):
+    """Merchant tracker reset acknowledgement."""
+
+    status: str = "ok"
+    cleared_merchants: int = 0
+    message: str = "Merchant tracker reset successfully."
+
+
 def create_app(
     *,
     model: FraudModel | None = None,
@@ -1358,6 +1448,11 @@ def create_app(
     device_card_cycling_threshold: int = 3,
     device_cycling_threshold: int = 3,
     device_max_devices: int = 50000,
+    merchant_tracker: MerchantTracker | None = None,
+    merchant_feature_extractor: MerchantFeatureExtractor | None = None,
+    merchant_window_seconds: float = 86400.0,
+    merchant_max_merchants: int = 50000,
+    merchant_chargeback_rate_threshold: float = 0.015,
 ) -> FastAPI:
     """Create an application using an injected model or a trusted artifact path.
 
@@ -1669,7 +1764,54 @@ def create_app(
             tracker=resolved_device_tracker,
         )
 
+    resolved_merchant_tracker: MerchantTracker | None = merchant_tracker
+    resolved_merchant_feature_extractor: MerchantFeatureExtractor | None = (
+        merchant_feature_extractor
+    )
+
+    if resolved_merchant_tracker is None:
+        raw_merch_window = os.getenv(MERCHANT_WINDOW_SECONDS_ENVIRONMENT_VARIABLE)
+        eff_merch_window = (
+            float(raw_merch_window) if raw_merch_window is not None else merchant_window_seconds
+        )
+        raw_max_merch = os.getenv(MERCHANT_MAX_MERCHANTS_ENVIRONMENT_VARIABLE)
+        eff_max_merch = int(raw_max_merch) if raw_max_merch is not None else merchant_max_merchants
+        raw_cb_thresh = os.getenv(MERCHANT_CHARGEBACK_RATE_THRESHOLD_ENVIRONMENT_VARIABLE)
+        eff_cb_thresh = (
+            float(raw_cb_thresh)
+            if raw_cb_thresh is not None
+            else merchant_chargeback_rate_threshold
+        )
+        resolved_merchant_tracker = MerchantTracker(
+            config=MerchantTrackerConfig(
+                window_seconds=eff_merch_window,
+                max_merchants=eff_max_merch,
+                chargeback_rate_threshold=eff_cb_thresh,
+            )
+        )
+
+    if resolved_merchant_feature_extractor is None and resolved_merchant_tracker is not None:
+        resolved_merchant_feature_extractor = MerchantFeatureExtractor(
+            tracker=resolved_merchant_tracker,
+        )
+
     metrics_registry = CollectorRegistry()
+    merchant_anomalies_counter = Counter(
+        "fraud_merchant_anomalies_total",
+        "Total merchant risk and chargeback anomalies detected by anomaly type.",
+        ["anomaly_type"],
+        registry=metrics_registry,
+    )
+    merchant_evaluations_counter = Counter(
+        "fraud_merchant_evaluations_total",
+        "Total merchant risk evaluations performed.",
+        registry=metrics_registry,
+    )
+    merchant_tracked_gauge = Gauge(
+        "fraud_merchant_tracked_merchants_total",
+        "Total active tracked merchants in sliding temporal window.",
+        registry=metrics_registry,
+    )
     device_anomalies_counter = Counter(
         "fraud_device_anomalies_total",
         "Total device and browser anomalies detected by anomaly type.",
@@ -2136,6 +2278,8 @@ def create_app(
                 geo_feature_extractor=geo_feature_extractor,
                 device_tracker=device_tracker,
                 device_feature_extractor=device_feature_extractor,
+                merchant_tracker=merchant_tracker,
+                merchant_feature_extractor=merchant_feature_extractor,
             )
 
         resolved_pipeline_exec = pipeline_executor
@@ -2171,6 +2315,11 @@ def create_app(
         application.state.device_anomalies_counter = device_anomalies_counter
         application.state.device_evaluations_counter = device_evaluations_counter
         application.state.device_tracked_gauge = device_tracked_gauge
+        application.state.merchant_tracker = resolved_merchant_tracker
+        application.state.merchant_feature_extractor = resolved_merchant_feature_extractor
+        application.state.merchant_anomalies_counter = merchant_anomalies_counter
+        application.state.merchant_evaluations_counter = merchant_evaluations_counter
+        application.state.merchant_tracked_gauge = merchant_tracked_gauge
         application.state.audit_sink = resolved_audit_sink
         application.state.explanation_provider = explanation_provider
         application.state.fallback_mode = resolved_fallback_mode
@@ -2269,7 +2418,7 @@ def create_app(
         call_next: RequestResponseEndpoint,
     ) -> Response:
         is_operational = request.url.path in OPERATIONAL_PATHS or request.url.path.startswith(
-            ("/v1/device/profile/", "/v1/geo/velocity/")
+            ("/v1/device/profile/", "/v1/geo/velocity/", "/v1/merchant/profile/")
         )
         if (
             api_key_set is not None
@@ -2290,7 +2439,7 @@ def create_app(
         # Registered after the API-key middleware, so it runs outside it: unauthenticated
         # traffic has to consume the client budget, otherwise key guessing is unmetered.
         is_operational = request.url.path in OPERATIONAL_PATHS or request.url.path.startswith(
-            ("/v1/device/profile/", "/v1/geo/velocity/")
+            ("/v1/device/profile/", "/v1/geo/velocity/", "/v1/merchant/profile/")
         )
         if rate_limiter is None or is_operational:
             return await call_next(request)
@@ -3926,6 +4075,175 @@ def create_app(
         )
 
     @application.get(
+        "/v1/merchant/profile/{merchant_id}",
+        response_model=MerchantProfileResponse,
+        responses={404: {"description": "Merchant profile or tracker not found."}},
+        tags=["merchant"],
+    )
+    async def merchant_profile(
+        merchant_id: str, request: Request
+    ) -> MerchantProfileResponse | JSONResponse:
+        """Query sliding-window risk, ticket statistics, and chargeback profile for a merchant."""
+        tracker: MerchantTracker | None = getattr(request.app.state, "merchant_tracker", None)
+        if tracker is None:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": "Merchant tracking is not enabled on this service."},
+            )
+        prof = tracker.get_profile(merchant_id)
+        if prof is None:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": f"Merchant '{merchant_id}' has no recorded profile."},
+            )
+        return MerchantProfileResponse(**prof.to_dict())
+
+    @application.get("/v1/merchant/stats", response_model=MerchantStatsResponse, tags=["merchant"])
+    async def merchant_stats(request: Request) -> MerchantStatsResponse:
+        """Return operational metrics of the real-time merchant risk tracker."""
+        tracker: MerchantTracker | None = getattr(request.app.state, "merchant_tracker", None)
+        if tracker is None:
+            return MerchantStatsResponse(
+                enabled=False,
+                tracked_merchants=0,
+                max_merchants=0,
+                window_seconds=0.0,
+                total_evaluations=0,
+                total_anomalies=0,
+            )
+        stats = tracker.get_stats()
+        return MerchantStatsResponse(
+            enabled=True,
+            tracked_merchants=stats["tracked_merchants"],
+            max_merchants=stats["max_merchants"],
+            window_seconds=stats["window_seconds"],
+            total_evaluations=stats["total_evaluations"],
+            total_anomalies=stats["total_anomalies"],
+        )
+
+    @application.post(
+        "/v1/merchant/assess",
+        response_model=MerchantAssessResponse,
+        responses={404: {"description": "Merchant tracking not enabled."}},
+        tags=["merchant"],
+    )
+    async def merchant_assess(
+        payload: MerchantAssessRequest,
+        request: Request,
+    ) -> MerchantAssessResponse | JSONResponse:
+        """Assess chargeback rate, ticket-size Z-score, card testing, and bust-out risk."""
+        tracker: MerchantTracker | None = getattr(request.app.state, "merchant_tracker", None)
+        extractor: MerchantFeatureExtractor | None = getattr(
+            request.app.state, "merchant_feature_extractor", None
+        )
+        if tracker is None or extractor is None:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": "Merchant tracking is not enabled on this service."},
+            )
+
+        ts = payload.timestamp if payload.timestamp is not None else time.time()
+        clean_card = (
+            payload.card_id.strip()
+            if payload.card_id is not None and payload.card_id.strip()
+            else None
+        )
+        try:
+            event = MerchantTransactionEvent(
+                merchant_id=payload.merchant_id,
+                timestamp=ts,
+                amount=payload.amount,
+                mcc=payload.mcc,
+                card_id=clean_card,
+                is_fraud=payload.is_fraud,
+                is_chargeback=payload.is_chargeback,
+            )
+            mcc_prof = resolve_mcc_profile(event.mcc)
+        except (MerchantRiskError, ValueError, TypeError) as exc:
+            return JSONResponse(
+                status_code=422,
+                content={"detail": f"Invalid merchant assessment payload: {exc}"},
+            )
+
+        if payload.record:
+            _, report = tracker.record_event(event)
+        else:
+            report = tracker.assess_event(event)
+
+        features = {
+            "merchant_tx_count_24h": float(report.transaction_count),
+            "merchant_smoothed_fraud_rate": round(float(report.smoothed_fraud_rate), 6),
+            "merchant_mcc_risk_score": round(float(mcc_prof.risk_score), 4),
+            "merchant_amount_zscore": round(float(report.amount_zscore), 4),
+            "merchant_distinct_cards_24h": float(report.distinct_cards_count),
+            "merchant_micro_tx_ratio": round(float(report.micro_tx_ratio), 4),
+            "merchant_is_high_chargeback": 1.0 if report.is_high_chargeback else 0.0,
+            "merchant_is_bust_out_surge": 1.0 if report.is_bust_out_surge else 0.0,
+        }
+
+        eval_counter: Counter | None = getattr(
+            request.app.state, "merchant_evaluations_counter", None
+        )
+        if eval_counter is not None:
+            eval_counter.inc()
+
+        anom_counter: Counter | None = getattr(
+            request.app.state, "merchant_anomalies_counter", None
+        )
+        if anom_counter is not None:
+            if report.is_high_chargeback:
+                anom_counter.labels(anomaly_type="high_chargeback").inc()
+            if report.is_bust_out_surge:
+                anom_counter.labels(anomaly_type="bust_out_surge").inc()
+            if report.is_card_testing:
+                anom_counter.labels(anomaly_type="card_testing").inc()
+            if report.is_ticket_outlier:
+                anom_counter.labels(anomaly_type="ticket_outlier").inc()
+
+        if report.severity in ("HIGH", "CRITICAL"):
+            audit_sink_obj: AuditSink | None = getattr(request.app.state, "audit_sink", None)
+            if audit_sink_obj is not None:
+                audit_sink_obj.emit(
+                    build_merchant_anomaly_audit_event(
+                        report=report,
+                        merchant_id=event.merchant_id,
+                        card_id=clean_card,
+                        trigger_action="DENY" if report.severity == "CRITICAL" else "CHALLENGE",
+                    )
+                )
+
+        return MerchantAssessResponse(
+            merchant_id=event.merchant_id,
+            mcc=mcc_prof.mcc,
+            mcc_category=str(mcc_prof.category),
+            mcc_risk_score=mcc_prof.risk_score,
+            has_anomaly=report.has_anomaly,
+            is_high_chargeback=report.is_high_chargeback,
+            is_bust_out_surge=report.is_bust_out_surge,
+            is_card_testing=report.is_card_testing,
+            is_ticket_outlier=report.is_ticket_outlier,
+            smoothed_fraud_rate=report.smoothed_fraud_rate,
+            amount_zscore=report.amount_zscore,
+            micro_tx_ratio=report.micro_tx_ratio,
+            distinct_cards_count=report.distinct_cards_count,
+            transaction_count=report.transaction_count,
+            severity=report.severity,
+            reasons=list(report.reasons),
+            features=features,
+        )
+
+    @application.post("/v1/merchant/reset", response_model=MerchantResetResponse, tags=["merchant"])
+    async def merchant_reset(request: Request) -> MerchantResetResponse:
+        """Reset the real-time merchant risk tracker and clear active profiles."""
+        tracker: MerchantTracker | None = getattr(request.app.state, "merchant_tracker", None)
+        cleared = tracker.reset() if tracker is not None else 0
+        return MerchantResetResponse(
+            status="ok",
+            cleared_merchants=cleared,
+            message="Merchant tracker reset successfully.",
+        )
+
+    @application.get(
         "/v1/routing/status",
         response_model=RoutingStatusResponse,
         responses={503: {"description": "Model not loaded."}},
@@ -5157,6 +5475,12 @@ def create_app(
             dev_gauge: Gauge | None = getattr(application.state, "device_tracked_gauge", None)
             if dev_gauge is not None:
                 dev_gauge.set(float(dev_trk.get_tracked_device_count()))
+
+        merch_trk: MerchantTracker | None = getattr(application.state, "merchant_tracker", None)
+        if merch_trk is not None:
+            merch_gauge: Gauge | None = getattr(application.state, "merchant_tracked_gauge", None)
+            if merch_gauge is not None:
+                merch_gauge.set(float(merch_trk.get_tracked_merchant_count()))
 
         return Response(
             content=generate_latest(metrics_registry),

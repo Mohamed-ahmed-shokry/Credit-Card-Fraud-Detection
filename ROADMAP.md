@@ -1987,6 +1987,62 @@ This phase does not embed client-side JavaScript injection libraries or heavy br
 - [x] Task 9: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate.
 
 
+## Phase 41 — Real-Time Merchant & MCC Risk Profiling, Chargeback Surveillance & Bust-Out Anomaly Detection (In progress)
+
+### Objective
+
+Detect merchant collusion, excessive chargeback breaches, terminal bust-out surges, and micro-transaction card-testing enumeration by introducing an in-process, zero-dependency streaming merchant and ISO 18245 Merchant Category Code (`MCC`) risk profiling engine (`merchant.py`). Compute Empirical Bayes (Beta-Binomial) credibility-smoothed merchant fraud rates, Wilson score upper confidence bounds, online Welford ticket-size Z-scores, and sliding-window merchant velocity profiles, wired into the Decision DAG, declarative rules, structured audit trail, FastAPI endpoints, Prometheus metrics, and CLI workflows.
+
+### Scope
+
+1. **Domain Models, MCC Taxonomy & Empirical Bayes Smoothing (`merchant.py`)**:
+   - `MerchantRiskError`, `MCCCategory`, `MCCRiskProfile`, `resolve_mcc_profile`.
+   - `calculate_empirical_bayes_fraud_rate` and `calculate_wilson_upper_bound`.
+   - `MerchantTransactionEvent`, `MerchantTrackerConfig`, `MerchantProfile`, `MerchantAnomalyReport`, and thread-safe `MerchantTracker` with sliding temporal window eviction, LRU capacity bounding, and Welford online ticket statistics.
+   - `MerchantFeatureExtractor`: Sequential zero-lookahead extraction of 8 merchant risk features (`merchant_tx_count_24h`, `merchant_smoothed_fraud_rate`, `merchant_mcc_risk_score`, `merchant_amount_zscore`, `merchant_distinct_cards_24h`, `merchant_micro_tx_ratio`, `merchant_is_high_chargeback`, `merchant_is_bust_out_surge`).
+2. **Decision Pipeline & Declarative Rules Integration (`rules.py`, `pipeline.py`)**:
+   - `build_merchant_chargeback_rule` and `build_merchant_bust_out_rule` in `rules.py`.
+   - `MerchantEnrichmentStageProcessor` in `pipeline.py` and integration with `create_default_fraud_pipeline`.
+3. **Structured Audit Trail & PCI-DSS Redaction (`audit.py`)**:
+   - `build_merchant_anomaly_audit_event` emitting `fraud.merchant.anomaly_detected` with Luhn PAN masking.
+4. **FastAPI Serving & Prometheus Telemetry (`api.py`)**:
+   - Endpoints `GET /v1/merchant/stats`, `GET /v1/merchant/profile/{merchant_id}`, `POST /v1/merchant/assess`, and `POST /v1/merchant/reset`.
+   - Prometheus metrics `fraud_merchant_anomalies_total`, `fraud_merchant_evaluations_total`, and `fraud_merchant_tracked_merchants_total`.
+5. **CLI Orchestration (`cli.py`)**:
+   - `fraud-detect merchant-surveillance` (with `--fail-on-anomaly` exit code 3) and `fraud-detect merchant-enrich`.
+
+### Acceptance Criteria
+
+1. **AC-1 (MCC Taxonomy & Empirical Bayes Smoothing)**: `resolve_mcc_profile`, `calculate_empirical_bayes_fraud_rate`, and `calculate_wilson_upper_bound` compute validated risk scores and smoothed rates across edge cases.
+2. **AC-2 (Streaming Merchant Tracker & Anomaly Heuristics)**: `MerchantTracker` tracks sliding-window events, Welford ticket stats, distinct cards, micro-tx ratios, chargeback breaches, and bust-out surges with TTL and LRU bounds.
+3. **AC-3 (Zero-Lookahead Feature Extraction)**: `MerchantFeatureExtractor` extracts 8 structured merchant features sequentially without future-data leakage.
+4. **AC-4 (Pipeline & Decision Rule Integration)**: `MerchantEnrichmentStageProcessor` and `build_merchant_chargeback_rule` / `build_merchant_bust_out_rule` integrate with the Decision DAG and `RuleSet`.
+5. **AC-5 (Structured Audit Trail & Redaction)**: `build_merchant_anomaly_audit_event` emits redacted `fraud.merchant.anomaly_detected` events with Luhn PAN masking.
+6. **AC-6 (API Serving & Operational Telemetry)**: FastAPI exposes `/v1/merchant/*` endpoints and updates Prometheus counters/gauges.
+7. **AC-7 (CLI Workflows & Gating)**: `fraud-detect merchant-surveillance` and `fraud-detect merchant-enrich` support CSV/JSON inputs and `--fail-on-anomaly` exit code 3 gating.
+8. **AC-8 (Quality Standards & 100% Green CI)**: All local CI-parity checks and remote CI workflow runs pass 100%, branch coverage $\ge 97.0\%$, strict mypy 0 issues, Ruff clean, and build/twine valid.
+
+### Validation & CI Plan
+
+- Local CI-parity commands: `ruff format --check src tests`, `ruff check src tests`, `mypy src`, `pip_audit --skip-editable`, `pytest --cov=fraud_detection --cov-report=term-missing`, `build`, `twine check dist/*`.
+- Remote CI workflow runs monitored via `gh run list` and `gh run view`.
+
+### Exclusions
+
+Does not integrate external commercial merchant onboarding KYB APIs or card-network Master Alert systems (MATCH/TMF); provides a self-contained, in-process streaming merchant risk and chargeback surveillance engine.
+
+### Micro-Task Breakdown
+
+- [x] Task 1: Create `src/fraud_detection/merchant.py` with `MerchantRiskError`, `MCCCategory`, `MCCRiskProfile`, `resolve_mcc_profile`, and unit tests in `tests/test_merchant.py`.
+- [x] Task 2: Implement `calculate_empirical_bayes_fraud_rate`, `calculate_wilson_upper_bound`, and `MerchantTransactionEvent` in `merchant.py` with tests in `tests/test_merchant.py`.
+- [x] Task 3: Implement `MerchantTrackerConfig`, `MerchantProfile`, `MerchantAnomalyReport`, and `MerchantTracker` in `merchant.py` with tests in `tests/test_merchant.py`.
+- [x] Task 4: Implement `MerchantFeatureExtractor` in `merchant.py` with sequential batch/single extraction and tests in `tests/test_merchant.py`.
+- [x] Task 5: Integrate merchant rules (`build_merchant_chargeback_rule`, `build_merchant_bust_out_rule`) in `rules.py` and `MerchantEnrichmentStageProcessor` in `pipeline.py` with tests.
+- [x] Task 6: Implement `build_merchant_anomaly_audit_event` in `audit.py` with tests in `tests/test_audit.py`.
+- [x] Task 7: Implement `/v1/merchant/*` API endpoints and Prometheus telemetry in `api.py` with tests in `tests/test_api.py`.
+- [x] Task 8: Implement `merchant-surveillance` and `merchant-enrich` CLI commands in `cli.py` with tests in `tests/test_cli.py`.
+- [ ] Task 9: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate.
+
 
 ## Contributing to the roadmap
 

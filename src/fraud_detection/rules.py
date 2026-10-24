@@ -457,3 +457,53 @@ def build_device_card_cycling_rule(
         priority=priority,
         reason=reason,
     )
+
+
+def build_merchant_chargeback_rule(
+    rule_id: str = "RULE_MERCHANT_CHARGEBACK_DENY",
+    name: str = "Merchant Excessive Chargeback Auto Deny",
+    action: RuleAction = RuleAction.DENY,
+    priority: int = 16,
+    reason: str = "Merchant exceeds Empirical Bayes smoothed chargeback rate threshold.",
+) -> DecisionRule:
+    """Build a pre-configured DecisionRule for excessive merchant chargeback mitigation."""
+    conditions = (
+        RuleCondition(
+            field="merchant_is_high_chargeback",
+            operator=RuleOperator.EQUALS,
+            value=1.0,
+        ),
+    )
+    return DecisionRule(
+        rule_id=rule_id,
+        name=name,
+        action=action,
+        conditions=conditions,
+        priority=priority,
+        reason=reason,
+    )
+
+
+def build_merchant_bust_out_rule(
+    rule_id: str = "RULE_MERCHANT_BUST_OUT_DENY",
+    name: str = "Merchant Bust-Out Surge Auto Deny",
+    action: RuleAction = RuleAction.DENY,
+    priority: int = 18,
+    reason: str = "Merchant exhibiting extreme ticket-size Z-score surge and bust-out anomaly.",
+) -> DecisionRule:
+    """Build a pre-configured DecisionRule for merchant bust-out surge mitigation."""
+    conditions = (
+        RuleCondition(
+            field="merchant_is_bust_out_surge",
+            operator=RuleOperator.EQUALS,
+            value=1.0,
+        ),
+    )
+    return DecisionRule(
+        rule_id=rule_id,
+        name=name,
+        action=action,
+        conditions=conditions,
+        priority=priority,
+        reason=reason,
+    )

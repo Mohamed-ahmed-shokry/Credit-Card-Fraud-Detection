@@ -5152,3 +5152,160 @@ def test_device_api_metrics_and_reset_branches(
         reset_resp = client.post("/v1/device/reset")
         assert reset_resp.status_code == 200
         assert reset_resp.json()["status"] == "ok"
+
+
+def test_merchant_api_endpoints_and_telemetry(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+    tmp_path: Path,
+) -> None:
+    _, model, _ = api_context
+    audit_file = tmp_path / "merchant_api_audit.jsonl"
+    sink = JsonlAuditSink(audit_file)
+    app = create_app(model=model, audit_sink=sink)
+
+    with TestClient(app) as client:
+        # 1. Initial stats check
+        stats_resp = client.get("/v1/merchant/stats")
+        assert stats_resp.status_code == 200
+        stats = stats_resp.json()
+        assert stats["enabled"] is True
+        assert stats["tracked_merchants"] == 0
+
+        # 2. Query unknown profile returns 404
+        prof_404 = client.get("/v1/merchant/profile/m_unknown_999")
+        assert prof_404.status_code == 404
+        assert "no recorded profile" in prof_404.json()["detail"]
+
+        # 3. Whitespace-only merchant_id raises MerchantRiskError -> 422
+        bad_assess = client.post(
+            "/v1/merchant/assess",
+            json={"merchant_id": "   ", "mcc": "5411", "amount": 10.0},
+        )
+        assert bad_assess.status_code == 422
+
+        # 4. Read-only assessment (record=False)
+        ro_resp = client.post(
+            "/v1/merchant/assess",
+            json={
+                "merchant_id": "m_readonly",
+                "mcc": "5411",
+                "amount": 25.0,
+                "timestamp": 900.0,
+                "record": False,
+            },
+        )
+        assert ro_resp.status_code == 200
+        assert client.get("/v1/merchant/profile/m_readonly").status_code == 404
+
+        # 5. Record baseline and chargeback/bust-out events on m_collusion
+        pan_card = "4532015112830366"
+        for i in range(5):
+            client.post(
+                "/v1/merchant/assess",
+                json={
+                    "merchant_id": "m_collusion",
+                    "mcc": "7995",
+                    "amount": 20.0 + i,
+                    "timestamp": 1000.0 + i * 10,
+                    "card_id": f"card_{i}",
+                    "is_fraud": True,
+                    "is_chargeback": True,
+                    "record": True,
+                },
+            )
+        assess_crit = client.post(
+            "/v1/merchant/assess",
+            json={
+                "merchant_id": "m_collusion",
+                "mcc": "7995",
+                "amount": 600.0,
+                "timestamp": 1100.0,
+                "card_id": pan_card,
+                "is_fraud": True,
+                "is_chargeback": True,
+                "record": True,
+            },
+        )
+        assert assess_crit.status_code == 200
+        crit_data = assess_crit.json()
+        assert crit_data["is_high_chargeback"] is True
+        assert crit_data["is_bust_out_surge"] is True
+        assert crit_data["severity"] == "CRITICAL"
+
+        # 6. Profile check
+        prof_resp = client.get("/v1/merchant/profile/m_collusion")
+        assert prof_resp.status_code == 200
+        prof_data = prof_resp.json()
+        assert prof_data["merchant_id"] == "m_collusion"
+        assert prof_data["transaction_count"] == 6
+        assert prof_data["chargeback_count"] == 6
+
+        # 7. Card testing anomaly on m_micro
+        for idx in range(5):
+            client.post(
+                "/v1/merchant/assess",
+                json={
+                    "merchant_id": "m_micro",
+                    "mcc": "5817",
+                    "amount": 1.0,
+                    "timestamp": 2000.0 + idx,
+                    "card_id": f"c_micro_{idx}",
+                    "record": True,
+                },
+            )
+
+        # 8. Check Prometheus metrics
+        metrics_resp = client.get("/metrics")
+        assert metrics_resp.status_code == 200
+        metrics_text = metrics_resp.text
+        assert "fraud_merchant_anomalies_total" in metrics_text
+        assert "fraud_merchant_evaluations_total" in metrics_text
+        assert "fraud_merchant_tracked_merchants_total" in metrics_text
+
+        # 9. Check audit log event emitted with PAN masked
+        sink.close()
+        assert audit_file.exists()
+        lines = [
+            json.loads(line) for line in audit_file.read_text(encoding="utf-8").splitlines() if line
+        ]
+        merch_events = [
+            ev for ev in lines if ev.get("event_type") == "fraud.merchant.anomaly_detected"
+        ]
+        assert len(merch_events) >= 1
+        assert merch_events[-1]["payload"]["merchant_id"] in ("m_collusion", "m_micro")
+
+        # 10. Reset endpoint
+        reset_resp = client.post("/v1/merchant/reset")
+        assert reset_resp.status_code == 200
+        assert reset_resp.json()["cleared_merchants"] == 2
+        assert client.get("/v1/merchant/stats").json()["tracked_merchants"] == 0
+
+
+def test_merchant_api_disabled_and_environment_defaults(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, model, _ = api_context
+    monkeypatch.setenv("FRAUD_MERCHANT_WINDOW_SECONDS", "3600.0")
+    monkeypatch.setenv("FRAUD_MERCHANT_MAX_MERCHANTS", "500")
+    monkeypatch.setenv("FRAUD_MERCHANT_CHARGEBACK_RATE_THRESHOLD", "0.025")
+
+    app = create_app(model=model)
+    with TestClient(app) as client:
+        tracker = getattr(app.state, "merchant_tracker", None)
+        assert tracker is not None
+        assert tracker.config.window_seconds == 3600.0
+        assert tracker.config.max_merchants == 500
+        assert tracker.config.chargeback_rate_threshold == 0.025
+
+        app.state.merchant_tracker = None
+        assert client.get("/v1/merchant/stats").json()["enabled"] is False
+        assert client.get("/v1/merchant/profile/m1").status_code == 404
+        assert (
+            client.post(
+                "/v1/merchant/assess",
+                json={"merchant_id": "m1", "mcc": "5411", "amount": 10.0},
+            ).status_code
+            == 404
+        )
+        assert client.post("/v1/merchant/reset").json()["cleared_merchants"] == 0
