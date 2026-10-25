@@ -49,8 +49,10 @@ retraining triggers, automated closed-loop champion-challenger retraining with m
 candidate verification safety gating, cryptographic attestation signing, zero-downtime safe
 canary promotion (Phase 37), real-time streaming bipartite entity link analysis,
 Personalized PageRank risk diffusion, automated fraud ring and card-testing botnet detection,
-and graph feature aggregation (Phase 38), and real-time geographic geolocation anomaly detection,
-velocity speed-of-travel calculations, and in-process IP geocoding (Phase 39).
+and graph feature aggregation (Phase 38), real-time geographic geolocation anomaly detection,
+velocity speed-of-travel calculations, and in-process IP geocoding (Phase 39), adaptive
+device and browser fingerprinting with anomaly clustering (Phase 40), and real-time merchant
+and MCC risk profiling, chargeback surveillance, and bust-out anomaly detection (Phase 41).
 
 ## Phase 1 — Distribution
 
@@ -1987,7 +1989,7 @@ This phase does not embed client-side JavaScript injection libraries or heavy br
 - [x] Task 9: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate.
 
 
-## Phase 41 — Real-Time Merchant & MCC Risk Profiling, Chargeback Surveillance & Bust-Out Anomaly Detection (In progress)
+## Phase 41 — Real-Time Merchant & MCC Risk Profiling, Chargeback Surveillance & Bust-Out Anomaly Detection (Done)
 
 ### Objective
 
@@ -2041,7 +2043,18 @@ Does not integrate external commercial merchant onboarding KYB APIs or card-netw
 - [x] Task 6: Implement `build_merchant_anomaly_audit_event` in `audit.py` with tests in `tests/test_audit.py`.
 - [x] Task 7: Implement `/v1/merchant/*` API endpoints and Prometheus telemetry in `api.py` with tests in `tests/test_api.py`.
 - [x] Task 8: Implement `merchant-surveillance` and `merchant-enrich` CLI commands in `cli.py` with tests in `tests/test_cli.py`.
-- [ ] Task 9: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate.
+- [x] Task 9: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate.
+
+### Delivery Record
+
+- **Status**: Completed across 23 micro-commits.
+- **Verification**: 100% test pass rate (1,045 tests passed), branch coverage 97.04% (exceeding 97.0% gate), strict mypy 0 issues across 26 source files, Ruff format and check clean, pip-audit 0 vulnerabilities, wheel build and twine check valid, signed admission verification passed.
+- **Artifacts Delivered**:
+  - `src/fraud_detection/merchant.py`: ISO 18245 MCC risk taxonomy, Beta-Binomial Empirical Bayes smoothing, Wilson score confidence bounds, sliding-window `MerchantTracker` with online Welford ticket-size statistics, and zero-lookahead `MerchantFeatureExtractor`.
+  - `src/fraud_detection/rules.py` & `src/fraud_detection/pipeline.py`: Declarative merchant rules (`build_merchant_chargeback_rule`, `build_merchant_bust_out_rule`) and Decision DAG stage processor (`MerchantEnrichmentStageProcessor`).
+  - `src/fraud_detection/audit.py`: `build_merchant_anomaly_audit_event` with Luhn PAN masking.
+  - `src/fraud_detection/api.py`: Endpoints `/v1/merchant/stats`, `/v1/merchant/profile/{merchant_id}`, `/v1/merchant/assess`, `/v1/merchant/reset`, and Prometheus telemetry.
+  - `src/fraud_detection/cli.py`: CLI commands `merchant-surveillance` and `merchant-enrich` with `--fail-on-anomaly` gate.
 
 
 ## Contributing to the roadmap
