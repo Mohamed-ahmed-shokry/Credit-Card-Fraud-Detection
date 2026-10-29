@@ -67,6 +67,7 @@ from fraud_detection.pipeline import (
     StageFaultType,
     StageStatus,
     StageType,
+    TenantPartitionStageProcessor,
     create_default_fraud_pipeline,
     optimize_counterfactual_pipeline,
     replay_audit_log_through_pipeline,
@@ -83,6 +84,13 @@ from fraud_detection.rules import (
     build_device_emulator_rule,
     build_impossible_travel_rule,
     build_merchant_chargeback_rule,
+)
+from fraud_detection.tenant import (
+    TenantContext,
+    TenantRegistry,
+    TenantRiskProfile,
+    TenantStatus,
+    TenantTier,
 )
 from fraud_detection.velocity import VelocityConfig, VelocityWindow, VelocityWindowBuffer
 
@@ -2207,3 +2215,112 @@ def test_merchant_enrichment_stage_in_pipeline() -> None:
     assert res2.stage_results["merchant_enrichment"].output["merchant_is_high_chargeback"] is True
     assert res2.decision == "DENY"
     assert res2.matched_rule == "RULE_MERCHANT_CHARGEBACK_DENY"
+
+
+def test_tenant_partition_stage_processor_direct() -> None:
+    """Validate TenantPartitionStageProcessor with active and suspended tenants."""
+    registry = TenantRegistry()
+    active_profile = TenantRiskProfile(
+        decline_threshold=0.90,
+        feature_overrides={"tenant_feature_bonus": 1.0},
+    )
+    registry.register(
+        TenantContext(
+            tenant_id="acme_corp",
+            tier=TenantTier.ENTERPRISE,
+            status=TenantStatus.ACTIVE,
+            risk_profile=active_profile,
+        )
+    )
+    registry.register(
+        TenantContext(
+            tenant_id="suspended_corp",
+            tier=TenantTier.STANDARD,
+            status=TenantStatus.SUSPENDED,
+        )
+    )
+
+    proc = TenantPartitionStageProcessor(registry=registry)
+
+    # 1. Active tenant evaluation
+    ctx1 = PipelineContext(
+        transaction={"Amount": 100.0, "tenant_id": "acme_corp"},
+        metadata={},
+    )
+    out1 = proc(ctx1)
+    assert out1["tenant_id"] == "acme_corp"
+    assert out1["tenant_tier"] == "enterprise"
+    assert out1["is_suspended"] is False
+    assert ctx1.transaction.get("tenant_feature_bonus") == 1.0
+    assert ctx1.metadata["tenant_id"] == "acme_corp"
+    assert ctx1.metadata["tenant_thresholds"]["decline"] == 0.90
+
+    # 2. Suspended tenant evaluation (short-circuits with DENY)
+    ctx2 = PipelineContext(
+        transaction={"Amount": 50.0, "tenant_id": "suspended_corp"},
+        metadata={},
+    )
+    out2 = proc(ctx2)
+    assert out2["tenant_id"] == "suspended_corp"
+    assert out2["is_suspended"] is True
+    assert out2["action"] == "DENY"
+    assert out2["short_circuited"] is True
+    assert ctx2.metadata["short_circuit"] is True
+    assert ctx2.metadata["short_circuit_action"] == "DENY"
+
+
+def test_tenant_pipeline_integration() -> None:
+    """Validate full DecisionGraph pipeline with tenant_partition stage."""
+    df = validate_frame(generate_synthetic_data(rows=300, fraud_rate=0.1, random_state=42))
+    model = train_model(df)
+
+    registry = TenantRegistry()
+    tenant_rule = DecisionRule(
+        rule_id="RULE_TENANT_BLOCK_LARGE",
+        name="Block amounts over 250 for tenant",
+        conditions=(
+            RuleCondition(field="Amount", operator=RuleOperator.GREATER_THAN, value=250.0),
+        ),
+        action=RuleAction.DENY,
+        priority=1,
+    )
+    tenant_profile = TenantRiskProfile(
+        custom_rules=(tenant_rule,),
+    )
+    registry.register(
+        TenantContext(
+            tenant_id="tenant_fintech",
+            tier=TenantTier.PREMIUM,
+            risk_profile=tenant_profile,
+        )
+    )
+
+    pipeline = create_default_fraud_pipeline(
+        model=model,
+        tenant_registry=registry,
+    )
+    assert "tenant_partition" in pipeline.nodes
+    executor = DecisionGraphExecutor(pipeline)
+
+    # 1. Normal transaction under tenant threshold -> executes successfully
+    tx1: dict[str, Any] = {str(k): v for k, v in df.features.iloc[0].to_dict().items()}
+    tx1["Amount"] = 150.0
+    tx1["tenant_id"] = "tenant_fintech"
+    res1 = executor.execute_sync(tx1)
+    assert res1.stage_results["tenant_partition"].status == StageStatus.SUCCESS
+    assert res1.stage_results["tenant_partition"].output["tenant_id"] == "tenant_fintech"
+    assert res1.stage_results["tenant_partition"].output["matched"] is False
+
+    # 2. Large transaction triggering tenant rule -> DENY by tenant rule
+    tx2: dict[str, Any] = {str(k): v for k, v in df.features.iloc[1].to_dict().items()}
+    tx2["Amount"] = 300.0
+    tx2["tenant_id"] = "tenant_fintech"
+    res2 = executor.execute_sync(tx2)
+    assert res2.stage_results["tenant_partition"].status == StageStatus.SUCCESS
+    assert res2.stage_results["tenant_partition"].output["matched"] is True
+    assert (
+        res2.stage_results["tenant_partition"].output["matched_rule_id"]
+        == "RULE_TENANT_BLOCK_LARGE"
+    )
+    assert res2.decision == "DENY"
+    assert res2.matched_rule == "RULE_TENANT_BLOCK_LARGE"
