@@ -2116,7 +2116,7 @@ Does not implement external identity providers (OAuth2/SAML/OIDC JWT validation 
 - [x] Task 2: Implement `TenantRegistryConfig`, `TenantRegistry`, and thread-safe registry operations in `src/fraud_detection/tenant.py` with unit tests.
 - [x] Task 3: Implement `resolve_tenant_ruleset` and dynamic rule federation in `src/fraud_detection/tenant.py` with unit tests.
 - [x] Task 4: Implement `TenantPartitionStageProcessor` in `src/fraud_detection/pipeline.py` and integrate with decision pipeline with unit tests in `tests/test_pipeline.py`.
-- [ ] Task 5: Implement `build_tenant_audit_event` in `src/fraud_detection/audit.py` with unit tests in `tests/test_audit.py`.
+- [x] Task 5: Implement `build_tenant_audit_event` in `src/fraud_detection/audit.py` with unit tests in `tests/test_audit.py`.
 - [ ] Task 6: Implement tenant resolution dependency, `/v1/tenants/*` endpoints, and Prometheus metrics in `src/fraud_detection/api.py` with tests in `tests/test_api.py`.
 - [ ] Task 7: Implement `tenant-list`, `tenant-validate`, and `tenant-eval` CLI commands in `src/fraud_detection/cli.py` with tests in `tests/test_cli.py`.
 - [ ] Task 8: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate.

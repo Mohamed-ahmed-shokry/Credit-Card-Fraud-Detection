@@ -10,7 +10,7 @@
 - [x] Task 2: Implement `TenantRegistryConfig`, `TenantRegistry`, and thread-safe registry operations in `src/fraud_detection/tenant.py` with unit tests.
 - [x] Task 3: Implement `resolve_tenant_ruleset` and dynamic rule federation in `src/fraud_detection/tenant.py` with unit tests.
 - [x] Task 4: Implement `TenantPartitionStageProcessor` in `src/fraud_detection/pipeline.py` and integrate with decision pipeline with unit tests in `tests/test_pipeline.py`.
-- [ ] Task 5: Implement `build_tenant_audit_event` in `src/fraud_detection/audit.py` with unit tests in `tests/test_audit.py`.
+- [x] Task 5: Implement `build_tenant_audit_event` in `src/fraud_detection/audit.py` with unit tests in `tests/test_audit.py`.
 - [ ] Task 6: Implement tenant resolution dependency, `/v1/tenants/*` endpoints, and Prometheus metrics in `src/fraud_detection/api.py` with tests in `tests/test_api.py`.
 - [ ] Task 7: Implement `tenant-list`, `tenant-validate`, and `tenant-eval` CLI commands in `src/fraud_detection/cli.py` with tests in `tests/test_cli.py`.
 - [ ] Task 8: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate.
@@ -22,7 +22,7 @@
 | AC-2 (Thread-Safe Tenant Registry) | PASSED | 7 unit tests in `tests/test_tenant.py` covering default initialization, strict isolation, capacity bounding with LRU eviction, multithreaded concurrency, and manifest export/import. |
 | AC-3 (Dynamic Rule Federation) | PASSED | 3 unit tests in `tests/test_tenant.py` verifying OVERRIDE_ONLY, ISOLATED, and INHERIT_AND_OVERRIDE with deterministic priority sorting. |
 | AC-4 (Pipeline Stage Integration) | PASSED | 2 unit & integration tests in `tests/test_pipeline.py` verifying TenantPartitionStageProcessor direct execution, short-circuit on suspended tenant, and full DecisionGraph execution. |
-| AC-5 (Tenant Audit Trail) | PENDING | |
+| AC-5 (Tenant Audit Trail) | PASSED | Unit test in `tests/test_audit.py` validating `fraud.tenant.policy_evaluated` event payload, field redaction, and Luhn PAN masking. |
 | AC-6 (API Serving & Multi-Tenant Telemetry) | PENDING | |
 | AC-7 (CLI Tenant Workflows) | PENDING | |
 | AC-8 (Quality Standards & 100% Green CI) | PENDING | |
