@@ -5309,3 +5309,93 @@ def test_merchant_api_disabled_and_environment_defaults(
             == 404
         )
         assert client.post("/v1/merchant/reset").json()["cleared_merchants"] == 0
+
+
+def test_tenant_api_endpoints_and_telemetry(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    """Validate /v1/tenants CRUD endpoints, X-Tenant-ID scoring resolution, and metrics."""
+    _, model, dataset = api_context
+    with TestClient(create_app(model=model)) as client:
+        # 1. GET /v1/tenants: default tenant present
+        res = client.get("/v1/tenants")
+        assert res.status_code == 200
+        data = res.json()
+        assert data["total_count"] >= 1
+        default_t = next(t for t in data["tenants"] if t["tenant_id"] == "default")
+        assert default_t["tier"] == "standard"
+        assert default_t["is_active"] is True
+
+        # 2. POST /v1/tenants: register custom tenant
+        reg_payload = {
+            "tenant_id": "fintech_alpha",
+            "tier": "enterprise",
+            "status": "active",
+            "rate_limit_rpm": 2500,
+            "tags": ["tier1", "emea"],
+            "risk_profile": {
+                "decline_threshold": 0.90,
+                "challenge_threshold": 0.65,
+                "review_threshold": 0.40,
+                "max_amount_per_tx": 10000.0,
+                "velocity_tx_limit_1h": 50,
+                "chargeback_rate_limit": 0.01,
+                "rule_inheritance_mode": "inherit_and_override",
+                "feature_overrides": {"geo_velocity": 0.2},
+                "metadata": {"region": "EU"},
+            },
+        }
+        create_res = client.post("/v1/tenants", json=reg_payload)
+        assert create_res.status_code == 200
+        created_data = create_res.json()
+        assert created_data["tenant_id"] == "fintech_alpha"
+        assert created_data["tier"] == "enterprise"
+        assert created_data["risk_profile"]["decline_threshold"] == 0.90
+
+        # 3. GET /v1/tenants/fintech_alpha: retrieve details
+        get_res = client.get("/v1/tenants/fintech_alpha")
+        assert get_res.status_code == 200
+        assert get_res.json()["tenant_id"] == "fintech_alpha"
+        assert get_res.json()["risk_profile"]["max_amount_per_tx"] == 10000.0
+
+        # 4. Score with active tenant header X-Tenant-ID
+        row = dataset.features.iloc[0].to_dict()
+        score_res = client.post(
+            "/v1/score",
+            json={"transaction": row},
+            headers={"X-Tenant-ID": "fintech_alpha"},
+        )
+        assert score_res.status_code == 200
+        assert "prediction" in score_res.json()
+
+        # 5. Check Prometheus metrics for tenant evaluation
+        metrics_res = client.get("/metrics")
+        assert metrics_res.status_code == 200
+        assert "fraud_tenant_evaluations_total{" in metrics_res.text
+        assert 'tenant_id="fintech_alpha"' in metrics_res.text
+
+        # 6. POST /v1/tenants/fintech_alpha/status: suspend tenant
+        status_res = client.post(
+            "/v1/tenants/fintech_alpha/status",
+            json={"status": "suspended"},
+        )
+        assert status_res.status_code == 200
+        assert status_res.json()["status"] == "suspended"
+        assert status_res.json()["is_active"] is False
+
+        # 7. Score with suspended tenant -> 403 Forbidden
+        suspended_score_res = client.post(
+            "/v1/score",
+            json={"transaction": row},
+            headers={"X-Tenant-ID": "fintech_alpha"},
+        )
+        assert suspended_score_res.status_code == 403
+        assert "suspended" in suspended_score_res.json()["detail"]
+
+        # 8. DELETE /v1/tenants/fintech_alpha
+        del_res = client.delete("/v1/tenants/fintech_alpha")
+        assert del_res.status_code == 200
+
+        # 9. Cannot delete default tenant
+        del_def_res = client.delete("/v1/tenants/default")
+        assert del_def_res.status_code == 400
