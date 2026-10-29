@@ -1,46 +1,39 @@
-# Phase 41 Progress Record
+# Phase 42 Progress Record
 
 ### Overview
-- **Phase**: Phase 41 — Real-Time Merchant & MCC Risk Profiling, Chargeback Surveillance & Bust-Out Anomaly Detection
-- **Branch**: `phase/merchant-risk-surveillance`
-- **Status**: Complete (100% Green CI)
+- **Phase**: Phase 42 — Multi-Tenant Policy Partitioning, Dynamic Rule Federation & Account Isolation
+- **Branch**: `phase/tenant-policy-federation`
+- **Status**: In Progress
 
 ## Task Status
-- [x] Task 1: Create `src/fraud_detection/merchant.py` with `MerchantRiskError`, `MCCCategory`, `MCCRiskProfile`, `resolve_mcc_profile`, and unit tests in `tests/test_merchant.py`.
-- [x] Task 2: Implement `calculate_empirical_bayes_fraud_rate`, `calculate_wilson_upper_bound`, and `MerchantTransactionEvent` in `merchant.py` with tests in `tests/test_merchant.py`.
-- [x] Task 3: Implement `MerchantTrackerConfig`, `MerchantProfile`, `MerchantAnomalyReport`, and `MerchantTracker` in `merchant.py` with tests in `tests/test_merchant.py`.
-- [x] Task 4: Implement `MerchantFeatureExtractor` in `merchant.py` with sequential batch/single extraction and tests in `tests/test_merchant.py`.
-- [x] Task 5: Integrate merchant rules (`build_merchant_chargeback_rule`, `build_merchant_bust_out_rule`) in `rules.py` and `MerchantEnrichmentStageProcessor` in `pipeline.py` with tests.
-- [x] Task 6: Implement `build_merchant_anomaly_audit_event` in `audit.py` with tests in `tests/test_audit.py`.
-- [x] Task 7: Implement `/v1/merchant/*` API endpoints and Prometheus telemetry in `api.py` with tests in `tests/test_api.py`.
-- [x] Task 8: Implement `merchant-surveillance` and `merchant-enrich` CLI commands in `cli.py` with tests in `tests/test_cli.py`.
-- [x] Task 9: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate.
+- [x] Task 1: Create `src/fraud_detection/tenant.py` with domain data models (`TenantError`, `TenantTier`, `RuleInheritanceMode`, `TenantStatus`, `TenantContext`, `TenantRiskProfile`) and unit tests in `tests/test_tenant.py`.
+- [x] Task 2: Implement `TenantRegistryConfig`, `TenantRegistry`, and thread-safe registry operations in `src/fraud_detection/tenant.py` with unit tests.
+- [x] Task 3: Implement `resolve_tenant_ruleset` and dynamic rule federation in `src/fraud_detection/tenant.py` with unit tests.
+- [ ] Task 4: Implement `TenantPartitionStageProcessor` in `src/fraud_detection/pipeline.py` and integrate with decision pipeline with unit tests in `tests/test_pipeline.py`.
+- [ ] Task 5: Implement `build_tenant_audit_event` in `src/fraud_detection/audit.py` with unit tests in `tests/test_audit.py`.
+- [ ] Task 6: Implement tenant resolution dependency, `/v1/tenants/*` endpoints, and Prometheus metrics in `src/fraud_detection/api.py` with tests in `tests/test_api.py`.
+- [ ] Task 7: Implement `tenant-list`, `tenant-validate`, and `tenant-eval` CLI commands in `src/fraud_detection/cli.py` with tests in `tests/test_cli.py`.
+- [ ] Task 8: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate.
 
 ## Acceptance Criteria Status
 | Criterion | Status | Evidence |
 |-----------|--------|----------|
-| AC-1 (MCC Taxonomy & Empirical Bayes Smoothing) | PASSED | Unit tests in `tests/test_merchant.py` (4 passed) |
-| AC-2 (Streaming Merchant Tracker & Anomaly Heuristics) | PASSED | Unit tests in `tests/test_merchant.py` (6 passed) |
-| AC-3 (Zero-Lookahead Feature Extraction) | PASSED | Unit tests in `tests/test_merchant.py` (7 passed, 98.29% branch coverage) |
-| AC-4 (Pipeline & Decision Rule Integration) | PASSED | Unit tests in `tests/test_rules.py` and `tests/test_pipeline.py` |
-| AC-5 (Structured Audit Trail & Redaction) | PASSED | Unit tests in `tests/test_audit.py` |
-| AC-6 (API Serving & Operational Telemetry) | PASSED | Integration tests in `tests/test_api.py` |
-| AC-7 (CLI Workflows & Gating) | PASSED | Integration tests in `tests/test_cli.py` |
-| AC-8 (Quality Standards & 100% Green CI) | PASSED | 1,045 unit & integration tests passing with 97.04% branch coverage, Ruff format/lint clean, strict mypy 0 issues, pip-audit 0 vulnerabilities, build/twine valid, remote CI green (run ID 39845931127). |
+| AC-1 (Domain Models & Validation) | PASSED | 6 unit tests in `tests/test_tenant.py` covering enums, risk profile thresholds/order validation, context lifecycle, and exception hierarchy. |
+| AC-2 (Thread-Safe Tenant Registry) | PASSED | 7 unit tests in `tests/test_tenant.py` covering default initialization, strict isolation, capacity bounding with LRU eviction, multithreaded concurrency, and manifest export/import. |
+| AC-3 (Dynamic Rule Federation) | PASSED | 3 unit tests in `tests/test_tenant.py` verifying OVERRIDE_ONLY, ISOLATED, and INHERIT_AND_OVERRIDE with deterministic priority sorting. |
+| AC-4 (Pipeline Stage Integration) | PENDING | |
+| AC-5 (Tenant Audit Trail) | PENDING | |
+| AC-6 (API Serving & Multi-Tenant Telemetry) | PENDING | |
+| AC-7 (CLI Tenant Workflows) | PENDING | |
+| AC-8 (Quality Standards & 100% Green CI) | PENDING | |
 
 ## Decision Log
 | Date | Decision | Alternatives Considered | Rationale |
 |------|----------|-------------------------|-----------|
-| 2026-10-21 | Select Phase 41: Real-Time Merchant & MCC Risk Profiling, Chargeback Surveillance & Bust-Out Anomaly Detection | External commercial KYB/merchant risk APIs | Self-contained, zero-dependency Empirical Bayes smoothing, ISO 18245 MCC risk taxonomy, Welford ticket-size Z-scores, and sliding-window velocity surveillance fit the leakage-safe reference architecture. |
-| 2026-10-21 | Create branch `phase/merchant-risk-surveillance` from `origin/main` | Reuse old merged branch `phase/device-fingerprint-clustering` | Starts cleanly from merged `origin/main` (`1cc7812`) and isolates Phase 41 changes for continuous remote CI and PR delivery. |
+| 2026-10-29 | Select Phase 42: Multi-Tenant Policy Partitioning, Dynamic Rule Federation & Account Isolation | External API gateway multi-tenancy plugins | Providing an in-process, zero-dependency policy partitioner, dynamic rule federation engine, and tenant DAG stage processor guarantees end-to-end isolation and reproducible testing inside the core package. |
+| 2026-10-29 | Create branch `phase/tenant-policy-federation` from latest `origin/main` (`cb75a5e`) | Reusing old merged phase branches | Clean isolation from merged Phase 41 with fresh upstream tracking. |
 
 ## Validation Commands & Results
-- `python -m ruff format --check src tests`: PASSED (51 files verified)
-- `python -m ruff check src tests`: PASSED (0 issues found)
-- `python -m mypy src`: PASSED (0 issues in 26 source files)
-- `python -m pytest --cov=fraud_detection --cov-report=term-missing`: PASSED (1,045 passed, 97.04% branch coverage)
-- `python -m pip_audit --skip-editable`: PASSED (0 vulnerabilities found)
-- `python -m build`: PASSED (wheel and sdist built cleanly)
-- `python -m twine check dist/*`: PASSED (PASSED metadata check)
-- `smoke test installed wheel`: PASSED (CLI entry point returned 0.1.0 in isolated venv)
-- `signed artifact admission & key rotation verification`: PASSED (ed25519 signing, verification, and revocation enforcement validated)
+- Baseline `ruff format --check src tests`: PASSED (51 files verified)
+- Baseline `ruff check src tests`: PASSED (0 issues found)
+- Baseline `mypy src`: PASSED (0 issues in 26 source files)
