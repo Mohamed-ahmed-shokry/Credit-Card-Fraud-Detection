@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+
 import pytest
 
 from fraud_detection.tenant import (
@@ -9,6 +11,8 @@ from fraud_detection.tenant import (
     TenantContext,
     TenantError,
     TenantNotFoundError,
+    TenantRegistry,
+    TenantRegistryConfig,
     TenantRiskProfile,
     TenantStatus,
     TenantSuspendedError,
@@ -117,3 +121,153 @@ def test_tenant_error_hierarchy() -> None:
     assert issubclass(TenantNotFoundError, TenantError)
     assert issubclass(TenantValidationError, TenantError)
     assert issubclass(TenantSuspendedError, TenantError)
+
+
+def test_tenant_registry_initialization_and_default() -> None:
+    """Validate registry startup and default tenant lookup."""
+    reg = TenantRegistry()
+    assert reg.count() == 1
+    default_ctx = reg.get("default")
+    assert default_ctx.tenant_id == "default"
+    assert default_ctx.tier == TenantTier.STANDARD
+    assert default_ctx.status == TenantStatus.ACTIVE
+
+    # Fallback to default
+    fallback_ctx = reg.get("non-existent-tenant")
+    assert fallback_ctx.tenant_id == "default"
+
+
+def test_tenant_registry_strict_isolation() -> None:
+    """Validate strict isolation mode denies unknown tenants without fallback."""
+    config = TenantRegistryConfig(strict_isolation=True)
+    reg = TenantRegistry(config=config)
+    with pytest.raises(TenantNotFoundError, match="Tenant 'unknown' not found"):
+        reg.get("unknown")
+
+
+def test_tenant_registry_register_and_overwrite() -> None:
+    """Validate registering tenants and overwrite behavior."""
+    reg = TenantRegistry()
+    t1 = TenantContext(tenant_id="tenant-acme", tier=TenantTier.ENTERPRISE)
+    reg.register(t1)
+    assert reg.count() == 2
+    assert reg.get("tenant-acme").tier == TenantTier.ENTERPRISE
+
+    with pytest.raises(TenantValidationError, match="already registered"):
+        reg.register(t1, overwrite=False)
+
+    updated_t1 = TenantContext(tenant_id="tenant-acme", tier=TenantTier.PREMIUM)
+    reg.register(updated_t1, overwrite=True)
+    assert reg.get("tenant-acme").tier == TenantTier.PREMIUM
+
+
+def test_tenant_registry_capacity_bounding_and_lru() -> None:
+    """Validate capacity bounding with LRU eviction preserving default tenant."""
+    config = TenantRegistryConfig(max_tenants=3, default_tenant_id="default")
+    reg = TenantRegistry(config=config)
+    # Default is already registered, count=1
+    reg.register(TenantContext(tenant_id="t-1"))
+    reg.register(TenantContext(tenant_id="t-2"))
+    assert reg.count() == 3
+
+    # Access t-1 so t-2 becomes LRU
+    assert reg.get("t-1").tenant_id == "t-1"
+
+    # Register t-3, should evict t-2
+    reg.register(TenantContext(tenant_id="t-3"))
+    assert reg.count() == 3
+
+    # Default and t-1 should still exist, t-2 should fallback to default (or raise if strict)
+    strict_config = TenantRegistryConfig(max_tenants=3, strict_isolation=True)
+    strict_reg = TenantRegistry(config=strict_config)
+    strict_reg.register(TenantContext(tenant_id="a"))
+    strict_reg.register(TenantContext(tenant_id="b"))
+    strict_reg.get("a")  # Access a
+    strict_reg.register(TenantContext(tenant_id="c"))  # Should evict b
+
+    assert strict_reg.get("a").tenant_id == "a"
+    assert strict_reg.get("c").tenant_id == "c"
+    with pytest.raises(TenantNotFoundError):
+        strict_reg.get("b")
+
+
+def test_tenant_registry_lifecycle_and_updates() -> None:
+    """Validate status update, profile update, and deletion."""
+    reg = TenantRegistry()
+    reg.register(TenantContext(tenant_id="tenant-beta", tier=TenantTier.STANDARD))
+
+    # Update status
+    updated = reg.update_status("tenant-beta", TenantStatus.SUSPENDED)
+    assert updated.status == TenantStatus.SUSPENDED
+    assert reg.get("tenant-beta").status == TenantStatus.SUSPENDED
+
+    # Update risk profile
+    new_profile = TenantRiskProfile(decline_threshold=0.95, challenge_threshold=0.75)
+    updated_profile = reg.update_risk_profile("tenant-beta", new_profile)
+    assert updated_profile.risk_profile.decline_threshold == 0.95
+
+    # Delete
+    assert reg.delete("tenant-beta") is True
+    assert reg.delete("tenant-beta") is False
+
+    # Prevent deleting default tenant
+    with pytest.raises(TenantValidationError, match="Cannot delete system default"):
+        reg.delete("default")
+
+
+def test_tenant_registry_multithreaded_concurrency() -> None:
+    """Validate concurrent multi-threaded register and lookup without data race."""
+    reg = TenantRegistry(config=TenantRegistryConfig(max_tenants=500))
+
+    def worker(worker_id: int) -> None:
+        for i in range(20):
+            t_id = f"worker-{worker_id}-t-{i}"
+            reg.register(TenantContext(tenant_id=t_id), overwrite=True)
+            ctx = reg.get(t_id)
+            assert ctx.tenant_id == t_id
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = [executor.submit(worker, w) for w in range(8)]
+        for f in futures:
+            f.result()
+
+    assert reg.count() > 10
+
+
+def test_tenant_registry_manifest_export_and_import() -> None:
+    """Validate serialization roundtrip through export_manifest and import_manifest."""
+    reg = TenantRegistry(config=TenantRegistryConfig(max_tenants=50))
+    reg.register(
+        TenantContext(
+            tenant_id="tenant-x",
+            tier=TenantTier.PREMIUM,
+            status=TenantStatus.ACTIVE,
+            risk_profile=TenantRiskProfile(
+                decline_threshold=0.92,
+                challenge_threshold=0.68,
+                review_threshold=0.42,
+                max_amount_per_tx=12000.0,
+                velocity_tx_limit_1h=100,
+                chargeback_rate_limit=0.012,
+                rule_inheritance_mode=RuleInheritanceMode.OVERRIDE_ONLY,
+                feature_overrides={"geo_velocity": 0.5},
+                metadata={"region": "EMEA"},
+            ),
+            rate_limit_rpm=5000,
+            tags=("vip", "finance"),
+        )
+    )
+
+    manifest = reg.export_manifest()
+    assert manifest["max_tenants"] == 50
+    assert manifest["tenant_count"] == 2
+
+    imported = TenantRegistry.import_manifest(manifest)
+    assert imported.count() == 2
+    tx = imported.get("tenant-x")
+    assert tx.tier == TenantTier.PREMIUM
+    assert tx.risk_profile.decline_threshold == 0.92
+    assert tx.risk_profile.max_amount_per_tx == 12000.0
+    assert tx.risk_profile.rule_inheritance_mode == RuleInheritanceMode.OVERRIDE_ONLY
+    assert tx.rate_limit_rpm == 5000
+    assert tx.tags == ("vip", "finance")
