@@ -6,6 +6,13 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
+from fraud_detection.rules import (
+    DecisionRule,
+    RuleAction,
+    RuleCondition,
+    RuleOperator,
+    RuleSet,
+)
 from fraud_detection.tenant import (
     RuleInheritanceMode,
     TenantContext,
@@ -18,6 +25,7 @@ from fraud_detection.tenant import (
     TenantSuspendedError,
     TenantTier,
     TenantValidationError,
+    resolve_tenant_ruleset,
 )
 
 
@@ -271,3 +279,126 @@ def test_tenant_registry_manifest_export_and_import() -> None:
     assert tx.risk_profile.rule_inheritance_mode == RuleInheritanceMode.OVERRIDE_ONLY
     assert tx.rate_limit_rpm == 5000
     assert tx.tags == ("vip", "finance")
+
+
+def test_resolve_tenant_ruleset_override_only() -> None:
+    """Validate OVERRIDE_ONLY mode ignores global rules completely."""
+    global_rule = DecisionRule(
+        rule_id="RULE_GLOBAL_1",
+        name="Global rule",
+        conditions=(
+            RuleCondition(field="Amount", operator=RuleOperator.GREATER_THAN, value=100.0),
+        ),
+        action=RuleAction.CHALLENGE,
+        priority=10,
+    )
+    global_ruleset = RuleSet(rules=(global_rule,))
+
+    custom_rule = DecisionRule(
+        rule_id="RULE_TENANT_1",
+        name="Tenant custom rule",
+        conditions=(
+            RuleCondition(field="Amount", operator=RuleOperator.GREATER_THAN, value=500.0),
+        ),
+        action=RuleAction.DENY,
+        priority=5,
+    )
+    profile = TenantRiskProfile(
+        rule_inheritance_mode=RuleInheritanceMode.OVERRIDE_ONLY,
+        custom_rules=(custom_rule,),
+    )
+    ctx = TenantContext(tenant_id="tenant-override", risk_profile=profile)
+
+    resolved = resolve_tenant_ruleset(ctx, global_ruleset)
+    assert len(resolved) == 1
+    assert resolved.rules[0].rule_id == "RULE_TENANT_1"
+
+
+def test_resolve_tenant_ruleset_isolated() -> None:
+    """Validate ISOLATED mode isolates tenant namespace from global rules."""
+    global_rule = DecisionRule(
+        rule_id="RULE_GLOBAL_1",
+        name="Global rule",
+        conditions=(
+            RuleCondition(field="Amount", operator=RuleOperator.GREATER_THAN, value=100.0),
+        ),
+        action=RuleAction.CHALLENGE,
+        priority=10,
+    )
+    global_ruleset = RuleSet(rules=(global_rule,))
+
+    custom_rule = DecisionRule(
+        rule_id="RULE_ISO_1",
+        name="Isolated rule",
+        conditions=(
+            RuleCondition(field="Amount", operator=RuleOperator.GREATER_THAN, value=1000.0),
+        ),
+        action=RuleAction.DENY,
+        priority=1,
+    )
+    profile = TenantRiskProfile(
+        rule_inheritance_mode=RuleInheritanceMode.ISOLATED,
+        custom_rules=(custom_rule,),
+    )
+    ctx = TenantContext(tenant_id="tenant-iso", risk_profile=profile)
+
+    resolved = resolve_tenant_ruleset(ctx, global_ruleset)
+    assert len(resolved) == 1
+    assert resolved.rules[0].rule_id == "RULE_ISO_1"
+
+
+def test_resolve_tenant_ruleset_inherit_and_override() -> None:
+    """Validate INHERIT_AND_OVERRIDE mode merges rules and overrides matching rule_ids."""
+    global_rule_1 = DecisionRule(
+        rule_id="RULE_BASE_1",
+        name="Base rule 1",
+        conditions=(RuleCondition(field="Amount", operator=RuleOperator.GREATER_THAN, value=50.0),),
+        action=RuleAction.CHALLENGE,
+        priority=20,
+    )
+    global_rule_2 = DecisionRule(
+        rule_id="RULE_BASE_2",
+        name="Base rule 2",
+        conditions=(
+            RuleCondition(field="Amount", operator=RuleOperator.GREATER_THAN, value=100.0),
+        ),
+        action=RuleAction.DENY,
+        priority=30,
+    )
+    global_ruleset = RuleSet(rules=(global_rule_1, global_rule_2))
+
+    # Tenant overrides RULE_BASE_1 with a different threshold and action
+    override_rule_1 = DecisionRule(
+        rule_id="RULE_BASE_1",
+        name="Tenant override of base rule 1",
+        conditions=(RuleCondition(field="Amount", operator=RuleOperator.GREATER_THAN, value=75.0),),
+        action=RuleAction.DENY,
+        priority=15,
+    )
+    # Tenant adds a new rule
+    new_rule_tenant = DecisionRule(
+        rule_id="RULE_TENANT_SPECIFIC",
+        name="Tenant specific rule",
+        conditions=(RuleCondition(field="Amount", operator=RuleOperator.LESS_THAN, value=1.0),),
+        action=RuleAction.CHALLENGE,
+        priority=5,
+    )
+
+    profile = TenantRiskProfile(
+        rule_inheritance_mode=RuleInheritanceMode.INHERIT_AND_OVERRIDE,
+        custom_rules=(override_rule_1, new_rule_tenant),
+    )
+    ctx = TenantContext(tenant_id="tenant-hybrid", risk_profile=profile)
+
+    resolved = resolve_tenant_ruleset(ctx, global_ruleset)
+    # Should contain 3 rules: RULE_TENANT_SPECIFIC (p=5), override RULE_BASE_1 (p=15),
+    # and RULE_BASE_2 (p=30)
+    assert len(resolved) == 3
+    rule_ids = [r.rule_id for r in resolved.rules]
+    assert rule_ids == ["RULE_TENANT_SPECIFIC", "RULE_BASE_1", "RULE_BASE_2"]
+
+    # Check that RULE_BASE_1 has the tenant's overridden action
+    overridden_rule = next(r for r in resolved.rules if r.rule_id == "RULE_BASE_1")
+    assert overridden_rule.action == RuleAction.DENY
+    assert overridden_rule.priority == 15
+    assert overridden_rule.name == "Tenant override of base rule 1"
