@@ -8,7 +8,7 @@
 ## Task Status
 - [x] Task 1: Create `src/fraud_detection/tenant.py` with domain data models (`TenantError`, `TenantTier`, `RuleInheritanceMode`, `TenantStatus`, `TenantContext`, `TenantRiskProfile`) and unit tests in `tests/test_tenant.py`.
 - [x] Task 2: Implement `TenantRegistryConfig`, `TenantRegistry`, and thread-safe registry operations in `src/fraud_detection/tenant.py` with unit tests.
-- [ ] Task 3: Implement `resolve_tenant_ruleset` and dynamic rule federation in `src/fraud_detection/tenant.py` with unit tests.
+- [x] Task 3: Implement `resolve_tenant_ruleset` and dynamic rule federation in `src/fraud_detection/tenant.py` with unit tests.
 - [ ] Task 4: Implement `TenantPartitionStageProcessor` in `src/fraud_detection/pipeline.py` and integrate with decision pipeline with unit tests in `tests/test_pipeline.py`.
 - [ ] Task 5: Implement `build_tenant_audit_event` in `src/fraud_detection/audit.py` with unit tests in `tests/test_audit.py`.
 - [ ] Task 6: Implement tenant resolution dependency, `/v1/tenants/*` endpoints, and Prometheus metrics in `src/fraud_detection/api.py` with tests in `tests/test_api.py`.
@@ -20,7 +20,7 @@
 |-----------|--------|----------|
 | AC-1 (Domain Models & Validation) | PASSED | 6 unit tests in `tests/test_tenant.py` covering enums, risk profile thresholds/order validation, context lifecycle, and exception hierarchy. |
 | AC-2 (Thread-Safe Tenant Registry) | PASSED | 7 unit tests in `tests/test_tenant.py` covering default initialization, strict isolation, capacity bounding with LRU eviction, multithreaded concurrency, and manifest export/import. |
-| AC-3 (Dynamic Rule Federation) | PENDING | |
+| AC-3 (Dynamic Rule Federation) | PASSED | 3 unit tests in `tests/test_tenant.py` verifying OVERRIDE_ONLY, ISOLATED, and INHERIT_AND_OVERRIDE with deterministic priority sorting. |
 | AC-4 (Pipeline Stage Integration) | PENDING | |
 | AC-5 (Tenant Audit Trail) | PENDING | |
 | AC-6 (API Serving & Multi-Tenant Telemetry) | PENDING | |
