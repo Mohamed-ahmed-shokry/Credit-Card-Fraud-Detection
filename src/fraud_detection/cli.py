@@ -170,6 +170,15 @@ from fraud_detection.signing import (
     verify_attestation_signature,
     write_keypair,
 )
+from fraud_detection.tenant import (
+    RuleInheritanceMode,
+    TenantContext,
+    TenantError,
+    TenantRegistry,
+    TenantRiskProfile,
+    TenantStatus,
+    TenantTier,
+)
 from fraud_detection.trust import (
     TrustBundle,
     TrustBundleError,
@@ -7937,6 +7946,353 @@ def merchant_enrich(
         f"Successfully enriched {len(enriched_df)} transactions with {feature_count} "
         f"merchant features -> {output_file}"
     )
+
+
+@app.command("tenant-list")
+def tenant_list(
+    registry_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--registry-file",
+            "-r",
+            help="Optional path to serialized tenant registry JSON file.",
+        ),
+    ] = None,
+    tier: Annotated[
+        str | None,
+        typer.Option(
+            "--tier",
+            help="Filter tenants by tier: 'free', 'standard', 'premium', 'enterprise'.",
+        ),
+    ] = None,
+    status: Annotated[
+        str | None,
+        typer.Option(
+            "--status",
+            help="Filter tenants by status: 'active', 'suspended', 'deprecated'.",
+        ),
+    ] = None,
+    output_format: Annotated[
+        str,
+        typer.Option(
+            "--format",
+            "-f",
+            help="Output format: 'json' or 'table'.",
+        ),
+    ] = "json",
+) -> None:
+    """List registered tenant partitions and their operational configuration."""
+    registry = TenantRegistry()
+    if registry_file is not None:
+        if not registry_file.is_file():
+            _abort(f"Tenant registry file not found: {registry_file}")
+        try:
+            raw = registry_file.read_text(encoding="utf-8")
+            registry = TenantRegistry.import_manifest(json.loads(raw))
+        except (
+            OSError,
+            ValueError,
+            TypeError,
+            KeyError,
+            json.JSONDecodeError,
+            TenantError,
+        ) as exc:
+            _abort(f"Failed to load tenant registry from {registry_file}: {exc}")
+
+    tenants = registry.list_tenants()
+    if tier is not None:
+        tenants = [t for t in tenants if t.tier.value.lower() == tier.lower()]
+    if status is not None:
+        tenants = [t for t in tenants if t.status.value.lower() == status.lower()]
+
+    rows = [
+        {
+            "tenant_id": t.tenant_id,
+            "tier": t.tier.value,
+            "status": t.status.value,
+            "is_active": t.is_active,
+            "rate_limit_rpm": t.rate_limit_rpm,
+            "decline_threshold": t.risk_profile.decline_threshold,
+            "challenge_threshold": t.risk_profile.challenge_threshold,
+            "review_threshold": t.risk_profile.review_threshold,
+            "tags": list(t.tags),
+        }
+        for t in tenants
+    ]
+
+    payload = {
+        "total_count": len(rows),
+        "tenants": rows,
+    }
+
+    if output_format.lower() == "table":
+        headers = ["Tenant ID", "Tier", "Status", "Rate Limit", "Decline", "Review"]
+        col_w = [18, 12, 12, 12, 10, 10]
+        header_line = " | ".join(h.ljust(w) for h, w in zip(headers, col_w, strict=True))
+        divider = "-+-".join("-" * w for w in col_w)
+        typer.echo(header_line)
+        typer.echo(divider)
+        for r in rows:
+            line = " | ".join(
+                [
+                    str(r["tenant_id"])[:18].ljust(18),
+                    str(r["tier"])[:12].ljust(12),
+                    str(r["status"])[:12].ljust(12),
+                    str(r["rate_limit_rpm"]).ljust(12),
+                    f"{r['decline_threshold']:.2f}".ljust(10),
+                    f"{r['review_threshold']:.2f}".ljust(10),
+                ]
+            )
+            typer.echo(line)
+        typer.echo(f"\nTotal: {len(rows)} tenant(s)")
+    else:
+        typer.echo(json.dumps(payload, indent=2))
+
+
+@app.command("tenant-validate")
+def tenant_validate(
+    manifest_file: Annotated[
+        Path,
+        typer.Option(
+            "--manifest-file",
+            "-m",
+            help="Path to tenant JSON manifest file to validate.",
+        ),
+    ],
+    strict: Annotated[
+        bool,
+        typer.Option(
+            "--strict",
+            help="Enforce strict validation (require at least one tag and custom thresholds).",
+        ),
+    ] = False,
+) -> None:
+    """Validate tenant definition or registry manifest file for semantic correctness."""
+    if not manifest_file.is_file():
+        _abort(f"Manifest file not found: {manifest_file}")
+
+    try:
+        raw = manifest_file.read_text(encoding="utf-8")
+        data = json.loads(raw)
+    except (OSError, json.JSONDecodeError) as exc:
+        _abort(f"Failed to read JSON manifest {manifest_file}: {exc}")
+
+    tenant_items: list[dict[str, Any]] = []
+    if isinstance(data, list):
+        tenant_items = data
+    elif isinstance(data, dict):
+        if "tenants" in data and isinstance(data["tenants"], list):
+            tenant_items = data["tenants"]
+        else:
+            tenant_items = [data]
+    else:
+        _abort("Manifest root must be an object or a list of tenant objects.")
+
+    errors: list[str] = []
+    validated_count = 0
+
+    for idx, item in enumerate(tenant_items):
+        tid = item.get("tenant_id", f"<index {idx}>")
+        try:
+            rp_dict = item.get("risk_profile", {})
+            risk_profile = TenantRiskProfile(
+                decline_threshold=float(rp_dict.get("decline_threshold", 0.85)),
+                challenge_threshold=float(rp_dict.get("challenge_threshold", 0.60)),
+                review_threshold=float(rp_dict.get("review_threshold", 0.35)),
+                max_amount_per_tx=rp_dict.get("max_amount_per_tx"),
+                velocity_tx_limit_1h=rp_dict.get("velocity_tx_limit_1h"),
+                chargeback_rate_limit=float(rp_dict.get("chargeback_rate_limit", 0.015)),
+                rule_inheritance_mode=RuleInheritanceMode(
+                    rp_dict.get("rule_inheritance_mode", "inherit_and_override")
+                ),
+            )
+            ctx = TenantContext(
+                tenant_id=str(item.get("tenant_id", "")),
+                tier=TenantTier(item.get("tier", "standard")),
+                status=TenantStatus(item.get("status", "active")),
+                risk_profile=risk_profile,
+                rate_limit_rpm=int(item.get("rate_limit_rpm", 1000)),
+                tags=tuple(item.get("tags", ())),
+            )
+            if strict and not ctx.tags:
+                errors.append(f"Tenant '{tid}': Strict mode requires at least one tag.")
+            validated_count += 1
+        except (ValueError, TypeError, KeyError, TenantError) as exc:
+            errors.append(f"Tenant '{tid}': {exc}")
+
+    report = {
+        "file": str(manifest_file),
+        "total_evaluated": len(tenant_items),
+        "valid_count": validated_count - len(errors),
+        "status": "VALID" if not errors else "INVALID",
+        "errors": errors,
+    }
+    typer.echo(json.dumps(report, indent=2))
+    if errors:
+        raise typer.Exit(code=2)
+
+
+@app.command("tenant-eval")
+def tenant_eval(
+    input_file: Annotated[
+        Path,
+        typer.Option(
+            "--input-file",
+            "-i",
+            help="Input CSV or JSON file containing transactions to evaluate.",
+        ),
+    ],
+    tenant_id: Annotated[
+        str,
+        typer.Option(
+            "--tenant-id",
+            "-t",
+            help="Target tenant ID whose policy partition and thresholds apply.",
+        ),
+    ] = "default",
+    registry_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--registry-file",
+            "-r",
+            help="Optional path to serialized tenant registry JSON file.",
+        ),
+    ] = None,
+    model_path: Annotated[
+        Path | None,
+        typer.Option(
+            "--model-path",
+            "-m",
+            help="Optional directory containing trained FraudModel.",
+        ),
+    ] = None,
+    output_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--output-file",
+            "-o",
+            help="Optional output destination file to write scored batch with tenant decisions.",
+        ),
+    ] = None,
+    overwrite: Annotated[
+        bool,
+        typer.Option(
+            "--overwrite",
+            help="Overwrite output file if it exists.",
+        ),
+    ] = False,
+    output_format: Annotated[
+        str,
+        typer.Option(
+            "--format",
+            "-f",
+            help="Output format: 'json' or 'table'.",
+        ),
+    ] = "json",
+) -> None:
+    """Evaluate a batch of transactions under a specific tenant's policy partition."""
+    if output_file is not None:
+        _guard_output(output_file, overwrite)
+
+    registry = TenantRegistry()
+    if registry_file is not None:
+        if not registry_file.is_file():
+            _abort(f"Tenant registry file not found: {registry_file}")
+        try:
+            raw = registry_file.read_text(encoding="utf-8")
+            registry = TenantRegistry.import_manifest(json.loads(raw))
+        except (
+            OSError,
+            ValueError,
+            TypeError,
+            KeyError,
+            json.JSONDecodeError,
+            TenantError,
+        ) as exc:
+            _abort(f"Failed to load tenant registry from {registry_file}: {exc}")
+
+    try:
+        tenant_ctx = registry.get(tenant_id)
+        tenant_ctx.check_active()
+    except TenantError as exc:
+        _abort(f"Tenant resolution error: {exc}")
+
+    df = _load_transaction_dataframe(input_file)
+    model: FraudModel | None = None
+    if model_path is not None:
+        try:
+            model = load_model(model_path)
+        except (OSError, ValueError, RuntimeError, ModelArtifactError) as exc:
+            _abort(f"Failed to load model from {model_path}: {exc}")
+
+    features = df.copy()
+    feature_cols = [c for c in features.columns if c not in ("Class", "is_fraud", "target")]
+    features_subset = features[feature_cols]
+
+    if model is not None:
+        scores = model.predict_probabilities(features_subset)
+    else:
+        amount_col = (
+            features_subset["Amount"]
+            if "Amount" in features_subset.columns
+            else pd.Series(0.0, index=features_subset.index)
+        )
+        amounts = pd.to_numeric(amount_col, errors="coerce").fillna(0.0)
+        scores = np.clip(amounts.to_numpy(dtype=float) / 1000.0, 0.05, 0.95)
+
+    rp = tenant_ctx.risk_profile
+    decisions: list[str] = []
+    actions: dict[str, int] = {"ALLOW": 0, "CHALLENGE": 0, "REVIEW": 0, "DENY": 0}
+
+    for score in scores:
+        if score >= rp.decline_threshold:
+            decision = "DENY"
+        elif score >= rp.challenge_threshold:
+            decision = "CHALLENGE"
+        elif score >= rp.review_threshold:
+            decision = "REVIEW"
+        else:
+            decision = "ALLOW"
+        decisions.append(decision)
+        actions[decision] = actions.get(decision, 0) + 1
+
+    df_result = df.copy()
+    df_result["tenant_id"] = tenant_ctx.tenant_id
+    df_result["fraud_score"] = scores
+    df_result["decision"] = decisions
+
+    if output_file is not None:
+        fmt = output_file.suffix.lower()
+        if fmt == ".json":
+            _atomic_write_text(df_result.to_json(orient="records", indent=2) + "\n", output_file)
+        else:
+            _atomic_write_csv(df_result, output_file)
+
+    summary = {
+        "tenant_id": tenant_ctx.tenant_id,
+        "tenant_tier": tenant_ctx.tier.value,
+        "status": tenant_ctx.status.value,
+        "total_evaluated": len(df),
+        "thresholds": {
+            "decline": rp.decline_threshold,
+            "challenge": rp.challenge_threshold,
+            "review": rp.review_threshold,
+        },
+        "decisions": actions,
+        "fraud_rate_detected": float(np.mean([1 if d == "DENY" else 0 for d in decisions])),
+    }
+
+    if output_format.lower() == "table":
+        typer.echo(f"Tenant Policy Evaluation: {tenant_ctx.tenant_id} ({tenant_ctx.tier.value})")
+        typer.echo("=" * 45)
+        typer.echo(f"Total Transactions: {len(df)}")
+        typer.echo(f"ALLOW:              {actions['ALLOW']}")
+        typer.echo(f"REVIEW:             {actions['REVIEW']}")
+        typer.echo(f"CHALLENGE:          {actions['CHALLENGE']}")
+        typer.echo(f"DENY:               {actions['DENY']}")
+        typer.echo(f"Detected Fraud Rate:{summary['fraud_rate_detected']:.2%}")
+    else:
+        typer.echo(json.dumps(summary, indent=2))
 
 
 def _abort(message: str) -> NoReturn:
