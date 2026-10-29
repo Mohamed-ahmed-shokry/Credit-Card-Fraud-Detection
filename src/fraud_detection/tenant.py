@@ -15,7 +15,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 
-from fraud_detection.rules import DecisionRule
+from fraud_detection.rules import DecisionRule, RuleSet
 
 __all__ = [
     "RuleInheritanceMode",
@@ -29,6 +29,7 @@ __all__ = [
     "TenantSuspendedError",
     "TenantTier",
     "TenantValidationError",
+    "resolve_tenant_ruleset",
 ]
 
 _TENANT_ID_PATTERN = re.compile(r"^[a-zA-Z0-9_\-\.]{1,64}$")
@@ -381,3 +382,40 @@ class TenantRegistry:
             )
             registry.register(context, overwrite=True)
         return registry
+
+
+def resolve_tenant_ruleset(
+    tenant_context: TenantContext, global_ruleset: RuleSet | None = None
+) -> RuleSet:
+    """Resolve and federate a RuleSet for a specific tenant based on its inheritance mode.
+
+    Modes:
+      - OVERRIDE_ONLY: Ignores global rules; uses only the tenant's custom rules.
+      - ISOLATED: Strictly evaluates tenant custom rules with isolated rule namespaces.
+      - INHERIT_AND_OVERRIDE: Merges global rules with tenant custom rules, replacing
+        global rules when a tenant rule matches an existing rule_id.
+    """
+    mode = tenant_context.risk_profile.rule_inheritance_mode
+    custom_rules = tenant_context.risk_profile.custom_rules
+
+    if mode in (RuleInheritanceMode.OVERRIDE_ONLY, RuleInheritanceMode.ISOLATED):
+        return RuleSet(rules=custom_rules)
+
+    # INHERIT_AND_OVERRIDE
+    if not global_ruleset or not global_ruleset.rules:
+        return RuleSet(rules=custom_rules)
+
+    tenant_rule_map = {r.rule_id: r for r in custom_rules}
+    merged_rules: list[DecisionRule] = []
+
+    # Add global rules that are not overridden by tenant
+    for g_rule in global_ruleset.rules:
+        if g_rule.rule_id in tenant_rule_map:
+            merged_rules.append(tenant_rule_map.pop(g_rule.rule_id))
+        else:
+            merged_rules.append(g_rule)
+
+    # Append any remaining new tenant rules
+    merged_rules.extend(tenant_rule_map.values())
+
+    return RuleSet(rules=tuple(merged_rules))
