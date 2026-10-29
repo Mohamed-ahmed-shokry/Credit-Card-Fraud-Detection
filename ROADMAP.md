@@ -2057,6 +2057,71 @@ Does not integrate external commercial merchant onboarding KYB APIs or card-netw
   - `src/fraud_detection/cli.py`: CLI commands `merchant-surveillance` and `merchant-enrich` with `--fail-on-anomaly` gate.
 
 
+## Phase 42 — Multi-Tenant Policy Partitioning, Dynamic Rule Federation & Account Isolation (In progress)
+
+### Objective
+
+Enable secure multi-organization payment processing and SaaS fraud gateway hosting by introducing an in-process, zero-dependency multi-tenant policy partitioning and dynamic rule federation subsystem (`tenant.py`). Provide tenant-scoped risk profiles with customizable decision thresholds, federated declarative rule inheritance (`OVERRIDE_ONLY`, `INHERIT_AND_OVERRIDE`, `ISOLATED`), isolated DAG stage processing without cross-tenant state leakage, tenant-partitioned structured audit logs, FastAPI request resolution (`X-Tenant-ID`), Prometheus multi-tenant telemetry, and CLI tenant validation and evaluation workflows.
+
+### Scope
+
+1. **Domain Models, Tenant Taxonomy & Profiles (`tenant.py`)**:
+   - `TenantError`: Root exception hierarchy for tenant validation, resolution, and authorization failures.
+   - `TenantTier` (`FREE`, `STANDARD`, `PREMIUM`, `ENTERPRISE`), `RuleInheritanceMode` (`OVERRIDE_ONLY`, `INHERIT_AND_OVERRIDE`, `ISOLATED`), and `TenantStatus` (`ACTIVE`, `SUSPENDED`, `DEPRECATED`).
+   - `TenantRiskProfile`: Custom score thresholds (`decline_threshold`, `challenge_threshold`, `review_threshold`), custom velocity limits, feature overrides, and tenant metadata.
+   - `TenantContext`: Scoped runtime execution context (`tenant_id`, `tier`, `status`, `risk_profile`, `rate_limit_rpm`, `created_at`).
+2. **Tenant Registry & Rule Federation Engine (`tenant.py`)**:
+   - `TenantRegistryConfig` and thread-safe `TenantRegistry` with LRU eviction, fallback tenant configuration, registration, lifecycle updates, and serialized export/import.
+   - `resolve_tenant_ruleset`: Dynamically compiles federated rule sets by merging baseline system rules with tenant-specific overrides according to `RuleInheritanceMode`.
+3. **Pipeline & Decision DAG Stage Processor (`pipeline.py`)**:
+   - `TenantPartitionStageProcessor`: Context-aware pipeline stage processor binding the active `TenantContext` to the transaction evaluation graph, evaluating tenant rules and applying tenant decision thresholds.
+4. **Structured Audit Trail & Tenant Namespacing (`audit.py`)**:
+   - `build_tenant_audit_event`: Emits `fraud.tenant.policy_evaluated` and enriches decision audit records with `tenant_id` and `tenant_tier`.
+5. **FastAPI Serving & Multi-Tenant Telemetry (`api.py`)**:
+   - Dependency header resolution (`X-Tenant-ID`, `X-Tenant-Tier`) with fallback to default tenant.
+   - Endpoints `GET /v1/tenants`, `GET /v1/tenants/{tenant_id}`, `POST /v1/tenants`, `POST /v1/tenants/{tenant_id}/status`.
+   - Prometheus metrics `fraud_tenant_evaluations_total` and `fraud_tenant_rule_overrides_total`.
+6. **CLI Orchestration (`cli.py`)**:
+   - `fraud-detect tenant-list`, `fraud-detect tenant-validate`, and `fraud-detect tenant-eval`.
+
+### Acceptance Criteria
+
+1. **AC-1 (Domain Models & Validation)**: `TenantContext`, `TenantRiskProfile`, and validation logic correctly handle valid and invalid configurations, boundary thresholds, and status transitions.
+2. **AC-2 (Thread-Safe Tenant Registry)**: `TenantRegistry` supports concurrent registration, lookup, fallback handling, capacity bounding, and serialization with zero race conditions.
+3. **AC-3 (Dynamic Rule Federation)**: `resolve_tenant_ruleset` correctly federates rules under `OVERRIDE_ONLY`, `INHERIT_AND_OVERRIDE`, and `ISOLATED` modes with deterministic precedence.
+4. **AC-4 (Pipeline Stage Integration)**: `TenantPartitionStageProcessor` integrates with the Decision DAG, enforces tenant thresholds, and isolates evaluation without state contamination.
+5. **AC-5 (Tenant Audit Trail)**: Emits structured `fraud.tenant.policy_evaluated` audit records with tenant metadata.
+6. **AC-6 (API Serving & Multi-Tenant Telemetry)**: FastAPI resolves tenant headers, exposes tenant CRUD endpoints, and updates Prometheus tenant metrics.
+7. **AC-7 (CLI Tenant Workflows)**: `fraud-detect tenant-list`, `tenant-validate`, and `tenant-eval` run with standard exits and JSON/table reporting.
+8. **AC-8 (Quality Standards & 100% Green CI)**: All local CI-parity checks and remote CI workflow runs pass 100%, branch coverage $\ge 97.0\%$, strict mypy 0 issues, Ruff clean, and build/twine valid.
+
+### Validation & CI Plan
+
+- Local CI-parity commands:
+  - `python -m ruff format --check src tests`
+  - `python -m ruff check src tests`
+  - `python -m mypy src`
+  - `python -m pip_audit --skip-editable`
+  - `python -m pytest --cov=fraud_detection --cov-report=term-missing`
+  - `python -m build` & `python -m twine check dist/*`
+- Remote CI workflow runs monitored via `gh run list` and `gh pr checks`.
+
+### Exclusions
+
+Does not implement external identity providers (OAuth2/SAML/OIDC JWT validation is left to gateway layer per SECURITY.md); focuses on in-process tenant context isolation, policy federation, and execution safety.
+
+### Micro-Task Breakdown
+
+- [ ] Task 1: Create `src/fraud_detection/tenant.py` with domain data models (`TenantError`, `TenantTier`, `RuleInheritanceMode`, `TenantStatus`, `TenantContext`, `TenantRiskProfile`) and unit tests in `tests/test_tenant.py`.
+- [ ] Task 2: Implement `TenantRegistryConfig`, `TenantRegistry`, and thread-safe registry operations in `src/fraud_detection/tenant.py` with unit tests.
+- [ ] Task 3: Implement `resolve_tenant_ruleset` and dynamic rule federation in `src/fraud_detection/tenant.py` with unit tests.
+- [ ] Task 4: Implement `TenantPartitionStageProcessor` in `src/fraud_detection/pipeline.py` and integrate with decision pipeline with unit tests in `tests/test_pipeline.py`.
+- [ ] Task 5: Implement `build_tenant_audit_event` in `src/fraud_detection/audit.py` with unit tests in `tests/test_audit.py`.
+- [ ] Task 6: Implement tenant resolution dependency, `/v1/tenants/*` endpoints, and Prometheus metrics in `src/fraud_detection/api.py` with tests in `tests/test_api.py`.
+- [ ] Task 7: Implement `tenant-list`, `tenant-validate`, and `tenant-eval` CLI commands in `src/fraud_detection/cli.py` with tests in `tests/test_cli.py`.
+- [ ] Task 8: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate.
+
+
 ## Contributing to the roadmap
 
 Open an issue or a pull request that references the relevant phase item.
