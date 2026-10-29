@@ -2112,7 +2112,7 @@ Does not implement external identity providers (OAuth2/SAML/OIDC JWT validation 
 
 ### Micro-Task Breakdown
 
-- [ ] Task 1: Create `src/fraud_detection/tenant.py` with domain data models (`TenantError`, `TenantTier`, `RuleInheritanceMode`, `TenantStatus`, `TenantContext`, `TenantRiskProfile`) and unit tests in `tests/test_tenant.py`.
+- [x] Task 1: Create `src/fraud_detection/tenant.py` with domain data models (`TenantError`, `TenantTier`, `RuleInheritanceMode`, `TenantStatus`, `TenantContext`, `TenantRiskProfile`) and unit tests in `tests/test_tenant.py`.
 - [ ] Task 2: Implement `TenantRegistryConfig`, `TenantRegistry`, and thread-safe registry operations in `src/fraud_detection/tenant.py` with unit tests.
 - [ ] Task 3: Implement `resolve_tenant_ruleset` and dynamic rule federation in `src/fraud_detection/tenant.py` with unit tests.
 - [ ] Task 4: Implement `TenantPartitionStageProcessor` in `src/fraud_detection/pipeline.py` and integrate with decision pipeline with unit tests in `tests/test_pipeline.py`.
