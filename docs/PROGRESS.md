@@ -12,7 +12,7 @@
 - [x] Task 4: Implement `TenantPartitionStageProcessor` in `src/fraud_detection/pipeline.py` and integrate with decision pipeline with unit tests in `tests/test_pipeline.py`.
 - [x] Task 5: Implement `build_tenant_audit_event` in `src/fraud_detection/audit.py` with unit tests in `tests/test_audit.py`.
 - [x] Task 6: Implement tenant resolution dependency, `/v1/tenants/*` endpoints, and Prometheus metrics in `src/fraud_detection/api.py` with tests in `tests/test_api.py`.
-- [ ] Task 7: Implement `tenant-list`, `tenant-validate`, and `tenant-eval` CLI commands in `src/fraud_detection/cli.py` with tests in `tests/test_cli.py`.
+- [x] Task 7: Implement `tenant-list`, `tenant-validate`, and `tenant-eval` CLI commands in `src/fraud_detection/cli.py` with tests in `tests/test_cli.py`.
 - [ ] Task 8: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate.
 
 ## Acceptance Criteria Status
@@ -24,7 +24,7 @@
 | AC-4 (Pipeline Stage Integration) | PASSED | 2 unit & integration tests in `tests/test_pipeline.py` verifying TenantPartitionStageProcessor direct execution, short-circuit on suspended tenant, and full DecisionGraph execution. |
 | AC-5 (Tenant Audit Trail) | PASSED | Unit test in `tests/test_audit.py` validating `fraud.tenant.policy_evaluated` event payload, field redaction, and Luhn PAN masking. |
 | AC-6 (API Serving & Multi-Tenant Telemetry) | PASSED | Comprehensive integration test in `tests/test_api.py` covering `/v1/tenants` listing, registration, duplicate conflicts, detail fetching, status updates, suspended 403 enforcement, deletion, and Prometheus metric tracking. |
-| AC-7 (CLI Tenant Workflows) | PENDING | |
+| AC-7 (CLI Tenant Workflows) | PASSED | Comprehensive unit and integration test in `tests/test_cli.py` (`test_tenant_cli_commands`) verifying `tenant-list` JSON/table formatting, `tenant-validate` strict/schema validation, and `tenant-eval` transaction scoring and suspended tenant rejection. |
 | AC-8 (Quality Standards & 100% Green CI) | PENDING | |
 
 ## Decision Log
