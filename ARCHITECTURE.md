@@ -298,6 +298,12 @@ the request and response, while the tuned artifact threshold remains visible as
 - Online Welford ticket-size statistics (`_update_welford`) maintain running mean and variance accumulators per merchant in $O(1)$ space, detecting sudden terminal bust-out surges ($Z > 3.0$) and micro-transaction card-testing enumeration ($\ge 50\%$ micro-transactions across $\ge 5$ distinct cards).
 - Pipeline graph integration (`MerchantEnrichmentStageProcessor`) enriches real-time decision graph transactions with 8 merchant features (`merchant_tx_count_24h`, `merchant_smoothed_fraud_rate`, `merchant_mcc_risk_score`, `merchant_amount_zscore`, `merchant_distinct_cards_24h`, `merchant_micro_tx_ratio`, `merchant_is_high_chargeback`, `merchant_is_bust_out_surge`), enabling downstream rules (`build_merchant_chargeback_rule`, `build_merchant_bust_out_rule`) to trigger immediate challenges or denies.
 - Redacted audit trail logging (`build_merchant_anomaly_audit_event`) emits structured `fraud.merchant.anomaly_detected` records with automated PCI-DSS compliant Luhn PAN masking, and Prometheus merchant telemetry tracks evaluations (`fraud_merchant_evaluations_total`), anomalies (`fraud_merchant_anomalies_total`), and active tracked merchants (`fraud_merchant_tracked_merchants_total`).
+- Multi-tenant policy partitioning (`TenantContext`, `TenantRiskProfile`, `TenantRegistry`) enables secure multi-organization payment processing and SaaS fraud gateway hosting with strict account isolation, tenant-specific risk profiles (`decline_threshold`, `challenge_threshold`, `review_threshold`, `max_amount_per_tx`), custom velocity limits, and metadata tags.
+- Dynamic rule federation (`resolve_tenant_ruleset`) dynamically merges baseline system rules with organization-level declarative rules across three inheritance modes: `OVERRIDE_ONLY`, `INHERIT_AND_OVERRIDE`, and `ISOLATED`, resolving priority order and rule collisions deterministically.
+- Thread-safe tenant registry (`TenantRegistry`) manages runtime tenant onboarding and lifecycle states (`ACTIVE`, `SUSPENDED`, `DEPRECATED`), supporting bounded LRU memory eviction, strict isolation enforcement, and atomic manifest export/import.
+- Pipeline graph integration (`TenantPartitionStageProcessor`) binds active tenant context to Decision DAG evaluation without cross-tenant state leakage, dynamically injecting tenant thresholds and rule actions into `ActionAggregatorStageProcessor`.
+- Redacted audit trail logging (`build_tenant_audit_event`) emits structured `fraud.tenant.policy_evaluated` audit records with PCI-DSS compliant Luhn-validated PAN masking and sensitive credential redaction.
+- REST API and Prometheus observability provide tenant resolution (`X-Tenant-ID` header), tenant management endpoints (`/v1/tenants/*`), suspended 403 enforcement, and tenant telemetry (`fraud_tenant_evaluations_total`, `fraud_tenant_rule_overrides_total`).
 
 
 
@@ -439,6 +445,54 @@ flowchart TD
     M_STAGE --> M_API
     M_RULES --> M_AUDIT
     MT --> M_PROM
+```
+
+## Multi-Tenant Policy Partitioning & Dynamic Rule Federation Subsystem
+
+```mermaid
+flowchart TD
+    subgraph Client ["Multi-Tenant Client Request"]
+        REQ["Payment Transaction\n+ Header: X-Tenant-ID"]
+    end
+
+    subgraph Resolution ["Tenant Resolution & Validation"]
+        T_REG["TenantRegistry\n(LRU Bounded & Thread-Safe)"]
+        T_CTX["TenantContext\n(ID, Tier, Status, RiskProfile)"]
+        T_GUARD{"Status Check\n(Active vs Suspended)"}
+        T_ERR["403 Forbidden\n(Suspended Account)"]
+    end
+
+    subgraph Federation ["Dynamic Rule Federation Engine"]
+        SYS_RULES["Global System Rules"]
+        TENANT_RULES["Tenant Custom Rules"]
+        FED_ENGINE["resolve_tenant_ruleset\n(OVERRIDE_ONLY | INHERIT_AND_OVERRIDE | ISOLATED)"]
+        COMPILED_RULES["Federated RuleSet\n(Priority Sorted)"]
+    end
+
+    subgraph Execution ["Decision DAG Pipeline Execution"]
+        T_STAGE["TenantPartitionStageProcessor\n(Context-Bound Stage Node)"]
+        DAG["DecisionGraph\n(TOPOLOGICAL WAVE)"]
+        AGG["ActionAggregatorStageProcessor\n(Tenant-Specific Score Thresholds)"]
+    end
+
+    subgraph Observability ["Observability & Audit"]
+        AUDIT["Structured Audit Event\n(fraud.tenant.policy_evaluated + Luhn Masking)"]
+        PROM["Prometheus Metrics\n(fraud_tenant_evaluations_total, overrides)"]
+    end
+
+    REQ --> T_REG
+    T_REG --> T_CTX
+    T_CTX --> T_GUARD
+    T_GUARD -- Suspended --> T_ERR
+    T_GUARD -- Active --> T_STAGE
+    SYS_RULES --> FED_ENGINE
+    TENANT_RULES --> FED_ENGINE
+    FED_ENGINE --> COMPILED_RULES
+    COMPILED_RULES --> T_STAGE
+    T_STAGE --> DAG
+    DAG --> AGG
+    AGG --> AUDIT
+    AGG --> PROM
 ```
 
 
