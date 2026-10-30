@@ -8150,3 +8150,163 @@ def test_merchant_enrich_and_input_validation_branches(tmp_path: Path) -> None:
     )
     res_fb = runner.invoke(app, ["merchant-surveillance", "-i", str(fallback_csv), "--json"])
     assert res_fb.exit_code == 0, res_fb.output
+
+
+def test_tenant_cli_commands(tmp_path: Path) -> None:
+    """Validate tenant-list, tenant-validate, and tenant-eval CLI workflows."""
+    # 1. tenant-list default
+    res_list_default = runner.invoke(app, ["tenant-list"])
+    assert res_list_default.exit_code == 0, res_list_default.output
+    data_def = json.loads(res_list_default.output)
+    assert data_def["total_count"] >= 1
+    assert any(t["tenant_id"] == "default" for t in data_def["tenants"])
+
+    # Table format
+    res_list_tbl = runner.invoke(app, ["tenant-list", "--format", "table"])
+    assert res_list_tbl.exit_code == 0, res_list_tbl.output
+    assert "Tenant ID" in res_list_tbl.output
+    assert "default" in res_list_tbl.output
+
+    # List with custom registry file
+    reg_file = tmp_path / "tenants_registry.json"
+    manifest_data = {
+        "config": {"max_tenants": 1000, "default_tenant_id": "default"},
+        "tenants": [
+            {
+                "tenant_id": "tenant_alpha",
+                "tier": "enterprise",
+                "status": "active",
+                "rate_limit_rpm": 2500,
+                "tags": ["corp"],
+                "risk_profile": {
+                    "decline_threshold": 0.90,
+                    "challenge_threshold": 0.65,
+                    "review_threshold": 0.40,
+                },
+            },
+            {
+                "tenant_id": "tenant_beta",
+                "tier": "free",
+                "status": "suspended",
+                "rate_limit_rpm": 500,
+                "tags": ["trial"],
+                "risk_profile": {
+                    "decline_threshold": 0.85,
+                    "challenge_threshold": 0.60,
+                    "review_threshold": 0.35,
+                },
+            },
+        ],
+    }
+    reg_file.write_text(json.dumps(manifest_data), encoding="utf-8")
+
+    res_list_custom = runner.invoke(
+        app, ["tenant-list", "-r", str(reg_file), "--tier", "enterprise"]
+    )
+    assert res_list_custom.exit_code == 0, res_list_custom.output
+    data_custom = json.loads(res_list_custom.output)
+    assert data_custom["total_count"] == 1
+    assert data_custom["tenants"][0]["tenant_id"] == "tenant_alpha"
+
+    # Missing registry file -> exit 2
+    res_list_missing = runner.invoke(
+        app, ["tenant-list", "-r", str(tmp_path / "non_existent.json")]
+    )
+    assert res_list_missing.exit_code == 2
+
+    # 2. tenant-validate
+    valid_manifest = tmp_path / "valid_manifest.json"
+    valid_manifest.write_text(json.dumps(manifest_data), encoding="utf-8")
+    res_val_ok = runner.invoke(app, ["tenant-validate", "-m", str(valid_manifest)])
+    assert res_val_ok.exit_code == 0, res_val_ok.output
+    val_out = json.loads(res_val_ok.output)
+    assert val_out["status"] == "VALID"
+    assert val_out["valid_count"] == 2
+
+    # Strict mode failure (tenant missing tags)
+    untagged_manifest = tmp_path / "untagged_manifest.json"
+    untagged_manifest.write_text(
+        json.dumps([{"tenant_id": "tenant_no_tags", "tags": []}]),
+        encoding="utf-8",
+    )
+    res_val_strict = runner.invoke(
+        app, ["tenant-validate", "-m", str(untagged_manifest), "--strict"]
+    )
+    assert res_val_strict.exit_code == 2
+    assert "Strict mode requires at least one tag" in res_val_strict.output
+
+    # Invalid threshold order
+    invalid_manifest = tmp_path / "invalid_manifest.json"
+    invalid_manifest.write_text(
+        json.dumps(
+            [
+                {
+                    "tenant_id": "tenant_bad_thresh",
+                    "risk_profile": {
+                        "decline_threshold": 0.20,
+                        "review_threshold": 0.80,
+                    },
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    res_val_bad = runner.invoke(app, ["tenant-validate", "-m", str(invalid_manifest)])
+    assert res_val_bad.exit_code == 2
+    assert "Threshold order constraint violated" in res_val_bad.output
+
+    # Missing manifest file -> exit 2
+    assert (
+        runner.invoke(app, ["tenant-validate", "-m", str(tmp_path / "missing.json")]).exit_code == 2
+    )
+
+    # 3. tenant-eval
+    csv_file = tmp_path / "transactions.csv"
+    csv_file.write_text(
+        "Time,Amount,V1,V2,V3\n10.0,50.0,-0.5,0.2,0.1\n20.0,1200.0,2.5,-1.2,0.8\n",
+        encoding="utf-8",
+    )
+
+    out_eval = tmp_path / "eval_out.csv"
+    res_eval = runner.invoke(
+        app,
+        [
+            "tenant-eval",
+            "-i",
+            str(csv_file),
+            "-t",
+            "default",
+            "-o",
+            str(out_eval),
+        ],
+    )
+    assert res_eval.exit_code == 0, res_eval.output
+    eval_json = json.loads(res_eval.output)
+    assert eval_json["tenant_id"] == "default"
+    assert eval_json["total_evaluated"] == 2
+    assert "decisions" in eval_json
+    assert out_eval.is_file()
+
+    # Table format
+    res_eval_tbl = runner.invoke(
+        app,
+        ["tenant-eval", "-i", str(csv_file), "-t", "default", "--format", "table"],
+    )
+    assert res_eval_tbl.exit_code == 0, res_eval_tbl.output
+    assert "Tenant Policy Evaluation: default" in res_eval_tbl.output
+
+    # Eval under suspended tenant -> exit 2
+    res_eval_suspended = runner.invoke(
+        app,
+        [
+            "tenant-eval",
+            "-i",
+            str(csv_file),
+            "-r",
+            str(reg_file),
+            "-t",
+            "tenant_beta",
+        ],
+    )
+    assert res_eval_suspended.exit_code == 2
+    assert "cannot process requests" in res_eval_suspended.output
