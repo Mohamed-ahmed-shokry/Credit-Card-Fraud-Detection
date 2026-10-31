@@ -5518,3 +5518,11 @@ def test_webhook_api_endpoints_and_telemetry(
         assert del_res.status_code == 200
         assert client.get(f"/v1/webhooks/{sub_id}").status_code == 404
         assert client.delete(f"/v1/webhooks/{sub_id}").status_code == 404
+        assert client.post(f"/v1/webhooks/{sub_id}/test").status_code == 404
+
+        # 11. Invalid webhook registration -> 400
+        bad_res = client.post(
+            "/v1/webhooks",
+            json={"tenant_id": "bad#tenant", "target_url": "ftp://bad-url"},
+        )
+        assert bad_res.status_code == 400
