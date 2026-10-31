@@ -68,6 +68,17 @@ from fraud_detection.evaluation import (
     expected_classification_cost,
     summarize_thresholds,
 )
+from fraud_detection.events import (
+    DeadLetterRecord,
+    DispatchConfig,
+    EventDeliveryStatus,
+    EventError,
+    EventType,
+    FraudDomainEvent,
+    SubscriptionRegistry,
+    WebhookDispatcher,
+    WebhookSubscription,
+)
 from fraud_detection.explanations import ExplanationProvider
 from fraud_detection.features import (
     FeatureSkewAnalyzer,
@@ -8293,6 +8304,275 @@ def tenant_eval(
         typer.echo(f"Detected Fraud Rate:{summary['fraud_rate_detected']:.2%}")
     else:
         typer.echo(json.dumps(summary, indent=2))
+
+
+@app.command("webhook-list")
+def webhook_list(
+    manifest_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--manifest-file",
+            "-m",
+            help="Optional path to serialized webhook subscription registry manifest JSON.",
+        ),
+    ] = None,
+    tenant_id: Annotated[
+        str | None,
+        typer.Option(
+            "--tenant-id",
+            "-t",
+            help="Optional tenant filter for webhook subscriptions.",
+        ),
+    ] = None,
+    output_format: Annotated[
+        str,
+        typer.Option(
+            "--format",
+            "-f",
+            help="Output format: 'json' or 'table'.",
+        ),
+    ] = "json",
+) -> None:
+    """List registered webhook notification subscriptions and dispatch targets."""
+    registry = SubscriptionRegistry()
+    if manifest_file is not None:
+        if not manifest_file.is_file():
+            _abort(f"Webhook manifest file not found: {manifest_file}")
+        try:
+            raw = manifest_file.read_text(encoding="utf-8")
+            registry = SubscriptionRegistry.import_manifest(json.loads(raw))
+        except (
+            OSError,
+            ValueError,
+            TypeError,
+            KeyError,
+            json.JSONDecodeError,
+            EventError,
+        ) as exc:
+            _abort(f"Failed to load webhook registry from {manifest_file}: {exc}")
+
+    subs = registry.list_subscriptions(tenant_id=tenant_id)
+    rows = [
+        {
+            "subscription_id": s.subscription_id,
+            "tenant_id": s.tenant_id,
+            "target_url": s.target_url,
+            "is_active": s.is_active,
+            "max_retries": s.max_retries,
+            "timeout_seconds": s.timeout_seconds,
+            "subscribed_events": [e.value for e in s.subscribed_events],
+            "created_at": s.created_at,
+        }
+        for s in subs
+    ]
+
+    payload = {
+        "total_count": len(rows),
+        "subscriptions": rows,
+    }
+
+    if output_format.lower() == "table":
+        headers = ["Subscription ID", "Tenant ID", "Target URL", "Active", "Retries"]
+        col_w = [18, 12, 30, 8, 8]
+        header_line = " | ".join(h.ljust(w) for h, w in zip(headers, col_w, strict=True))
+        divider = "-+-".join("-" * w for w in col_w)
+        typer.echo(header_line)
+        typer.echo(divider)
+        for r in rows:
+            line = " | ".join(
+                [
+                    str(r["subscription_id"])[:18].ljust(18),
+                    str(r["tenant_id"])[:12].ljust(12),
+                    str(r["target_url"])[:30].ljust(30),
+                    str(r["is_active"]).ljust(8),
+                    str(r["max_retries"]).ljust(8),
+                ]
+            )
+            typer.echo(line)
+        typer.echo(f"\nTotal: {len(rows)} subscription(s)")
+    else:
+        typer.echo(json.dumps(payload, indent=2))
+
+
+@app.command("webhook-test")
+def webhook_test(
+    target_url: Annotated[
+        str,
+        typer.Option(
+            "--target-url",
+            "-u",
+            help="Target HTTP/HTTPS webhook receiver URL.",
+        ),
+    ],
+    secret: Annotated[
+        str | None,
+        typer.Option(
+            "--secret",
+            "-s",
+            help="Shared HMAC-SHA256 signature secret (minimum 16 characters).",
+        ),
+    ] = None,
+    tenant_id: Annotated[
+        str,
+        typer.Option(
+            "--tenant-id",
+            "-t",
+            help="Tenant identifier context for the simulated event.",
+        ),
+    ] = "default",
+    event_type: Annotated[
+        str,
+        typer.Option(
+            "--event-type",
+            "-e",
+            help="Domain event type to simulate (e.g. fraud.transaction.scored).",
+        ),
+    ] = EventType.TRANSACTION_SCORED.value,
+    timeout_seconds: Annotated[
+        float,
+        typer.Option(
+            "--timeout",
+            help="HTTP connection and read timeout in seconds.",
+        ),
+    ] = 5.0,
+) -> None:
+    """Send a signed test notification payload to a webhook destination."""
+    try:
+        ev_type = EventType(event_type)
+    except ValueError:
+        _abort(f"Unknown event type: '{event_type}'. Valid types: {[e.value for e in EventType]}")
+
+    token = secret or f"test_secret_{uuid4().hex}"
+    try:
+        sub = WebhookSubscription(
+            tenant_id=tenant_id,
+            target_url=target_url,
+            secret_token=token,
+            subscribed_events=(ev_type,),
+            timeout_seconds=timeout_seconds,
+            max_retries=1,
+        )
+    except EventError as exc:
+        _abort(f"Invalid webhook subscription configuration: {exc}")
+
+    event = FraudDomainEvent(
+        event_type=ev_type,
+        tenant_id=tenant_id,
+        payload={"ping": "test", "simulated": True, "timestamp": time.time()},
+    )
+
+    config = DispatchConfig(
+        max_retries=1,
+        initial_backoff_seconds=0.1,
+        http_timeout_seconds=timeout_seconds,
+    )
+    dispatcher = WebhookDispatcher(config=config)
+    result = dispatcher.dispatch(sub, event)
+
+    result_payload = {
+        "delivery_id": result.delivery_id,
+        "subscription_id": result.subscription_id,
+        "status": result.status.value,
+        "status_code": result.status_code,
+        "attempt_count": result.attempt_count,
+        "duration_seconds": round(result.duration_seconds, 4),
+        "error_message": result.error_message,
+    }
+    typer.echo(json.dumps(result_payload, indent=2))
+
+    if result.status != EventDeliveryStatus.DELIVERED:
+        raise typer.Exit(code=1)
+
+
+@app.command("webhook-replay-dlq")
+def webhook_replay_dlq(
+    dlq_file: Annotated[
+        Path,
+        typer.Option(
+            "--dlq-file",
+            "-d",
+            help="Path to serialized Dead Letter Queue JSON file.",
+        ),
+    ],
+    target_url: Annotated[
+        str | None,
+        typer.Option(
+            "--target-url",
+            "-u",
+            help="Optional override endpoint URL for replayed notifications.",
+        ),
+    ] = None,
+    tenant_id: Annotated[
+        str | None,
+        typer.Option(
+            "--tenant-id",
+            "-t",
+            help="Optional tenant filter for dead-letter records.",
+        ),
+    ] = None,
+    dry_run: Annotated[
+        bool,
+        typer.Option(
+            "--dry-run",
+            help="Inspect matching failed records without performing network delivery.",
+        ),
+    ] = False,
+) -> None:
+    """Replay undeliverable webhook events from a dead letter queue file."""
+    if not dlq_file.is_file():
+        _abort(f"DLQ file not found: {dlq_file}")
+
+    try:
+        raw_data = json.loads(dlq_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        _abort(f"Failed to read DLQ file {dlq_file}: {exc}")
+
+    records_data = raw_data.get("records", [])
+    if not isinstance(records_data, list):
+        _abort(f"Invalid DLQ file structure: expected top-level 'records' array in {dlq_file}")
+
+    records: list[DeadLetterRecord] = []
+    for item in records_data:
+        try:
+            records.append(DeadLetterRecord.from_dict(item))
+        except EventError as exc:
+            _abort(f"Corrupted dead-letter record in {dlq_file}: {exc}")
+
+    if tenant_id is not None:
+        records = [r for r in records if r.event.tenant_id == tenant_id]
+
+    replayed = 0
+    succeeded = 0
+    failed = 0
+
+    if not dry_run:
+        dispatcher = WebhookDispatcher()
+        for rec in records:
+            dest_url = target_url or rec.target_url
+            sub = WebhookSubscription(
+                subscription_id=rec.subscription_id,
+                tenant_id=rec.event.tenant_id,
+                target_url=dest_url,
+                secret_token=uuid4().hex,
+                subscribed_events=(rec.event.event_type,),
+                max_retries=1,
+            )
+            replayed += 1
+            res = dispatcher.dispatch(sub, rec.event)
+            if res.status == EventDeliveryStatus.DELIVERED:
+                succeeded += 1
+            else:
+                failed += 1
+
+    summary = {
+        "dlq_file": str(dlq_file),
+        "total_matched": len(records),
+        "dry_run": dry_run,
+        "replayed_count": replayed,
+        "succeeded_count": succeeded,
+        "failed_count": failed,
+    }
+    typer.echo(json.dumps(summary, indent=2))
 
 
 def _abort(message: str) -> NoReturn:
