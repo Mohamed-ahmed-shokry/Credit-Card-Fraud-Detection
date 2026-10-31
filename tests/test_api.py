@@ -5399,3 +5399,122 @@ def test_tenant_api_endpoints_and_telemetry(
         # 9. Cannot delete default tenant
         del_def_res = client.delete("/v1/tenants/default")
         assert del_def_res.status_code == 400
+
+
+def test_webhook_api_endpoints_and_telemetry(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    """Validate /v1/webhooks CRUD, test pings, DLQ endpoints, and telemetry."""
+    from fraud_detection.events import (
+        EventBus,
+        WebhookDispatcher,
+    )
+
+    _, model, dataset = api_context
+    dispatched_calls: list[tuple[str, bytes, dict[str, str]]] = []
+
+    def mock_transport(
+        url: str,
+        payload_bytes: bytes,
+        headers: dict[str, str],
+        _timeout: float,
+    ) -> tuple[int, bytes]:
+        dispatched_calls.append((url, payload_bytes, headers))
+        if "failing" in url:
+            return (500, b'{"error": "internal"}')
+        return (200, b'{"status": "ok"}')
+
+    dispatcher = WebhookDispatcher(transport=mock_transport)
+    custom_bus = EventBus(dispatcher=dispatcher)
+
+    with TestClient(create_app(model=model, event_bus=custom_bus)) as client:
+        # 1. GET /v1/webhooks: initially empty
+        res = client.get("/v1/webhooks")
+        assert res.status_code == 200
+        assert res.json()["total_count"] == 0
+
+        # 2. POST /v1/webhooks: register subscription
+        sub_payload = {
+            "tenant_id": "fintech_alpha",
+            "target_url": "https://api.example.com/webhook",
+            "subscribed_events": ["fraud.transaction.scored", "fraud.decision.denied"],
+            "is_active": True,
+            "max_retries": 1,
+            "timeout_seconds": 2.0,
+        }
+        create_res = client.post("/v1/webhooks", json=sub_payload)
+        assert create_res.status_code == 200
+        created_data = create_res.json()
+        sub_id = created_data["subscription_id"]
+        assert sub_id.startswith("sub_")
+        assert created_data["tenant_id"] == "fintech_alpha"
+        assert created_data["target_url"] == "https://api.example.com/webhook"
+        assert created_data["secret_token"] is not None
+        assert len(created_data["secret_token"]) >= 16
+
+        # 3. GET /v1/webhooks/{sub_id}: retrieve details (secret_token redacted)
+        get_res = client.get(f"/v1/webhooks/{sub_id}")
+        assert get_res.status_code == 200
+        assert get_res.json()["subscription_id"] == sub_id
+        assert get_res.json()["secret_token"] is None
+
+        # 4. GET /v1/webhooks with tenant filter
+        filter_res = client.get("/v1/webhooks?tenant_id=fintech_alpha")
+        assert filter_res.status_code == 200
+        assert filter_res.json()["total_count"] == 1
+
+        filter_other = client.get("/v1/webhooks?tenant_id=other_tenant")
+        assert filter_other.status_code == 200
+        assert filter_other.json()["total_count"] == 0
+
+        # 5. POST /v1/webhooks/{sub_id}/test: trigger test delivery
+        test_res = client.post(f"/v1/webhooks/{sub_id}/test")
+        assert test_res.status_code == 200
+        assert test_res.json()["status"] == "delivered"
+        assert test_res.json()["status_code"] == 200
+        assert len(dispatched_calls) == 1
+
+        # 6. Check DLQ when subscription fails
+        fail_sub_payload = {
+            "tenant_id": "fintech_alpha",
+            "target_url": "https://failing.example.com/webhook",
+            "max_retries": 0,
+        }
+        fail_sub_res = client.post("/v1/webhooks", json=fail_sub_payload)
+        fail_sub_id = fail_sub_res.json()["subscription_id"]
+
+        fail_test_res = client.post(f"/v1/webhooks/{fail_sub_id}/test")
+        assert fail_test_res.status_code == 200
+        assert fail_test_res.json()["status"] == "dead_letter"
+
+        # 7. GET /v1/webhooks/dlq: verify DLQ record exists
+        dlq_res = client.get("/v1/webhooks/dlq?tenant_id=fintech_alpha")
+        assert dlq_res.status_code == 200
+        dlq_records = dlq_res.json()["records"]
+        assert len(dlq_records) >= 1
+        assert dlq_records[0]["subscription_id"] == fail_sub_id
+
+        # 8. POST /v1/webhooks/dlq/replay
+        replay_res = client.post("/v1/webhooks/dlq/replay?tenant_id=fintech_alpha")
+        assert replay_res.status_code == 200
+        assert replay_res.json()["replayed_count"] >= 1
+
+        # 9. Score a transaction: verify domain event published and metrics incremented
+        row = dataset.features.iloc[0].to_dict()
+        score_res = client.post(
+            "/v1/score",
+            json={"transaction": row},
+            headers={"X-Tenant-ID": "fintech_alpha"},
+        )
+        assert score_res.status_code == 200
+
+        metrics_res = client.get("/metrics")
+        assert metrics_res.status_code == 200
+        assert "fraud_event_bus_published_total{" in metrics_res.text
+        assert "fraud_webhook_dispatches_total{" in metrics_res.text
+
+        # 10. DELETE /v1/webhooks/{sub_id}
+        del_res = client.delete(f"/v1/webhooks/{sub_id}")
+        assert del_res.status_code == 200
+        assert client.get(f"/v1/webhooks/{sub_id}").status_code == 404
+        assert client.delete(f"/v1/webhooks/{sub_id}").status_code == 404
