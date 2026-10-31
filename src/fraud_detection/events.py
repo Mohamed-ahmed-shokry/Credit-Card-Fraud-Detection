@@ -418,6 +418,10 @@ class DeadLetterQueue:
                 return len(self._records)
             return sum(1 for r in self._records.values() if r.event.tenant_id == tenant_id)
 
+    def __len__(self) -> int:
+        """Return total count of queued dead letter records."""
+        return self.count()
+
 
 @dataclass(frozen=True)
 class DispatchConfig:
@@ -741,6 +745,12 @@ class EventBus:
     def registry(self) -> SubscriptionRegistry:
         """Return subscription registry."""
         return self._registry
+
+    @property
+    def listeners_count(self) -> int:
+        """Return count of registered in-memory subscribers."""
+        with self._lock:
+            return len(self._listeners)
 
     @property
     def dispatcher(self) -> WebhookDispatcher:
