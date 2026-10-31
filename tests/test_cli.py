@@ -8493,3 +8493,32 @@ def test_webhook_cli_commands(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
     assert replay_out["replayed_count"] == 1
     assert replay_out["succeeded_count"] == 1
     assert replay_out["failed_count"] == 0
+
+    # Replay with failing transport
+    monkeypatch.setattr(
+        WebhookDispatcher,
+        "_default_http_transport",
+        staticmethod(lambda _url, _body, _headers, _timeout: (500, b"fail")),
+    )
+    res_dlq_fail = runner.invoke(
+        app,
+        ["webhook-replay-dlq", "-d", str(dlq_file), "-t", "fintech_alpha"],
+    )
+    assert res_dlq_fail.exit_code == 0, res_dlq_fail.output
+    fail_replay_out = json.loads(res_dlq_fail.output)
+    assert fail_replay_out["failed_count"] == 1
+
+    # Corrupt DLQ JSON
+    corrupt_dlq = tmp_path / "corrupt_dlq.json"
+    corrupt_dlq.write_text("{invalid_json", encoding="utf-8")
+    assert runner.invoke(app, ["webhook-replay-dlq", "-d", str(corrupt_dlq)]).exit_code == 2
+
+    # DLQ without records array
+    no_records_dlq = tmp_path / "no_records_dlq.json"
+    no_records_dlq.write_text(json.dumps({"wrong_key": []}), encoding="utf-8")
+    assert runner.invoke(app, ["webhook-replay-dlq", "-d", str(no_records_dlq)]).exit_code == 2
+
+    # DLQ with corrupted record inside records
+    bad_item_dlq = tmp_path / "bad_item_dlq.json"
+    bad_item_dlq.write_text(json.dumps({"records": [{"bad": "data"}]}), encoding="utf-8")
+    assert runner.invoke(app, ["webhook-replay-dlq", "-d", str(bad_item_dlq)]).exit_code == 2
