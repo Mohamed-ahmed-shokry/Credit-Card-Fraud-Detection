@@ -8310,3 +8310,186 @@ def test_tenant_cli_commands(tmp_path: Path) -> None:
     )
     assert res_eval_suspended.exit_code == 2
     assert "cannot process requests" in res_eval_suspended.output
+
+
+def test_webhook_cli_commands(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Validate webhook-list, webhook-test, and webhook-replay-dlq CLI workflows."""
+    from fraud_detection.events import (
+        EventType,
+        FraudDomainEvent,
+        WebhookDispatcher,
+        WebhookSubscription,
+    )
+
+    # 1. webhook-list default (empty registry)
+    res_list_def = runner.invoke(app, ["webhook-list"])
+    assert res_list_def.exit_code == 0, res_list_def.output
+    data_def = json.loads(res_list_def.output)
+    assert data_def["total_count"] == 0
+
+    # Table format
+    res_list_tbl = runner.invoke(app, ["webhook-list", "--format", "table"])
+    assert res_list_tbl.exit_code == 0, res_list_tbl.output
+    assert "Subscription ID" in res_list_tbl.output
+
+    # Missing manifest file -> exit 2
+    res_list_missing = runner.invoke(
+        app, ["webhook-list", "-m", str(tmp_path / "non_existent.json")]
+    )
+    assert res_list_missing.exit_code == 2
+
+    # Manifest file with subscriptions
+    sub1 = WebhookSubscription(
+        subscription_id="sub_alpha_001",
+        tenant_id="fintech_alpha",
+        target_url="https://alpha.example.com/webhook",
+        secret_token="tok_" + "a" * 20,
+    )
+    sub2 = WebhookSubscription(
+        subscription_id="sub_beta_002",
+        tenant_id="fintech_beta",
+        target_url="https://beta.example.com/webhook",
+        secret_token="tok_" + "b" * 20,
+    )
+    manifest_data = {
+        "version": "1.0",
+        "subscriptions": [
+            sub1.to_dict(include_secret=True),
+            sub2.to_dict(include_secret=True),
+        ],
+    }
+    manifest_file = tmp_path / "webhooks_manifest.json"
+    manifest_file.write_text(json.dumps(manifest_data), encoding="utf-8")
+
+    res_list_filtered = runner.invoke(
+        app, ["webhook-list", "-m", str(manifest_file), "-t", "fintech_alpha"]
+    )
+    assert res_list_filtered.exit_code == 0, res_list_filtered.output
+    filtered_data = json.loads(res_list_filtered.output)
+    assert filtered_data["total_count"] == 1
+    assert filtered_data["subscriptions"][0]["subscription_id"] == "sub_alpha_001"
+
+    # 2. webhook-test
+    # Invalid event type -> exit 2
+    res_test_invalid_ev = runner.invoke(
+        app, ["webhook-test", "-u", "https://api.example.com/wh", "-e", "non.existent.event"]
+    )
+    assert res_test_invalid_ev.exit_code == 2
+    assert "Unknown event type" in res_test_invalid_ev.output
+
+    # Invalid URL scheme -> exit 2
+    res_test_invalid_url = runner.invoke(app, ["webhook-test", "-u", "ftp://invalid.com/wh"])
+    assert res_test_invalid_url.exit_code == 2
+
+    # Successful test delivery via monkeypatched transport
+    monkeypatch.setattr(
+        WebhookDispatcher,
+        "_default_http_transport",
+        staticmethod(lambda _url, _body, _headers, _timeout: (200, b'{"received": true}')),
+    )
+    res_test_ok = runner.invoke(
+        app,
+        [
+            "webhook-test",
+            "-u",
+            "https://api.example.com/wh",
+            "-t",
+            "fintech_alpha",
+            "-s",
+            "tok_" + "c" * 20,
+        ],
+    )
+    assert res_test_ok.exit_code == 0, res_test_ok.output
+    test_data = json.loads(res_test_ok.output)
+    assert test_data["status"] == "delivered"
+    assert test_data["status_code"] == 200
+
+    # Failing delivery via monkeypatched transport -> exit 1
+    monkeypatch.setattr(
+        WebhookDispatcher,
+        "_default_http_transport",
+        staticmethod(lambda _url, _body, _headers, _timeout: (500, b"Server Error")),
+    )
+    res_test_fail = runner.invoke(
+        app,
+        [
+            "webhook-test",
+            "-u",
+            "https://api.example.com/wh",
+            "-t",
+            "fintech_alpha",
+            "-s",
+            "tok_" + "c" * 20,
+        ],
+    )
+    assert res_test_fail.exit_code == 1
+    fail_data = json.loads(res_test_fail.output)
+    assert fail_data["status"] == "dead_letter"
+
+    # 3. webhook-replay-dlq
+    # Missing DLQ file -> exit 2
+    res_dlq_missing = runner.invoke(
+        app, ["webhook-replay-dlq", "-d", str(tmp_path / "missing_dlq.json")]
+    )
+    assert res_dlq_missing.exit_code == 2
+
+    # Prepare DLQ file
+    dlq_event1 = FraudDomainEvent(
+        event_type=EventType.TRANSACTION_SCORED,
+        tenant_id="fintech_alpha",
+        payload={"amount": 100.0},
+    )
+    dlq_event2 = FraudDomainEvent(
+        event_type=EventType.DECISION_DENIED,
+        tenant_id="fintech_beta",
+        payload={"amount": 5000.0},
+    )
+    dlq_file = tmp_path / "dlq_dump.json"
+    dlq_data = {
+        "records": [
+            {
+                "record_id": "rec_001",
+                "subscription_id": "sub_alpha_001",
+                "target_url": "https://alpha.example.com/webhook",
+                "error_reason": "HTTP 500 Server error",
+                "attempt_count": 3,
+                "event": dlq_event1.to_dict(),
+                "payload": {},
+            },
+            {
+                "record_id": "rec_002",
+                "subscription_id": "sub_beta_002",
+                "target_url": "https://beta.example.com/webhook",
+                "error_reason": "Connection timeout",
+                "attempt_count": 3,
+                "event": dlq_event2.to_dict(),
+                "payload": {},
+            },
+        ]
+    }
+    dlq_file.write_text(json.dumps(dlq_data), encoding="utf-8")
+
+    # Dry-run
+    res_dlq_dry = runner.invoke(app, ["webhook-replay-dlq", "-d", str(dlq_file), "--dry-run"])
+    assert res_dlq_dry.exit_code == 0, res_dlq_dry.output
+    dry_out = json.loads(res_dlq_dry.output)
+    assert dry_out["total_matched"] == 2
+    assert dry_out["dry_run"] is True
+    assert dry_out["replayed_count"] == 0
+
+    # Actual replay filtered by tenant fintech_alpha with successful transport
+    monkeypatch.setattr(
+        WebhookDispatcher,
+        "_default_http_transport",
+        staticmethod(lambda _url, _body, _headers, _timeout: (200, b"replayed")),
+    )
+    res_dlq_replay = runner.invoke(
+        app,
+        ["webhook-replay-dlq", "-d", str(dlq_file), "-t", "fintech_alpha"],
+    )
+    assert res_dlq_replay.exit_code == 0, res_dlq_replay.output
+    replay_out = json.loads(res_dlq_replay.output)
+    assert replay_out["total_matched"] == 1
+    assert replay_out["replayed_count"] == 1
+    assert replay_out["succeeded_count"] == 1
+    assert replay_out["failed_count"] == 0
