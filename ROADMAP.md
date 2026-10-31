@@ -2138,7 +2138,7 @@ Does not implement external identity providers (OAuth2/SAML/OIDC JWT validation 
   - Artifact build: wheel and sdist cleanly validated with twine.
 
 
-## Phase 43 — Asynchronous Real-Time Event Bus & Streaming Webhook Dispatcher (In progress)
+## Phase 43 — Asynchronous Real-Time Event Bus & Streaming Webhook Dispatcher (Done)
 
 ### Objective
 
@@ -2201,7 +2201,16 @@ Does not implement external message brokers (Kafka/RabbitMQ/Redis Streams) as ex
 - [x] Task 4: Implement in-memory thread-safe `EventBus` and Decision DAG event publisher in `src/fraud_detection/events.py` and `src/fraud_detection/pipeline.py` with unit tests.
 - [x] Task 5: Implement `/v1/webhooks/*` endpoints, test ping dispatcher, and Prometheus metrics in `src/fraud_detection/api.py` with integration tests in `tests/test_api.py`.
 - [x] Task 6: Implement CLI commands `webhook-list`, `webhook-test`, and `webhook-replay-dlq` in `src/fraud_detection/cli.py` with tests in `tests/test_cli.py`.
-- [ ] Task 7: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate.
+- [x] Task 7: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate.
+
+### Delivery Record
+
+- **Delivered**: 2026-10-31
+- **Branch**: `phase/webhook-event-dispatcher`
+- **Pull Request**: [#24](https://github.com/Mohamed-ahmed-shokry/Credit-Card-Fraud-Detection/pull/24)
+- **Primary Modules**: `src/fraud_detection/events.py`, `src/fraud_detection/pipeline.py`, `src/fraud_detection/api.py`, `src/fraud_detection/cli.py`
+- **Test Modules**: `tests/test_events.py`, `tests/test_pipeline.py`, `tests/test_api.py`, `tests/test_cli.py`
+- **Verification Gates**: 100% Green local CI parity, $\ge 97.0\%$ branch coverage, 0 mypy issues, Ruff formatted, pip-audit clean, wheel build and twine valid.
 
 
 ## Contributing to the roadmap
