@@ -63,6 +63,14 @@ from fraud_detection.device import (
     DeviceTrackerConfig,
 )
 from fraud_detection.evaluation import DecisionAction, TieredThresholds
+from fraud_detection.events import (
+    EventBus,
+    EventDeliveryStatus,
+    EventType,
+    FraudDomainEvent,
+    SubscriptionError,
+    WebhookSubscription,
+)
 from fraud_detection.explanations import ExplanationProvider
 from fraud_detection.features import FeatureStoreProtocol, FileFeatureStore
 from fraud_detection.feedback import (
@@ -249,6 +257,10 @@ OPERATIONAL_PATHS = frozenset(
         "/v1/merchant/reset",
         "/v1/tenants",
         "/v1/tenants/",
+        "/v1/webhooks",
+        "/v1/webhooks/",
+        "/v1/webhooks/dlq",
+        "/v1/webhooks/dlq/replay",
     }
 )
 UNMATCHED_ROUTE_LABEL = "unmatched"
@@ -1448,6 +1460,85 @@ class TenantStatusUpdateRequest(BaseModel):
     status: str
 
 
+class WebhookSubscriptionCreateRequest(BaseModel):
+    """Payload to register a new webhook notification endpoint."""
+
+    tenant_id: str = "default"
+    target_url: str
+    secret_token: str | None = None
+    subscribed_events: list[str] = Field(
+        default_factory=lambda: [
+            EventType.TRANSACTION_SCORED.value,
+            EventType.DECISION_DENIED.value,
+        ]
+    )
+    is_active: bool = True
+    max_retries: int = 3
+    timeout_seconds: float = 5.0
+
+
+class WebhookSubscriptionResponse(BaseModel):
+    """Serialized representation of a webhook subscription."""
+
+    subscription_id: str
+    tenant_id: str
+    target_url: str
+    secret_token: str | None = None
+    subscribed_events: list[str]
+    is_active: bool
+    max_retries: int
+    timeout_seconds: float
+    created_at: str
+
+
+class WebhookSubscriptionListResponse(BaseModel):
+    """Response containing registered webhook subscriptions."""
+
+    total_count: int
+    subscriptions: list[WebhookSubscriptionResponse]
+
+
+class WebhookTestDeliveryResponse(BaseModel):
+    """Outcome of an on-demand test webhook dispatch."""
+
+    delivery_id: str
+    subscription_id: str
+    status: str
+    status_code: int | None = None
+    error_message: str | None = None
+    attempt_count: int
+    duration_seconds: float
+
+
+class DeadLetterRecordResponse(BaseModel):
+    """Dead-letter queue record representation."""
+
+    record_id: str
+    subscription_id: str
+    target_url: str
+    event_id: str
+    event_type: str
+    tenant_id: str
+    error_reason: str
+    attempt_count: int
+    failed_at: str
+
+
+class DeadLetterListResponse(BaseModel):
+    """Response containing dead-letter queue records."""
+
+    total_count: int
+    records: list[DeadLetterRecordResponse]
+
+
+class DeadLetterReplayResponse(BaseModel):
+    """Summary of replaying failed dead-letter records."""
+
+    total_matched: int
+    replayed_count: int
+    success_count: int
+
+
 def create_app(
     *,
     model: FraudModel | None = None,
@@ -1527,6 +1618,7 @@ def create_app(
     merchant_max_merchants: int = 50000,
     merchant_chargeback_rate_threshold: float = 0.015,
     tenant_registry: TenantRegistry | None = None,
+    event_bus: EventBus | None = None,
 ) -> FastAPI:
     """Create an application using an injected model or a trusted artifact path.
 
@@ -1880,6 +1972,24 @@ def create_app(
         "fraud_tenant_rule_overrides_total",
         "Total rule matches triggered on tenant custom or federated rules.",
         ["tenant_id", "rule_id"],
+        registry=metrics_registry,
+    )
+    event_bus_published_counter = Counter(
+        "fraud_event_bus_published_total",
+        "Total domain events published to event bus.",
+        ["event_type", "tenant_id"],
+        registry=metrics_registry,
+    )
+    webhook_dispatches_counter = Counter(
+        "fraud_webhook_dispatches_total",
+        "Total webhook notification dispatches by delivery status.",
+        ["status", "tenant_id"],
+        registry=metrics_registry,
+    )
+    webhook_dlq_size_gauge = Gauge(
+        "fraud_webhook_dlq_size",
+        "Current number of failed webhook events retained in the dead-letter queue.",
+        ["tenant_id"],
         registry=metrics_registry,
     )
     merchant_anomalies_counter = Counter(
@@ -2410,6 +2520,11 @@ def create_app(
         application.state.tenant_registry = resolved_tenant_registry
         application.state.tenant_evaluations_counter = tenant_evaluations_counter
         application.state.tenant_rule_overrides_counter = tenant_rule_overrides_counter
+        resolved_event_bus = event_bus or EventBus()
+        application.state.event_bus = resolved_event_bus
+        application.state.event_bus_published_counter = event_bus_published_counter
+        application.state.webhook_dispatches_counter = webhook_dispatches_counter
+        application.state.webhook_dlq_size_gauge = webhook_dlq_size_gauge
         application.state.audit_sink = resolved_audit_sink
         application.state.explanation_provider = explanation_provider
         application.state.fallback_mode = resolved_fallback_mode
@@ -2490,6 +2605,7 @@ def create_app(
         shadow_tasks: set[asyncio.Task[None]] = set()
         application.state.shadow_tasks = shadow_tasks
         yield
+        resolved_event_bus.close()
         await _drain_shadow_tasks(shadow_tasks, SHADOW_SHUTDOWN_TIMEOUT_SECONDS)
         resolved_audit_sink.close()
 
@@ -2513,6 +2629,7 @@ def create_app(
                 "/v1/geo/velocity/",
                 "/v1/merchant/profile/",
                 "/v1/tenants/",
+                "/v1/webhooks/",
             )
         )
         if (
@@ -2539,6 +2656,7 @@ def create_app(
                 "/v1/geo/velocity/",
                 "/v1/merchant/profile/",
                 "/v1/tenants/",
+                "/v1/webhooks/",
             )
         )
         if rate_limiter is None or is_operational:
@@ -3720,6 +3838,37 @@ def create_app(
                         outcome=r.decision,
                     ).inc()
 
+        app_event_bus: EventBus | None = getattr(request.app.state, "event_bus", None)
+        if app_event_bus is not None and results:
+            resolved_tenant_id = active_tenant.tenant_id if active_tenant is not None else "default"
+            first_res = results[0]
+            dec_type = EventType.TRANSACTION_SCORED
+            if first_res.decision == "DENY":
+                dec_type = EventType.DECISION_DENIED
+            elif first_res.decision == "CHALLENGE":
+                dec_type = EventType.DECISION_CHALLENGED
+            elif first_res.decision == "REVIEW":
+                dec_type = EventType.DECISION_REVIEW
+
+            tc = getattr(request.state, "trace_context", None)
+            ev = FraudDomainEvent(
+                event_type=dec_type,
+                tenant_id=resolved_tenant_id,
+                payload={
+                    "decision": first_res.decision,
+                    "probability": first_res.fraud_probability,
+                    "threshold": applied_threshold,
+                    "rule_action": first_res.rule_action,
+                },
+                traceparent=tc.traceparent if tc is not None else None,
+            )
+            app_event_bus.publish(ev, synchronous=False)
+            pub_counter: Counter | None = getattr(
+                request.app.state, "event_bus_published_counter", None
+            )
+            if pub_counter is not None:
+                pub_counter.labels(event_type=dec_type.value, tenant_id=resolved_tenant_id).inc()
+
         return ScoreResponse(
             model_version=_model_version(loaded),
             threshold=applied_threshold,
@@ -4622,6 +4771,264 @@ def create_app(
             )
         except TenantValidationError as exc:
             return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+    @application.get(
+        "/v1/webhooks",
+        response_model=WebhookSubscriptionListResponse,
+        tags=["webhooks"],
+    )
+    async def list_webhooks_endpoint(
+        request: Request,
+        tenant_id: str | None = Query(default=None),
+    ) -> WebhookSubscriptionListResponse:
+        """List registered webhook notification subscriptions."""
+        bus: EventBus | None = getattr(request.app.state, "event_bus", None)
+        if bus is None:
+            return WebhookSubscriptionListResponse(total_count=0, subscriptions=[])
+        subs = bus.registry.list_subscriptions(tenant_id=tenant_id)
+        return WebhookSubscriptionListResponse(
+            total_count=len(subs),
+            subscriptions=[
+                WebhookSubscriptionResponse(
+                    subscription_id=s.subscription_id,
+                    tenant_id=s.tenant_id,
+                    target_url=s.target_url,
+                    secret_token=None,
+                    subscribed_events=[e.value for e in s.subscribed_events],
+                    is_active=s.is_active,
+                    max_retries=s.max_retries,
+                    timeout_seconds=s.timeout_seconds,
+                    created_at=s.created_at,
+                )
+                for s in subs
+            ],
+        )
+
+    @application.post(
+        "/v1/webhooks",
+        response_model=WebhookSubscriptionResponse,
+        responses={
+            400: {"description": "Invalid subscription configuration."},
+        },
+        tags=["webhooks"],
+    )
+    async def create_webhook_endpoint(
+        payload: WebhookSubscriptionCreateRequest,
+        request: Request,
+    ) -> WebhookSubscriptionResponse | JSONResponse:
+        """Register a new webhook subscription endpoint."""
+        bus: EventBus | None = getattr(request.app.state, "event_bus", None)
+        if bus is None:
+            return JSONResponse(status_code=500, content={"detail": "EventBus not initialized"})
+
+        secret = payload.secret_token or secrets.token_hex(24)
+        try:
+            event_types = tuple(EventType(e) for e in payload.subscribed_events)
+            subscription = WebhookSubscription(
+                tenant_id=payload.tenant_id,
+                target_url=payload.target_url,
+                secret_token=secret,
+                subscribed_events=event_types,
+                is_active=payload.is_active,
+                max_retries=payload.max_retries,
+                timeout_seconds=payload.timeout_seconds,
+            )
+            bus.registry.register(subscription, overwrite=True)
+        except (SubscriptionError, ValueError) as exc:
+            return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+        return WebhookSubscriptionResponse(
+            subscription_id=subscription.subscription_id,
+            tenant_id=subscription.tenant_id,
+            target_url=subscription.target_url,
+            secret_token=subscription.secret_token,
+            subscribed_events=[e.value for e in subscription.subscribed_events],
+            is_active=subscription.is_active,
+            max_retries=subscription.max_retries,
+            timeout_seconds=subscription.timeout_seconds,
+            created_at=subscription.created_at,
+        )
+
+    @application.get(
+        "/v1/webhooks/dlq",
+        response_model=DeadLetterListResponse,
+        tags=["webhooks"],
+    )
+    async def list_dlq_endpoint(
+        request: Request,
+        tenant_id: str | None = Query(default=None),
+    ) -> DeadLetterListResponse:
+        """Inspect undeliverable webhook events in the Dead Letter Queue."""
+        bus: EventBus | None = getattr(request.app.state, "event_bus", None)
+        if bus is None:
+            return DeadLetterListResponse(total_count=0, records=[])
+        records = bus.dispatcher.dlq.list_records(tenant_id=tenant_id)
+        return DeadLetterListResponse(
+            total_count=len(records),
+            records=[
+                DeadLetterRecordResponse(
+                    record_id=r.record_id,
+                    subscription_id=r.subscription_id,
+                    target_url=r.target_url,
+                    event_id=r.event.event_id,
+                    event_type=r.event.event_type.value,
+                    tenant_id=r.event.tenant_id,
+                    error_reason=r.error_reason,
+                    attempt_count=r.attempt_count,
+                    failed_at=r.failed_at,
+                )
+                for r in records
+            ],
+        )
+
+    @application.post(
+        "/v1/webhooks/dlq/replay",
+        response_model=DeadLetterReplayResponse,
+        tags=["webhooks"],
+    )
+    async def replay_dlq_endpoint(
+        request: Request,
+        tenant_id: str | None = Query(default=None),
+    ) -> DeadLetterReplayResponse:
+        """Replay failed webhook events from the Dead Letter Queue."""
+        bus: EventBus | None = getattr(request.app.state, "event_bus", None)
+        if bus is None:
+            return DeadLetterReplayResponse(total_matched=0, replayed_count=0, success_count=0)
+
+        records = bus.dispatcher.dlq.list_records(tenant_id=tenant_id)
+        replayed = 0
+        successes = 0
+
+        counter: Counter | None = getattr(request.app.state, "webhook_dispatches_counter", None)
+
+        for rec in records:
+            sub = bus.registry.get(rec.subscription_id)
+            if sub is not None:
+                replayed += 1
+                res = await run_in_threadpool(bus.dispatcher.dispatch, sub, rec.event)
+                if counter is not None:
+                    counter.labels(status=res.status.value, tenant_id=sub.tenant_id).inc()
+                if res.status == EventDeliveryStatus.DELIVERED:
+                    bus.dispatcher.dlq.acknowledge(rec.record_id)
+                    successes += 1
+
+        dlq_gauge: Gauge | None = getattr(request.app.state, "webhook_dlq_size_gauge", None)
+        if dlq_gauge is not None:
+            dlq_gauge.labels(tenant_id=tenant_id or "all").set(bus.dispatcher.dlq.size)
+
+        return DeadLetterReplayResponse(
+            total_matched=len(records),
+            replayed_count=replayed,
+            success_count=successes,
+        )
+
+    @application.get(
+        "/v1/webhooks/{subscription_id}",
+        response_model=WebhookSubscriptionResponse,
+        responses={
+            404: {"description": "Webhook subscription not found."},
+        },
+        tags=["webhooks"],
+    )
+    async def get_webhook_endpoint(
+        subscription_id: str,
+        request: Request,
+    ) -> WebhookSubscriptionResponse | JSONResponse:
+        """Retrieve details of a registered webhook subscription."""
+        bus: EventBus | None = getattr(request.app.state, "event_bus", None)
+        if bus is None:
+            return JSONResponse(status_code=404, content={"detail": "EventBus not initialized"})
+        sub = bus.registry.get(subscription_id)
+        if sub is None:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": f"Webhook subscription '{subscription_id}' not found"},
+            )
+        return WebhookSubscriptionResponse(
+            subscription_id=sub.subscription_id,
+            tenant_id=sub.tenant_id,
+            target_url=sub.target_url,
+            secret_token=None,
+            subscribed_events=[e.value for e in sub.subscribed_events],
+            is_active=sub.is_active,
+            max_retries=sub.max_retries,
+            timeout_seconds=sub.timeout_seconds,
+            created_at=sub.created_at,
+        )
+
+    @application.delete(
+        "/v1/webhooks/{subscription_id}",
+        responses={
+            200: {"description": "Webhook subscription deleted."},
+            404: {"description": "Webhook subscription not found."},
+        },
+        tags=["webhooks"],
+    )
+    async def delete_webhook_endpoint(
+        subscription_id: str,
+        request: Request,
+    ) -> JSONResponse:
+        """Unregister a webhook subscription."""
+        bus: EventBus | None = getattr(request.app.state, "event_bus", None)
+        if bus is None:
+            return JSONResponse(status_code=404, content={"detail": "EventBus not initialized"})
+        removed = bus.registry.remove(subscription_id)
+        if not removed:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": f"Webhook subscription '{subscription_id}' not found"},
+            )
+        return JSONResponse(
+            status_code=200,
+            content={"detail": f"Webhook subscription '{subscription_id}' deleted successfully"},
+        )
+
+    @application.post(
+        "/v1/webhooks/{subscription_id}/test",
+        response_model=WebhookTestDeliveryResponse,
+        responses={
+            404: {"description": "Webhook subscription not found."},
+        },
+        tags=["webhooks"],
+    )
+    async def test_webhook_endpoint(
+        subscription_id: str,
+        request: Request,
+    ) -> WebhookTestDeliveryResponse | JSONResponse:
+        """Trigger an on-demand test webhook ping to verify target reachability."""
+        bus: EventBus | None = getattr(request.app.state, "event_bus", None)
+        if bus is None:
+            return JSONResponse(status_code=404, content={"detail": "EventBus not initialized"})
+        sub = bus.registry.get(subscription_id)
+        if sub is None:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": f"Webhook subscription '{subscription_id}' not found"},
+            )
+
+        test_event = FraudDomainEvent(
+            event_type=EventType.TRANSACTION_SCORED,
+            tenant_id=sub.tenant_id,
+            payload={"test": True, "ping": "pong"},
+        )
+        delivery_res = await run_in_threadpool(bus.dispatcher.dispatch, sub, test_event)
+        counter: Counter | None = getattr(request.app.state, "webhook_dispatches_counter", None)
+        if counter is not None:
+            counter.labels(status=delivery_res.status.value, tenant_id=sub.tenant_id).inc()
+
+        dlq_gauge: Gauge | None = getattr(request.app.state, "webhook_dlq_size_gauge", None)
+        if dlq_gauge is not None:
+            dlq_gauge.labels(tenant_id=sub.tenant_id).set(bus.dispatcher.dlq.size)
+
+        return WebhookTestDeliveryResponse(
+            delivery_id=delivery_res.delivery_id,
+            subscription_id=delivery_res.subscription_id,
+            status=delivery_res.status.value,
+            status_code=delivery_res.status_code,
+            error_message=delivery_res.error_message,
+            attempt_count=delivery_res.attempt_count,
+            duration_seconds=delivery_res.duration_seconds,
+        )
 
     @application.get(
         "/v1/routing/status",

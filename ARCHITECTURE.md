@@ -496,6 +496,60 @@ flowchart TD
 ```
 
 
+## Asynchronous Real-Time Event Bus & Streaming Webhook Dispatcher
+
+The fraud detection engine includes a zero-dependency, in-process asynchronous streaming event bus and resilient webhook dispatch system (`events.py`). This allows multi-tenant payment gateways, downstream fraud analyst portals, and external alerting systems to subscribe to transaction verdicts, graph fraud rings, merchant anomalies, and model promotions without introducing latency overhead into online scoring paths.
+
+```mermaid
+flowchart TD
+    subgraph Publisher ["Event Sources & Ingestion"]
+        DAG["DecisionGraph / Pipeline\n(ActionAggregatorStageProcessor)"]
+        API["FastAPI Engine\n(/v1/score)"]
+        GRAPH["Graph / Merchant / Model Engine"]
+    end
+
+    subgraph EventBusSub ["EventBus & Subscription Registry"]
+        BUS["EventBus\n(Thread-Safe Broadcaster)"]
+        REG["SubscriptionRegistry\n(Tenant-Filtered Subscriptions)"]
+        WORKERS["ThreadPoolExecutor\n(Non-Blocking Asynchronous Dispatch)"]
+    end
+
+    subgraph DispatcherSub ["Webhook Dispatch Engine"]
+        DISP["WebhookDispatcher\n(HMAC-SHA256 Signing + Luhn Masking)"]
+        CB{"Circuit Breaker\n(Failures >= Threshold?)"}
+        RETRY["Exponential Backoff\n(Full Jittered Sleep)"]
+        HTTP["HTTP POST Delivery\n(X-Fraud-Signature: t=...,v1=...)"]
+    end
+
+    subgraph DLQSub ["Dead Letter Retention & Observability"]
+        DLQ["DeadLetterQueue\n(Bounded FIFO Queue)"]
+        PROM["Prometheus Telemetry\n(fraud_event_bus_published_total\nfraud_webhook_dispatches_total)"]
+    end
+
+    DAG --> BUS
+    API --> BUS
+    GRAPH --> BUS
+    BUS --> REG
+    BUS --> WORKERS
+    WORKERS --> DISP
+    DISP --> CB
+    CB -- Closed --> HTTP
+    CB -- Open / Tripped --> DLQ
+    HTTP -- Failure / 5xx --> RETRY
+    RETRY -- Attempts Exhausted --> DLQ
+    HTTP -- Success 2xx --> PROM
+    DLQ --> PROM
+```
+
+### Key Components
+
+- **Domain Event Taxonomy (`EventType`)**: Typed domain events across the fraud detection lifecycle (`fraud.transaction.scored`, `fraud.decision.denied`, `fraud.graph.ring_detected`, `fraud.merchant.anomaly_detected`, `fraud.geo.anomaly_detected`, `fraud.model.promoted`, etc.).
+- **HMAC-SHA256 Signature Verification**: All webhook notifications include an `X-Fraud-Signature: t={timestamp},v1={hex_digest}` header computed over the serialized payload to ensure integrity and prevent replay attacks within a 300-second window.
+- **PCI-DSS PAN Redaction**: Domain events and webhook envelopes automatically pass through Luhn PAN masking and credential redaction, preventing cardholder data leakage.
+- **Circuit Breaker & Exponential Backoff**: Webhook destinations experiencing repeated server errors are quarantined by an automatic circuit breaker (`circuit_breaker_failure_threshold=5`, `recovery_seconds=30.0`), with intermediate attempts scheduled via exponential backoff with full jitter.
+- **Dead-Letter Queue (DLQ)**: Undeliverable notifications are preserved in a thread-safe, bounded in-memory buffer (`DeadLetterQueue`) for inspection and on-demand replay via CLI or API.
+
+
 ## Extension guidance
 
 

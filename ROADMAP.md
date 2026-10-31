@@ -2138,6 +2138,81 @@ Does not implement external identity providers (OAuth2/SAML/OIDC JWT validation 
   - Artifact build: wheel and sdist cleanly validated with twine.
 
 
+## Phase 43 — Asynchronous Real-Time Event Bus & Streaming Webhook Dispatcher (Done)
+
+### Objective
+
+Deliver an in-process, zero-dependency asynchronous streaming event bus and resilient webhook dispatch engine (`events.py`) for multi-tenant payment gateways and external fraud alert consumers. Support decoupled publish-subscribe semantics, tenant-isolated event queues, HMAC-SHA256 request signing, exponential backoff with full jitter, circuit breaking against unresponsive webhook endpoints, dead-letter queue (DLQ) persistent retention and replay, Decision DAG event emission, FastAPI webhook subscription management endpoints (`/v1/webhooks/*`), Prometheus event metrics, and CLI inspection and replay tools (`webhook-list`, `webhook-test`, `webhook-replay-dlq`).
+
+### Scope
+
+1. **Domain Event Models, Taxonomy & Subscriptions (`events.py`)**:
+   - `EventError` hierarchy (`SubscriptionError`, `DispatchError`, `SignatureVerificationError`, `DeadLetterQueueError`).
+   - `EventType` (`TRANSACTION_SCORED`, `DECISION_DENIED`, `DECISION_CHALLENGED`, `DECISION_REVIEW`, `FRAUD_RING_DETECTED`, `MERCHANT_ANOMALY_DETECTED`, `GEOGRAPHIC_ANOMALY_DETECTED`, `MODEL_PROMOTED`, `TENANT_STATUS_CHANGED`).
+   - `EventDeliveryStatus` (`PENDING`, `DELIVERED`, `FAILED`, `DEAD_LETTER`, `FILTERED`).
+   - `FraudDomainEvent`: Immutable event record (`event_id`, `event_type`, `tenant_id`, `timestamp`, `payload`, `traceparent`).
+   - `WebhookSubscription`: Webhook endpoint registration (`subscription_id`, `tenant_id`, `target_url`, `secret_token`, `subscribed_events`, `is_active`, `max_retries`, `timeout_seconds`, `created_at`).
+2. **HMAC-SHA256 Payload Signing & Redaction (`events.py`)**:
+   - Standardized `X-Fraud-Signature: t={timestamp},v1={hmac_hex}` signature generation and verification with timestamp tolerance.
+   - Payload sanitization guaranteeing PCI-DSS compliant Luhn PAN masking and credential redaction.
+3. **Resilient Webhook Dispatcher & Dead-Letter Queue (`events.py`)**:
+   - `DispatchConfig`: Retry policy parameters (`max_retries=3`, `initial_backoff_seconds=1.0`, `backoff_multiplier=2.0`, `max_backoff_seconds=30.0`, `jitter=True`, `dlq_max_size=10_000`).
+   - `DeadLetterQueue`: Thread-safe, bounded DLQ recording delivery failures with cause, timestamp, and replay capabilities.
+   - `WebhookDispatcher`: Asynchronous/threaded delivery worker with per-endpoint circuit breaking and backoff retry loop.
+4. **Pipeline & DAG Integration (`events.py`, `pipeline.py`)**:
+   - `EventBus`: Thread-safe publish-subscribe bus supporting synchronous and asynchronous subscribers, topic/event filtering, and tenant partitioning.
+   - Decision DAG event emission hook publishing transaction outcomes without latency impact on scoring.
+5. **FastAPI Serving & Telemetry (`api.py`)**:
+   - Endpoints `GET /v1/webhooks`, `POST /v1/webhooks`, `GET /v1/webhooks/{subscription_id}`, `DELETE /v1/webhooks/{subscription_id}`, `POST /v1/webhooks/{subscription_id}/test`, `GET /v1/webhooks/dlq`, `POST /v1/webhooks/dlq/replay`.
+   - Prometheus metrics `fraud_event_bus_published_total`, `fraud_webhook_dispatches_total`, `fraud_webhook_dispatch_duration_seconds`, `fraud_webhook_dlq_size`.
+6. **CLI Workflows (`cli.py`)**:
+   - `fraud-detect webhook-list`, `fraud-detect webhook-test`, `fraud-detect webhook-replay-dlq`.
+
+### Acceptance Criteria
+
+1. **AC-1 (Domain Models & Validation)**: `FraudDomainEvent`, `WebhookSubscription`, and event taxonomy validate types, URIs, and field constraints with complete exception hierarchy.
+2. **AC-2 (HMAC-SHA256 Webhook Signing & Sanitization)**: Webhook payloads generate valid `X-Fraud-Signature` headers with replay-attack protection, verification against secret tokens, and automated Luhn PAN masking.
+3. **AC-3 (Resilient Webhook Dispatcher & DLQ)**: Dispatcher retries failures with exponential backoff and jitter, tracks circuit breaking on failing endpoints, and routes exhausted attempts to bounded `DeadLetterQueue`.
+4. **AC-4 (Event Bus & DAG Integration)**: `EventBus` broadcasts domain events to registered subscribers by topic and tenant; Decision DAG pipeline optionally publishes scoring and decision outcomes.
+5. **AC-5 (API Serving & Prometheus Telemetry)**: FastAPI surfaces `/v1/webhooks/*` CRUD and DLQ endpoints, executes test pings, and records Prometheus delivery and publication counters.
+6. **AC-6 (CLI Webhook Workflows)**: CLI commands `webhook-list`, `webhook-test`, and `webhook-replay-dlq` run with standard exit codes and JSON/table reporting.
+7. **AC-7 (Quality Standards & 100% Green CI)**: All local CI-parity checks and remote CI workflow runs pass 100%, branch coverage $\ge 97.0\%$, strict mypy 0 issues, Ruff clean, and build/twine valid.
+
+### Validation & CI Plan
+
+- Local CI-parity commands:
+  - `python -m ruff format --check src tests`
+  - `python -m ruff check src tests`
+  - `python -m mypy src`
+  - `python -m pip_audit --skip-editable`
+  - `python -m pytest --cov=fraud_detection --cov-report=term-missing`
+  - `python -m build` & `python -m twine check dist/*`
+- Remote CI workflow runs monitored via `gh run list` and `gh pr checks`.
+
+### Exclusions
+
+Does not implement external message brokers (Kafka/RabbitMQ/Redis Streams) as external server dependencies; delivers an in-process, zero-dependency streaming bus and HTTP dispatcher that operates natively within single or horizontally scaled gateway nodes.
+
+### Micro-Task Breakdown
+
+- [x] Task 1: Create `src/fraud_detection/events.py` with domain event models (`EventType`, `EventDeliveryStatus`, `FraudDomainEvent`, `WebhookSubscription`, `EventError` hierarchy) and unit tests in `tests/test_events.py`.
+- [x] Task 2: Implement HMAC-SHA256 signature generation/verification and PCI-DSS payload sanitization in `src/fraud_detection/events.py` with unit tests.
+- [x] Task 3: Implement `DeadLetterQueue`, `DispatchConfig`, and `WebhookDispatcher` with jittered exponential backoff and circuit breaking in `src/fraud_detection/events.py` with unit tests.
+- [x] Task 4: Implement in-memory thread-safe `EventBus` and Decision DAG event publisher in `src/fraud_detection/events.py` and `src/fraud_detection/pipeline.py` with unit tests.
+- [x] Task 5: Implement `/v1/webhooks/*` endpoints, test ping dispatcher, and Prometheus metrics in `src/fraud_detection/api.py` with integration tests in `tests/test_api.py`.
+- [x] Task 6: Implement CLI commands `webhook-list`, `webhook-test`, and `webhook-replay-dlq` in `src/fraud_detection/cli.py` with tests in `tests/test_cli.py`.
+- [x] Task 7: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate.
+
+### Delivery Record
+
+- **Delivered**: 2026-10-31
+- **Branch**: `phase/webhook-event-dispatcher`
+- **Pull Request**: [#24](https://github.com/Mohamed-ahmed-shokry/Credit-Card-Fraud-Detection/pull/24)
+- **Primary Modules**: `src/fraud_detection/events.py`, `src/fraud_detection/pipeline.py`, `src/fraud_detection/api.py`, `src/fraud_detection/cli.py`
+- **Test Modules**: `tests/test_events.py`, `tests/test_pipeline.py`, `tests/test_api.py`, `tests/test_cli.py`
+- **Verification Gates**: 100% Green local CI parity, $\ge 97.0\%$ branch coverage, 0 mypy issues, Ruff formatted, pip-audit clean, wheel build and twine valid.
+
+
 ## Contributing to the roadmap
 
 Open an issue or a pull request that references the relevant phase item.

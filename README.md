@@ -1823,6 +1823,32 @@ FastAPI multi-tenant REST endpoints and telemetry:
 - `DELETE /v1/tenants/{tenant_id}`: Unregister a tenant partition (protected against deleting default tenant).
 - `X-Tenant-ID` header: Evaluates `/score` and `/predict` transactions against the designated tenant's federated rules and decision thresholds, recording Prometheus metrics (`fraud_tenant_evaluations_total`, `fraud_tenant_rule_overrides_total`).
 
+## Asynchronous Webhooks & Real-Time Event Bus
+
+Decoupled streaming domain events and outbound webhook notifications (`events.py`):
+
+```bash
+# List registered webhook subscriptions
+fraud-detect webhook-list --format table
+
+# Send a signed test notification ping with HMAC verification
+fraud-detect webhook-test --target-url https://api.example.com/webhook --tenant-id fintech_alpha
+
+# Inspect or replay undelivered dead-letter notifications
+fraud-detect webhook-replay-dlq --dlq-file dlq_dump.json --dry-run
+fraud-detect webhook-replay-dlq --dlq-file dlq_dump.json --tenant-id fintech_alpha
+```
+
+FastAPI webhook REST endpoints:
+- `GET /v1/webhooks`: List registered webhook subscriptions with optional `?tenant_id=` filter.
+- `POST /v1/webhooks`: Register a webhook notification endpoint with subscribed events, retry limits, and secret tokens.
+- `GET /v1/webhooks/{subscription_id}`: Retrieve subscription metadata (with secret tokens safely redacted).
+- `DELETE /v1/webhooks/{subscription_id}`: Unregister an active webhook subscription.
+- `POST /v1/webhooks/{subscription_id}/test`: Trigger an on-demand signed ping to test connectivity and latency.
+- `GET /v1/webhooks/dlq`: Inspect failed delivery records preserved in the Dead-Letter Queue.
+- `POST /v1/webhooks/dlq/replay`: Replay undelivered dead-letter events through the webhook dispatcher.
+- Prometheus metrics: `fraud_event_bus_published_total`, `fraud_webhook_dispatches_total`, and `fraud_webhook_dlq_size`.
+
 ## Reference label-delay analysis
 
 
