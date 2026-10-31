@@ -2324,3 +2324,39 @@ def test_tenant_pipeline_integration() -> None:
     )
     assert res2.decision == "DENY"
     assert res2.matched_rule == "RULE_TENANT_BLOCK_LARGE"
+
+
+def test_pipeline_event_bus_publishing() -> None:
+    """Validate that ActionAggregatorStageProcessor publishes domain events to injected EventBus."""
+    from fraud_detection.data import generate_synthetic_data, validate_frame
+    from fraud_detection.events import EventBus, EventType, FraudDomainEvent
+    from fraud_detection.model import train_model
+
+    df = validate_frame(generate_synthetic_data(rows=300, fraud_rate=0.1, random_state=42))
+    model = train_model(df)
+
+    published_events: list[FraudDomainEvent] = []
+    bus = EventBus()
+    bus.subscribe(lambda ev: published_events.append(ev))
+
+    pipeline = create_default_fraud_pipeline(model=model)
+    executor = DecisionGraphExecutor(pipeline)
+
+    tx: dict[str, Any] = {f"V{i}": 0.0 for i in range(1, 29)}
+    tx["Time"] = 100.0
+    tx["Amount"] = 50.0
+
+    # Execute with event_bus in metadata
+    res = executor.execute_sync(tx, metadata={"event_bus": bus, "tenant_id": "test_corp"})
+    assert res.success is True
+    assert len(published_events) == 1
+    ev = published_events[0]
+    assert ev.tenant_id == "test_corp"
+    assert ev.event_type in (
+        EventType.TRANSACTION_SCORED,
+        EventType.DECISION_DENIED,
+        EventType.DECISION_REVIEW,
+        EventType.DECISION_CHALLENGED,
+    )
+    assert ev.payload["decision"] == res.decision
+    bus.close()
