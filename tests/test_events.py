@@ -5,12 +5,18 @@ from __future__ import annotations
 import pytest
 
 from fraud_detection.events import (
+    DeadLetterQueue,
+    DeadLetterQueueError,
+    DeadLetterRecord,
+    DispatchConfig,
+    DispatchError,
     EventDeliveryStatus,
     EventError,
     EventType,
     FraudDomainEvent,
     SignatureVerificationError,
     SubscriptionError,
+    WebhookDispatcher,
     WebhookSubscription,
     compute_webhook_signature,
     sanitize_event_payload,
@@ -219,3 +225,179 @@ def test_sanitize_event_payload_redaction() -> None:
     assert sanitized["metadata"]["api_key"] == "[REDACTED]"
     assert sanitized["metadata"]["password_hash"] == "[REDACTED]"  # noqa: S105
     assert "[REDACTED_PAN]" in sanitized["metadata"]["notes"]
+
+
+def test_dead_letter_queue_operations() -> None:
+    """Validate DeadLetterQueue capacity bounding, tenant filtering, and retrieval."""
+    dlq = DeadLetterQueue(max_size=3)
+    assert dlq.max_size == 3
+
+    event1 = FraudDomainEvent(event_id="e1", tenant_id="tenant_a")
+    event2 = FraudDomainEvent(event_id="e2", tenant_id="tenant_b")
+    event3 = FraudDomainEvent(event_id="e3", tenant_id="tenant_a")
+    event4 = FraudDomainEvent(event_id="e4", tenant_id="tenant_b")
+
+    rec1 = DeadLetterRecord(record_id="r1", event=event1, error_reason="HTTP 500")
+    rec2 = DeadLetterRecord(record_id="r2", event=event2, error_reason="Timeout")
+    rec3 = DeadLetterRecord(record_id="r3", event=event3, error_reason="HTTP 502")
+    rec4 = DeadLetterRecord(record_id="r4", event=event4, error_reason="HTTP 503")
+
+    dlq.push(rec1)
+    dlq.push(rec2)
+    dlq.push(rec3)
+    assert dlq.count() == 3
+    assert dlq.count("tenant_a") == 2
+    assert dlq.count("tenant_b") == 1
+
+    # Over capacity evicts oldest (rec1)
+    dlq.push(rec4)
+    assert dlq.count() == 3
+    assert dlq.get("r1") is None
+    assert dlq.get("r4") is not None
+
+    # Filtering by tenant
+    tenant_b_recs = dlq.list_records(tenant_id="tenant_b")
+    assert len(tenant_b_recs) == 2
+    assert all(r.event.tenant_id == "tenant_b" for r in tenant_b_recs)
+
+    # Remove single record
+    assert dlq.remove("r2") is True
+    assert dlq.get("r2") is None
+    assert dlq.remove("non_existent") is False
+
+    # Clear tenant-specific
+    cleared = dlq.clear(tenant_id="tenant_b")
+    assert cleared == 1
+    assert dlq.count() == 1
+
+    # Clear all
+    assert dlq.clear() == 1
+    assert dlq.count() == 0
+
+    # Serialization roundtrip
+    rec_dict = rec3.to_dict()
+    restored = DeadLetterRecord.from_dict(rec_dict)
+    assert restored.record_id == "r3"
+    assert restored.error_reason == "HTTP 502"
+
+    with pytest.raises(DeadLetterQueueError, match="max_size must be positive"):
+        DeadLetterQueue(max_size=0)
+
+    with pytest.raises(DeadLetterQueueError, match="Invalid DeadLetterRecord dictionary"):
+        DeadLetterRecord.from_dict({"record_id": "r"})
+
+
+def test_dispatch_config_validation() -> None:
+    """Validate DispatchConfig constraints and parameters."""
+    cfg = DispatchConfig(max_retries=2, initial_backoff_seconds=0.1)
+    assert cfg.max_retries == 2
+
+    with pytest.raises(DispatchError, match="max_retries must be non-negative"):
+        DispatchConfig(max_retries=-1)
+
+    with pytest.raises(DispatchError, match="initial_backoff_seconds must be positive"):
+        DispatchConfig(initial_backoff_seconds=0)
+
+    with pytest.raises(DispatchError, match=r"backoff_multiplier must be >= 1.0"):
+        DispatchConfig(backoff_multiplier=0.5)
+
+    with pytest.raises(DispatchError, match="max_backoff_seconds must be >="):
+        DispatchConfig(initial_backoff_seconds=10.0, max_backoff_seconds=5.0)
+
+    with pytest.raises(DispatchError, match="circuit_breaker_failure_threshold"):
+        DispatchConfig(circuit_breaker_failure_threshold=0)
+
+    with pytest.raises(DispatchError, match="circuit_breaker_recovery_seconds"):
+        DispatchConfig(circuit_breaker_recovery_seconds=0)
+
+    with pytest.raises(DispatchError, match="http_timeout_seconds"):
+        DispatchConfig(http_timeout_seconds=0)
+
+
+def test_webhook_dispatcher_lifecycle_and_retries() -> None:
+    """Validate WebhookDispatcher delivery, retries, terminal 4xx, and circuit breaking."""
+    call_counts: dict[str, int] = {"count": 0}
+
+    def mock_transport_success(
+        _url: str, _payload: bytes, headers: dict[str, str], _timeout: float
+    ) -> tuple[int, bytes]:
+        call_counts["count"] += 1
+        assert "X-Fraud-Signature" in headers
+        assert "X-Event-Type" in headers
+        assert "X-Tenant-ID" in headers
+        return 200, b'{"received": true}'
+
+    cfg = DispatchConfig(
+        max_retries=2,
+        initial_backoff_seconds=0.01,
+        circuit_breaker_failure_threshold=2,
+        circuit_breaker_recovery_seconds=1.0,
+    )
+    dispatcher = WebhookDispatcher(config=cfg, transport=mock_transport_success)
+
+    sub = WebhookSubscription(
+        subscription_id="sub_delivery",
+        tenant_id="fintech_alpha",
+        target_url="https://api.example.com/events",
+        secret_token="secret_key_1234567890",  # noqa: S106
+        max_retries=2,
+    )
+    event = FraudDomainEvent(
+        event_id="evt_success",
+        event_type=EventType.TRANSACTION_SCORED,
+        tenant_id="fintech_alpha",
+    )
+
+    # 1. Successful dispatch
+    res = dispatcher.dispatch(sub, event)
+    assert res.status == EventDeliveryStatus.DELIVERED
+    assert res.status_code == 200
+    assert res.attempt_count == 1
+    assert dispatcher.dlq.count() == 0
+
+    # 2. Retrying server error (500) leading to dead letter queue
+    fail_counts: dict[str, int] = {"count": 0}
+
+    def mock_transport_500(
+        _url: str, _payload: bytes, _headers: dict[str, str], _timeout: float
+    ) -> tuple[int, bytes]:
+        fail_counts["count"] += 1
+        return 500, b'{"error": "internal error"}'
+
+    dispatcher_fail = WebhookDispatcher(config=cfg, transport=mock_transport_500)
+    res_fail = dispatcher_fail.dispatch(sub, event)
+    assert res_fail.status == EventDeliveryStatus.DEAD_LETTER
+    assert res_fail.status_code == 500
+    assert res_fail.attempt_count == 3  # 1 initial + 2 retries
+    assert fail_counts["count"] == 3
+    assert dispatcher_fail.dlq.count() == 1
+
+    # 3. Terminal client error (400): fails immediately without retrying
+    client_err_counts: dict[str, int] = {"count": 0}
+
+    def mock_transport_400(
+        _url: str, _payload: bytes, _headers: dict[str, str], _timeout: float
+    ) -> tuple[int, bytes]:
+        client_err_counts["count"] += 1
+        return 400, b'{"error": "bad request"}'
+
+    dispatcher_client_err = WebhookDispatcher(config=cfg, transport=mock_transport_400)
+    res_400 = dispatcher_client_err.dispatch(sub, event)
+    assert res_400.status == EventDeliveryStatus.DEAD_LETTER
+    assert res_400.status_code == 400
+    assert client_err_counts["count"] == 1  # No retry
+
+    # 4. Circuit breaker activation after threshold reached
+    # Dispatch again on dispatcher_fail to trip circuit breaker (threshold = 2)
+    dispatcher_fail.dispatch(sub, event)
+    assert dispatcher_fail.is_circuit_open("sub_delivery") is True
+
+    # Immediate rejection when circuit breaker is open
+    res_cb = dispatcher_fail.dispatch(sub, event)
+    assert res_cb.status == EventDeliveryStatus.FAILED
+    assert res_cb.attempt_count == 0
+    assert "Circuit breaker open" in str(res_cb.error_message)
+
+    # Reset circuit breaker
+    dispatcher_fail.reset_circuit_breaker("sub_delivery")
+    assert dispatcher_fail.is_circuit_open("sub_delivery") is False
