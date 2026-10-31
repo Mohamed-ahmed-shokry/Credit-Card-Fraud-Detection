@@ -10,12 +10,14 @@ from fraud_detection.events import (
     DeadLetterRecord,
     DispatchConfig,
     DispatchError,
+    EventBus,
     EventDeliveryStatus,
     EventError,
     EventType,
     FraudDomainEvent,
     SignatureVerificationError,
     SubscriptionError,
+    SubscriptionRegistry,
     WebhookDispatcher,
     WebhookSubscription,
     compute_webhook_signature,
@@ -401,3 +403,132 @@ def test_webhook_dispatcher_lifecycle_and_retries() -> None:
     # Reset circuit breaker
     dispatcher_fail.reset_circuit_breaker("sub_delivery")
     assert dispatcher_fail.is_circuit_open("sub_delivery") is False
+
+
+def test_subscription_registry_crud_and_matching() -> None:
+    """Validate SubscriptionRegistry CRUD, filtering, manifest import/export, and matching."""
+    reg = SubscriptionRegistry()
+    assert reg.count() == 0
+
+    sub1 = WebhookSubscription(
+        subscription_id="sub_alpha",
+        tenant_id="fintech_a",
+        target_url="https://api.a.com/hook",
+        secret_token="secret_key_1234567890",  # noqa: S106
+        subscribed_events=(EventType.DECISION_DENIED,),
+    )
+    sub2 = WebhookSubscription(
+        subscription_id="sub_beta",
+        tenant_id="fintech_b",
+        target_url="https://api.b.com/hook",
+        secret_token="secret_key_0987654321",  # noqa: S106
+        subscribed_events=(EventType.TRANSACTION_SCORED, EventType.DECISION_DENIED),
+    )
+
+    reg.register(sub1)
+    reg.register(sub2)
+    assert reg.count() == 2
+    assert reg.count("fintech_a") == 1
+    assert reg.get("sub_alpha") == sub1
+
+    # Duplicate rejection without overwrite
+    with pytest.raises(SubscriptionError, match="already registered"):
+        reg.register(sub1, overwrite=False)
+
+    # Overwrite
+    sub1_mod = WebhookSubscription(
+        subscription_id="sub_alpha",
+        tenant_id="fintech_a",
+        target_url="https://api.a.com/v2/hook",
+        secret_token="secret_key_1234567890",  # noqa: S106
+    )
+    reg.register(sub1_mod, overwrite=True)
+    assert reg.get("sub_alpha") == sub1_mod
+
+    # Matching logic
+    evt_denied_a = FraudDomainEvent(
+        event_id="e1",
+        event_type=EventType.DECISION_DENIED,
+        tenant_id="fintech_a",
+    )
+    matches = reg.find_matching(evt_denied_a)
+    assert len(matches) == 1
+    assert matches[0].subscription_id == "sub_alpha"
+
+    # Manifest export and import
+    manifest = reg.export_manifest()
+    assert manifest["version"] == "1.0"
+    assert len(manifest["subscriptions"]) == 2
+
+    restored_reg = SubscriptionRegistry.import_manifest(manifest)
+    assert restored_reg.count() == 2
+    assert restored_reg.get("sub_beta") is not None
+
+    with pytest.raises(SubscriptionError, match="'subscriptions' must be a list"):
+        SubscriptionRegistry.import_manifest({"subscriptions": "invalid"})
+
+    # Remove
+    assert reg.remove("sub_alpha") is True
+    assert reg.remove("sub_alpha") is False
+    assert reg.count() == 1
+
+
+def test_event_bus_in_memory_and_webhook_dispatch() -> None:
+    """Validate EventBus in-memory listener callbacks, filtering, and webhook dispatches."""
+    reg = SubscriptionRegistry()
+    delivered_payloads: list[bytes] = []
+
+    def mock_transport(
+        _url: str, payload: bytes, _headers: dict[str, str], _timeout: float
+    ) -> tuple[int, bytes]:
+        delivered_payloads.append(payload)
+        return 200, b'{"ok": true}'
+
+    dispatcher = WebhookDispatcher(transport=mock_transport)
+    bus = EventBus(registry=reg, dispatcher=dispatcher, max_workers=2)
+
+    received_events: list[FraudDomainEvent] = []
+
+    def listener(event: FraudDomainEvent) -> None:
+        received_events.append(event)
+
+    # Subscribe in-memory
+    token = bus.subscribe(listener, event_type=EventType.DECISION_DENIED)
+
+    # Register webhook
+    sub = WebhookSubscription(
+        subscription_id="sub_bus",
+        tenant_id="fintech_alpha",
+        target_url="https://api.example.com/fraud",
+        secret_token="secret_key_1234567890",  # noqa: S106
+        subscribed_events=(EventType.DECISION_DENIED,),
+    )
+    reg.register(sub)
+
+    # Publish matched event
+    matched = FraudDomainEvent(
+        event_id="evt_bus_01",
+        event_type=EventType.DECISION_DENIED,
+        tenant_id="fintech_alpha",
+        payload={"score": 0.95},
+    )
+    count = bus.publish(matched, synchronous=True)
+    assert count == 2  # 1 in-memory + 1 webhook
+    assert len(received_events) == 1
+    assert len(delivered_payloads) == 1
+
+    # Publish unmatched event (TRANSACTION_SCORED)
+    unmatched = FraudDomainEvent(
+        event_id="evt_bus_02",
+        event_type=EventType.TRANSACTION_SCORED,
+        tenant_id="fintech_alpha",
+    )
+    count_unmatched = bus.publish(unmatched, synchronous=True)
+    assert count_unmatched == 0
+    assert len(received_events) == 1
+
+    # Unsubscribe in-memory
+    assert bus.unsubscribe(token) is True
+    assert bus.unsubscribe("invalid_token") is False
+
+    bus.close()
