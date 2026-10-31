@@ -8,6 +8,7 @@ dead-letter queue (DLQ) persistent retention.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import hmac
 import json
@@ -19,6 +20,7 @@ import urllib.error
 import urllib.request
 from collections import OrderedDict
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -34,12 +36,14 @@ __all__ = [
     "DeadLetterRecord",
     "DispatchConfig",
     "DispatchError",
+    "EventBus",
     "EventDeliveryStatus",
     "EventError",
     "EventType",
     "FraudDomainEvent",
     "SignatureVerificationError",
     "SubscriptionError",
+    "SubscriptionRegistry",
     "WebhookDeliveryResult",
     "WebhookDispatcher",
     "WebhookSubscription",
@@ -627,3 +631,161 @@ class WebhookDispatcher:
                 return int(resp.status), resp.read()
         except urllib.error.HTTPError as exc:
             return int(exc.code), exc.read()
+
+
+class SubscriptionRegistry:
+    """Thread-safe registry for managing active webhook subscriptions."""
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._subscriptions: dict[str, WebhookSubscription] = {}
+
+    def register(self, subscription: WebhookSubscription, overwrite: bool = False) -> None:
+        """Register a new webhook subscription."""
+        with self._lock:
+            sub_id = subscription.subscription_id
+            if sub_id in self._subscriptions and not overwrite:
+                raise SubscriptionError(
+                    f"Subscription '{sub_id}' already registered. Set overwrite=True to update."
+                )
+            self._subscriptions[sub_id] = subscription
+
+    def get(self, subscription_id: str) -> WebhookSubscription | None:
+        """Retrieve a subscription by identifier."""
+        with self._lock:
+            return self._subscriptions.get(subscription_id)
+
+    def remove(self, subscription_id: str) -> bool:
+        """Remove a subscription by identifier. Returns True if removed."""
+        with self._lock:
+            return self._subscriptions.pop(subscription_id, None) is not None
+
+    def list_subscriptions(
+        self,
+        tenant_id: str | None = None,
+    ) -> list[WebhookSubscription]:
+        """List subscriptions, optionally filtered by tenant."""
+        with self._lock:
+            subs = list(self._subscriptions.values())
+            if tenant_id is not None:
+                subs = [s for s in subs if s.tenant_id == tenant_id]
+            return subs
+
+    def find_matching(self, event: FraudDomainEvent) -> list[WebhookSubscription]:
+        """Find active subscriptions that match the event type and tenant."""
+        with self._lock:
+            return [s for s in self._subscriptions.values() if s.matches(event)]
+
+    def count(self, tenant_id: str | None = None) -> int:
+        """Return total count of registered subscriptions."""
+        with self._lock:
+            if tenant_id is None:
+                return len(self._subscriptions)
+            return sum(1 for s in self._subscriptions.values() if s.tenant_id == tenant_id)
+
+    def export_manifest(self) -> dict[str, Any]:
+        """Export all subscriptions to a serializable dictionary manifest."""
+        with self._lock:
+            return {
+                "version": "1.0",
+                "exported_at": datetime.now(UTC).isoformat(),
+                "subscriptions": [
+                    s.to_dict(include_secret=True) for s in self._subscriptions.values()
+                ],
+            }
+
+    @classmethod
+    def import_manifest(cls, data: dict[str, Any]) -> SubscriptionRegistry:
+        """Construct a SubscriptionRegistry from an exported manifest."""
+        registry = cls()
+        subs_data = data.get("subscriptions", [])
+        if not isinstance(subs_data, list):
+            raise SubscriptionError("Invalid manifest format: 'subscriptions' must be a list")
+        for item in subs_data:
+            sub = WebhookSubscription.from_dict(item)
+            registry.register(sub, overwrite=True)
+        return registry
+
+
+class EventBus:
+    """In-process thread-safe streaming event bus for domain events and webhooks."""
+
+    def __init__(
+        self,
+        registry: SubscriptionRegistry | None = None,
+        dispatcher: WebhookDispatcher | None = None,
+        max_workers: int = 4,
+    ) -> None:
+        self._registry = registry or SubscriptionRegistry()
+        self._dispatcher = dispatcher or WebhookDispatcher()
+        self._lock = threading.RLock()
+        self._pool = ThreadPoolExecutor(
+            max_workers=max(1, max_workers),
+            thread_name_prefix="fraud-event-bus",
+        )
+        # In-memory listeners: token -> (event_type | None, tenant_id | None, callback)
+        self._listeners: dict[
+            str, tuple[EventType | None, str | None, Callable[[FraudDomainEvent], None]]
+        ] = {}
+
+    @property
+    def registry(self) -> SubscriptionRegistry:
+        """Return subscription registry."""
+        return self._registry
+
+    @property
+    def dispatcher(self) -> WebhookDispatcher:
+        """Return webhook dispatcher."""
+        return self._dispatcher
+
+    def subscribe(
+        self,
+        callback: Callable[[FraudDomainEvent], None],
+        event_type: EventType | None = None,
+        tenant_id: str | None = None,
+    ) -> str:
+        """Register an in-memory listener callback, returning a cancellation token."""
+        with self._lock:
+            token = f"listener_{uuid4().hex[:12]}"
+            self._listeners[token] = (event_type, tenant_id, callback)
+            return token
+
+    def unsubscribe(self, token: str) -> bool:
+        """Unregister an in-memory listener by token."""
+        with self._lock:
+            return self._listeners.pop(token, None) is not None
+
+    def publish(
+        self,
+        event: FraudDomainEvent,
+        synchronous: bool = False,
+    ) -> int:
+        """Publish a domain event to all matching in-memory listeners and webhooks."""
+        with self._lock:
+            listeners_to_notify = [
+                cb
+                for et, tid, cb in self._listeners.values()
+                if (et is None or et == event.event_type)
+                and (tid is None or tid == "default" or tid == event.tenant_id)
+            ]
+            matching_webhooks = self._registry.find_matching(event)
+
+        dispatched_count = len(listeners_to_notify) + len(matching_webhooks)
+
+        # Notify in-memory listeners
+        for listener in listeners_to_notify:
+            with contextlib.suppress(Exception):
+                listener(event)
+
+        # Dispatch webhooks
+        for sub in matching_webhooks:
+            if synchronous:
+                self._dispatcher.dispatch(sub, event)
+            else:
+                self._pool.submit(self._dispatcher.dispatch, sub, event)
+
+        return dispatched_count
+
+    def close(self, _timeout: float = 2.0) -> None:
+        """Shutdown background worker pool cleanly."""
+        self._pool.shutdown(wait=True, cancel_futures=True)
