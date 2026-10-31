@@ -1369,3 +1369,41 @@ def build_merchant_anomaly_audit_event(
         dataset_fingerprint=dataset_fingerprint,
         payload=payload,
     )
+
+
+def build_tenant_audit_event(
+    *,
+    tenant_id: str,
+    tier: str = "standard",
+    status: str = "active",
+    transaction_id: str | None = None,
+    action: str | None = None,
+    matched_rule_id: str | None = None,
+    matched_rule_name: str | None = None,
+    is_suspended: bool = False,
+    thresholds: Mapping[str, float] | None = None,
+    model_version: str = "v1",
+    dataset_fingerprint: str | None = None,
+    metadata: Mapping[str, Any] | None = None,
+) -> AuditEvent:
+    """Construct a structured audit event when a multi-tenant policy is evaluated."""
+    payload: dict[str, Any] = {
+        "tenant_id": _mask_pans_in_string(str(tenant_id)),
+        "tier": str(tier),
+        "status": str(status),
+        "transaction_id": _mask_pans_in_string(str(transaction_id)) if transaction_id else None,
+        "action": str(action) if action is not None else None,
+        "matched_rule_id": str(matched_rule_id) if matched_rule_id is not None else None,
+        "matched_rule_name": str(matched_rule_name) if matched_rule_name is not None else None,
+        "is_suspended": bool(is_suspended),
+        "thresholds": dict(thresholds) if thresholds is not None else {},
+    }
+    if metadata:
+        payload["metadata"] = dict(metadata)
+
+    return AuditEvent(
+        event_type="fraud.tenant.policy_evaluated",
+        model_version=model_version,
+        dataset_fingerprint=dataset_fingerprint,
+        payload=payload,
+    )

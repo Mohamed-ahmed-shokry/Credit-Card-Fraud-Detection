@@ -55,6 +55,7 @@ from fraud_detection.merchant import (
 from fraud_detection.model import FraudModel
 from fraud_detection.recalibration import BaseRecalibrator
 from fraud_detection.rules import RuleAction, RulePrecedence, RuleSet
+from fraud_detection.tenant import TenantRegistry, resolve_tenant_ruleset
 from fraud_detection.velocity import (
     VelocityConfig,
     VelocityWindowBuffer,
@@ -1186,6 +1187,99 @@ GraphEnrichmentStage = GraphEnrichmentStageProcessor
 MerchantEnrichmentStage = MerchantEnrichmentStageProcessor
 
 
+class TenantPartitionStageProcessor:
+    """Enforces multi-tenant isolation, federates tenant-specific rules, and applies thresholds."""
+
+    def __init__(
+        self,
+        registry: TenantRegistry | None = None,
+        base_ruleset: RuleSet | None = None,
+        short_circuit_actions: Sequence[RuleAction] | None = None,
+    ) -> None:
+        self.registry = registry if registry is not None else TenantRegistry()
+        self.base_ruleset = base_ruleset
+        self.short_circuit_actions = (
+            tuple(short_circuit_actions)
+            if short_circuit_actions is not None
+            else (RuleAction.DENY, RuleAction.ALLOW)
+        )
+
+    def __call__(self, context: PipelineContext) -> dict[str, Any]:
+        tx = dict(context.transaction)
+        raw_tenant_id = context.metadata.get("tenant_id") or tx.get("tenant_id") or "default"
+        tenant_id = str(raw_tenant_id).strip()
+
+        tenant = self.registry.get(tenant_id)
+
+        context.metadata["tenant_id"] = tenant.tenant_id
+        context.metadata["tenant_tier"] = tenant.tier.value
+        context.metadata["tenant_status"] = tenant.status.value
+
+        if tenant.risk_profile.feature_overrides:
+            tx.update(tenant.risk_profile.feature_overrides)
+            context.transaction = tx
+
+        if not tenant.is_active:
+            context.metadata["short_circuit"] = True
+            context.metadata["short_circuit_action"] = RuleAction.DENY.value
+            context.metadata["matched_rule_id"] = "TENANT_INACTIVE"
+            context.metadata["matched_rule_name"] = f"Tenant {tenant.tenant_id} is inactive"
+            return {
+                "tenant_id": tenant.tenant_id,
+                "tenant_tier": tenant.tier.value,
+                "tenant_status": tenant.status.value,
+                "is_suspended": True,
+                "matched": True,
+                "matched_rule_id": "TENANT_INACTIVE",
+                "matched_rule_name": f"Tenant {tenant.tenant_id} is inactive",
+                "action": RuleAction.DENY.value,
+                "reason": (
+                    f"Tenant '{tenant.tenant_id}' is {tenant.status.value} "
+                    "and cannot process requests"
+                ),
+                "short_circuited": True,
+                "thresholds": {
+                    "decline": tenant.risk_profile.decline_threshold,
+                    "challenge": tenant.risk_profile.challenge_threshold,
+                    "review": tenant.risk_profile.review_threshold,
+                },
+            }
+
+        federated_rules = resolve_tenant_ruleset(tenant, self.base_ruleset)
+        eval_res = federated_rules.evaluate_record(context.transaction)
+
+        short_circuit = False
+        if eval_res.matched and eval_res.action in self.short_circuit_actions:
+            short_circuit = True
+            context.metadata["short_circuit"] = True
+            context.metadata["short_circuit_action"] = eval_res.action.value
+            context.metadata["matched_rule_id"] = eval_res.matched_rule_id
+            context.metadata["matched_rule_name"] = eval_res.matched_rule_name
+
+        context.metadata["tenant_thresholds"] = {
+            "decline": tenant.risk_profile.decline_threshold,
+            "challenge": tenant.risk_profile.challenge_threshold,
+            "review": tenant.risk_profile.review_threshold,
+        }
+
+        return {
+            "tenant_id": tenant.tenant_id,
+            "tenant_tier": tenant.tier.value,
+            "tenant_status": tenant.status.value,
+            "is_suspended": False,
+            "matched": eval_res.matched,
+            "matched_rule_id": eval_res.matched_rule_id,
+            "matched_rule_name": eval_res.matched_rule_name,
+            "action": eval_res.action.value if eval_res.action is not None else None,
+            "reason": eval_res.reason,
+            "short_circuited": short_circuit,
+            "thresholds": context.metadata["tenant_thresholds"],
+        }
+
+
+TenantPartitionStage = TenantPartitionStageProcessor
+
+
 class RuleStageProcessor:
     """Evaluates declarative rules against current transaction features."""
 
@@ -1351,11 +1445,24 @@ class ActionAggregatorStageProcessor:
 
     def __call__(self, context: PipelineContext) -> dict[str, Any]:
         rules_out = context.get_output(self.rules_node_name) or {}
+        tenant_out = context.get_output("tenant_partition") or {}
         cal_out = context.get_output(self.calibration_node_name) or {}
         inf_out = context.get_output(self.inference_node_name) or {}
 
-        matched_rule = rules_out.get("matched_rule_id")
-        rule_action = rules_out.get("action")
+        # Prioritize tenant matched rule, then global rule, or short-circuit metadata
+        if tenant_out.get("matched") and tenant_out.get("matched_rule_id"):
+            matched_rule = tenant_out.get("matched_rule_id")
+            rule_action = tenant_out.get("action")
+        elif rules_out.get("matched_rule_id"):
+            matched_rule = rules_out.get("matched_rule_id")
+            rule_action = rules_out.get("action")
+        elif context.metadata.get("short_circuit"):
+            matched_rule = context.metadata.get("matched_rule_id")
+            rule_action = context.metadata.get("short_circuit_action")
+        else:
+            matched_rule = None
+            rule_action = None
+
         contributions = inf_out.get("contributions")
 
         prob = cal_out.get("calibrated_probability")
@@ -1364,19 +1471,25 @@ class ActionAggregatorStageProcessor:
         if prob is None and inf_out.get("probability") is not None:
             prob = inf_out.get("probability")
 
+        # Resolve effective thresholds (respecting tenant thresholds if configured)
+        tenant_thresholds = context.metadata.get("tenant_thresholds") or {}
+        effective_deny = tenant_thresholds.get("decline", self.deny_threshold)
+        effective_review = tenant_thresholds.get("review", self.review_threshold)
+        effective_threshold = tenant_thresholds.get("challenge", self.threshold)
+
         model_action: str
         if prob is not None:
-            if self.review_threshold is not None and self.deny_threshold is not None:
-                if prob >= self.deny_threshold:
+            if effective_review is not None and effective_deny is not None:
+                if prob >= effective_deny:
                     model_action = DecisionAction.DENY.value
-                elif prob >= self.review_threshold:
+                elif prob >= effective_review:
                     model_action = DecisionAction.CHALLENGE.value
                 else:
                     model_action = DecisionAction.ALLOW.value
             else:
                 model_action = (
                     DecisionAction.DENY.value
-                    if prob >= self.threshold
+                    if prob >= effective_threshold
                     else DecisionAction.ALLOW.value
                 )
         else:
@@ -1405,9 +1518,9 @@ class ActionAggregatorStageProcessor:
             "matched_rule": matched_rule,
             "rule_action": rule_action,
             "contributions": contributions,
-            "threshold": self.threshold,
-            "review_threshold": self.review_threshold,
-            "deny_threshold": self.deny_threshold,
+            "threshold": effective_threshold,
+            "review_threshold": effective_review,
+            "deny_threshold": effective_deny,
         }
 
 
@@ -1929,6 +2042,8 @@ def create_default_fraud_pipeline(
     merchant_tracker: MerchantTracker | None = None,
     merchant_feature_extractor: MerchantFeatureExtractor | None = None,
     merchant_enrichment_timeout_seconds: float | None = 0.25,
+    tenant_registry: TenantRegistry | None = None,
+    tenant_stage_timeout_seconds: float | None = 0.25,
 ) -> DecisionGraph:
     """Build a standard, production-ready fraud decision execution graph."""
     applied_threshold = model.threshold if threshold is None else threshold
@@ -2060,6 +2175,25 @@ def create_default_fraud_pipeline(
             )
         )
         upstream_deps = ["merchant_enrichment"]
+
+    if tenant_registry is not None:
+        tenant_proc = TenantPartitionStageProcessor(
+            registry=tenant_registry,
+            base_ruleset=rules,
+        )
+        graph.add_node(
+            PipelineNode(
+                name="tenant_partition",
+                stage_type=StageType.RULES,
+                processor=tenant_proc,
+                dependencies=list(upstream_deps),
+                timeout_seconds=tenant_stage_timeout_seconds,
+                fallback_value={},
+                required=False,
+                circuit_policy=circuit_policy,
+            )
+        )
+        upstream_deps = ["tenant_partition"]
 
     rule_proc = RuleStageProcessor(rules=rules)
     graph.add_node(

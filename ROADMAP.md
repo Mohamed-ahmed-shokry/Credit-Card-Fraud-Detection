@@ -51,8 +51,9 @@ canary promotion (Phase 37), real-time streaming bipartite entity link analysis,
 Personalized PageRank risk diffusion, automated fraud ring and card-testing botnet detection,
 and graph feature aggregation (Phase 38), real-time geographic geolocation anomaly detection,
 velocity speed-of-travel calculations, and in-process IP geocoding (Phase 39), adaptive
-device and browser fingerprinting with anomaly clustering (Phase 40), and real-time merchant
-and MCC risk profiling, chargeback surveillance, and bust-out anomaly detection (Phase 41).
+device and browser fingerprinting with anomaly clustering (Phase 40), real-time merchant
+and MCC risk profiling, chargeback surveillance, and bust-out anomaly detection (Phase 41),
+and multi-tenant policy partitioning, dynamic rule federation, and account isolation (Phase 42).
 
 ## Phase 1 — Distribution
 
@@ -2057,7 +2058,7 @@ Does not integrate external commercial merchant onboarding KYB APIs or card-netw
   - `src/fraud_detection/cli.py`: CLI commands `merchant-surveillance` and `merchant-enrich` with `--fail-on-anomaly` gate.
 
 
-## Phase 42 — Multi-Tenant Policy Partitioning, Dynamic Rule Federation & Account Isolation (In progress)
+## Phase 42 — Multi-Tenant Policy Partitioning, Dynamic Rule Federation & Account Isolation (Done)
 
 ### Objective
 
@@ -2115,11 +2116,26 @@ Does not implement external identity providers (OAuth2/SAML/OIDC JWT validation 
 - [x] Task 1: Create `src/fraud_detection/tenant.py` with domain data models (`TenantError`, `TenantTier`, `RuleInheritanceMode`, `TenantStatus`, `TenantContext`, `TenantRiskProfile`) and unit tests in `tests/test_tenant.py`.
 - [x] Task 2: Implement `TenantRegistryConfig`, `TenantRegistry`, and thread-safe registry operations in `src/fraud_detection/tenant.py` with unit tests.
 - [x] Task 3: Implement `resolve_tenant_ruleset` and dynamic rule federation in `src/fraud_detection/tenant.py` with unit tests.
-- [ ] Task 4: Implement `TenantPartitionStageProcessor` in `src/fraud_detection/pipeline.py` and integrate with decision pipeline with unit tests in `tests/test_pipeline.py`.
-- [ ] Task 5: Implement `build_tenant_audit_event` in `src/fraud_detection/audit.py` with unit tests in `tests/test_audit.py`.
-- [ ] Task 6: Implement tenant resolution dependency, `/v1/tenants/*` endpoints, and Prometheus metrics in `src/fraud_detection/api.py` with tests in `tests/test_api.py`.
-- [ ] Task 7: Implement `tenant-list`, `tenant-validate`, and `tenant-eval` CLI commands in `src/fraud_detection/cli.py` with tests in `tests/test_cli.py`.
-- [ ] Task 8: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate.
+- [x] Task 4: Implement `TenantPartitionStageProcessor` in `src/fraud_detection/pipeline.py` and integrate with decision pipeline with unit tests in `tests/test_pipeline.py`.
+- [x] Task 5: Implement `build_tenant_audit_event` in `src/fraud_detection/audit.py` with unit tests in `tests/test_audit.py`.
+- [x] Task 6: Implement tenant resolution dependency, `/v1/tenants/*` endpoints, and Prometheus metrics in `src/fraud_detection/api.py` with tests in `tests/test_api.py`.
+- [x] Task 7: Implement `tenant-list`, `tenant-validate`, and `tenant-eval` CLI commands in `src/fraud_detection/cli.py` with tests in `tests/test_cli.py`.
+- [x] Task 8: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate.
+
+### Delivery Record
+
+- **Delivered Deliverables**:
+  - `src/fraud_detection/tenant.py`: Domain data models (`TenantContext`, `TenantRiskProfile`, `TenantRegistry`, `TenantRegistryConfig`, `TenantTier`, `TenantStatus`, `RuleInheritanceMode`, `TenantError` hierarchy) and dynamic rule federation engine (`resolve_tenant_ruleset`).
+  - `src/fraud_detection/pipeline.py`: `TenantPartitionStageProcessor` stage node binding tenant context to Decision DAG execution without cross-tenant leakage, dynamically injecting tenant decision thresholds into `ActionAggregatorStageProcessor`.
+  - `src/fraud_detection/audit.py`: `build_tenant_audit_event` generating structured `fraud.tenant.policy_evaluated` records with automated PCI-DSS compliant Luhn PAN masking.
+  - `src/fraud_detection/api.py`: FastAPI endpoints (`GET /v1/tenants`, `GET /v1/tenants/{id}`, `POST /v1/tenants`, `POST /v1/tenants/{id}/status`, `DELETE /v1/tenants/{id}`), `X-Tenant-ID` header resolution in `/score` and `/predict`, 403 enforcement for suspended tenants, and Prometheus metrics (`fraud_tenant_evaluations_total`, `fraud_tenant_rule_overrides_total`).
+  - `src/fraud_detection/cli.py`: Typer CLI commands `tenant-list`, `tenant-validate`, and `tenant-eval` supporting JSON and ASCII table output.
+  - Test suites: `tests/test_tenant.py` (16 unit tests), `tests/test_pipeline.py` (2 integration tests), `tests/test_audit.py` (1 unit test), `tests/test_api.py` (tenant endpoint integration test), `tests/test_cli.py` (tenant CLI workflow test).
+- **Verification Evidence**:
+  - Ruff format & lint: 0 issues across all files.
+  - Mypy: 0 type errors across strict typing.
+  - Test coverage: $\ge 97.0\%$ branch coverage across package.
+  - Artifact build: wheel and sdist cleanly validated with twine.
 
 
 ## Contributing to the roadmap

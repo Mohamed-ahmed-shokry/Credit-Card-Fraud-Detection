@@ -147,6 +147,16 @@ from fraud_detection.telemetry import (
     TraceSpan,
     parse_traceparent,
 )
+from fraud_detection.tenant import (
+    RuleInheritanceMode,
+    TenantContext,
+    TenantNotFoundError,
+    TenantRegistry,
+    TenantRiskProfile,
+    TenantStatus,
+    TenantTier,
+    TenantValidationError,
+)
 from fraud_detection.velocity import (
     VelocityConfig,
     VelocityWindowBuffer,
@@ -237,6 +247,8 @@ OPERATIONAL_PATHS = frozenset(
         "/v1/merchant/stats",
         "/v1/merchant/assess",
         "/v1/merchant/reset",
+        "/v1/tenants",
+        "/v1/tenants/",
     }
 )
 UNMATCHED_ROUTE_LABEL = "unmatched"
@@ -1375,6 +1387,67 @@ class MerchantResetResponse(BaseModel):
     message: str = "Merchant tracker reset successfully."
 
 
+class TenantRiskProfileModel(BaseModel):
+    """Configurable risk and threshold parameters for a tenant."""
+
+    decline_threshold: float = 0.85
+    challenge_threshold: float = 0.60
+    review_threshold: float = 0.35
+    max_amount_per_tx: float | None = None
+    velocity_tx_limit_1h: int | None = None
+    chargeback_rate_limit: float = 0.015
+    rule_inheritance_mode: str = "inherit_and_override"
+    feature_overrides: dict[str, float] = Field(default_factory=dict)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class TenantContextResponse(BaseModel):
+    """Full detail response model for a registered tenant."""
+
+    tenant_id: str
+    tier: str
+    status: str
+    is_active: bool
+    rate_limit_rpm: int
+    created_at: str
+    tags: list[str] = Field(default_factory=list)
+    risk_profile: TenantRiskProfileModel
+
+
+class TenantSummaryModel(BaseModel):
+    """Summary item in tenant list."""
+
+    tenant_id: str
+    tier: str
+    status: str
+    is_active: bool
+    rate_limit_rpm: int
+
+
+class TenantListResponse(BaseModel):
+    """Response containing list of registered tenants."""
+
+    total_count: int
+    tenants: list[TenantSummaryModel]
+
+
+class TenantRegisterRequest(BaseModel):
+    """Payload to register or update a tenant context."""
+
+    tenant_id: str
+    tier: str = "standard"
+    status: str = "active"
+    rate_limit_rpm: int = 1000
+    tags: list[str] = Field(default_factory=list)
+    risk_profile: TenantRiskProfileModel | None = None
+
+
+class TenantStatusUpdateRequest(BaseModel):
+    """Payload to update a tenant's lifecycle status."""
+
+    status: str
+
+
 def create_app(
     *,
     model: FraudModel | None = None,
@@ -1453,6 +1526,7 @@ def create_app(
     merchant_window_seconds: float = 86400.0,
     merchant_max_merchants: int = 50000,
     merchant_chargeback_rate_threshold: float = 0.015,
+    tenant_registry: TenantRegistry | None = None,
 ) -> FastAPI:
     """Create an application using an injected model or a trusted artifact path.
 
@@ -1796,6 +1870,18 @@ def create_app(
         )
 
     metrics_registry = CollectorRegistry()
+    tenant_evaluations_counter = Counter(
+        "fraud_tenant_evaluations_total",
+        "Total fraud evaluations categorized by tenant ID, tier, and outcome.",
+        ["tenant_id", "tier", "outcome"],
+        registry=metrics_registry,
+    )
+    tenant_rule_overrides_counter = Counter(
+        "fraud_tenant_rule_overrides_total",
+        "Total rule matches triggered on tenant custom or federated rules.",
+        ["tenant_id", "rule_id"],
+        registry=metrics_registry,
+    )
     merchant_anomalies_counter = Counter(
         "fraud_merchant_anomalies_total",
         "Total merchant risk and chargeback anomalies detected by anomaly type.",
@@ -2320,6 +2406,10 @@ def create_app(
         application.state.merchant_anomalies_counter = merchant_anomalies_counter
         application.state.merchant_evaluations_counter = merchant_evaluations_counter
         application.state.merchant_tracked_gauge = merchant_tracked_gauge
+        resolved_tenant_registry = tenant_registry or TenantRegistry()
+        application.state.tenant_registry = resolved_tenant_registry
+        application.state.tenant_evaluations_counter = tenant_evaluations_counter
+        application.state.tenant_rule_overrides_counter = tenant_rule_overrides_counter
         application.state.audit_sink = resolved_audit_sink
         application.state.explanation_provider = explanation_provider
         application.state.fallback_mode = resolved_fallback_mode
@@ -2418,7 +2508,12 @@ def create_app(
         call_next: RequestResponseEndpoint,
     ) -> Response:
         is_operational = request.url.path in OPERATIONAL_PATHS or request.url.path.startswith(
-            ("/v1/device/profile/", "/v1/geo/velocity/", "/v1/merchant/profile/")
+            (
+                "/v1/device/profile/",
+                "/v1/geo/velocity/",
+                "/v1/merchant/profile/",
+                "/v1/tenants/",
+            )
         )
         if (
             api_key_set is not None
@@ -2439,7 +2534,12 @@ def create_app(
         # Registered after the API-key middleware, so it runs outside it: unauthenticated
         # traffic has to consume the client budget, otherwise key guessing is unmetered.
         is_operational = request.url.path in OPERATIONAL_PATHS or request.url.path.startswith(
-            ("/v1/device/profile/", "/v1/geo/velocity/", "/v1/merchant/profile/")
+            (
+                "/v1/device/profile/",
+                "/v1/geo/velocity/",
+                "/v1/merchant/profile/",
+                "/v1/tenants/",
+            )
         )
         if rate_limiter is None or is_operational:
             return await call_next(request)
@@ -3287,6 +3387,27 @@ def create_app(
         request: Request,
     ) -> PredictionResponse | JSONResponse:
         loaded = _model_from_request(request)
+        tenant_registry: TenantRegistry | None = getattr(request.app.state, "tenant_registry", None)
+        active_tenant: TenantContext | None = None
+        if tenant_registry is not None:
+            header_tenant = request.headers.get("X-Tenant-ID") or "default"
+            try:
+                active_tenant = tenant_registry.get(header_tenant)
+            except TenantNotFoundError:
+                return JSONResponse(
+                    status_code=404,
+                    content={"detail": f"Tenant '{header_tenant}' not found in registry"},
+                )
+            if not active_tenant.is_active:
+                return JSONResponse(
+                    status_code=403,
+                    content={
+                        "detail": (
+                            f"Tenant '{active_tenant.tenant_id}' is "
+                            f"{active_tenant.status.value} and cannot process requests"
+                        )
+                    },
+                )
         vel_buf: VelocityWindowBuffer | None = getattr(request.app.state, "velocity_buffer", None)
         vel_cfg: VelocityConfig | None = getattr(request.app.state, "velocity_config", None)
         vel_counter: Counter | None = getattr(
@@ -3374,6 +3495,27 @@ def create_app(
         request: Request,
     ) -> ScoreResponse | JSONResponse:
         loaded = _model_from_request(request)
+        tenant_registry: TenantRegistry | None = getattr(request.app.state, "tenant_registry", None)
+        active_tenant: TenantContext | None = None
+        if tenant_registry is not None:
+            header_tenant = request.headers.get("X-Tenant-ID") or "default"
+            try:
+                active_tenant = tenant_registry.get(header_tenant)
+            except TenantNotFoundError:
+                return JSONResponse(
+                    status_code=404,
+                    content={"detail": f"Tenant '{header_tenant}' not found in registry"},
+                )
+            if not active_tenant.is_active:
+                return JSONResponse(
+                    status_code=403,
+                    content={
+                        "detail": (
+                            f"Tenant '{active_tenant.tenant_id}' is "
+                            f"{active_tenant.status.value} and cannot process requests"
+                        )
+                    },
+                )
         vel_buf: VelocityWindowBuffer | None = getattr(request.app.state, "velocity_buffer", None)
         vel_cfg: VelocityConfig | None = getattr(request.app.state, "velocity_config", None)
         vel_counter: Counter | None = getattr(
@@ -3565,6 +3707,18 @@ def create_app(
                         dev_anom_c.labels(anomaly_type="card_cycling").inc()
                     if dev_feats.get("device_is_device_cycling") == 1.0:
                         dev_anom_c.labels(anomaly_type="device_cycling").inc()
+
+        if active_tenant is not None:
+            t_eval_counter: Counter | None = getattr(
+                request.app.state, "tenant_evaluations_counter", None
+            )
+            if t_eval_counter is not None:
+                for r in results:
+                    t_eval_counter.labels(
+                        tenant_id=active_tenant.tenant_id,
+                        tier=active_tenant.tier.value,
+                        outcome=r.decision,
+                    ).inc()
 
         return ScoreResponse(
             model_version=_model_version(loaded),
@@ -4242,6 +4396,232 @@ def create_app(
             cleared_merchants=cleared,
             message="Merchant tracker reset successfully.",
         )
+
+    @application.get(
+        "/v1/tenants",
+        response_model=TenantListResponse,
+        tags=["tenants"],
+    )
+    async def list_tenants_endpoint(
+        request: Request,
+        limit: int = 100,
+    ) -> TenantListResponse:
+        """List all registered tenants and their operational status."""
+        reg: TenantRegistry | None = getattr(request.app.state, "tenant_registry", None)
+        if reg is None:
+            return TenantListResponse(total_count=0, tenants=[])
+        tenants = reg.list_tenants(limit=limit)
+        summaries = [
+            TenantSummaryModel(
+                tenant_id=t.tenant_id,
+                tier=t.tier.value,
+                status=t.status.value,
+                is_active=t.is_active,
+                rate_limit_rpm=t.rate_limit_rpm,
+            )
+            for t in tenants
+        ]
+        return TenantListResponse(total_count=reg.count(), tenants=summaries)
+
+    @application.get(
+        "/v1/tenants/{tenant_id}",
+        response_model=TenantContextResponse,
+        responses={404: {"description": "Tenant not found."}},
+        tags=["tenants"],
+    )
+    async def get_tenant_endpoint(
+        tenant_id: str,
+        request: Request,
+    ) -> TenantContextResponse | JSONResponse:
+        """Retrieve full configuration and risk profile for a specific tenant."""
+        reg: TenantRegistry | None = getattr(request.app.state, "tenant_registry", None)
+        if reg is None:
+            return JSONResponse(
+                status_code=404, content={"detail": "Tenant registry not initialized"}
+            )
+        try:
+            t = reg.get(tenant_id)
+            if reg.config.strict_isolation and t.tenant_id != tenant_id:
+                return JSONResponse(
+                    status_code=404, content={"detail": f"Tenant '{tenant_id}' not found"}
+                )
+        except TenantNotFoundError:
+            return JSONResponse(
+                status_code=404, content={"detail": f"Tenant '{tenant_id}' not found"}
+            )
+
+        rp = t.risk_profile
+        return TenantContextResponse(
+            tenant_id=t.tenant_id,
+            tier=t.tier.value,
+            status=t.status.value,
+            is_active=t.is_active,
+            rate_limit_rpm=t.rate_limit_rpm,
+            created_at=t.created_at,
+            tags=list(t.tags),
+            risk_profile=TenantRiskProfileModel(
+                decline_threshold=rp.decline_threshold,
+                challenge_threshold=rp.challenge_threshold,
+                review_threshold=rp.review_threshold,
+                max_amount_per_tx=rp.max_amount_per_tx,
+                velocity_tx_limit_1h=rp.velocity_tx_limit_1h,
+                chargeback_rate_limit=rp.chargeback_rate_limit,
+                rule_inheritance_mode=rp.rule_inheritance_mode.value,
+                feature_overrides=dict(rp.feature_overrides),
+                metadata=dict(rp.metadata),
+            ),
+        )
+
+    @application.post(
+        "/v1/tenants",
+        response_model=TenantContextResponse,
+        responses={400: {"description": "Invalid tenant payload."}},
+        tags=["tenants"],
+    )
+    async def register_tenant_endpoint(
+        payload: TenantRegisterRequest,
+        request: Request,
+    ) -> TenantContextResponse | JSONResponse:
+        """Register or update a tenant context and risk profile."""
+        reg: TenantRegistry | None = getattr(request.app.state, "tenant_registry", None)
+        if reg is None:
+            return JSONResponse(
+                status_code=400, content={"detail": "Tenant registry not initialized"}
+            )
+        try:
+            tier = TenantTier(payload.tier.lower())
+            status = TenantStatus(payload.status.lower())
+            rp_req = payload.risk_profile
+            if rp_req:
+                mode = RuleInheritanceMode(rp_req.rule_inheritance_mode.lower())
+                risk_profile = TenantRiskProfile(
+                    decline_threshold=rp_req.decline_threshold,
+                    challenge_threshold=rp_req.challenge_threshold,
+                    review_threshold=rp_req.review_threshold,
+                    max_amount_per_tx=rp_req.max_amount_per_tx,
+                    velocity_tx_limit_1h=rp_req.velocity_tx_limit_1h,
+                    chargeback_rate_limit=rp_req.chargeback_rate_limit,
+                    rule_inheritance_mode=mode,
+                    feature_overrides=dict(rp_req.feature_overrides),
+                    metadata=dict(rp_req.metadata),
+                )
+            else:
+                risk_profile = TenantRiskProfile()
+
+            context = TenantContext(
+                tenant_id=payload.tenant_id,
+                tier=tier,
+                status=status,
+                risk_profile=risk_profile,
+                rate_limit_rpm=payload.rate_limit_rpm,
+                tags=tuple(payload.tags),
+            )
+            reg.register(context, overwrite=True)
+        except (TenantValidationError, ValueError) as exc:
+            return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+        return TenantContextResponse(
+            tenant_id=context.tenant_id,
+            tier=context.tier.value,
+            status=context.status.value,
+            is_active=context.is_active,
+            rate_limit_rpm=context.rate_limit_rpm,
+            created_at=context.created_at,
+            tags=list(context.tags),
+            risk_profile=TenantRiskProfileModel(
+                decline_threshold=risk_profile.decline_threshold,
+                challenge_threshold=risk_profile.challenge_threshold,
+                review_threshold=risk_profile.review_threshold,
+                max_amount_per_tx=risk_profile.max_amount_per_tx,
+                velocity_tx_limit_1h=risk_profile.velocity_tx_limit_1h,
+                chargeback_rate_limit=risk_profile.chargeback_rate_limit,
+                rule_inheritance_mode=risk_profile.rule_inheritance_mode.value,
+                feature_overrides=dict(risk_profile.feature_overrides),
+                metadata=dict(risk_profile.metadata),
+            ),
+        )
+
+    @application.post(
+        "/v1/tenants/{tenant_id}/status",
+        response_model=TenantContextResponse,
+        responses={
+            404: {"description": "Tenant not found."},
+            400: {"description": "Invalid status."},
+        },
+        tags=["tenants"],
+    )
+    async def update_tenant_status_endpoint(
+        tenant_id: str,
+        payload: TenantStatusUpdateRequest,
+        request: Request,
+    ) -> TenantContextResponse | JSONResponse:
+        """Update the lifecycle status of an existing tenant."""
+        reg: TenantRegistry | None = getattr(request.app.state, "tenant_registry", None)
+        if reg is None:
+            return JSONResponse(
+                status_code=404, content={"detail": "Tenant registry not initialized"}
+            )
+        try:
+            new_status = TenantStatus(payload.status.lower())
+            updated = reg.update_status(tenant_id, new_status)
+        except TenantNotFoundError:
+            return JSONResponse(
+                status_code=404, content={"detail": f"Tenant '{tenant_id}' not found"}
+            )
+        except ValueError as exc:
+            return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+        rp = updated.risk_profile
+        return TenantContextResponse(
+            tenant_id=updated.tenant_id,
+            tier=updated.tier.value,
+            status=updated.status.value,
+            is_active=updated.is_active,
+            rate_limit_rpm=updated.rate_limit_rpm,
+            created_at=updated.created_at,
+            tags=list(updated.tags),
+            risk_profile=TenantRiskProfileModel(
+                decline_threshold=rp.decline_threshold,
+                challenge_threshold=rp.challenge_threshold,
+                review_threshold=rp.review_threshold,
+                max_amount_per_tx=rp.max_amount_per_tx,
+                velocity_tx_limit_1h=rp.velocity_tx_limit_1h,
+                chargeback_rate_limit=rp.chargeback_rate_limit,
+                rule_inheritance_mode=rp.rule_inheritance_mode.value,
+                feature_overrides=dict(rp.feature_overrides),
+                metadata=dict(rp.metadata),
+            ),
+        )
+
+    @application.delete(
+        "/v1/tenants/{tenant_id}",
+        responses={
+            400: {"description": "Cannot delete default tenant."},
+            404: {"description": "Tenant not found."},
+        },
+        tags=["tenants"],
+    )
+    async def delete_tenant_endpoint(
+        tenant_id: str,
+        request: Request,
+    ) -> JSONResponse:
+        """Delete a registered tenant context."""
+        reg: TenantRegistry | None = getattr(request.app.state, "tenant_registry", None)
+        if reg is None:
+            return JSONResponse(
+                status_code=404, content={"detail": "Tenant registry not initialized"}
+            )
+        try:
+            deleted = reg.delete(tenant_id)
+            if not deleted:
+                return JSONResponse(
+                    status_code=404, content={"detail": f"Tenant '{tenant_id}' not found"}
+                )
+            return JSONResponse(
+                status_code=200, content={"detail": f"Tenant '{tenant_id}' deleted successfully"}
+            )
+        except TenantValidationError as exc:
+            return JSONResponse(status_code=400, content={"detail": str(exc)})
 
     @application.get(
         "/v1/routing/status",

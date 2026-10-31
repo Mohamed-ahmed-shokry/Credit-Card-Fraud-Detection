@@ -32,6 +32,7 @@ from fraud_detection.audit import (
     build_retraining_trigger_audit_event,
     build_scoring_audit_event,
     build_shadow_scoring_audit_event,
+    build_tenant_audit_event,
     redact_data,
     replay_audit_log,
 )
@@ -1469,3 +1470,38 @@ def test_build_merchant_anomaly_audit_event() -> None:
     assert mapping_event.payload["is_card_testing"] is True
     assert mapping_event.payload["distinct_cards_count"] == 7
     assert mapping_event.payload["severity"] == "HIGH"
+
+
+def test_build_tenant_audit_event() -> None:
+    """Validate construction and sanitization of tenant audit event."""
+    pan_id = "4532015112830366"  # Valid Luhn PAN inside transaction id
+    event = build_tenant_audit_event(
+        tenant_id="tenant_fintech_enterprise",
+        tier="enterprise",
+        status="active",
+        transaction_id=pan_id,
+        action="DENY",
+        matched_rule_id="RULE_TENANT_HIGH_RISK",
+        matched_rule_name="Tenant High Risk Block",
+        is_suspended=False,
+        thresholds={"decline": 0.90, "challenge": 0.65, "review": 0.40},
+        metadata={"operator": "fraud_lead", "api_key": "secret_key_123"},
+    )
+
+    assert event.event_type == "fraud.tenant.policy_evaluated"
+    assert event.payload["tenant_id"] == "tenant_fintech_enterprise"
+    assert event.payload["tier"] == "enterprise"
+    assert event.payload["status"] == "active"
+    assert event.payload["action"] == "DENY"
+    assert event.payload["matched_rule_id"] == "RULE_TENANT_HIGH_RISK"
+    assert event.payload["matched_rule_name"] == "Tenant High Risk Block"
+    assert event.payload["is_suspended"] is False
+    assert event.payload["thresholds"]["decline"] == 0.90
+
+    # Ensure PAN in transaction_id was redacted
+    assert event.payload["transaction_id"] == "[REDACTED_PAN]"
+
+    # Redaction test through to_dict
+    d = event.to_dict(redact=True)
+    assert d["payload"]["metadata"]["api_key"] == "[REDACTED]"
+    assert d["payload"]["metadata"]["operator"] == "fraud_lead"

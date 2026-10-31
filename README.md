@@ -1796,6 +1796,33 @@ FastAPI endpoints surface real-time merchant risk profiling and surveillance:
 - `POST /v1/merchant/assess`: Evaluate candidate merchant transaction event (optionally recording state via `"record": true` and emitting redacted audit events on anomaly).
 - `POST /v1/merchant/reset`: Reset tracked merchant profiles and sliding windows.
 
+## Multi-tenant policy partitioning, dynamic rule federation & account isolation
+
+Payment gateways and multi-client fraud management platforms require strict account isolation and custom risk thresholds without deploying redundant model instances. The multi-tenant policy subsystem (`tenant.py`) partitions transaction evaluations by client identity (`X-Tenant-ID`), enforces tenant-specific risk profiles (`decline_threshold`, `challenge_threshold`, `review_threshold`, `max_amount_per_tx`), dynamic rule federation (`OVERRIDE_ONLY`, `INHERIT_AND_OVERRIDE`, `ISOLATED`), thread-safe capacity bounding with LRU eviction, and PCI-DSS redacted audit logs:
+
+```bash
+# List registered tenant partitions and operational statuses
+fraud-detect tenant-list --format table
+
+# Validate a tenant manifest or configuration file against semantic and threshold constraints
+fraud-detect tenant-validate --manifest-file config/tenants.json --strict
+
+# Score a transaction batch under an explicit tenant policy partition and thresholds
+fraud-detect tenant-eval \
+  --input-file data/transactions.csv \
+  --tenant-id fintech_alpha \
+  --output-file reports/tenant_eval.csv \
+  --format table
+```
+
+FastAPI multi-tenant REST endpoints and telemetry:
+- `GET /v1/tenants`: List registered tenant partitions, rate limits, tiers, and operational statuses.
+- `GET /v1/tenants/{tenant_id}`: Retrieve full runtime context and custom risk profiles for a tenant.
+- `POST /v1/tenants`: Dynamically register a new tenant context with thread-safe LRU capacity bounding.
+- `POST /v1/tenants/{tenant_id}/status`: Transition tenant lifecycle state (`active`, `suspended`, `deprecated`). Requests from suspended tenants receive `403 Forbidden`.
+- `DELETE /v1/tenants/{tenant_id}`: Unregister a tenant partition (protected against deleting default tenant).
+- `X-Tenant-ID` header: Evaluates `/score` and `/predict` transactions against the designated tenant's federated rules and decision thresholds, recording Prometheus metrics (`fraud_tenant_evaluations_total`, `fraud_tenant_rule_overrides_total`).
+
 ## Reference label-delay analysis
 
 
@@ -1855,6 +1882,7 @@ src/fraud_detection/
 ├── rules.py          # declarative rule engine and expert override policies
 ├── signing.py        # Ed25519 signing and trusted public-key verification
 ├── telemetry.py      # trace propagation and optional OTLP export
+├── tenant.py         # multi-tenant policy partitioning, dynamic rule federation, and account isolation
 ├── trust.py          # rotating trust bundles and deployment admission
 └── velocity.py       # sliding-window behavioral aggregations and feature enrichment
 tests/                # unit, integration, CLI, and API tests
