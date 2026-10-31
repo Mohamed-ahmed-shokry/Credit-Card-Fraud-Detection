@@ -378,6 +378,15 @@ class DeadLetterQueue:
         with self._lock:
             return self._records.pop(record_id, None) is not None
 
+    def acknowledge(self, record_id: str) -> bool:
+        """Acknowledge and remove a record from the DLQ. Returns True if removed."""
+        return self.remove(record_id)
+
+    @property
+    def size(self) -> int:
+        """Return current count of queued dead letter records."""
+        return self.count()
+
     def list_records(
         self,
         limit: int = 100,
