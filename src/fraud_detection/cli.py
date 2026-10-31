@@ -8527,9 +8527,10 @@ def webhook_replay_dlq(
     except (OSError, json.JSONDecodeError) as exc:
         _abort(f"Failed to read DLQ file {dlq_file}: {exc}")
 
-    records_data = raw_data.get("records", [])
-    if not isinstance(records_data, list):
+    if "records" not in raw_data or not isinstance(raw_data["records"], list):
         _abort(f"Invalid DLQ file structure: expected top-level 'records' array in {dlq_file}")
+
+    records_data = raw_data["records"]
 
     records: list[DeadLetterRecord] = []
     for item in records_data:
