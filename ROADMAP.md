@@ -2198,7 +2198,7 @@ Does not implement external message brokers (Kafka/RabbitMQ/Redis Streams) as ex
 - [x] Task 1: Create `src/fraud_detection/events.py` with domain event models (`EventType`, `EventDeliveryStatus`, `FraudDomainEvent`, `WebhookSubscription`, `EventError` hierarchy) and unit tests in `tests/test_events.py`.
 - [x] Task 2: Implement HMAC-SHA256 signature generation/verification and PCI-DSS payload sanitization in `src/fraud_detection/events.py` with unit tests.
 - [x] Task 3: Implement `DeadLetterQueue`, `DispatchConfig`, and `WebhookDispatcher` with jittered exponential backoff and circuit breaking in `src/fraud_detection/events.py` with unit tests.
-- [ ] Task 4: Implement in-memory thread-safe `EventBus` and Decision DAG event publisher in `src/fraud_detection/events.py` and `src/fraud_detection/pipeline.py` with unit tests.
+- [x] Task 4: Implement in-memory thread-safe `EventBus` and Decision DAG event publisher in `src/fraud_detection/events.py` and `src/fraud_detection/pipeline.py` with unit tests.
 - [ ] Task 5: Implement `/v1/webhooks/*` endpoints, test ping dispatcher, and Prometheus metrics in `src/fraud_detection/api.py` with integration tests in `tests/test_api.py`.
 - [ ] Task 6: Implement CLI commands `webhook-list`, `webhook-test`, and `webhook-replay-dlq` in `src/fraud_detection/cli.py` with tests in `tests/test_cli.py`.
 - [ ] Task 7: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate.
