@@ -8,6 +8,8 @@ dead-letter queue (DLQ) persistent retention.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import re
 import time
 from dataclasses import dataclass, field
@@ -16,6 +18,8 @@ from enum import StrEnum
 from typing import Any
 from urllib.parse import urlparse
 from uuid import uuid4
+
+from fraud_detection.audit import redact_data
 
 __all__ = [
     "DeadLetterQueueError",
@@ -27,6 +31,9 @@ __all__ = [
     "SignatureVerificationError",
     "SubscriptionError",
     "WebhookSubscription",
+    "compute_webhook_signature",
+    "sanitize_event_payload",
+    "verify_webhook_signature",
 ]
 
 _IDENTIFIER_PATTERN = re.compile(r"^[a-zA-Z0-9_\-\.]{1,64}$")
@@ -75,6 +82,72 @@ class EventDeliveryStatus(StrEnum):
     FAILED = "failed"
     DEAD_LETTER = "dead_letter"
     FILTERED = "filtered"
+
+
+def sanitize_event_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Sanitize domain event payload ensuring PCI-DSS PAN masking and credential redaction."""
+    redacted = redact_data(payload, mask_value="[REDACTED]", mask_pan_values=True)
+    return redacted if isinstance(redacted, dict) else dict(payload)
+
+
+def compute_webhook_signature(
+    payload_bytes: bytes,
+    secret_token: str,
+    timestamp: int | None = None,
+) -> str:
+    """Compute HMAC-SHA256 signature header for webhook payload.
+
+    Formats the header as `t={timestamp},v1={hex_digest}`.
+    """
+    ts = int(time.time()) if timestamp is None else timestamp
+    signed_payload = f"{ts}.".encode() + payload_bytes
+    hex_digest = hmac.new(
+        secret_token.encode("utf-8"),
+        signed_payload,
+        hashlib.sha256,
+    ).hexdigest()
+    return f"t={ts},v1={hex_digest}"
+
+
+def verify_webhook_signature(
+    payload_bytes: bytes,
+    secret_token: str,
+    signature_header: str,
+    tolerance_seconds: float = 300.0,
+    current_time: float | None = None,
+) -> bool:
+    """Verify HMAC-SHA256 webhook signature and check timestamp replay skew.
+
+    Raises SignatureVerificationError if signature is invalid, missing, or expired.
+    """
+    if not signature_header or not secret_token:
+        raise SignatureVerificationError("Missing signature header or secret token")
+
+    parts = dict(item.split("=", 1) for item in signature_header.split(",") if "=" in item)
+    if "t" not in parts or "v1" not in parts:
+        raise SignatureVerificationError(
+            f"Invalid signature header format '{signature_header}': expected t=...,v1=..."
+        )
+
+    try:
+        ts = int(parts["t"])
+    except ValueError as exc:
+        raise SignatureVerificationError(f"Invalid timestamp in signature header: {exc}") from exc
+
+    now = time.time() if current_time is None else current_time
+    if abs(now - ts) > tolerance_seconds:
+        raise SignatureVerificationError(
+            f"Webhook signature timestamp expired or skewed: skew={abs(now - ts):.1f}s, "
+            f"tolerance={tolerance_seconds:.1f}s"
+        )
+
+    expected_sig = compute_webhook_signature(payload_bytes, secret_token, timestamp=ts)
+    expected_v1 = dict(item.split("=", 1) for item in expected_sig.split(",") if "=" in item)["v1"]
+
+    if not hmac.compare_digest(parts["v1"], expected_v1):
+        raise SignatureVerificationError("Webhook signature HMAC mismatch")
+
+    return True
 
 
 @dataclass(frozen=True)
