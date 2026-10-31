@@ -532,3 +532,128 @@ def test_event_bus_in_memory_and_webhook_dispatch() -> None:
     assert bus.unsubscribe("invalid_token") is False
 
     bus.close()
+    # Idempotent close
+    bus.close()
+
+
+def test_events_edge_cases_and_coverage(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Cover edge cases, properties, and error branches across events module."""
+    import urllib.error
+    import urllib.request
+    from typing import Any
+    from unittest.mock import MagicMock
+
+    dummy_secret = "tok_" + "x" * 20
+
+    # 1. Invalid timestamp in signature header
+    with pytest.raises(SignatureVerificationError, match="Invalid timestamp"):
+        verify_webhook_signature(b"data", dummy_secret, "t=not_a_number,v1=abc")
+
+    # 2. Invalid subscription_id and tenant_id patterns
+    with pytest.raises(SubscriptionError, match="Invalid subscription_id"):
+        WebhookSubscription(
+            subscription_id="bad#id!",
+            tenant_id="fintech_alpha",
+            target_url="https://api.example.com",
+            secret_token=dummy_secret,
+        )
+
+    with pytest.raises(SubscriptionError, match="Invalid tenant_id"):
+        WebhookSubscription(
+            subscription_id="sub_valid",
+            tenant_id="bad#tenant!",
+            target_url="https://api.example.com",
+            secret_token=dummy_secret,
+        )
+
+    # 3. WebhookSubscription.from_dict invalid event type
+    with pytest.raises(SubscriptionError, match="Invalid subscription dictionary"):
+        WebhookSubscription.from_dict(
+            {"target_url": "https://api.example.com", "subscribed_events": ["invalid.event"]}
+        )
+
+    # 4. DeadLetterRecord.from_dict invalid dictionary
+    with pytest.raises(DeadLetterQueueError, match="Invalid DeadLetterRecord"):
+        DeadLetterRecord.from_dict({"not_a_valid_record": True})
+
+    # 5. DeadLetterQueue clear tenant-specific vs all
+    dlq = DeadLetterQueue(max_size=10)
+    ev1 = FraudDomainEvent(tenant_id="tenant_a")
+    ev2 = FraudDomainEvent(tenant_id="tenant_b")
+    r1 = DeadLetterRecord(event=ev1, subscription_id="sub1", target_url="https://a.com")
+    r2 = DeadLetterRecord(event=ev2, subscription_id="sub2", target_url="https://b.com")
+    dlq.push(r1)
+    dlq.push(r2)
+    assert len(dlq) == 2
+    assert dlq.count(tenant_id="tenant_a") == 1
+    assert dlq.clear(tenant_id="tenant_a") == 1
+    assert len(dlq) == 1
+    assert dlq.clear() == 1
+    assert len(dlq) == 0
+
+    # 6. DispatchConfig and WebhookDispatcher config property
+    cfg = DispatchConfig(
+        max_retries=1,
+        initial_backoff_seconds=0.01,
+        jitter=False,
+    )
+    dispatcher = WebhookDispatcher(config=cfg)
+    assert dispatcher.config.jitter is False
+    assert dispatcher.dlq.size == 0
+
+    # 7. WebhookDispatcher retry backoff without jitter
+    sub = WebhookSubscription(
+        tenant_id="tenant_a",
+        target_url="https://a.com/wh",
+        secret_token=dummy_secret,
+        max_retries=1,
+    )
+    res = dispatcher.dispatch(sub, ev1)
+    assert res.status == EventDeliveryStatus.DEAD_LETTER
+
+    # 8. WebhookDispatcher._default_http_transport urllib mock
+    mock_resp = MagicMock()
+    mock_resp.status = 200
+    mock_resp.read.return_value = b'{"ok": true}'
+    mock_resp.__enter__.return_value = mock_resp
+
+    def fake_urlopen(*_args: Any, **_kwargs: Any) -> Any:
+        return mock_resp
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    status_code, body = WebhookDispatcher._default_http_transport(  # noqa: SLF001
+        "https://api.example.com", b"{}", {}, 5.0
+    )
+    assert status_code == 200
+    assert body == b'{"ok": true}'
+
+    # HTTPError handling in _default_http_transport
+    def fake_urlopen_err(*_args: Any, **_kwargs: Any) -> Any:
+        raise urllib.error.HTTPError("https://api.example.com", 400, "Bad Request", {}, None)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen_err)
+    err_code, _ = WebhookDispatcher._default_http_transport(  # noqa: SLF001
+        "https://api.example.com", b"{}", {}, 5.0
+    )
+    assert err_code == 400
+
+    # 9. Additional methods and edge cases
+    # Registry count with tenant_id filter
+    reg = SubscriptionRegistry()
+    reg.register(sub)
+    assert reg.count(tenant_id="tenant_a") == 1
+    assert reg.count(tenant_id="other") == 0
+
+    # DLQ list records limit
+    assert len(dlq.list_records(limit=0)) == 0
+
+    # EventBus properties and listeners count
+    bus = EventBus(registry=reg)
+    assert bus.registry is reg
+    assert bus.dispatcher is not None
+    assert bus.listeners_count == 0
+    token = bus.subscribe(lambda _ev: None, event_type=EventType.TRANSACTION_SCORED)
+    assert bus.listeners_count == 1
+    bus.unsubscribe(token)
+    assert bus.listeners_count == 0
+    bus.close()
