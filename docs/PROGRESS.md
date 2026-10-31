@@ -6,7 +6,7 @@
 - **Status**: In Progress
 
 ## Task Status
-- [ ] Task 1: Create `src/fraud_detection/events.py` with domain event models (`EventType`, `EventDeliveryStatus`, `FraudDomainEvent`, `WebhookSubscription`, `EventError` hierarchy) and unit tests in `tests/test_events.py`.
+- [x] Task 1: Create `src/fraud_detection/events.py` with domain event models (`EventType`, `EventDeliveryStatus`, `FraudDomainEvent`, `WebhookSubscription`, `EventError` hierarchy) and unit tests in `tests/test_events.py`.
 - [ ] Task 2: Implement HMAC-SHA256 signature generation/verification and PCI-DSS payload sanitization in `src/fraud_detection/events.py` with unit tests.
 - [ ] Task 3: Implement `DeadLetterQueue`, `DispatchConfig`, and `WebhookDispatcher` with jittered exponential backoff and circuit breaking in `src/fraud_detection/events.py` with unit tests.
 - [ ] Task 4: Implement in-memory thread-safe `EventBus` and Decision DAG event publisher in `src/fraud_detection/events.py` and `src/fraud_detection/pipeline.py` with unit tests.
@@ -17,7 +17,7 @@
 ## Acceptance Criteria Status
 | Criterion | Status | Evidence |
 |-----------|--------|----------|
-| AC-1 (Domain Models & Validation) | PENDING | |
+| AC-1 (Domain Models & Validation) | PASSED | 3 unit tests in `tests/test_events.py` verifying `FraudDomainEvent`, `WebhookSubscription`, status enums, matching, and validation error bounds. |
 | AC-2 (HMAC-SHA256 Webhook Signing & Sanitization) | PENDING | |
 | AC-3 (Resilient Webhook Dispatcher & DLQ) | PENDING | |
 | AC-4 (Event Bus & DAG Integration) | PENDING | |

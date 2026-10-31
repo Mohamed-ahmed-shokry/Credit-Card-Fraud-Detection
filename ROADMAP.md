@@ -2195,7 +2195,7 @@ Does not implement external message brokers (Kafka/RabbitMQ/Redis Streams) as ex
 
 ### Micro-Task Breakdown
 
-- [ ] Task 1: Create `src/fraud_detection/events.py` with domain event models (`EventType`, `EventDeliveryStatus`, `FraudDomainEvent`, `WebhookSubscription`, `EventError` hierarchy) and unit tests in `tests/test_events.py`.
+- [x] Task 1: Create `src/fraud_detection/events.py` with domain event models (`EventType`, `EventDeliveryStatus`, `FraudDomainEvent`, `WebhookSubscription`, `EventError` hierarchy) and unit tests in `tests/test_events.py`.
 - [ ] Task 2: Implement HMAC-SHA256 signature generation/verification and PCI-DSS payload sanitization in `src/fraud_detection/events.py` with unit tests.
 - [ ] Task 3: Implement `DeadLetterQueue`, `DispatchConfig`, and `WebhookDispatcher` with jittered exponential backoff and circuit breaking in `src/fraud_detection/events.py` with unit tests.
 - [ ] Task 4: Implement in-memory thread-safe `EventBus` and Decision DAG event publisher in `src/fraud_detection/events.py` and `src/fraud_detection/pipeline.py` with unit tests.
