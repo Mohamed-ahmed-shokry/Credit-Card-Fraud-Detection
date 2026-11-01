@@ -5625,3 +5625,159 @@ def test_challenge_api_endpoints_and_telemetry(
         )
         assert client.post("/v1/challenges/ch_nonexistent/resend", json={}).status_code == 404
         assert client.delete("/v1/challenges/ch_nonexistent").status_code == 404
+
+
+def test_challenge_api_error_branches(api_context: tuple[Path, Any, Path]) -> None:
+    """Test challenge API error branches, uninitialized manager, lockout, and expiration."""
+    from datetime import UTC, datetime, timedelta
+
+    from fraud_detection.challenge import (
+        ChallengeManager,
+        ChallengePolicy,
+        InMemoryNotificationAdapter,
+    )
+
+    _, model, _ = api_context
+
+    # 1. Uninitialized manager -> 500 on mutative / query routes, empty on list
+    uninit_app = create_app(model=model)
+    with TestClient(uninit_app) as uninit_client:
+        uninit_client.app.state.challenge_manager = None
+        assert uninit_client.get("/v1/challenges").json() == {"total_count": 0, "challenges": []}
+        r_create = uninit_client.post(
+            "/v1/challenges",
+            json={
+                "transaction_id": "tx1",
+                "user_id": "u1",
+                "tenant_id": "t1",
+                "destination": "+14155551234",
+                "method": "sms_otp",
+            },
+        )
+        assert r_create.status_code == 500
+        assert "ChallengeManager not initialized" in r_create.json()["detail"]
+        assert uninit_client.get("/v1/challenges/ch_123").status_code == 500
+        assert (
+            uninit_client.post("/v1/challenges/ch_123/verify", json={"token": "123456"}).status_code
+            == 500
+        )
+        assert uninit_client.post("/v1/challenges/ch_123/resend", json={}).status_code == 500
+        assert uninit_client.delete("/v1/challenges/ch_123").status_code == 500
+
+    # 2. Initialized manager with edge cases
+    adapter = InMemoryNotificationAdapter()
+    policy = ChallengePolicy(
+        max_attempts=2, lockout_duration_seconds=300, resend_cooldown_seconds=10
+    )
+    manager = ChallengeManager(policy=policy, adapter=adapter)
+
+    with TestClient(create_app(model=model, challenge_manager=manager)) as client:
+        # 2a. Unsupported challenge method -> 400
+        r_invalid_method = client.post(
+            "/v1/challenges",
+            json={
+                "transaction_id": "tx1",
+                "user_id": "u1",
+                "tenant_id": "t1",
+                "destination": "+14155551234",
+                "method": "smoke_signal",
+            },
+        )
+        assert r_invalid_method.status_code == 400
+        assert "Unsupported challenge method" in r_invalid_method.json()["detail"]
+
+        # 2b. ValueError (e.g. empty user_id) -> 400
+        r_val_err = client.post(
+            "/v1/challenges",
+            json={
+                "transaction_id": "tx1",
+                "user_id": "",
+                "tenant_id": "t1",
+                "destination": "+14155551234",
+                "method": "sms_otp",
+            },
+        )
+        assert r_val_err.status_code == 400
+
+        # 2c. Locked out user -> 429
+        manager.store.set_user_lockout(
+            "t1", "usr_locked", datetime.now(UTC) + timedelta(minutes=15)
+        )
+        r_locked = client.post(
+            "/v1/challenges",
+            json={
+                "transaction_id": "tx1",
+                "user_id": "usr_locked",
+                "tenant_id": "t1",
+                "destination": "+14155551234",
+                "method": "sms_otp",
+            },
+        )
+        assert r_locked.status_code == 429
+        assert "locked out" in r_locked.json()["detail"]
+
+        # 2d. Create normal session to test verify expiration & lockout
+        r_ok = client.post(
+            "/v1/challenges",
+            json={
+                "transaction_id": "tx_exp",
+                "user_id": "usr_exp",
+                "tenant_id": "t1",
+                "destination": "user@example.com",
+                "method": "email_otp",
+            },
+        )
+        assert r_ok.status_code == 201
+        ch_id = r_ok.json()["challenge_id"]
+
+        # Simulate expiration
+        sess = manager.get_session(ch_id)
+        assert sess is not None
+        sess.expires_at = datetime.now(UTC) - timedelta(seconds=60)
+        manager.store.put(sess)
+
+        r_exp_verify = client.post(f"/v1/challenges/{ch_id}/verify", json={"token": "123456"})
+        assert r_exp_verify.status_code == 410
+
+        # 2e. Create session and exceed max attempts -> 429 lockout
+        r_attempts = client.post(
+            "/v1/challenges",
+            json={
+                "transaction_id": "tx_att",
+                "user_id": "usr_att",
+                "tenant_id": "t1",
+                "destination": "att@example.com",
+                "method": "email_otp",
+            },
+        )
+        ch_att_id = r_attempts.json()["challenge_id"]
+        # Attempt 1 -> 400
+        assert (
+            client.post(f"/v1/challenges/{ch_att_id}/verify", json={"token": "000000"}).status_code
+            == 400
+        )
+        # Attempt 2 -> 429 (max attempts exceeded / lockout)
+        r_lock_verify = client.post(f"/v1/challenges/{ch_att_id}/verify", json={"token": "000000"})
+        assert r_lock_verify.status_code == 429
+
+        # 2f. Challenge already cancelled -> 400 on verify / resend
+        r_canc = client.post(
+            "/v1/challenges",
+            json={
+                "transaction_id": "tx_canc",
+                "user_id": "usr_canc",
+                "tenant_id": "t1",
+                "destination": "+14155559999",
+                "method": "sms_otp",
+            },
+        )
+        ch_canc_id = r_canc.json()["challenge_id"]
+        assert client.delete(f"/v1/challenges/{ch_canc_id}").status_code == 200
+
+        # Verifying cancelled -> 400
+        assert (
+            client.post(f"/v1/challenges/{ch_canc_id}/verify", json={"token": "123456"}).status_code
+            == 400
+        )
+        # Resending cancelled -> 400
+        assert client.post(f"/v1/challenges/{ch_canc_id}/resend", json={}).status_code == 400
