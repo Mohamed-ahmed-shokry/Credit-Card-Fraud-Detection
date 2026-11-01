@@ -465,3 +465,137 @@ def test_pipeline_and_eventbus_challenge_integration() -> None:
     event_types = [e.event_type for e in captured_events]
     assert EventType.DECISION_CHALLENGED in event_types
     assert EventType.CHALLENGE_ISSUED in event_types
+
+
+def test_challenge_edge_cases_and_coverage() -> None:
+    """Cover edge cases across models, masking, store, and manager to ensure >= 97% branch coverage."""
+    token_h = "hash_" + "x" * 59
+    salt_s = "salt_" + "y" * 27
+
+    # 1. Validation errors on empty transaction_id, user_id, tenant_id
+    with pytest.raises(ValueError, match="transaction_id must be a non-empty string"):
+        ChallengeSession(
+            challenge_id="ch1",
+            transaction_id="",
+            user_id="u",
+            tenant_id="t",
+            method=ChallengeMethod.SMS_OTP,
+            target_masked="x",
+            token_hash=token_h,
+            token_salt=salt_s,
+        )
+
+    with pytest.raises(ValueError, match="user_id must be a non-empty string"):
+        ChallengeSession(
+            challenge_id="ch1",
+            transaction_id="tx",
+            user_id="",
+            tenant_id="t",
+            method=ChallengeMethod.SMS_OTP,
+            target_masked="x",
+            token_hash=token_h,
+            token_salt=salt_s,
+        )
+
+    with pytest.raises(ValueError, match="tenant_id must be a non-empty string"):
+        ChallengeSession(
+            challenge_id="ch1",
+            transaction_id="tx",
+            user_id="u",
+            tenant_id="",
+            method=ChallengeMethod.SMS_OTP,
+            target_masked="x",
+            token_hash=token_h,
+            token_salt=salt_s,
+        )
+
+    # Invalid status
+    with pytest.raises(ValueError, match="Invalid challenge status"):
+        ChallengeSession(
+            challenge_id="ch1",
+            transaction_id="tx",
+            user_id="u",
+            tenant_id="t",
+            method=ChallengeMethod.SMS_OTP,
+            target_masked="x",
+            token_hash=token_h,
+            token_salt=salt_s,
+            status="invalid_status",  # type: ignore[arg-type]
+        )
+
+    # 2. Corrupt expires_at in is_expired
+    sess = ChallengeSession(
+        challenge_id="ch1",
+        transaction_id="tx",
+        user_id="u",
+        tenant_id="t",
+        method=ChallengeMethod.SMS_OTP,
+        target_masked="x",
+        token_hash=token_h,
+        token_salt=salt_s,
+        expires_at="not_an_iso_date",
+    )
+    assert sess.is_expired is True
+
+    # 3. Mask target short strings
+    assert mask_target_destination("ab", ChallengeMethod.OUT_OF_BAND) == "***"
+    assert mask_target_destination("12", ChallengeMethod.SMS_OTP) == "***"
+    assert mask_target_destination("abcde", ChallengeMethod.OUT_OF_BAND) == "ab***de"
+
+    # 4. ChallengeStore.list_sessions limit
+    store = ChallengeStore()
+    for i in range(10):
+        store.put(
+            ChallengeSession(
+                challenge_id=f"ch_lim_{i}",
+                transaction_id=f"tx_{i}",
+                user_id="u",
+                tenant_id="t",
+                method=ChallengeMethod.SMS_OTP,
+                target_masked="x",
+                token_hash=token_h,
+                token_salt=salt_s,
+            )
+        )
+    assert len(store.list_sessions(limit=3)) == 3
+
+    # 5. InMemoryNotificationAdapter.clear
+    adapter = InMemoryNotificationAdapter()
+    adapter.dispatch(sess, "123456", "dest")
+    assert len(adapter.dispatches) == 1
+    adapter.clear()
+    assert len(adapter.dispatches) == 0
+
+    # 6. Disallowed method by policy
+    policy = ChallengePolicy(allowed_methods=(ChallengeMethod.EMAIL_OTP,))
+    mgr = ChallengeManager(policy=policy)
+    with pytest.raises(ValueError, match="is not allowed by policy"):
+        mgr.create_challenge(
+            transaction_id="tx",
+            user_id="u",
+            tenant_id="t",
+            destination="+1234567890",
+            method=ChallengeMethod.SMS_OTP,
+        )
+
+    # 7. Resend token with invalid last_resend_at string
+    sess_resend, _ = mgr.create_challenge(
+        transaction_id="tx_resend",
+        user_id="u",
+        tenant_id="t",
+        destination="user@example.com",
+        method=ChallengeMethod.EMAIL_OTP,
+    )
+    sess_resend.last_resend_at = "corrupt_datetime"
+    sess_resend.created_at = "corrupt_datetime"
+    updated_resend, _ = mgr.resend_challenge(sess_resend.challenge_id)
+    assert updated_resend.status == ChallengeStatus.PENDING
+
+    # 8. Resend when status is LOCKED_OUT or CANCELLED -> ChallengeError
+    sess_resend.status = ChallengeStatus.LOCKED_OUT
+    with pytest.raises(ChallengeError, match="Cannot resend token"):
+        mgr.resend_challenge(sess_resend.challenge_id)
+
+    # 9. Cancel with empty reason
+    cancelled = mgr.cancel_challenge(sess_resend.challenge_id, reason="")
+    assert cancelled.status == ChallengeStatus.CANCELLED
