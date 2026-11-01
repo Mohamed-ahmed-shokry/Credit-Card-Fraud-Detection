@@ -2213,7 +2213,7 @@ Does not implement external message brokers (Kafka/RabbitMQ/Redis Streams) as ex
 - **Verification Gates**: 100% Green local CI parity, $\ge 97.0\%$ branch coverage, 0 mypy issues, Ruff formatted, pip-audit clean, wheel build and twine valid.
 
 
-## Phase 44 — Risk-Based Step-Up Authentication & Challenge Orchestration (In progress)
+## Phase 44 — Risk-Based Step-Up Authentication & Challenge Orchestration (Done)
 
 ### Objective
 
@@ -2277,7 +2277,16 @@ Does not implement telecom SMS/Email carrier gateways (Twilio, SendGrid, etc.) a
 - [x] Task 4: Integrate Challenge Orchestration into Decision DAG (`pipeline.py`) and EventBus (`events.py`) with unit/integration tests.
 - [x] Task 5: Implement `/v1/challenges/*` REST endpoints and Prometheus metrics in `src/fraud_detection/api.py` with integration tests in `tests/test_api.py`.
 - [x] Task 6: Implement CLI commands `challenge-create`, `challenge-verify`, and `challenge-inspect` in `src/fraud_detection/cli.py` with tests in `tests/test_cli.py`.
-- [ ] Task 7: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate with 100% Green CI.
+- [x] Task 7: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate with 100% Green CI.
+
+### Delivery Record
+
+- **Delivered**: 2026-11-01
+- **Branch**: `phase/challenge-orchestrator`
+- **Pull Request**: [#25](https://github.com/Mohamed-ahmed-shokry/Credit-Card-Fraud-Detection/pull/25)
+- **Primary Modules**: `src/fraud_detection/challenge.py`, `src/fraud_detection/pipeline.py`, `src/fraud_detection/events.py`, `src/fraud_detection/api.py`, `src/fraud_detection/cli.py`
+- **Test Modules**: `tests/test_challenge.py`, `tests/test_api.py`, `tests/test_cli.py`
+- **Verification Gates**: 100% Green local CI parity, $\ge 97.0\%$ branch coverage, 0 mypy issues, Ruff formatted, pip-audit clean, wheel build and twine valid.
 
 
 ## Contributing to the roadmap
