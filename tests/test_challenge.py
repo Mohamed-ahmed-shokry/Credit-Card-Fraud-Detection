@@ -468,7 +468,7 @@ def test_pipeline_and_eventbus_challenge_integration() -> None:
 
 
 def test_challenge_edge_cases_and_coverage() -> None:
-    """Cover edge cases across models, masking, store, and manager to ensure >= 97% branch coverage."""
+    """Cover edge cases across models, masking, and manager to ensure >= 97% branch coverage."""
     token_h = "hash_" + "x" * 59
     salt_s = "salt_" + "y" * 27
 
