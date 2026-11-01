@@ -8522,3 +8522,135 @@ def test_webhook_cli_commands(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
     bad_item_dlq = tmp_path / "bad_item_dlq.json"
     bad_item_dlq.write_text(json.dumps({"records": [{"bad": "data"}]}), encoding="utf-8")
     assert runner.invoke(app, ["webhook-replay-dlq", "-d", str(bad_item_dlq)]).exit_code == 2
+
+
+def test_challenge_cli_commands(tmp_path: Path) -> None:
+    """Validate challenge-create, challenge-verify, and challenge-inspect CLI workflows."""
+    runner = CliRunner()
+    store_file = tmp_path / "challenge_sessions.json"
+
+    # 1. challenge-create (JSON format)
+    res_create = runner.invoke(
+        app,
+        [
+            "challenge-create",
+            "-x",
+            "tx_cli_101",
+            "-u",
+            "usr_bob",
+            "-d",
+            "+15551234567",
+            "-t",
+            "fintech_alpha",
+            "-m",
+            "sms_otp",
+            "-s",
+            str(store_file),
+            "-f",
+            "json",
+        ],
+    )
+    assert res_create.exit_code == 0, res_create.output
+    created_data = json.loads(res_create.output)
+    ch_id = created_data["challenge_id"]
+    raw_token = created_data["raw_token"]
+    assert ch_id.startswith("ch_")
+    assert created_data["status"] == "pending"
+    assert created_data["target_masked"] == "+1 ***-***-4567"
+
+    # 2. challenge-create (Table format)
+    res_create_table = runner.invoke(
+        app,
+        [
+            "challenge-create",
+            "-x",
+            "tx_cli_102",
+            "-u",
+            "usr_alice",
+            "-d",
+            "alice@example.com",
+            "-m",
+            "email_otp",
+            "-f",
+            "table",
+        ],
+    )
+    assert res_create_table.exit_code == 0, res_create_table.output
+    assert "Challenge ID:" in res_create_table.output
+
+    # Invalid method -> exit 2
+    res_bad_method = runner.invoke(
+        app,
+        [
+            "challenge-create",
+            "-x",
+            "tx_1",
+            "-u",
+            "u1",
+            "-d",
+            "d1",
+            "-m",
+            "carrier_pigeon",
+        ],
+    )
+    assert res_bad_method.exit_code == 2
+
+    # 3. challenge-inspect
+    res_inspect = runner.invoke(
+        app,
+        ["challenge-inspect", "-s", str(store_file), "-c", ch_id],
+    )
+    assert res_inspect.exit_code == 0, res_inspect.output
+    inspect_data = json.loads(res_inspect.output)
+    assert inspect_data["total_count"] == 1
+    assert inspect_data["challenges"][0]["challenge_id"] == ch_id
+
+    # Table format inspect
+    res_inspect_table = runner.invoke(
+        app,
+        ["challenge-inspect", "-s", str(store_file), "-f", "table"],
+    )
+    assert res_inspect_table.exit_code == 0
+    assert "CHALLENGE ID" in res_inspect_table.output
+
+    # Missing challenge in inspect -> exit 2
+    res_inspect_missing = runner.invoke(
+        app,
+        ["challenge-inspect", "-s", str(store_file), "-c", "ch_nonexistent"],
+    )
+    assert res_inspect_missing.exit_code == 2
+
+    # 4. challenge-verify with wrong token -> exit 1
+    res_verify_fail = runner.invoke(
+        app,
+        [
+            "challenge-verify",
+            "-s",
+            str(store_file),
+            "-c",
+            ch_id,
+            "--token",
+            "000000",
+        ],
+    )
+    assert res_verify_fail.exit_code == 1
+    verify_fail_data = json.loads(res_verify_fail.output)
+    assert verify_fail_data["verified"] is False
+
+    # 5. challenge-verify with correct token -> exit 0
+    res_verify_ok = runner.invoke(
+        app,
+        [
+            "challenge-verify",
+            "-s",
+            str(store_file),
+            "-c",
+            ch_id,
+            "--token",
+            raw_token,
+        ],
+    )
+    assert res_verify_ok.exit_code == 0, res_verify_ok.output
+    verify_ok_data = json.loads(res_verify_ok.output)
+    assert verify_ok_data["verified"] is True
+    assert verify_ok_data["status"] == "verified"
