@@ -8,10 +8,118 @@ rate-limiting, brute-force lockout, and thread-safe session lifecycle management
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import secrets
+import string
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
+
+
+def generate_secure_otp(length: int = 6, numeric_only: bool = True) -> str:
+    """Generate a cryptographically secure one-time password (OTP).
+
+    Args:
+        length: Number of characters in the OTP (must be between 4 and 32).
+        numeric_only: If True, uses digits '0'-'9'; otherwise alphanumeric.
+
+    Returns:
+        The generated OTP string.
+    """
+    if length < 4 or length > 32:
+        raise ValueError("OTP length must be between 4 and 32 characters")
+
+    alphabet = string.digits if numeric_only else string.digits + string.ascii_uppercase
+    return "".join(secrets.choice(alphabet) for _ in range(length))
+
+
+def generate_salt(num_bytes: int = 16) -> str:
+    """Generate a cryptographically secure random hexadecimal salt."""
+    if num_bytes < 8:
+        raise ValueError("Salt length must be at least 8 bytes")
+    return secrets.token_hex(num_bytes)
+
+
+def hash_challenge_token(token: str, salt: str) -> str:
+    """Compute an HMAC-SHA256 hash of a verification token with salt.
+
+    Args:
+        token: The plaintext token or OTP string.
+        salt: The hexadecimal salt string.
+
+    Returns:
+        Hex-encoded HMAC-SHA256 digest string.
+    """
+    if not token or not isinstance(token, str):
+        raise ValueError("token must be a non-empty string")
+    if not salt or not isinstance(salt, str):
+        raise ValueError("salt must be a non-empty string")
+
+    key = salt.encode("utf-8")
+    msg = token.strip().encode("utf-8")
+    return hmac.new(key, msg, hashlib.sha256).hexdigest()
+
+
+def verify_challenge_token(token: str, token_hash: str, salt: str) -> bool:
+    """Verify a challenge token against its stored hash using constant-time comparison.
+
+    Args:
+        token: The candidate token provided by the user.
+        token_hash: The stored expected HMAC-SHA256 hex digest.
+        salt: The salt used when creating the hash.
+
+    Returns:
+        True if the token matches, False otherwise.
+    """
+    if not token or not isinstance(token, str):
+        return False
+    if not token_hash or not isinstance(token_hash, str):
+        return False
+    if not salt or not isinstance(salt, str):
+        return False
+
+    computed = hash_challenge_token(token, salt)
+    return hmac.compare_digest(computed, token_hash)
+
+
+def mask_target_destination(target: str, method: ChallengeMethod) -> str:
+    """Mask a destination address (phone number, email) to protect PII.
+
+    Args:
+        target: The raw destination string (e.g. phone number or email).
+        method: The challenge method.
+
+    Returns:
+        A masked string preserving minimal identifiable parts.
+    """
+    if not target or not isinstance(target, str):
+        return "***"
+
+    clean_target = target.strip()
+    if method == ChallengeMethod.EMAIL_OTP or "@" in clean_target:
+        parts = clean_target.split("@", 1)
+        name, domain = parts[0], parts[1] if len(parts) > 1 else ""
+        if len(name) <= 2:
+            masked_name = name[0] + "***" if name else "***"
+        else:
+            masked_name = name[0] + "***" + name[-1]
+        return f"{masked_name}@{domain}" if domain else masked_name
+
+    if method == ChallengeMethod.SMS_OTP:
+        digits_only = "".join(c for c in clean_target if c.isdigit())
+        if len(digits_only) >= 10:
+            last4 = digits_only[-4:]
+            country = "+" + digits_only[:-10] if len(digits_only) > 10 else "+1"
+            return f"{country} ***-***-{last4}"
+        if len(clean_target) > 4:
+            return "*" * (len(clean_target) - 4) + clean_target[-4:]
+        return "***"
+
+    if len(clean_target) > 4:
+        return clean_target[:2] + "***" + clean_target[-2:]
+    return "***"
 
 
 class ChallengeError(Exception):
