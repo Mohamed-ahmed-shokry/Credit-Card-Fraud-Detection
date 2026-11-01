@@ -403,3 +403,65 @@ def test_challenge_manager_expiration_and_cancellation() -> None:
         manager.resend_challenge("ch_nonexistent")
     with pytest.raises(ChallengeSessionNotFoundError):
         manager.cancel_challenge("ch_nonexistent")
+
+
+def test_pipeline_and_eventbus_challenge_integration() -> None:
+    """Verify ActionAggregatorStageProcessor issues challenges and publishes to EventBus."""
+    from fraud_detection.events import EventBus, EventType, FraudDomainEvent
+    from fraud_detection.pipeline import ActionAggregatorStageProcessor, PipelineContext
+
+    event_bus = EventBus()
+    captured_events: list[FraudDomainEvent] = []
+
+    def on_event(ev: FraudDomainEvent) -> None:
+        captured_events.append(ev)
+
+    event_bus.subscribe(on_event)
+
+    challenge_manager = ChallengeManager()
+    processor = ActionAggregatorStageProcessor()
+
+    # Create a context where rules output a CHALLENGE action
+    context = PipelineContext(
+        transaction={"amount": 100.0, "Time": 10.0},
+        metadata={
+            "event_bus": event_bus,
+            "challenge_manager": challenge_manager,
+            "transaction_id": "tx_challenge_101",
+            "user_id": "usr_vip_99",
+            "tenant_id": "tenant_eu",
+            "challenge_destination": "+447700900077",
+            "challenge_method": "sms_otp",
+            "synchronous_event_publish": True,
+        },
+    )
+    # Set simulated rules stage output returning CHALLENGE
+    from fraud_detection.pipeline import StageExecutionResult, StageStatus, StageType
+
+    context.results["rules"] = StageExecutionResult(
+        node_name="rules",
+        stage_type=StageType.RULES,
+        status=StageStatus.SUCCESS,
+        latency_ms=1.0,
+        output={
+            "matched_rule_id": "rule_velocity_elevated",
+            "action": "CHALLENGE",
+        },
+    )
+
+    out = processor(context)
+    assert out["decision"] == "CHALLENGE"
+    assert out["challenge"] is not None
+    assert out["challenge"]["challenge_method"] == "sms_otp"
+    assert out["challenge"]["challenge_target_masked"] == "+44 ***-***-0077"
+
+    ch_id = out["challenge"]["challenge_id"]
+    session = challenge_manager.get_session(ch_id)
+    assert session is not None
+    assert session.transaction_id == "tx_challenge_101"
+    assert session.user_id == "usr_vip_99"
+
+    # Verify events on event_bus
+    event_types = [e.event_type for e in captured_events]
+    assert EventType.DECISION_CHALLENGED in event_types
+    assert EventType.CHALLENGE_ISSUED in event_types
