@@ -8654,3 +8654,215 @@ def test_challenge_cli_commands(tmp_path: Path) -> None:
     verify_ok_data = json.loads(res_verify_ok.output)
     assert verify_ok_data["verified"] is True
     assert verify_ok_data["status"] == "verified"
+
+
+def test_challenge_cli_error_and_edge_cases(tmp_path: Path) -> None:
+    """Test challenge CLI error branches, filters, table formatting, and invalid inputs."""
+    runner = CliRunner()
+
+    # 1. challenge-create with invalid method -> exit 2
+    res_bad_method = runner.invoke(
+        app,
+        [
+            "challenge-create",
+            "-x",
+            "tx_bad",
+            "-u",
+            "usr_bad",
+            "-d",
+            "+14155551234",
+            "-m",
+            "smoke_signal",
+        ],
+    )
+    assert res_bad_method.exit_code == 2
+    assert "Invalid challenge method" in res_bad_method.output
+
+    # 2. challenge-create with table format output
+    store_file = tmp_path / "challenges.json"
+    res_table = runner.invoke(
+        app,
+        [
+            "challenge-create",
+            "-x",
+            "tx_tbl",
+            "-u",
+            "usr_tbl",
+            "--tenant-id",
+            "fintech_gamma",
+            "-d",
+            "gamma@example.com",
+            "-m",
+            "email_otp",
+            "-s",
+            str(store_file),
+            "-f",
+            "table",
+        ],
+    )
+    assert res_table.exit_code == 0
+    assert "Challenge ID:" in res_table.output
+    assert "Issued OTP:" in res_table.output
+
+    # 3. challenge-create store file write failure -> exit 2
+    bad_store_dir = tmp_path / "as_dir"
+    bad_store_dir.mkdir()
+    res_store_fail = runner.invoke(
+        app,
+        [
+            "challenge-create",
+            "-x",
+            "tx_fail",
+            "-u",
+            "usr_fail",
+            "-d",
+            "+14155551234",
+            "-s",
+            str(bad_store_dir),
+        ],
+    )
+    assert res_store_fail.exit_code == 2
+    assert "Failed to persist challenge session" in res_store_fail.output
+
+    # 4. challenge-verify store file not found -> exit 2
+    res_v_missing_store = runner.invoke(
+        app,
+        [
+            "challenge-verify",
+            "-s",
+            str(tmp_path / "nonexistent.json"),
+            "-c",
+            "ch_xyz",
+            "--token",
+            "123456",
+        ],
+    )
+    assert res_v_missing_store.exit_code == 2
+    assert "Store file not found" in res_v_missing_store.output
+
+    # 5. challenge-verify store file corrupt JSON / non-list -> exit 2
+    corrupt_store = tmp_path / "corrupt.json"
+    corrupt_store.write_text("{not json}", encoding="utf-8")
+    res_v_corrupt = runner.invoke(
+        app,
+        [
+            "challenge-verify",
+            "-s",
+            str(corrupt_store),
+            "-c",
+            "ch_xyz",
+            "--token",
+            "123456",
+        ],
+    )
+    assert res_v_corrupt.exit_code == 2
+    assert "Could not read store file" in res_v_corrupt.output
+
+    non_list_store = tmp_path / "non_list.json"
+    non_list_store.write_text('{"key": "val"}', encoding="utf-8")
+    res_v_non_list = runner.invoke(
+        app,
+        [
+            "challenge-verify",
+            "-s",
+            str(non_list_store),
+            "-c",
+            "ch_xyz",
+            "--token",
+            "123456",
+        ],
+    )
+    assert res_v_non_list.exit_code == 2
+    assert "expected a JSON array" in res_v_non_list.output
+
+    # 6. challenge-verify missing challenge_id in store -> exit 2
+    res_v_not_found = runner.invoke(
+        app,
+        [
+            "challenge-verify",
+            "-s",
+            str(store_file),
+            "-c",
+            "ch_nonexistent",
+            "--token",
+            "123456",
+        ],
+    )
+    assert res_v_not_found.exit_code == 2
+    assert "not found in store file" in res_v_not_found.output
+
+    # 7. challenge-verify table format with error -> exit 1
+    # Get the challenge ID from store_file
+    stored_records = json.loads(store_file.read_text(encoding="utf-8"))
+    ch_id = stored_records[0]["challenge_id"]
+    res_v_table_err = runner.invoke(
+        app,
+        [
+            "challenge-verify",
+            "-s",
+            str(store_file),
+            "-c",
+            ch_id,
+            "--token",
+            "000000",
+            "-f",
+            "table",
+        ],
+    )
+    assert res_v_table_err.exit_code == 1
+    assert "Error:" in res_v_table_err.output
+    assert "Verified:      False" in res_v_table_err.output
+
+    # 8. challenge-inspect store file not found -> exit 2
+    res_i_missing = runner.invoke(
+        app,
+        ["challenge-inspect", "-s", str(tmp_path / "nonexistent.json")],
+    )
+    assert res_i_missing.exit_code == 2
+
+    # 9. challenge-inspect corrupt store file -> exit 2
+    res_i_corrupt = runner.invoke(
+        app,
+        ["challenge-inspect", "-s", str(corrupt_store)],
+    )
+    assert res_i_corrupt.exit_code == 2
+
+    # 10. challenge-inspect non-list store file -> exit 2
+    res_i_non_list = runner.invoke(
+        app,
+        ["challenge-inspect", "-s", str(non_list_store)],
+    )
+    assert res_i_non_list.exit_code == 2
+
+    # 11. challenge-inspect with tenant-id filter matching and skipping
+    res_i_tenant_match = runner.invoke(
+        app,
+        ["challenge-inspect", "-s", str(store_file), "-t", "fintech_gamma"],
+    )
+    assert res_i_tenant_match.exit_code == 0
+    match_data = json.loads(res_i_tenant_match.output)
+    assert match_data["total_count"] == 1
+
+    res_i_tenant_skip = runner.invoke(
+        app,
+        ["challenge-inspect", "-s", str(store_file), "-t", "nonexistent_tenant"],
+    )
+    assert res_i_tenant_skip.exit_code == 0
+    skip_data = json.loads(res_i_tenant_skip.output)
+    assert skip_data["total_count"] == 0
+
+    # 12. challenge-inspect table format with empty matched -> "No challenge sessions found."
+    res_i_table_empty = runner.invoke(
+        app,
+        [
+            "challenge-inspect",
+            "-s",
+            str(store_file),
+            "-t",
+            "nonexistent_tenant",
+            "-f",
+            "table",
+        ],
+    )
+    assert res_i_table_empty.exit_code == 0
+    assert "No challenge sessions found." in res_i_table_empty.output
