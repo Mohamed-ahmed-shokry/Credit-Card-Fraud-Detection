@@ -88,6 +88,10 @@ class EventType(StrEnum):
     DEVICE_ANOMALY_DETECTED = "fraud.device.anomaly_detected"
     MODEL_PROMOTED = "fraud.model.promoted"
     TENANT_STATUS_CHANGED = "fraud.tenant.status_changed"
+    CHALLENGE_ISSUED = "fraud.challenge.issued"
+    CHALLENGE_VERIFIED = "fraud.challenge.verified"
+    CHALLENGE_FAILED = "fraud.challenge.failed"
+    CHALLENGE_EXPIRED = "fraud.challenge.expired"
 
 
 class EventDeliveryStatus(StrEnum):
