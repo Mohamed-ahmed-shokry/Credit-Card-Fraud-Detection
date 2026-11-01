@@ -1849,6 +1849,36 @@ FastAPI webhook REST endpoints:
 - `POST /v1/webhooks/dlq/replay`: Replay undelivered dead-letter events through the webhook dispatcher.
 - Prometheus metrics: `fraud_event_bus_published_total`, `fraud_webhook_dispatches_total`, and `fraud_webhook_dlq_size`.
 
+## Step-Up Authentication & Challenge Orchestration (Phase 44)
+
+Orchestrate Strong Customer Authentication (SCA) step-up challenges and 3-D Secure (3DS 2.3) workflows for friction decisions (`challenge.py`):
+
+```bash
+# Issue a step-up challenge session for a high-risk transaction
+fraud-detect challenge-create \
+  --transaction-id tx_88492 \
+  --user-id usr_42 \
+  --destination "+14155552671" \
+  --method sms_otp \
+  --store-file sessions.json \
+  --format table
+
+# Inspect stored challenge sessions
+fraud-detect challenge-inspect --store-file sessions.json --format table
+
+# Verify an entered OTP code
+fraud-detect challenge-verify --store-file sessions.json --challenge-id ch_0c39d3 --token 492018
+```
+
+FastAPI step-up challenge REST endpoints:
+- `POST /v1/challenges`: Create a new step-up friction challenge session with cryptographic OTP generation and destination masking.
+- `GET /v1/challenges`: List active and historical challenge sessions with optional `?tenant_id=` filter.
+- `GET /v1/challenges/{challenge_id}`: Retrieve challenge details, lifecycle status, attempts, and masked destination.
+- `POST /v1/challenges/{challenge_id}/verify`: Verify candidate OTP token with constant-time comparison, updating session status or enforcing brute-force lockouts.
+- `POST /v1/challenges/{challenge_id}/resend`: Request a fresh token subject to rate-limiting cooldown periods.
+- `DELETE /v1/challenges/{challenge_id}`: Cancel a pending challenge session.
+- Prometheus metrics: `fraud_challenges_issued_total`, `fraud_challenges_verified_total`, and `fraud_challenges_failed_total`.
+
 ## Reference label-delay analysis
 
 
