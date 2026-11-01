@@ -5526,3 +5526,102 @@ def test_webhook_api_endpoints_and_telemetry(
             json={"tenant_id": "bad#tenant", "target_url": "ftp://bad-url"},
         )
         assert bad_res.status_code == 400
+
+
+def test_challenge_api_endpoints_and_telemetry(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    """Validate /v1/challenges CRUD, verification, cooldown, and telemetry."""
+    from fraud_detection.challenge import (
+        ChallengeManager,
+        ChallengePolicy,
+        InMemoryNotificationAdapter,
+    )
+
+    _, model, _ = api_context
+    adapter = InMemoryNotificationAdapter()
+    policy = ChallengePolicy(resend_cooldown_seconds=30)
+    manager = ChallengeManager(policy=policy, adapter=adapter)
+
+    with TestClient(create_app(model=model, challenge_manager=manager)) as client:
+        # 1. GET /v1/challenges: initially empty
+        res = client.get("/v1/challenges")
+        assert res.status_code == 200
+        assert res.json()["total_count"] == 0
+
+        # 2. POST /v1/challenges: create challenge session
+        req_payload = {
+            "transaction_id": "tx_api_001",
+            "user_id": "usr_api_42",
+            "tenant_id": "fintech_alpha",
+            "destination": "+14155552671",
+            "method": "sms_otp",
+            "metadata": {"risk_level": "high"},
+        }
+        create_res = client.post("/v1/challenges", json=req_payload)
+        assert create_res.status_code == 201
+        created = create_res.json()
+        ch_id = created["challenge_id"]
+        assert ch_id.startswith("ch_")
+        assert created["status"] == "pending"
+        assert created["method"] == "sms_otp"
+        assert created["target_masked"] == "+1 ***-***-2671"
+        assert len(adapter.dispatches) == 1
+        raw_otp = adapter.dispatches[0]["raw_token"]
+
+        # 3. GET /v1/challenges/{ch_id}: inspect session
+        get_res = client.get(f"/v1/challenges/{ch_id}")
+        assert get_res.status_code == 200
+        assert get_res.json()["challenge_id"] == ch_id
+        assert get_res.json()["attempts_count"] == 0
+
+        # 4. POST /v1/challenges/{ch_id}/verify with invalid code -> 400
+        verify_bad = client.post(
+            f"/v1/challenges/{ch_id}/verify",
+            json={"token": "000000"},
+        )
+        assert verify_bad.status_code == 400
+        assert "Invalid token" in verify_bad.json()["detail"]
+
+        # 5. POST /v1/challenges/{ch_id}/resend immediately -> 429
+        resend_bad = client.post(
+            f"/v1/challenges/{ch_id}/resend",
+            json={},
+        )
+        assert resend_bad.status_code == 429
+        assert "Resend cooldown active" in resend_bad.json()["detail"]
+
+        # 6. POST /v1/challenges/{ch_id}/verify with valid code -> 200
+        verify_good = client.post(
+            f"/v1/challenges/{ch_id}/verify",
+            json={"token": raw_otp},
+        )
+        assert verify_good.status_code == 200
+        assert verify_good.json()["status"] == "verified"
+        assert verify_good.json()["verified_at"] is not None
+
+        # 7. Check Prometheus metrics
+        metrics_res = client.get("/metrics")
+        assert metrics_res.status_code == 200
+        assert "fraud_challenges_issued_total{" in metrics_res.text
+        assert "fraud_challenges_verified_total{" in metrics_res.text
+
+        # 8. GET /v1/challenges: list sessions
+        list_res = client.get("/v1/challenges?tenant_id=fintech_alpha")
+        assert list_res.status_code == 200
+        assert list_res.json()["total_count"] == 1
+
+        # 9. DELETE /v1/challenges/{ch_id}: cancel
+        del_res = client.delete(f"/v1/challenges/{ch_id}")
+        assert del_res.status_code == 200
+
+        # 10. Nonexistent challenge -> 404
+        assert client.get("/v1/challenges/ch_nonexistent").status_code == 404
+        assert (
+            client.post(
+                "/v1/challenges/ch_nonexistent/verify", json={"token": "123456"}
+            ).status_code
+            == 404
+        )
+        assert client.post("/v1/challenges/ch_nonexistent/resend", json={}).status_code == 404
+        assert client.delete("/v1/challenges/ch_nonexistent").status_code == 404
