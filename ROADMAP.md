@@ -2271,7 +2271,7 @@ Does not implement telecom SMS/Email carrier gateways (Twilio, SendGrid, etc.) a
 
 ### Micro-Task Breakdown
 
-- [ ] Task 1: Create `src/fraud_detection/challenge.py` with domain data models (`ChallengeError` hierarchy, `ChallengeMethod`, `ChallengeStatus`, `ChallengeSession`) and unit tests in `tests/test_challenge.py`.
+- [x] Task 1: Create `src/fraud_detection/challenge.py` with domain data models (`ChallengeError` hierarchy, `ChallengeMethod`, `ChallengeStatus`, `ChallengeSession`) and unit tests in `tests/test_challenge.py`.
 - [ ] Task 2: Implement cryptographic token generation, masking, and constant-time verification in `src/fraud_detection/challenge.py` with unit tests.
 - [ ] Task 3: Implement `ChallengePolicy`, `ChallengeStore`, and `ChallengeManager` with lifecycle enforcement in `src/fraud_detection/challenge.py` with unit tests.
 - [ ] Task 4: Integrate Challenge Orchestration into Decision DAG (`pipeline.py`) and EventBus (`events.py`) with unit/integration tests.

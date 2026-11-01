@@ -6,7 +6,7 @@
 - **Status**: In progress
 
 ## Task Status
-- [ ] Task 1: Create `src/fraud_detection/challenge.py` with domain data models (`ChallengeError` hierarchy, `ChallengeMethod`, `ChallengeStatus`, `ChallengeSession`) and unit tests in `tests/test_challenge.py`.
+- [x] Task 1: Create `src/fraud_detection/challenge.py` with domain data models (`ChallengeError` hierarchy, `ChallengeMethod`, `ChallengeStatus`, `ChallengeSession`) and unit tests in `tests/test_challenge.py`.
 - [ ] Task 2: Implement cryptographic token generation, masking, and constant-time verification in `src/fraud_detection/challenge.py` with unit tests.
 - [ ] Task 3: Implement `ChallengePolicy`, `ChallengeStore`, and `ChallengeManager` with lifecycle enforcement in `src/fraud_detection/challenge.py` with unit tests.
 - [ ] Task 4: Integrate Challenge Orchestration into Decision DAG (`pipeline.py`) and EventBus (`events.py`) with unit/integration tests.
@@ -17,7 +17,7 @@
 ## Acceptance Criteria Status
 | Criterion | Status | Evidence |
 |-----------|--------|----------|
-| AC-1 (Domain Models & Taxonomy) | PENDING | Pending Task 1 implementation |
+| AC-1 (Domain Models & Taxonomy) | PASSED | 3 unit tests in `tests/test_challenge.py` verifying `ChallengeSession`, `ChallengeMethod`, `ChallengeStatus`, serialization, and exception hierarchy. |
 | AC-2 (Cryptographic OTP & Constant-Time Verification) | PENDING | Pending Task 2 implementation |
 | AC-3 (Thread-Safe Challenge Manager & Policy Lifecycle) | PENDING | Pending Task 3 implementation |
 | AC-4 (Decision DAG & EventBus Integration) | PENDING | Pending Task 4 implementation |
