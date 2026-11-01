@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import contextlib
 import copy
 import hashlib
 import inspect
@@ -1509,6 +1510,37 @@ class ActionAggregatorStageProcessor:
 
         is_fraud = final_action == DecisionAction.DENY.value
         final_prob = float(prob) if prob is not None else (1.0 if is_fraud else 0.0)
+
+        bus = context.metadata.get("event_bus")
+        if bus is not None:
+            with contextlib.suppress(Exception):
+                from fraud_detection.events import EventType, FraudDomainEvent
+
+                tenant_id = str(context.metadata.get("tenant_id", "default"))
+                ev_type = EventType.TRANSACTION_SCORED
+                if final_action == "DENY":
+                    ev_type = EventType.DECISION_DENIED
+                elif final_action == "CHALLENGE":
+                    ev_type = EventType.DECISION_CHALLENGED
+                elif final_action == "REVIEW":
+                    ev_type = EventType.DECISION_REVIEW
+
+                event = FraudDomainEvent(
+                    event_type=ev_type,
+                    tenant_id=tenant_id,
+                    payload={
+                        "decision": final_action,
+                        "is_fraud": is_fraud,
+                        "fraud_probability": round(final_prob, 5),
+                        "matched_rule": matched_rule,
+                        "rule_action": rule_action,
+                        "threshold": effective_threshold,
+                    },
+                    traceparent=str(context.metadata.get("traceparent"))
+                    if context.metadata.get("traceparent")
+                    else None,
+                )
+                bus.publish(event, synchronous=False)
 
         return {
             "decision": final_action,
