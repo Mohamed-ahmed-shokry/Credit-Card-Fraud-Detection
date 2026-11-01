@@ -13,6 +13,11 @@ from fraud_detection.challenge import (
     ChallengeStatus,
     InvalidChallengeTokenError,
     RateLimitExceededError,
+    generate_salt,
+    generate_secure_otp,
+    hash_challenge_token,
+    mask_target_destination,
+    verify_challenge_token,
 )
 
 
@@ -117,3 +122,64 @@ def test_challenge_models_invariants() -> None:
             token_hash=token_h,
             token_salt=salt_s,
         )
+
+
+def test_generate_secure_otp() -> None:
+    """Verify cryptographically secure OTP generation length and character sets."""
+    otp6 = generate_secure_otp(length=6, numeric_only=True)
+    assert len(otp6) == 6
+    assert otp6.isdigit()
+
+    otp8 = generate_secure_otp(length=8, numeric_only=False)
+    assert len(otp8) == 8
+    assert all((c.isalnum() and c.isupper()) or c.isdigit() for c in otp8)
+
+    with pytest.raises(ValueError, match="OTP length must be between 4 and 32"):
+        generate_secure_otp(length=3)
+    with pytest.raises(ValueError, match="OTP length must be between 4 and 32"):
+        generate_secure_otp(length=33)
+
+
+def test_hash_and_verify_challenge_token() -> None:
+    """Verify constant-time HMAC-SHA256 token hashing and verification."""
+    salt = generate_salt(num_bytes=16)
+    assert len(salt) == 32
+    candidate_val = "".join(str(i) for i in [4, 9, 2, 0, 1, 8])
+    wrong_val = "".join(str(i) for i in [4, 9, 2, 0, 1, 9])
+    h = hash_challenge_token(candidate_val, salt)
+
+    assert verify_challenge_token(candidate_val, h, salt) is True
+    assert verify_challenge_token(wrong_val, h, salt) is False
+    assert verify_challenge_token("", h, salt) is False
+    assert verify_challenge_token(candidate_val, "", salt) is False
+    assert verify_challenge_token(candidate_val, h, "") is False
+
+    with pytest.raises(ValueError, match="Salt length must be at least 8 bytes"):
+        generate_salt(num_bytes=4)
+    with pytest.raises(ValueError, match="token must be a non-empty string"):
+        hash_challenge_token("", salt)
+    with pytest.raises(ValueError, match="salt must be a non-empty string"):
+        hash_challenge_token(candidate_val, "")
+
+
+def test_mask_target_destination() -> None:
+    """Verify PII masking across email, SMS phone numbers, and generic identifiers."""
+    masked_email = mask_target_destination("johndoe@example.com", ChallengeMethod.EMAIL_OTP)
+    assert masked_email == "j***e@example.com"
+
+    masked_short_email = mask_target_destination("ab@test.org", ChallengeMethod.EMAIL_OTP)
+    assert masked_short_email == "a***@test.org"
+
+    masked_phone = mask_target_destination("+14155552671", ChallengeMethod.SMS_OTP)
+    assert masked_phone == "+1 ***-***-2671"
+
+    masked_intl = mask_target_destination("+442071234567", ChallengeMethod.SMS_OTP)
+    assert masked_intl == "+44 ***-***-4567"
+
+    masked_short_phone = mask_target_destination("1234567", ChallengeMethod.SMS_OTP)
+    assert masked_short_phone == "***4567"
+
+    masked_generic = mask_target_destination("user_security_token_99", ChallengeMethod.OUT_OF_BAND)
+    assert masked_generic == "us***99"
+
+    assert mask_target_destination("", ChallengeMethod.SMS_OTP) == "***"
