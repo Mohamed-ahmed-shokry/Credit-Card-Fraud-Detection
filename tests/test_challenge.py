@@ -467,6 +467,51 @@ def test_pipeline_and_eventbus_challenge_integration() -> None:
     assert EventType.CHALLENGE_ISSUED in event_types
 
 
+def test_pipeline_challenge_integration_without_bus() -> None:
+    """Verify ActionAggregatorStageProcessor issues challenges even when event_bus is absent."""
+    from fraud_detection.pipeline import (
+        ActionAggregatorStageProcessor,
+        PipelineContext,
+        StageExecutionResult,
+        StageStatus,
+        StageType,
+    )
+
+    challenge_manager = ChallengeManager()
+    processor = ActionAggregatorStageProcessor()
+
+    context = PipelineContext(
+        transaction={"amount": 100.0, "Time": 10.0},
+        metadata={
+            "challenge_manager": challenge_manager,
+            "transaction_id": "tx_no_bus_101",
+            "user_id": "usr_vip_88",
+            "tenant_id": "tenant_no_bus",
+            "challenge_destination": "+447700900088",
+            "challenge_method": "sms_otp",
+        },
+    )
+    context.results["rules"] = StageExecutionResult(
+        node_name="rules",
+        stage_type=StageType.RULES,
+        status=StageStatus.SUCCESS,
+        latency_ms=1.0,
+        output={
+            "matched_rule_id": "rule_velocity_elevated",
+            "action": "CHALLENGE",
+        },
+    )
+
+    out = processor(context)
+    assert out["decision"] == "CHALLENGE"
+    assert out["challenge"] is not None
+    assert out["challenge"]["challenge_method"] == "sms_otp"
+    ch_id = out["challenge"]["challenge_id"]
+    session = challenge_manager.get_session(ch_id)
+    assert session is not None
+    assert session.transaction_id == "tx_no_bus_101"
+
+
 def test_challenge_edge_cases_and_coverage() -> None:
     """Cover edge cases across models, masking, and manager to ensure >= 97% branch coverage."""
     token_h = "hash_" + "x" * 59
