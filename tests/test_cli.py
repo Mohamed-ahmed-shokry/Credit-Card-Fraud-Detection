@@ -8813,6 +8813,43 @@ def test_challenge_cli_error_and_edge_cases(tmp_path: Path) -> None:
     assert "Error:" in res_v_table_err.output
     assert "Verified:      False" in res_v_table_err.output
 
+    # 7b. challenge-verify table format on SUCCESS -> exit 0
+    # Create another challenge with known OTP to verify via table format
+    res_create_succ = runner.invoke(
+        app,
+        [
+            "challenge-create",
+            "-x",
+            "tx_tbl_succ",
+            "-u",
+            "usr_tbl_succ",
+            "-d",
+            "succ@example.com",
+            "-s",
+            str(store_file),
+        ],
+    )
+    assert res_create_succ.exit_code == 0
+    succ_data = json.loads(res_create_succ.output)
+    ch_succ_id = succ_data["challenge_id"]
+    otp_succ = succ_data["raw_token"]
+    res_v_table_ok = runner.invoke(
+        app,
+        [
+            "challenge-verify",
+            "-s",
+            str(store_file),
+            "-c",
+            ch_succ_id,
+            "--token",
+            otp_succ,
+            "-f",
+            "table",
+        ],
+    )
+    assert res_v_table_ok.exit_code == 0
+    assert "Verified:      True" in res_v_table_ok.output
+
     # 8. challenge-inspect store file not found -> exit 2
     res_i_missing = runner.invoke(
         app,
@@ -8835,6 +8872,11 @@ def test_challenge_cli_error_and_edge_cases(tmp_path: Path) -> None:
     assert res_i_non_list.exit_code == 2
 
     # 11. challenge-inspect with tenant-id filter matching and skipping
+    # Also inject a non-dict element to verify non-dict item skip (line 8862)
+    records_with_non_dict = json.loads(store_file.read_text(encoding="utf-8"))
+    records_with_non_dict.append("invalid_record_string")
+    store_file.write_text(json.dumps(records_with_non_dict), encoding="utf-8")
+
     res_i_tenant_match = runner.invoke(
         app,
         ["challenge-inspect", "-s", str(store_file), "-t", "fintech_gamma"],
