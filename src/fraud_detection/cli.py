@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import statistics
 import subprocess
@@ -26,6 +27,14 @@ from fraud_detection.audit import (
     build_promotion_audit_event,
     build_scoring_audit_event,
     replay_audit_log,
+)
+from fraud_detection.challenge import (
+    ChallengeError,
+    ChallengeManager,
+    ChallengeMethod,
+    ChallengePolicy,
+    ChallengeSession,
+    ChallengeStore,
 )
 from fraud_detection.data import (
     DEFAULT_TARGET,
@@ -8574,6 +8583,311 @@ def webhook_replay_dlq(
         "failed_count": failed,
     }
     typer.echo(json.dumps(summary, indent=2))
+
+
+@app.command("challenge-create")
+def challenge_create(
+    transaction_id: Annotated[
+        str,
+        typer.Option(
+            "--transaction-id",
+            "-x",
+            help="Unique transaction ID requiring step-up challenge.",
+        ),
+    ],
+    user_id: Annotated[
+        str,
+        typer.Option(
+            "--user-id",
+            "-u",
+            help="User identifier associated with the transaction.",
+        ),
+    ],
+    destination: Annotated[
+        str,
+        typer.Option(
+            "--destination",
+            "-d",
+            help="Destination phone number or email address for OTP delivery.",
+        ),
+    ],
+    tenant_id: Annotated[
+        str,
+        typer.Option(
+            "--tenant-id",
+            "-t",
+            help="Tenant identifier.",
+        ),
+    ] = "default",
+    method: Annotated[
+        str,
+        typer.Option(
+            "--method",
+            "-m",
+            help="Challenge method (sms_otp, email_otp, totp, biometric_push).",
+        ),
+    ] = "sms_otp",
+    ttl_seconds: Annotated[
+        int,
+        typer.Option(
+            "--ttl-seconds",
+            help="Challenge session lifetime in seconds.",
+        ),
+    ] = 300,
+    store_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--store-file",
+            "-s",
+            help="Optional path to persistent JSON file to append session record.",
+        ),
+    ] = None,
+    output_format: Annotated[
+        str,
+        typer.Option(
+            "--format",
+            "-f",
+            help="Output format: 'json' or 'table'.",
+        ),
+    ] = "json",
+) -> None:
+    """Issue a new step-up authentication challenge for a friction decision."""
+    try:
+        method_enum = ChallengeMethod(method)
+    except ValueError:
+        valid_opts = [m.value for m in ChallengeMethod]
+        _abort(f"Invalid challenge method '{method}'. Valid options: {valid_opts}")
+
+    policy = ChallengePolicy(default_ttl_seconds=ttl_seconds)
+    manager = ChallengeManager(policy=policy)
+
+    try:
+        session, raw_token = manager.create_challenge(
+            transaction_id=transaction_id,
+            user_id=user_id,
+            tenant_id=tenant_id,
+            destination=destination,
+            method=method_enum,
+        )
+    except (ChallengeError, ValueError) as exc:
+        _abort(f"Failed to create challenge: {exc}")
+
+    if store_file is not None:
+        try:
+            records: list[dict[str, Any]] = []
+            if store_file.is_file():
+                raw = store_file.read_text(encoding="utf-8")
+                records = json.loads(raw) if raw.strip() else []
+                if not isinstance(records, list):
+                    records = []
+            records.append(session.to_dict())
+            _atomic_write_text(json.dumps(records, indent=2), store_file)
+        except (OSError, json.JSONDecodeError) as exc:
+            _abort(f"Failed to persist challenge session to store file: {exc}")
+
+    output_data = {
+        "challenge_id": session.challenge_id,
+        "transaction_id": session.transaction_id,
+        "user_id": session.user_id,
+        "tenant_id": session.tenant_id,
+        "method": session.method.value,
+        "target_masked": session.target_masked,
+        "status": session.status.value,
+        "raw_token": raw_token,
+        "expires_at": session.expires_at,
+        "created_at": session.created_at,
+    }
+
+    if output_format.lower() == "table":
+        typer.echo(f"Challenge ID:    {output_data['challenge_id']}")
+        typer.echo(f"Transaction ID:  {output_data['transaction_id']}")
+        typer.echo(f"User ID:         {output_data['user_id']}")
+        typer.echo(f"Tenant ID:       {output_data['tenant_id']}")
+        typer.echo(f"Method:          {output_data['method']}")
+        typer.echo(f"Target Masked:   {output_data['target_masked']}")
+        typer.echo(f"Status:          {output_data['status']}")
+        typer.echo(f"Issued OTP:      {output_data['raw_token']}")
+        typer.echo(f"Expires At:      {output_data['expires_at']}")
+    else:
+        typer.echo(json.dumps(output_data, indent=2))
+
+
+@app.command("challenge-verify")
+def challenge_verify(
+    store_file: Annotated[
+        Path,
+        typer.Option(
+            "--store-file",
+            "-s",
+            help="Path to JSON file containing challenge session records.",
+        ),
+    ],
+    challenge_id: Annotated[
+        str,
+        typer.Option(
+            "--challenge-id",
+            "-c",
+            help="Challenge ID to verify.",
+        ),
+    ],
+    token: Annotated[
+        str,
+        typer.Option(
+            "--token",
+            help="Candidate token entered by the user.",
+        ),
+    ],
+    output_format: Annotated[
+        str,
+        typer.Option(
+            "--format",
+            "-f",
+            help="Output format: 'json' or 'table'.",
+        ),
+    ] = "json",
+) -> None:
+    """Verify an entered OTP token against a stored challenge session."""
+    if not store_file.is_file():
+        _abort(f"Store file not found: {store_file}")
+
+    try:
+        raw = store_file.read_text(encoding="utf-8")
+        records = json.loads(raw)
+        if not isinstance(records, list):
+            _abort("Invalid store file format: expected a JSON array of session objects.")
+    except (OSError, json.JSONDecodeError) as exc:
+        _abort(f"Could not read store file: {exc}")
+
+    matching_idx = None
+    target_session = None
+    for idx, item in enumerate(records):
+        if isinstance(item, dict) and item.get("challenge_id") == challenge_id:
+            matching_idx = idx
+            target_session = ChallengeSession.from_dict(item)
+            break
+
+    if target_session is None or matching_idx is None:
+        _abort(f"Challenge session '{challenge_id}' not found in store file.")
+
+    store = ChallengeStore()
+    store.put(target_session)
+    manager = ChallengeManager(store=store)
+
+    success = False
+    error_msg = None
+    try:
+        updated_session = manager.verify_challenge(challenge_id, token)
+        success = True
+        records[matching_idx] = updated_session.to_dict()
+        _atomic_write_text(json.dumps(records, indent=2), store_file)
+    except ChallengeError as exc:
+        records[matching_idx] = target_session.to_dict()
+        with contextlib.suppress(OSError):
+            _atomic_write_text(json.dumps(records, indent=2), store_file)
+        error_msg = str(exc)
+
+    summary = {
+        "challenge_id": challenge_id,
+        "verified": success,
+        "status": target_session.status.value,
+        "attempts_count": target_session.attempts_count,
+        "max_attempts": target_session.max_attempts,
+        "error": error_msg,
+    }
+
+    if output_format.lower() == "table":
+        typer.echo(f"Challenge ID:  {summary['challenge_id']}")
+        typer.echo(f"Verified:      {summary['verified']}")
+        typer.echo(f"Status:        {summary['status']}")
+        typer.echo(f"Attempts:      {summary['attempts_count']}/{summary['max_attempts']}")
+        if error_msg:
+            typer.echo(f"Error:         {error_msg}")
+    else:
+        typer.echo(json.dumps(summary, indent=2))
+
+    if not success:
+        raise typer.Exit(code=1)
+
+
+@app.command("challenge-inspect")
+def challenge_inspect(
+    store_file: Annotated[
+        Path,
+        typer.Option(
+            "--store-file",
+            "-s",
+            help="Path to JSON file containing challenge session records.",
+        ),
+    ],
+    challenge_id: Annotated[
+        str | None,
+        typer.Option(
+            "--challenge-id",
+            "-c",
+            help="Specific challenge ID to inspect.",
+        ),
+    ] = None,
+    tenant_id: Annotated[
+        str | None,
+        typer.Option(
+            "--tenant-id",
+            "-t",
+            help="Filter by tenant ID.",
+        ),
+    ] = None,
+    output_format: Annotated[
+        str,
+        typer.Option(
+            "--format",
+            "-f",
+            help="Output format: 'json' or 'table'.",
+        ),
+    ] = "json",
+) -> None:
+    """Inspect stored challenge sessions from a session store file."""
+    if not store_file.is_file():
+        _abort(f"Store file not found: {store_file}")
+
+    try:
+        raw = store_file.read_text(encoding="utf-8")
+        records = json.loads(raw)
+        if not isinstance(records, list):
+            _abort("Invalid store file format: expected a JSON array of session objects.")
+    except (OSError, json.JSONDecodeError) as exc:
+        _abort(f"Could not read store file: {exc}")
+
+    matched: list[dict[str, Any]] = []
+    for item in records:
+        if not isinstance(item, dict):
+            continue
+        if challenge_id and item.get("challenge_id") != challenge_id:
+            continue
+        if tenant_id and item.get("tenant_id") != tenant_id:
+            continue
+        matched.append(item)
+
+    if challenge_id and not matched:
+        _abort(f"Challenge session '{challenge_id}' not found.")
+
+    if output_format.lower() == "table":
+        if not matched:
+            typer.echo("No challenge sessions found.")
+            return
+        header = (
+            f"{'CHALLENGE ID':<36}  {'TENANT':<12}  {'USER':<12}  "
+            f"{'METHOD':<10}  {'STATUS':<10}  {'ATTEMPTS':<8}"
+        )
+        typer.echo(header)
+        typer.echo("-" * len(header))
+        for m in matched:
+            att = f"{m.get('attempts_count', 0)}/{m.get('max_attempts', 3)}"
+            typer.echo(
+                f"{m.get('challenge_id', ''):<36}  {m.get('tenant_id', ''):<12}  "
+                f"{m.get('user_id', ''):<12}  {m.get('method', ''):<10}  "
+                f"{m.get('status', ''):<10}  {att}"
+            )
+    else:
+        typer.echo(json.dumps({"total_count": len(matched), "challenges": matched}, indent=2))
 
 
 def _abort(message: str) -> NoReturn:
