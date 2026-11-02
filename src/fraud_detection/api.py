@@ -54,6 +54,19 @@ from fraud_detection.audit import (
     build_scoring_audit_event,
     build_shadow_scoring_audit_event,
 )
+from fraud_detection.cases import (
+    CaseAssignmentError,
+    CaseDisposition,
+    CaseManager,
+    CaseNotFoundError,
+    CasePriority,
+    CaseStatus,
+    CaseValidationError,
+    DisputeEvidencePackage,
+    EvidencePackagingError,
+    FraudCase,
+    InvalidCaseStateTransitionError,
+)
 from fraud_detection.challenge import (
     ChallengeError,
     ChallengeExpiredError,
@@ -274,6 +287,9 @@ OPERATIONAL_PATHS = frozenset(
         "/v1/webhooks/dlq/replay",
         "/v1/challenges",
         "/v1/challenges/",
+        "/v1/cases",
+        "/v1/cases/",
+        "/v1/cases/summary",
     }
 )
 UNMATCHED_ROUTE_LABEL = "unmatched"
@@ -1600,6 +1616,122 @@ class ChallengeListResponse(BaseModel):
     challenges: list[ChallengeSessionResponse]
 
 
+class CaseCreateRequest(BaseModel):
+    """Payload to create an investigation case."""
+
+    transaction_id: str
+    fraud_score: float = 0.0
+    amount: float = 0.0
+    currency: str = "USD"
+    tenant_id: str = "default"
+    priority: str | None = None
+    sla_deadline_hours: float = 24.0
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    auto_assign: str | None = None
+
+
+class CaseUpdateRequest(BaseModel):
+    """Payload to update an existing case's status or assignment."""
+
+    assigned_analyst: str | None = None
+    status: str | None = None
+    priority: str | None = None
+    reason: str = ""
+    actor: str = "system"
+
+
+class CaseNoteRequest(BaseModel):
+    """Payload to append an analyst investigation note."""
+
+    author: str
+    text: str
+
+
+class CaseResolveRequest(BaseModel):
+    """Payload to finalize and resolve a fraud case."""
+
+    disposition: str
+    actor: str
+    notes: str = ""
+
+
+class CaseEvidenceRequest(BaseModel):
+    """Payload to compile and fingerprint a dispute evidence package."""
+
+    transaction_data: dict[str, Any] = Field(default_factory=dict)
+    device_data: dict[str, Any] | None = None
+    geo_data: dict[str, Any] | None = None
+    challenge_data: dict[str, Any] | None = None
+    merchant_data: dict[str, Any] | None = None
+    additional_evidence: dict[str, Any] | None = None
+    actor: str = "system"
+
+
+class CaseNoteResponse(BaseModel):
+    """Serialized analyst case note."""
+
+    note_id: str
+    author: str
+    text: str
+    timestamp: str
+
+
+class FraudCaseResponse(BaseModel):
+    """Serialized fraud case representation."""
+
+    case_id: str
+    transaction_id: str
+    tenant_id: str
+    assigned_analyst: str | None = None
+    status: str
+    priority: str
+    fraud_score: float
+    amount: float
+    currency: str
+    disposition: str
+    notes: list[CaseNoteResponse]
+    audit_trail: list[dict[str, Any]]
+    created_at: str
+    updated_at: str
+    sla_deadline_hours: float
+    sla_expires_at: str
+    is_sla_breached: bool
+    resolved_at: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class CaseListResponse(BaseModel):
+    """List of queried fraud cases."""
+
+    total_count: int
+    cases: list[FraudCaseResponse]
+
+
+class CaseSummaryResponse(BaseModel):
+    """Aggregate statistics for fraud cases."""
+
+    total_cases: int
+    by_status: dict[str, int]
+    by_priority: dict[str, int]
+    sla_breached_count: int
+
+
+class DisputeEvidenceResponse(BaseModel):
+    """Serialized dispute evidence package."""
+
+    package_id: str
+    case_id: str
+    transaction_id: str
+    tenant_id: str
+    created_at: str
+    evidence_items: dict[str, Any]
+    device_fingerprint: dict[str, Any] | None = None
+    geolocation_data: dict[str, Any] | None = None
+    challenge_verification: dict[str, Any] | None = None
+    merchant_profile: dict[str, Any] | None = None
+    sha256_fingerprint: str
+
+
 def create_app(
     *,
     model: FraudModel | None = None,
@@ -1681,6 +1813,7 @@ def create_app(
     tenant_registry: TenantRegistry | None = None,
     event_bus: EventBus | None = None,
     challenge_manager: ChallengeManager | None = None,
+    case_manager: CaseManager | None = None,
 ) -> FastAPI:
     """Create an application using an injected model or a trusted artifact path.
 
@@ -2070,6 +2203,24 @@ def create_app(
         "fraud_challenges_failed_total",
         "Total step-up challenge verification failures by reason.",
         ["tenant_id", "method", "reason"],
+        registry=metrics_registry,
+    )
+    cases_created_counter = Counter(
+        "fraud_cases_total",
+        "Total fraud cases created by priority.",
+        ["tenant_id", "priority"],
+        registry=metrics_registry,
+    )
+    cases_resolved_counter = Counter(
+        "fraud_cases_resolved_total",
+        "Total fraud cases resolved by disposition.",
+        ["tenant_id", "disposition"],
+        registry=metrics_registry,
+    )
+    evidence_packages_counter = Counter(
+        "fraud_evidence_packages_total",
+        "Total dispute evidence packages compiled.",
+        ["tenant_id"],
         registry=metrics_registry,
     )
     merchant_anomalies_counter = Counter(
@@ -2610,6 +2761,11 @@ def create_app(
         application.state.challenges_issued_counter = challenges_issued_counter
         application.state.challenges_verified_counter = challenges_verified_counter
         application.state.challenges_failed_counter = challenges_failed_counter
+        resolved_case_manager = case_manager or CaseManager()
+        application.state.case_manager = resolved_case_manager
+        application.state.cases_created_counter = cases_created_counter
+        application.state.cases_resolved_counter = cases_resolved_counter
+        application.state.evidence_packages_counter = evidence_packages_counter
         application.state.audit_sink = resolved_audit_sink
         application.state.explanation_provider = explanation_provider
         application.state.fallback_mode = resolved_fallback_mode
@@ -2715,6 +2871,8 @@ def create_app(
                 "/v1/merchant/profile/",
                 "/v1/tenants/",
                 "/v1/webhooks/",
+                "/v1/challenges/",
+                "/v1/cases/",
             )
         )
         if (
@@ -2742,6 +2900,8 @@ def create_app(
                 "/v1/merchant/profile/",
                 "/v1/tenants/",
                 "/v1/webhooks/",
+                "/v1/challenges/",
+                "/v1/cases/",
             )
         )
         if rate_limiter is None or is_operational:
@@ -5410,6 +5570,399 @@ def create_app(
                 status_code=404,
                 content={"detail": f"Challenge session '{challenge_id}' not found"},
             )
+
+    def _case_to_response(case: FraudCase) -> FraudCaseResponse:
+        return FraudCaseResponse(
+            case_id=case.case_id,
+            transaction_id=case.transaction_id,
+            tenant_id=case.tenant_id,
+            assigned_analyst=case.assigned_analyst,
+            status=case.status.value,
+            priority=case.priority.value,
+            fraud_score=case.fraud_score,
+            amount=case.amount,
+            currency=case.currency,
+            disposition=case.disposition.value,
+            notes=[
+                CaseNoteResponse(
+                    note_id=n.note_id,
+                    author=n.author,
+                    text=n.text,
+                    timestamp=n.timestamp,
+                )
+                for n in case.notes
+            ],
+            audit_trail=list(case.audit_trail),
+            created_at=case.created_at,
+            updated_at=case.updated_at,
+            sla_deadline_hours=case.sla_deadline_hours,
+            sla_expires_at=case.sla_expires_at,
+            is_sla_breached=case.is_sla_breached,
+            resolved_at=case.resolved_at,
+            metadata=dict(case.metadata),
+        )
+
+    def _evidence_to_response(pkg: DisputeEvidencePackage) -> DisputeEvidenceResponse:
+        return DisputeEvidenceResponse(
+            package_id=pkg.package_id,
+            case_id=pkg.case_id,
+            transaction_id=pkg.transaction_id,
+            tenant_id=pkg.tenant_id,
+            created_at=pkg.created_at,
+            evidence_items=dict(pkg.evidence_items),
+            device_fingerprint=pkg.device_fingerprint,
+            geolocation_data=pkg.geolocation_data,
+            challenge_verification=pkg.challenge_verification,
+            merchant_profile=pkg.merchant_profile,
+            sha256_fingerprint=pkg.sha256_fingerprint,
+        )
+
+    @application.get(
+        "/v1/cases/summary",
+        response_model=CaseSummaryResponse,
+        tags=["cases"],
+    )
+    async def case_summary_endpoint(
+        request: Request,
+        tenant_id: str | None = None,
+    ) -> CaseSummaryResponse | JSONResponse:
+        """Retrieve aggregated statistics across all investigation cases."""
+        mgr: CaseManager | None = getattr(request.app.state, "case_manager", None)
+        if mgr is None:
+            return JSONResponse(status_code=500, content={"detail": "CaseManager not initialized"})
+        summary = mgr.get_summary(tenant_id=tenant_id)
+        return CaseSummaryResponse(
+            total_cases=summary["total_cases"],
+            by_status=summary["by_status"],
+            by_priority=summary["by_priority"],
+            sla_breached_count=summary["sla_breached_count"],
+        )
+
+    @application.get(
+        "/v1/cases",
+        response_model=CaseListResponse,
+        tags=["cases"],
+    )
+    async def list_cases_endpoint(
+        request: Request,
+        tenant_id: str | None = None,
+        status: str | None = None,
+        priority: str | None = None,
+        assigned_analyst: str | None = None,
+        sla_breached_only: bool = False,
+        limit: int = 100,
+    ) -> CaseListResponse | JSONResponse:
+        """Query and filter fraud cases with multi-criteria search."""
+        mgr: CaseManager | None = getattr(request.app.state, "case_manager", None)
+        if mgr is None:
+            return CaseListResponse(total_count=0, cases=[])
+
+        status_enum = None
+        if status:
+            try:
+                status_enum = CaseStatus(status)
+            except ValueError:
+                return JSONResponse(
+                    status_code=400,
+                    content={"detail": f"Invalid case status '{status}'"},
+                )
+
+        prio_enum = None
+        if priority:
+            try:
+                prio_enum = CasePriority(priority)
+            except ValueError:
+                return JSONResponse(
+                    status_code=400,
+                    content={"detail": f"Invalid case priority '{priority}'"},
+                )
+
+        cases = mgr.store.list_cases(
+            tenant_id=tenant_id,
+            status=status_enum,
+            priority=prio_enum,
+            assigned_analyst=assigned_analyst,
+            sla_breached_only=sla_breached_only,
+            limit=limit,
+        )
+        return CaseListResponse(
+            total_count=len(cases),
+            cases=[_case_to_response(c) for c in cases],
+        )
+
+    @application.post(
+        "/v1/cases",
+        response_model=FraudCaseResponse,
+        status_code=201,
+        responses={
+            400: {"description": "Invalid case parameters."},
+        },
+        tags=["cases"],
+    )
+    async def create_case_endpoint(
+        payload: CaseCreateRequest,
+        request: Request,
+    ) -> FraudCaseResponse | JSONResponse:
+        """Create a new manual or automated fraud investigation case."""
+        mgr: CaseManager | None = getattr(request.app.state, "case_manager", None)
+        if mgr is None:
+            return JSONResponse(status_code=500, content={"detail": "CaseManager not initialized"})
+
+        prio_enum = None
+        if payload.priority:
+            try:
+                prio_enum = CasePriority(payload.priority)
+            except ValueError:
+                return JSONResponse(
+                    status_code=400,
+                    content={"detail": f"Invalid case priority '{payload.priority}'"},
+                )
+
+        try:
+            case = mgr.create_case(
+                transaction_id=payload.transaction_id,
+                fraud_score=payload.fraud_score,
+                amount=payload.amount,
+                currency=payload.currency,
+                tenant_id=payload.tenant_id,
+                priority=prio_enum,
+                sla_deadline_hours=payload.sla_deadline_hours,
+                metadata=payload.metadata,
+                auto_assign=payload.auto_assign,
+            )
+        except CaseValidationError as exc:
+            return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+        cases_counter: Counter | None = getattr(request.app.state, "cases_created_counter", None)
+        if cases_counter is not None:
+            cases_counter.labels(tenant_id=case.tenant_id, priority=case.priority.value).inc()
+
+        return _case_to_response(case)
+
+    @application.get(
+        "/v1/cases/{case_id}",
+        response_model=FraudCaseResponse,
+        responses={
+            404: {"description": "Case not found."},
+        },
+        tags=["cases"],
+    )
+    async def get_case_endpoint(
+        case_id: str,
+        request: Request,
+    ) -> FraudCaseResponse | JSONResponse:
+        """Retrieve full details, notes, and audit trail of a fraud case."""
+        mgr: CaseManager | None = getattr(request.app.state, "case_manager", None)
+        if mgr is None:
+            return JSONResponse(status_code=500, content={"detail": "CaseManager not initialized"})
+
+        try:
+            case = mgr.get_case(case_id)
+            return _case_to_response(case)
+        except CaseNotFoundError as exc:
+            return JSONResponse(status_code=404, content={"detail": str(exc)})
+
+    @application.patch(
+        "/v1/cases/{case_id}",
+        response_model=FraudCaseResponse,
+        responses={
+            400: {"description": "Invalid transition or assignment."},
+            404: {"description": "Case not found."},
+        },
+        tags=["cases"],
+    )
+    async def update_case_endpoint(
+        case_id: str,
+        payload: CaseUpdateRequest,
+        request: Request,
+    ) -> FraudCaseResponse | JSONResponse:
+        """Update case assignment, status, or priority."""
+        mgr: CaseManager | None = getattr(request.app.state, "case_manager", None)
+        if mgr is None:
+            return JSONResponse(status_code=500, content={"detail": "CaseManager not initialized"})
+
+        try:
+            case = mgr.get_case(case_id)
+            if payload.assigned_analyst is not None:
+                case = mgr.assign_case(case_id, payload.assigned_analyst, actor=payload.actor)
+            if payload.status is not None:
+                try:
+                    new_st = CaseStatus(payload.status)
+                    case = mgr.update_status(
+                        case_id, new_st, actor=payload.actor, reason=payload.reason
+                    )
+                except ValueError:
+                    return JSONResponse(
+                        status_code=400,
+                        content={"detail": f"Invalid status '{payload.status}'"},
+                    )
+            if payload.priority is not None:
+                try:
+                    case.priority = CasePriority(payload.priority)
+                    case.add_audit_entry(
+                        action="priority_changed",
+                        actor=payload.actor,
+                        details={"new_priority": case.priority.value, "reason": payload.reason},
+                    )
+                    mgr.store.put(case)
+                except ValueError:
+                    return JSONResponse(
+                        status_code=400,
+                        content={"detail": f"Invalid priority '{payload.priority}'"},
+                    )
+            return _case_to_response(case)
+        except CaseNotFoundError as exc:
+            return JSONResponse(status_code=404, content={"detail": str(exc)})
+        except (InvalidCaseStateTransitionError, CaseAssignmentError, CaseValidationError) as exc:
+            return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+    @application.post(
+        "/v1/cases/{case_id}/notes",
+        response_model=CaseNoteResponse,
+        status_code=201,
+        responses={
+            400: {"description": "Invalid note content."},
+            404: {"description": "Case not found."},
+        },
+        tags=["cases"],
+    )
+    async def add_case_note_endpoint(
+        case_id: str,
+        payload: CaseNoteRequest,
+        request: Request,
+    ) -> CaseNoteResponse | JSONResponse:
+        """Append an investigation finding note to a fraud case."""
+        mgr: CaseManager | None = getattr(request.app.state, "case_manager", None)
+        if mgr is None:
+            return JSONResponse(status_code=500, content={"detail": "CaseManager not initialized"})
+
+        try:
+            note = mgr.add_note(case_id, author=payload.author, text=payload.text)
+            return CaseNoteResponse(
+                note_id=note.note_id,
+                author=note.author,
+                text=note.text,
+                timestamp=note.timestamp,
+            )
+        except CaseNotFoundError as exc:
+            return JSONResponse(status_code=404, content={"detail": str(exc)})
+        except CaseValidationError as exc:
+            return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+    @application.post(
+        "/v1/cases/{case_id}/resolve",
+        response_model=FraudCaseResponse,
+        responses={
+            400: {"description": "Invalid disposition."},
+            404: {"description": "Case not found."},
+        },
+        tags=["cases"],
+    )
+    async def resolve_case_endpoint(
+        case_id: str,
+        payload: CaseResolveRequest,
+        request: Request,
+    ) -> FraudCaseResponse | JSONResponse:
+        """Resolve a fraud case with a final disposition and conclusion notes."""
+        mgr: CaseManager | None = getattr(request.app.state, "case_manager", None)
+        if mgr is None:
+            return JSONResponse(status_code=500, content={"detail": "CaseManager not initialized"})
+
+        try:
+            disp_enum = CaseDisposition(payload.disposition)
+        except ValueError:
+            return JSONResponse(
+                status_code=400,
+                content={"detail": f"Invalid disposition '{payload.disposition}'"},
+            )
+
+        try:
+            case = mgr.resolve_case(
+                case_id,
+                disposition=disp_enum,
+                actor=payload.actor,
+                notes=payload.notes,
+            )
+            resolved_counter: Counter | None = getattr(
+                request.app.state, "cases_resolved_counter", None
+            )
+            if resolved_counter is not None:
+                resolved_counter.labels(
+                    tenant_id=case.tenant_id, disposition=case.disposition.value
+                ).inc()
+
+            return _case_to_response(case)
+        except CaseNotFoundError as exc:
+            return JSONResponse(status_code=404, content={"detail": str(exc)})
+        except (CaseValidationError, InvalidCaseStateTransitionError) as exc:
+            return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+    @application.post(
+        "/v1/cases/{case_id}/evidence",
+        response_model=DisputeEvidenceResponse,
+        status_code=201,
+        responses={
+            400: {"description": "Evidence packaging failed."},
+            404: {"description": "Case not found."},
+        },
+        tags=["cases"],
+    )
+    async def generate_evidence_endpoint(
+        case_id: str,
+        payload: CaseEvidenceRequest,
+        request: Request,
+    ) -> DisputeEvidenceResponse | JSONResponse:
+        """Generate and fingerprint a tamper-evident dispute evidence dossier."""
+        mgr: CaseManager | None = getattr(request.app.state, "case_manager", None)
+        if mgr is None:
+            return JSONResponse(status_code=500, content={"detail": "CaseManager not initialized"})
+
+        try:
+            pkg = mgr.generate_evidence_package(
+                case_id=case_id,
+                transaction_data=payload.transaction_data,
+                device_data=payload.device_data,
+                geo_data=payload.geo_data,
+                challenge_data=payload.challenge_data,
+                merchant_data=payload.merchant_data,
+                additional_evidence=payload.additional_evidence,
+                actor=payload.actor,
+            )
+            ev_counter: Counter | None = getattr(
+                request.app.state, "evidence_packages_counter", None
+            )
+            if ev_counter is not None:
+                ev_counter.labels(tenant_id=pkg.tenant_id).inc()
+
+            return _evidence_to_response(pkg)
+        except CaseNotFoundError as exc:
+            return JSONResponse(status_code=404, content={"detail": str(exc)})
+        except EvidencePackagingError as exc:
+            return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+    @application.get(
+        "/v1/cases/{case_id}/evidence",
+        response_model=list[DisputeEvidenceResponse],
+        responses={
+            404: {"description": "Case not found."},
+        },
+        tags=["cases"],
+    )
+    async def list_evidence_endpoint(
+        case_id: str,
+        request: Request,
+    ) -> list[DisputeEvidenceResponse] | JSONResponse:
+        """List all compiled dispute evidence packages for a case."""
+        mgr: CaseManager | None = getattr(request.app.state, "case_manager", None)
+        if mgr is None:
+            return JSONResponse(status_code=500, content={"detail": "CaseManager not initialized"})
+
+        try:
+            mgr.get_case(case_id)
+            packages = mgr.store.list_evidence_packages(case_id)
+            return [_evidence_to_response(p) for p in packages]
+        except CaseNotFoundError as exc:
+            return JSONResponse(status_code=404, content={"detail": str(exc)})
 
     @application.get(
         "/v1/routing/status",
