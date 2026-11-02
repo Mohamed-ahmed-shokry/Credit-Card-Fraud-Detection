@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -307,3 +310,134 @@ class FraudCase:
             resolved_at=data.get("resolved_at"),
             metadata=dict(data.get("metadata") or {}),
         )
+
+
+@dataclass
+class DisputeEvidencePackage:
+    """Cryptographic, tamper-evident dispute evidence dossier for card network representment."""
+
+    case_id: str
+    transaction_id: str
+    tenant_id: str
+    evidence_items: dict[str, Any]
+    package_id: str = field(default_factory=lambda: f"evpkg_{uuid4().hex[:12]}")
+    created_at: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
+    device_fingerprint: dict[str, Any] | None = None
+    geolocation_data: dict[str, Any] | None = None
+    challenge_verification: dict[str, Any] | None = None
+    merchant_profile: dict[str, Any] | None = None
+    sha256_fingerprint: str = field(default="")
+
+    def __post_init__(self) -> None:
+        if not self.case_id or not self.case_id.strip():
+            raise EvidencePackagingError("case_id must be a non-empty string")
+        if not self.transaction_id or not self.transaction_id.strip():
+            raise EvidencePackagingError("transaction_id must be a non-empty string")
+        if not self.tenant_id or not self.tenant_id.strip():
+            raise EvidencePackagingError("tenant_id must be a non-empty string")
+
+        if not self.sha256_fingerprint:
+            self.sha256_fingerprint = self.compute_fingerprint()
+
+    def _canonical_payload(self) -> dict[str, Any]:
+        return {
+            "package_id": self.package_id,
+            "case_id": self.case_id,
+            "transaction_id": self.transaction_id,
+            "tenant_id": self.tenant_id,
+            "created_at": self.created_at,
+            "evidence_items": self.evidence_items,
+            "device_fingerprint": self.device_fingerprint,
+            "geolocation_data": self.geolocation_data,
+            "challenge_verification": self.challenge_verification,
+            "merchant_profile": self.merchant_profile,
+        }
+
+    def to_canonical_json(self) -> str:
+        """Produce deterministic sorted canonical JSON representation for hashing and export."""
+        return json.dumps(
+            self._canonical_payload(),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            default=str,
+        )
+
+    def compute_fingerprint(self) -> str:
+        """Compute SHA-256 cryptographic digest across all canonical evidence attributes."""
+        canonical_bytes = self.to_canonical_json().encode("utf-8")
+        return hashlib.sha256(canonical_bytes).hexdigest()
+
+    def verify_integrity(self) -> bool:
+        """Verify that the evidence package payload matches the cryptographic SHA-256 digest."""
+        calculated = self.compute_fingerprint()
+        return hmac.compare_digest(calculated, self.sha256_fingerprint)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize evidence package to JSON dictionary."""
+        payload = self._canonical_payload()
+        payload["sha256_fingerprint"] = self.sha256_fingerprint
+        return payload
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> DisputeEvidencePackage:
+        """Hydrate evidence package from dictionary representation."""
+        return cls(
+            package_id=str(data.get("package_id") or f"evpkg_{uuid4().hex[:12]}"),
+            case_id=str(data.get("case_id", "")),
+            transaction_id=str(data.get("transaction_id", "")),
+            tenant_id=str(data.get("tenant_id", "default")),
+            created_at=str(data.get("created_at") or datetime.now(UTC).isoformat()),
+            evidence_items=dict(data.get("evidence_items") or {}),
+            device_fingerprint=data.get("device_fingerprint"),
+            geolocation_data=data.get("geolocation_data"),
+            challenge_verification=data.get("challenge_verification"),
+            merchant_profile=data.get("merchant_profile"),
+            sha256_fingerprint=str(data.get("sha256_fingerprint", "")),
+        )
+
+
+def compile_evidence_package(
+    case: FraudCase,
+    transaction_data: dict[str, Any],
+    device_data: dict[str, Any] | None = None,
+    geo_data: dict[str, Any] | None = None,
+    challenge_data: dict[str, Any] | None = None,
+    merchant_data: dict[str, Any] | None = None,
+    additional_evidence: dict[str, Any] | None = None,
+) -> DisputeEvidencePackage:
+    """Compile multi-modal fraud evaluation evidence into a tamper-evident dispute dossier.
+
+    Args:
+        case: FraudCase instance being represented or investigated.
+        transaction_data: Base transaction attributes (amount, currency, timestamps).
+        device_data: Optional device fingerprint metadata (Phase 40).
+        geo_data: Optional geolocation velocity metrics (Phase 39).
+        challenge_data: Optional step-up authentication verification proof (Phase 44).
+        merchant_data: Optional merchant risk profiling metrics (Phase 41).
+        additional_evidence: Optional custom evidence key-values (receipts, delivery proof).
+
+    Returns:
+        Fingerprinted DisputeEvidencePackage.
+    """
+    evidence_items = {
+        "case_priority": case.priority.value,
+        "case_fraud_score": case.fraud_score,
+        "case_disposition": case.disposition.value,
+        "transaction": dict(transaction_data),
+        "notes_count": len(case.notes),
+        "audit_events_count": len(case.audit_trail),
+    }
+    if additional_evidence:
+        evidence_items.update(additional_evidence)
+
+    return DisputeEvidencePackage(
+        case_id=case.case_id,
+        transaction_id=case.transaction_id,
+        tenant_id=case.tenant_id,
+        evidence_items=evidence_items,
+        device_fingerprint=dict(device_data) if device_data is not None else None,
+        geolocation_data=dict(geo_data) if geo_data is not None else None,
+        challenge_verification=dict(challenge_data) if challenge_data is not None else None,
+        merchant_profile=dict(merchant_data) if merchant_data is not None else None,
+    )

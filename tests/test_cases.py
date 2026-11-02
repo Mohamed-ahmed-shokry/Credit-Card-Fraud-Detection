@@ -15,9 +15,11 @@ from fraud_detection.cases import (
     CasePriority,
     CaseStatus,
     CaseValidationError,
+    DisputeEvidencePackage,
     EvidencePackagingError,
     FraudCase,
     InvalidCaseStateTransitionError,
+    compile_evidence_package,
     compute_priority,
 )
 
@@ -159,3 +161,103 @@ def test_fraud_case_validation_errors() -> None:
 
     with pytest.raises(CaseValidationError, match="sla_deadline_hours"):
         FraudCase(transaction_id="tx_1", sla_deadline_hours=0.0)
+
+
+def test_dispute_evidence_package_fingerprint_and_integrity() -> None:
+    """Validate deterministic canonical hashing and tamper-evident integrity checking."""
+    pkg = DisputeEvidencePackage(
+        case_id="case_123",
+        transaction_id="tx_abc",
+        tenant_id="tenant_fintech",
+        evidence_items={"amount": 499.99, "currency": "USD", "reason": "fraud_dispute"},
+        device_fingerprint={"device_id": "dev_001", "risk_tier": "elevated"},
+    )
+    assert pkg.package_id.startswith("evpkg_")
+    assert len(pkg.sha256_fingerprint) == 64
+    assert pkg.verify_integrity() is True
+
+    # Check canonical JSON deterministic structure
+    canonical = pkg.to_canonical_json()
+    assert '"case_id":"case_123"' in canonical
+    assert '"device_id":"dev_001"' in canonical
+
+    # Tampering test: alter internal evidence item
+    pkg.evidence_items["amount"] = 9999.99
+    assert pkg.verify_integrity() is False
+
+    # Restoring original restores integrity
+    pkg.evidence_items["amount"] = 499.99
+    assert pkg.verify_integrity() is True
+
+
+def test_compile_evidence_package_multi_modal() -> None:
+    """Verify multi-modal compiler aggregates device, geo, 3DS challenge, and merchant context."""
+    case = FraudCase(
+        transaction_id="tx_multi_001",
+        tenant_id="tenant_alpha",
+        fraud_score=0.91,
+        amount=1200.0,
+        priority=CasePriority.CRITICAL,
+    )
+    case.notes.append(CaseNote(author="analyst_1", text="Suspicious IP hop"))
+
+    tx_data = {"card_network": "Visa", "auth_code": "V12345", "avs_result": "MATCH"}
+    device_data = {"device_cookie_age_days": 0.5, "is_proxy": True}
+    geo_data = {"country": "FR", "speed_kmh": 1200.0, "impossible_travel": True}
+    challenge_data = {"status": "verified", "method": "sms_otp", "attempts": 1}
+    merchant_data = {"mcc": "5732", "merchant_risk_tier": "high"}
+
+    pkg = compile_evidence_package(
+        case=case,
+        transaction_data=tx_data,
+        device_data=device_data,
+        geo_data=geo_data,
+        challenge_data=challenge_data,
+        merchant_data=merchant_data,
+        additional_evidence={"chargeback_reason_code": "10.4"},
+    )
+
+    assert pkg.case_id == case.case_id
+    assert pkg.transaction_id == "tx_multi_001"
+    assert pkg.tenant_id == "tenant_alpha"
+    assert pkg.device_fingerprint == device_data
+    assert pkg.geolocation_data == geo_data
+    assert pkg.challenge_verification == challenge_data
+    assert pkg.merchant_profile == merchant_data
+    assert pkg.evidence_items["chargeback_reason_code"] == "10.4"
+    assert pkg.evidence_items["case_fraud_score"] == 0.91
+    assert pkg.verify_integrity() is True
+
+    # Serialization and hydration
+    d = pkg.to_dict()
+    assert d["sha256_fingerprint"] == pkg.sha256_fingerprint
+    hydrated = DisputeEvidencePackage.from_dict(d)
+    assert hydrated.package_id == pkg.package_id
+    assert hydrated.verify_integrity() is True
+
+
+def test_evidence_package_validation_errors() -> None:
+    """Verify bounds and validation errors on evidence packages."""
+    with pytest.raises(EvidencePackagingError, match="case_id"):
+        DisputeEvidencePackage(
+            case_id="",
+            transaction_id="tx_1",
+            tenant_id="t1",
+            evidence_items={},
+        )
+
+    with pytest.raises(EvidencePackagingError, match="transaction_id"):
+        DisputeEvidencePackage(
+            case_id="c1",
+            transaction_id="",
+            tenant_id="t1",
+            evidence_items={},
+        )
+
+    with pytest.raises(EvidencePackagingError, match="tenant_id"):
+        DisputeEvidencePackage(
+            case_id="c1",
+            transaction_id="tx_1",
+            tenant_id="",
+            evidence_items={},
+        )
