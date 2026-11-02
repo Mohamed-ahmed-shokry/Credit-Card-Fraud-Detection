@@ -2289,7 +2289,7 @@ Does not implement telecom SMS/Email carrier gateways (Twilio, SendGrid, etc.) a
 - **Verification Gates**: 100% Green local CI parity, $\ge 97.0\%$ branch coverage, 0 mypy issues, Ruff formatted, pip-audit clean, wheel build and twine valid.
 
 
-## Phase 45 — Fraud Case Management, Investigation SLA Tracking & Dispute Evidence Packaging Engine (In Progress)
+## Phase 45 — Fraud Case Management, Investigation SLA Tracking & Dispute Evidence Packaging Engine (Done)
 
 ### Objective
 
@@ -2352,7 +2352,18 @@ Does not implement direct merchant payment processor API webhooks for card netwo
 - [x] Task 4: Integrate Case Management into Decision DAG (`pipeline.py`) and EventBus (`events.py`) with unit/integration tests.
 - [x] Task 5: Implement `/v1/cases/*` REST endpoints and Prometheus metrics in `src/fraud_detection/api.py` with integration tests in `tests/test_api.py`.
 - [x] Task 6: Implement CLI commands `case-create`, `case-list`, `case-inspect`, `case-resolve`, and `case-evidence` in `src/fraud_detection/cli.py` with tests in `tests/test_cli.py`.
-- [ ] Task 7: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate with 100% Green CI.
+- [x] Task 7: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate with 100% Green CI.
+
+### Delivery record
+
+- Delivered an in-process, zero-dependency Fraud Case Management, Analyst Workflow, SLA Tracking, and Dispute Evidence Packaging Engine (`cases.py`).
+- Implemented `FraudCase`, `CasePriority` (dynamic severity calculation), `CaseStatus` (invariant state machine), `CaseDisposition`, and append-only `CaseNote` models with audit logging.
+- Implemented `DisputeEvidencePackage` with deterministic RFC 8785 canonical JSON formatting and SHA-256 tamper-evident fingerprinting for card network chargeback representment (Visa CE3.0 / Mastercard First-Party Trust).
+- Implemented thread-safe, bounded, multi-index `CaseStore` and `CaseManager` supporting concurrent lifecycle mutations and SLA breach monitoring.
+- Integrated automated case generation into Decision DAG (`ActionAggregatorStageProcessor` in `pipeline.py`) on `REVIEW` decisions and broadcasted domain events (`CASE_CREATED`, `CASE_ASSIGNED`, `CASE_STATUS_CHANGED`, `CASE_RESOLVED`, `EVIDENCE_PACKAGED`) over `EventBus`.
+- Added FastAPI REST endpoints under `/v1/cases/*` for case CRUD, status/priority patching, note logging, resolution, and evidence dossier export with Prometheus metrics.
+- Added Typer CLI commands: `case-create`, `case-list`, `case-inspect`, `case-resolve`, `case-evidence` supporting both JSON and ASCII table outputs.
+- Comprehensive unit and integration test coverage across `tests/test_cases.py`, `tests/test_api.py`, `tests/test_cli.py`, and `tests/test_pipeline.py`.
 
 
 ## Contributing to the roadmap
