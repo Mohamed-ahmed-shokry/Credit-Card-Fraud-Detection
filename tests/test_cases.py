@@ -10,10 +10,12 @@ from fraud_detection.cases import (
     CaseAssignmentError,
     CaseDisposition,
     CaseError,
+    CaseManager,
     CaseNote,
     CaseNotFoundError,
     CasePriority,
     CaseStatus,
+    CaseStore,
     CaseValidationError,
     DisputeEvidencePackage,
     EvidencePackagingError,
@@ -261,3 +263,152 @@ def test_evidence_package_validation_errors() -> None:
             tenant_id="",
             evidence_items={},
         )
+
+
+def test_case_store_operations() -> None:
+    """Validate thread-safe CaseStore indexing, queries, filtering, and package storage."""
+    store = CaseStore()
+    c1 = FraudCase(transaction_id="tx_s1", tenant_id="t1", priority=CasePriority.HIGH)
+    c2 = FraudCase(transaction_id="tx_s2", tenant_id="t2", priority=CasePriority.LOW)
+    c3 = FraudCase(
+        transaction_id="tx_s3",
+        tenant_id="t1",
+        priority=CasePriority.CRITICAL,
+        sla_expires_at=(datetime.now(UTC) - timedelta(hours=1)).isoformat(),
+    )
+
+    store.put(c1)
+    store.put(c2)
+    store.put(c3)
+
+    assert store.count() == 3
+    assert store.get(c1.case_id) == c1
+    assert store.get_by_transaction("tx_s2") == c2
+    assert store.get_by_transaction("nonexistent") is None
+
+    # Filter by tenant
+    t1_cases = store.list_cases(tenant_id="t1")
+    assert len(t1_cases) == 2
+
+    # Filter by priority
+    low_cases = store.list_cases(priority=CasePriority.LOW)
+    assert len(low_cases) == 1
+    assert low_cases[0].case_id == c2.case_id
+
+    # Filter by SLA breached
+    breached = store.list_cases(sla_breached_only=True)
+    assert len(breached) == 1
+    assert breached[0].case_id == c3.case_id
+
+    # Evidence package indexing
+    pkg = DisputeEvidencePackage(
+        case_id=c1.case_id,
+        transaction_id="tx_s1",
+        tenant_id="t1",
+        evidence_items={"test": True},
+    )
+    store.put_evidence_package(pkg)
+    assert store.get_evidence_package(pkg.package_id) == pkg
+    assert len(store.list_evidence_packages(c1.case_id)) == 1
+
+    # Delete
+    assert store.delete(c1.case_id) is True
+    assert store.get(c1.case_id) is None
+    assert store.delete("nonexistent") is False
+    assert store.count() == 2
+
+    store.clear()
+    assert store.count() == 0
+
+
+def test_case_manager_lifecycle_and_transitions() -> None:
+    """Verify CaseManager workflows: creation, assignment, transition rules, and resolution."""
+    mgr = CaseManager()
+
+    # 1. Create case with auto-calculated priority
+    case = mgr.create_case(
+        transaction_id="tx_flow_01",
+        fraud_score=0.85,
+        amount=2500.0,
+        tenant_id="fintech_beta",
+    )
+    assert case.priority == CasePriority.HIGH
+    assert case.status == CaseStatus.OPEN
+    assert case.assigned_analyst is None
+
+    # 2. Assign analyst -> auto transitions to INVESTIGATING
+    assigned = mgr.assign_case(case.case_id, analyst="analyst_charlie", actor="supervisor")
+    assert assigned.assigned_analyst == "analyst_charlie"
+    assert assigned.status == CaseStatus.INVESTIGATING
+
+    # 3. Add note
+    note = mgr.add_note(
+        case.case_id,
+        author="analyst_charlie",
+        text="Called bank, suspicious card.",
+    )
+    assert note.text == "Called bank, suspicious card."
+    assert len(assigned.notes) == 1
+
+    # 4. Status transitions
+    mgr.update_status(case.case_id, CaseStatus.PENDING_CUSTOMER, actor="analyst_charlie")
+    assert assigned.status == CaseStatus.PENDING_CUSTOMER
+
+    # Illegal transition: PENDING_CUSTOMER cannot go directly to REPRESENTED
+    with pytest.raises(InvalidCaseStateTransitionError, match="Illegal transition"):
+        mgr.update_status(case.case_id, CaseStatus.REPRESENTED, actor="analyst_charlie")
+
+    # Transition to INVESTIGATING
+    mgr.update_status(case.case_id, CaseStatus.INVESTIGATING, actor="analyst_charlie")
+
+    # 5. Resolve case
+    resolved = mgr.resolve_case(
+        case.case_id,
+        disposition=CaseDisposition.CONFIRMED_FRAUD,
+        actor="analyst_charlie",
+        notes="Cardholder confirmed stolen credentials.",
+    )
+    assert resolved.status == CaseStatus.RESOLVED
+    assert resolved.disposition == CaseDisposition.CONFIRMED_FRAUD
+    assert resolved.resolved_at is not None
+
+    # 6. Cannot resolve with UNRESOLVED disposition
+    with pytest.raises(CaseValidationError, match="cannot be resolved with UNRESOLVED"):
+        mgr.resolve_case(
+            case.case_id,
+            disposition=CaseDisposition.UNRESOLVED,
+            actor="analyst_charlie",
+        )
+
+    # 7. Generate evidence package through manager
+    pkg = mgr.generate_evidence_package(
+        case.case_id,
+        transaction_data={"amount": 2500.0},
+        device_data={"ip": "1.2.3.4"},
+        actor="analyst_charlie",
+    )
+    assert pkg.case_id == case.case_id
+    assert pkg.verify_integrity() is True
+    assert len(mgr.store.list_evidence_packages(case.case_id)) == 1
+
+    # 8. Summary statistics
+    summary = mgr.get_summary(tenant_id="fintech_beta")
+    assert summary["total_cases"] == 1
+    assert summary["by_status"]["resolved"] == 1
+    assert summary["by_priority"]["high"] == 1
+
+
+def test_case_manager_error_paths() -> None:
+    """Verify error checking for nonexistent cases and invalid assignment."""
+    mgr = CaseManager()
+
+    with pytest.raises(CaseNotFoundError, match="not found"):
+        mgr.get_case("case_missing")
+
+    with pytest.raises(CaseNotFoundError, match="not found"):
+        mgr.assign_case("case_missing", analyst="bob")
+
+    # Create case then attempt empty analyst assignment
+    c = mgr.create_case(transaction_id="tx_err")
+    with pytest.raises(CaseAssignmentError, match="Analyst identifier cannot be empty"):
+        mgr.assign_case(c.case_id, analyst="   ")

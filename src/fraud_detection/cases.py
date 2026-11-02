@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import threading
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -441,3 +442,326 @@ def compile_evidence_package(
         challenge_verification=dict(challenge_data) if challenge_data is not None else None,
         merchant_profile=dict(merchant_data) if merchant_data is not None else None,
     )
+
+
+class CaseStore:
+    """Thread-safe multi-index in-memory store for fraud cases and dispute packages."""
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._cases: dict[str, FraudCase] = {}
+        self._by_tx: dict[str, str] = {}
+        self._evidence_packages: dict[str, DisputeEvidencePackage] = {}
+        self._pkg_by_case: dict[str, list[str]] = {}
+
+    def put(self, case: FraudCase) -> None:
+        """Store or update a FraudCase instance."""
+        with self._lock:
+            self._cases[case.case_id] = case
+            self._by_tx[case.transaction_id] = case.case_id
+
+    def get(self, case_id: str) -> FraudCase | None:
+        """Retrieve a case by its unique case_id."""
+        with self._lock:
+            return self._cases.get(case_id)
+
+    def get_by_transaction(self, transaction_id: str) -> FraudCase | None:
+        """Retrieve the latest case associated with a transaction_id."""
+        with self._lock:
+            case_id = self._by_tx.get(transaction_id)
+            if case_id:
+                return self._cases.get(case_id)
+            return None
+
+    def delete(self, case_id: str) -> bool:
+        """Remove a case by ID from the store."""
+        with self._lock:
+            case = self._cases.pop(case_id, None)
+            if case is not None:
+                if self._by_tx.get(case.transaction_id) == case_id:
+                    self._by_tx.pop(case.transaction_id, None)
+                self._pkg_by_case.pop(case_id, None)
+                return True
+            return False
+
+    def list_cases(
+        self,
+        tenant_id: str | None = None,
+        status: CaseStatus | None = None,
+        priority: CasePriority | None = None,
+        assigned_analyst: str | None = None,
+        sla_breached_only: bool = False,
+        limit: int = 100,
+    ) -> list[FraudCase]:
+        """Query and filter cases by tenant, status, priority, analyst, and SLA."""
+        with self._lock:
+            results: list[FraudCase] = []
+            for case in self._cases.values():
+                if tenant_id and case.tenant_id != tenant_id:
+                    continue
+                if status and case.status != status:
+                    continue
+                if priority and case.priority != priority:
+                    continue
+                if assigned_analyst and case.assigned_analyst != assigned_analyst:
+                    continue
+                if sla_breached_only and not case.is_sla_breached:
+                    continue
+                results.append(case)
+                if len(results) >= limit:
+                    break
+            # Sort by created_at descending
+            results.sort(key=lambda c: c.created_at, reverse=True)
+            return results
+
+    def put_evidence_package(self, pkg: DisputeEvidencePackage) -> None:
+        """Index and store a DisputeEvidencePackage."""
+        with self._lock:
+            self._evidence_packages[pkg.package_id] = pkg
+            if pkg.case_id not in self._pkg_by_case:
+                self._pkg_by_case[pkg.case_id] = []
+            if pkg.package_id not in self._pkg_by_case[pkg.case_id]:
+                self._pkg_by_case[pkg.case_id].append(pkg.package_id)
+
+    def get_evidence_package(self, package_id: str) -> DisputeEvidencePackage | None:
+        """Retrieve an evidence package by ID."""
+        with self._lock:
+            return self._evidence_packages.get(package_id)
+
+    def list_evidence_packages(self, case_id: str) -> list[DisputeEvidencePackage]:
+        """List all evidence packages compiled for a given case."""
+        with self._lock:
+            pkg_ids = self._pkg_by_case.get(case_id, [])
+            return [
+                self._evidence_packages[pid] for pid in pkg_ids if pid in self._evidence_packages
+            ]
+
+    def count(self) -> int:
+        """Total number of active cases in store."""
+        with self._lock:
+            return len(self._cases)
+
+    def clear(self) -> None:
+        """Reset all case and package storage."""
+        with self._lock:
+            self._cases.clear()
+            self._by_tx.clear()
+            self._evidence_packages.clear()
+            self._pkg_by_case.clear()
+
+
+class CaseManager:
+    """Orchestrates case lifecycle, analyst assignment, SLA queries, and evidence generation."""
+
+    def __init__(self, store: CaseStore | None = None) -> None:
+        self.store = store or CaseStore()
+        self._lock = threading.RLock()
+
+    def create_case(
+        self,
+        transaction_id: str,
+        fraud_score: float = 0.0,
+        amount: float = 0.0,
+        currency: str = "USD",
+        tenant_id: str = "default",
+        priority: CasePriority | None = None,
+        sla_deadline_hours: float = 24.0,
+        metadata: dict[str, Any] | None = None,
+        auto_assign: str | None = None,
+    ) -> FraudCase:
+        """Create and persist a new fraud case."""
+        with self._lock:
+            resolved_priority = priority or compute_priority(fraud_score, amount)
+            case = FraudCase(
+                transaction_id=transaction_id,
+                tenant_id=tenant_id,
+                fraud_score=fraud_score,
+                amount=amount,
+                currency=currency,
+                priority=resolved_priority,
+                sla_deadline_hours=sla_deadline_hours,
+                metadata=metadata or {},
+            )
+            if auto_assign:
+                case.assigned_analyst = auto_assign
+                case.status = CaseStatus.INVESTIGATING
+                case.add_audit_entry(
+                    action="case_assigned",
+                    actor="system",
+                    details={"analyst": auto_assign},
+                )
+            self.store.put(case)
+            return case
+
+    def get_case(self, case_id: str) -> FraudCase:
+        """Retrieve case by ID or raise CaseNotFoundError."""
+        with self._lock:
+            case = self.store.get(case_id)
+            if case is None:
+                raise CaseNotFoundError(f"Case '{case_id}' not found")
+            return case
+
+    def assign_case(
+        self,
+        case_id: str,
+        analyst: str,
+        actor: str = "system",
+    ) -> FraudCase:
+        """Assign an analyst to an active case, transitioning from OPEN to INVESTIGATING."""
+        with self._lock:
+            case = self.get_case(case_id)
+            if not analyst or not analyst.strip():
+                raise CaseAssignmentError("Analyst identifier cannot be empty")
+
+            old_analyst = case.assigned_analyst
+            case.assigned_analyst = analyst.strip()
+            if case.status == CaseStatus.OPEN:
+                case.status = CaseStatus.INVESTIGATING
+
+            case.add_audit_entry(
+                action="case_assigned",
+                actor=actor,
+                details={"old_analyst": old_analyst, "new_analyst": case.assigned_analyst},
+            )
+            self.store.put(case)
+            return case
+
+    def update_status(
+        self,
+        case_id: str,
+        new_status: CaseStatus,
+        actor: str,
+        reason: str = "",
+    ) -> FraudCase:
+        """Transition case to a new lifecycle status enforcing state machine rules."""
+        with self._lock:
+            case = self.get_case(case_id)
+            if new_status == case.status:
+                return case
+
+            allowed = ALLOWED_STATUS_TRANSITIONS.get(case.status, set())
+            if new_status not in allowed:
+                raise InvalidCaseStateTransitionError(
+                    f"Illegal transition from '{case.status.value}' to '{new_status.value}'. "
+                    f"Allowed: {[s.value for s in allowed]}"
+                )
+
+            old_status = case.status
+            case.status = new_status
+            if new_status == CaseStatus.RESOLVED and not case.resolved_at:
+                case.resolved_at = datetime.now(UTC).isoformat()
+
+            case.add_audit_entry(
+                action="status_changed",
+                actor=actor,
+                details={
+                    "old_status": old_status.value,
+                    "new_status": new_status.value,
+                    "reason": reason,
+                },
+            )
+            self.store.put(case)
+            return case
+
+    def add_note(self, case_id: str, author: str, text: str) -> CaseNote:
+        """Append an investigation note to the case audit log."""
+        with self._lock:
+            case = self.get_case(case_id)
+            note = CaseNote(author=author, text=text)
+            case.notes.append(note)
+            case.add_audit_entry(
+                action="note_added",
+                actor=author,
+                details={"note_id": note.note_id, "snippet": text[:40]},
+            )
+            self.store.put(case)
+            return note
+
+    def resolve_case(
+        self,
+        case_id: str,
+        disposition: CaseDisposition,
+        actor: str,
+        notes: str = "",
+    ) -> FraudCase:
+        """Finalize a case with a resolution disposition."""
+        with self._lock:
+            case = self.get_case(case_id)
+            if disposition == CaseDisposition.UNRESOLVED:
+                raise CaseValidationError("Case cannot be resolved with UNRESOLVED disposition")
+
+            case.disposition = disposition
+            case.resolved_at = datetime.now(UTC).isoformat()
+            if case.status != CaseStatus.RESOLVED:
+                # Transition status to RESOLVED
+                case.status = CaseStatus.RESOLVED
+
+            if notes.strip():
+                case.notes.append(CaseNote(author=actor, text=f"Resolution: {notes}"))
+
+            case.add_audit_entry(
+                action="case_resolved",
+                actor=actor,
+                details={
+                    "disposition": disposition.value,
+                    "notes": notes,
+                },
+            )
+            self.store.put(case)
+            return case
+
+    def generate_evidence_package(
+        self,
+        case_id: str,
+        transaction_data: dict[str, Any],
+        device_data: dict[str, Any] | None = None,
+        geo_data: dict[str, Any] | None = None,
+        challenge_data: dict[str, Any] | None = None,
+        merchant_data: dict[str, Any] | None = None,
+        additional_evidence: dict[str, Any] | None = None,
+        actor: str = "system",
+    ) -> DisputeEvidencePackage:
+        """Generate, fingerprint, and persist a DisputeEvidencePackage for a case."""
+        with self._lock:
+            case = self.get_case(case_id)
+            pkg = compile_evidence_package(
+                case=case,
+                transaction_data=transaction_data,
+                device_data=device_data,
+                geo_data=geo_data,
+                challenge_data=challenge_data,
+                merchant_data=merchant_data,
+                additional_evidence=additional_evidence,
+            )
+            self.store.put_evidence_package(pkg)
+            case.add_audit_entry(
+                action="evidence_packaged",
+                actor=actor,
+                details={
+                    "package_id": pkg.package_id,
+                    "sha256_fingerprint": pkg.sha256_fingerprint,
+                },
+            )
+            self.store.put(case)
+            return pkg
+
+    def get_summary(self, tenant_id: str | None = None) -> dict[str, Any]:
+        """Aggregate high-level metrics across all cases."""
+        with self._lock:
+            cases = self.store.list_cases(tenant_id=tenant_id, limit=10000)
+            status_counts = {s.value: 0 for s in CaseStatus}
+            priority_counts = {p.value: 0 for p in CasePriority}
+            sla_breached_count = 0
+
+            for c in cases:
+                status_counts[c.status.value] = status_counts.get(c.status.value, 0) + 1
+                priority_counts[c.priority.value] = priority_counts.get(c.priority.value, 0) + 1
+                if c.is_sla_breached:
+                    sla_breached_count += 1
+
+            return {
+                "total_cases": len(cases),
+                "by_status": status_counts,
+                "by_priority": priority_counts,
+                "sla_breached_count": sla_breached_count,
+            }
