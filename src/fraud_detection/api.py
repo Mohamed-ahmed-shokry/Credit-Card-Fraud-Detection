@@ -54,6 +54,17 @@ from fraud_detection.audit import (
     build_scoring_audit_event,
     build_shadow_scoring_audit_event,
 )
+from fraud_detection.challenge import (
+    ChallengeError,
+    ChallengeExpiredError,
+    ChallengeLockedOutError,
+    ChallengeManager,
+    ChallengeMaxAttemptsExceededError,
+    ChallengeMethod,
+    ChallengeSessionNotFoundError,
+    InvalidChallengeTokenError,
+    RateLimitExceededError,
+)
 from fraud_detection.device import (
     DeviceFeatureExtractor,
     DeviceFingerprint,
@@ -261,6 +272,8 @@ OPERATIONAL_PATHS = frozenset(
         "/v1/webhooks/",
         "/v1/webhooks/dlq",
         "/v1/webhooks/dlq/replay",
+        "/v1/challenges",
+        "/v1/challenges/",
     }
 )
 UNMATCHED_ROUTE_LABEL = "unmatched"
@@ -1539,6 +1552,54 @@ class DeadLetterReplayResponse(BaseModel):
     success_count: int
 
 
+class ChallengeCreateRequest(BaseModel):
+    """Payload to create an SCA step-up challenge session."""
+
+    transaction_id: str
+    user_id: str
+    tenant_id: str = "default"
+    destination: str
+    method: str = "sms_otp"
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ChallengeVerifyRequest(BaseModel):
+    """Payload to verify an entered challenge token."""
+
+    token: str
+
+
+class ChallengeResendRequest(BaseModel):
+    """Payload to request an OTP resend."""
+
+    destination: str | None = None
+
+
+class ChallengeSessionResponse(BaseModel):
+    """Serialized step-up challenge session response."""
+
+    challenge_id: str
+    transaction_id: str
+    user_id: str
+    tenant_id: str
+    method: str
+    target_masked: str
+    attempts_count: int
+    max_attempts: int
+    status: str
+    created_at: str
+    expires_at: str
+    verified_at: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ChallengeListResponse(BaseModel):
+    """List of active and historical challenge sessions."""
+
+    total_count: int
+    challenges: list[ChallengeSessionResponse]
+
+
 def create_app(
     *,
     model: FraudModel | None = None,
@@ -1619,6 +1680,7 @@ def create_app(
     merchant_chargeback_rate_threshold: float = 0.015,
     tenant_registry: TenantRegistry | None = None,
     event_bus: EventBus | None = None,
+    challenge_manager: ChallengeManager | None = None,
 ) -> FastAPI:
     """Create an application using an injected model or a trusted artifact path.
 
@@ -1990,6 +2052,24 @@ def create_app(
         "fraud_webhook_dlq_size",
         "Current number of failed webhook events retained in the dead-letter queue.",
         ["tenant_id"],
+        registry=metrics_registry,
+    )
+    challenges_issued_counter = Counter(
+        "fraud_challenges_issued_total",
+        "Total step-up challenge sessions created.",
+        ["tenant_id", "method"],
+        registry=metrics_registry,
+    )
+    challenges_verified_counter = Counter(
+        "fraud_challenges_verified_total",
+        "Total step-up challenge sessions successfully verified.",
+        ["tenant_id", "method"],
+        registry=metrics_registry,
+    )
+    challenges_failed_counter = Counter(
+        "fraud_challenges_failed_total",
+        "Total step-up challenge verification failures by reason.",
+        ["tenant_id", "method", "reason"],
         registry=metrics_registry,
     )
     merchant_anomalies_counter = Counter(
@@ -2525,6 +2605,11 @@ def create_app(
         application.state.event_bus_published_counter = event_bus_published_counter
         application.state.webhook_dispatches_counter = webhook_dispatches_counter
         application.state.webhook_dlq_size_gauge = webhook_dlq_size_gauge
+        resolved_challenge_manager = challenge_manager or ChallengeManager()
+        application.state.challenge_manager = resolved_challenge_manager
+        application.state.challenges_issued_counter = challenges_issued_counter
+        application.state.challenges_verified_counter = challenges_verified_counter
+        application.state.challenges_failed_counter = challenges_failed_counter
         application.state.audit_sink = resolved_audit_sink
         application.state.explanation_provider = explanation_provider
         application.state.fallback_mode = resolved_fallback_mode
@@ -5029,6 +5114,302 @@ def create_app(
             attempt_count=delivery_res.attempt_count,
             duration_seconds=delivery_res.duration_seconds,
         )
+
+    @application.get(
+        "/v1/challenges",
+        response_model=ChallengeListResponse,
+        tags=["challenges"],
+    )
+    async def list_challenges(
+        request: Request,
+        tenant_id: str | None = None,
+        limit: int = 100,
+    ) -> ChallengeListResponse:
+        """List active and historical step-up challenge sessions."""
+        mgr: ChallengeManager | None = getattr(request.app.state, "challenge_manager", None)
+        if mgr is None:
+            return ChallengeListResponse(total_count=0, challenges=[])
+        sessions = mgr.store.list_sessions(tenant_id=tenant_id, limit=limit)
+        return ChallengeListResponse(
+            total_count=len(sessions),
+            challenges=[
+                ChallengeSessionResponse(
+                    challenge_id=s.challenge_id,
+                    transaction_id=s.transaction_id,
+                    user_id=s.user_id,
+                    tenant_id=s.tenant_id,
+                    method=s.method.value,
+                    target_masked=s.target_masked,
+                    attempts_count=s.attempts_count,
+                    max_attempts=s.max_attempts,
+                    status=s.status.value,
+                    created_at=s.created_at,
+                    expires_at=s.expires_at,
+                    verified_at=s.verified_at,
+                    metadata=s.metadata,
+                )
+                for s in sessions
+            ],
+        )
+
+    @application.post(
+        "/v1/challenges",
+        response_model=ChallengeSessionResponse,
+        status_code=201,
+        responses={
+            400: {"description": "Invalid challenge parameters."},
+            429: {"description": "User is locked out."},
+        },
+        tags=["challenges"],
+    )
+    async def create_challenge_endpoint(
+        payload: ChallengeCreateRequest,
+        request: Request,
+    ) -> ChallengeSessionResponse | JSONResponse:
+        """Create a new step-up friction challenge session."""
+        mgr: ChallengeManager | None = getattr(request.app.state, "challenge_manager", None)
+        if mgr is None:
+            return JSONResponse(
+                status_code=500, content={"detail": "ChallengeManager not initialized"}
+            )
+
+        try:
+            method_enum = ChallengeMethod(payload.method)
+        except ValueError:
+            return JSONResponse(
+                status_code=400,
+                content={"detail": f"Unsupported challenge method '{payload.method}'"},
+            )
+
+        try:
+            session, _ = mgr.create_challenge(
+                transaction_id=payload.transaction_id,
+                user_id=payload.user_id,
+                tenant_id=payload.tenant_id,
+                destination=payload.destination,
+                method=method_enum,
+                metadata=payload.metadata,
+            )
+        except ChallengeLockedOutError as exc:
+            return JSONResponse(status_code=429, content={"detail": str(exc)})
+        except ValueError as exc:
+            return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+        issued_counter: Counter | None = getattr(
+            request.app.state, "challenges_issued_counter", None
+        )
+        if issued_counter is not None:
+            issued_counter.labels(tenant_id=session.tenant_id, method=session.method.value).inc()
+
+        return ChallengeSessionResponse(
+            challenge_id=session.challenge_id,
+            transaction_id=session.transaction_id,
+            user_id=session.user_id,
+            tenant_id=session.tenant_id,
+            method=session.method.value,
+            target_masked=session.target_masked,
+            attempts_count=session.attempts_count,
+            max_attempts=session.max_attempts,
+            status=session.status.value,
+            created_at=session.created_at,
+            expires_at=session.expires_at,
+            verified_at=session.verified_at,
+            metadata=session.metadata,
+        )
+
+    @application.get(
+        "/v1/challenges/{challenge_id}",
+        response_model=ChallengeSessionResponse,
+        responses={
+            404: {"description": "Challenge session not found."},
+        },
+        tags=["challenges"],
+    )
+    async def get_challenge_endpoint(
+        challenge_id: str,
+        request: Request,
+    ) -> ChallengeSessionResponse | JSONResponse:
+        """Retrieve the status and masked destination of a challenge session."""
+        mgr: ChallengeManager | None = getattr(request.app.state, "challenge_manager", None)
+        if mgr is None:
+            return JSONResponse(
+                status_code=500, content={"detail": "ChallengeManager not initialized"}
+            )
+        session = mgr.get_session(challenge_id)
+        if session is None:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": f"Challenge session '{challenge_id}' not found"},
+            )
+
+        return ChallengeSessionResponse(
+            challenge_id=session.challenge_id,
+            transaction_id=session.transaction_id,
+            user_id=session.user_id,
+            tenant_id=session.tenant_id,
+            method=session.method.value,
+            target_masked=session.target_masked,
+            attempts_count=session.attempts_count,
+            max_attempts=session.max_attempts,
+            status=session.status.value,
+            created_at=session.created_at,
+            expires_at=session.expires_at,
+            verified_at=session.verified_at,
+            metadata=session.metadata,
+        )
+
+    @application.post(
+        "/v1/challenges/{challenge_id}/verify",
+        response_model=ChallengeSessionResponse,
+        responses={
+            400: {"description": "Invalid token or inactive session."},
+            404: {"description": "Challenge session not found."},
+            410: {"description": "Challenge has expired."},
+            429: {"description": "Max attempts exceeded or user locked out."},
+        },
+        tags=["challenges"],
+    )
+    async def verify_challenge_endpoint(
+        challenge_id: str,
+        payload: ChallengeVerifyRequest,
+        request: Request,
+    ) -> ChallengeSessionResponse | JSONResponse:
+        """Verify candidate OTP token for an active challenge session."""
+        mgr: ChallengeManager | None = getattr(request.app.state, "challenge_manager", None)
+        if mgr is None:
+            return JSONResponse(
+                status_code=500, content={"detail": "ChallengeManager not initialized"}
+            )
+
+        failed_counter: Counter | None = getattr(
+            request.app.state, "challenges_failed_counter", None
+        )
+        verified_counter: Counter | None = getattr(
+            request.app.state, "challenges_verified_counter", None
+        )
+
+        try:
+            session = mgr.verify_challenge(challenge_id, payload.token)
+            if verified_counter is not None:
+                verified_counter.labels(
+                    tenant_id=session.tenant_id, method=session.method.value
+                ).inc()
+            return ChallengeSessionResponse(
+                challenge_id=session.challenge_id,
+                transaction_id=session.transaction_id,
+                user_id=session.user_id,
+                tenant_id=session.tenant_id,
+                method=session.method.value,
+                target_masked=session.target_masked,
+                attempts_count=session.attempts_count,
+                max_attempts=session.max_attempts,
+                status=session.status.value,
+                created_at=session.created_at,
+                expires_at=session.expires_at,
+                verified_at=session.verified_at,
+                metadata=session.metadata,
+            )
+        except ChallengeSessionNotFoundError:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": f"Challenge session '{challenge_id}' not found"},
+            )
+        except ChallengeExpiredError as exc:
+            if failed_counter is not None:
+                failed_counter.labels(tenant_id="unknown", method="unknown", reason="expired").inc()
+            return JSONResponse(status_code=410, content={"detail": str(exc)})
+        except (ChallengeMaxAttemptsExceededError, ChallengeLockedOutError) as exc:
+            if failed_counter is not None:
+                failed_counter.labels(
+                    tenant_id="unknown", method="unknown", reason="locked_out"
+                ).inc()
+            return JSONResponse(status_code=429, content={"detail": str(exc)})
+        except InvalidChallengeTokenError as exc:
+            if failed_counter is not None:
+                failed_counter.labels(
+                    tenant_id="unknown", method="unknown", reason="invalid_token"
+                ).inc()
+            return JSONResponse(status_code=400, content={"detail": str(exc)})
+        except ChallengeError as exc:
+            return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+    @application.post(
+        "/v1/challenges/{challenge_id}/resend",
+        response_model=ChallengeSessionResponse,
+        responses={
+            400: {"description": "Cannot resend challenge."},
+            404: {"description": "Challenge session not found."},
+            429: {"description": "Cooldown rate limit active."},
+        },
+        tags=["challenges"],
+    )
+    async def resend_challenge_endpoint(
+        challenge_id: str,
+        payload: ChallengeResendRequest,
+        request: Request,
+    ) -> ChallengeSessionResponse | JSONResponse:
+        """Request a fresh OTP token subject to cooldown rate-limiting."""
+        mgr: ChallengeManager | None = getattr(request.app.state, "challenge_manager", None)
+        if mgr is None:
+            return JSONResponse(
+                status_code=500, content={"detail": "ChallengeManager not initialized"}
+            )
+
+        try:
+            session, _ = mgr.resend_challenge(challenge_id, destination=payload.destination)
+            return ChallengeSessionResponse(
+                challenge_id=session.challenge_id,
+                transaction_id=session.transaction_id,
+                user_id=session.user_id,
+                tenant_id=session.tenant_id,
+                method=session.method.value,
+                target_masked=session.target_masked,
+                attempts_count=session.attempts_count,
+                max_attempts=session.max_attempts,
+                status=session.status.value,
+                created_at=session.created_at,
+                expires_at=session.expires_at,
+                verified_at=session.verified_at,
+                metadata=session.metadata,
+            )
+        except ChallengeSessionNotFoundError:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": f"Challenge session '{challenge_id}' not found"},
+            )
+        except RateLimitExceededError as exc:
+            return JSONResponse(status_code=429, content={"detail": str(exc)})
+        except ChallengeError as exc:
+            return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+    @application.delete(
+        "/v1/challenges/{challenge_id}",
+        responses={
+            404: {"description": "Challenge session not found."},
+        },
+        tags=["challenges"],
+    )
+    async def cancel_challenge_endpoint(
+        challenge_id: str,
+        request: Request,
+    ) -> JSONResponse:
+        """Cancel a pending challenge session."""
+        mgr: ChallengeManager | None = getattr(request.app.state, "challenge_manager", None)
+        if mgr is None:
+            return JSONResponse(
+                status_code=500, content={"detail": "ChallengeManager not initialized"}
+            )
+        try:
+            mgr.cancel_challenge(challenge_id, reason="Cancelled via API")
+            return JSONResponse(
+                status_code=200,
+                content={"detail": f"Challenge '{challenge_id}' cancelled"},
+            )
+        except ChallengeSessionNotFoundError:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": f"Challenge session '{challenge_id}' not found"},
+            )
 
     @application.get(
         "/v1/routing/status",

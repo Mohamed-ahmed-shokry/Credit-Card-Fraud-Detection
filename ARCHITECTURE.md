@@ -550,6 +550,48 @@ flowchart TD
 - **Dead-Letter Queue (DLQ)**: Undeliverable notifications are preserved in a thread-safe, bounded in-memory buffer (`DeadLetterQueue`) for inspection and on-demand replay via CLI or API.
 
 
+## Risk-Based Step-Up Authentication & Challenge Orchestration (Phase 44)
+
+The platform incorporates an in-process, zero-dependency Strong Customer Authentication (SCA) step-up challenge and 3-D Secure (3DS 2.3) orchestration engine (`challenge.py`). When transaction risk evaluation falls into review/friction thresholds (`RuleAction.CHALLENGE`), step-up authentication sessions are automatically provisioned with cryptographically secure OTP tokens, channel destination masking, constant-time verification, brute-force lockout, and rate-limited resends.
+
+```mermaid
+flowchart TD
+    subgraph Decision Engine
+        DAG["Decision DAG Pipeline"] -->|Evaluate Rules & Model| Action["ActionAggregatorStageProcessor"]
+        Action -->|Action == CHALLENGE| CM["ChallengeManager"]
+    end
+
+    subgraph Challenge Lifecycle
+        CM --> Gen["Cryptographic OTP Generator\n(secrets.SystemRandom)"]
+        Gen --> Hash["HMAC-SHA256 Token Hash + Salt"]
+        Hash --> Mask["PII Masking Filter\n(Email/SMS Phone Masking)"]
+        Mask --> Store[("ChallengeStore\n(Thread-Safe Multi-Index)")]
+        Store --> State{"Session State Machine\n(PENDING / VERIFIED / LOCKED_OUT / EXPIRED)"}
+    end
+
+    subgraph Verification & Protection
+        API["FastAPI /v1/challenges/*\nCLI challenge-*"] -->|Verify Token| Comp["Constant-Time Verification\nhmac.compare_digest"]
+        Comp -->|Match| Verified["Status: VERIFIED\nPrometheus: fraud_challenges_verified_total"]
+        Comp -->|Mismatch| Attempts{"Attempts >= Max?"}
+        Attempts -->|No| Invalid["Status: PENDING\nRemaining Attempts Decremented"]
+        Attempts -->|Yes| Lockout["Status: LOCKED_OUT\nUser Lockout Timer Triggered"]
+    end
+
+    subgraph Event Broadcasting
+        CM -->|Emit CHALLENGE_ISSUED| Bus["EventBus"]
+        Comp -->|Emit CHALLENGE_VERIFIED / FAILED| Bus
+    end
+```
+
+### Key Components
+
+- **Domain Models & Enums (`ChallengeSession`, `ChallengeMethod`, `ChallengeStatus`)**: Immutable records tracking multi-channel challenge methods (`sms_otp`, `email_otp`, `totp`, `biometric_push`, `kba_security_questions`, `out_of_band`) and lifecycle states.
+- **Cryptographic Security & Constant-Time Verification**: Generates cryptographically secure nonces via `secrets.SystemRandom`, salted with high-entropy bytes and hashed using HMAC-SHA256. Verified using `hmac.compare_digest` to prevent side-channel timing attacks.
+- **PII Destination Redaction**: Automatically redacts sensitive phone numbers and emails (e.g., `+1 ***-***-1234` and `a***e@example.com`) to prevent exposure in logs, API responses, and audit records.
+- **Brute-Force Lockout & Cooldown Rate Limiting**: Enforces configurable max attempts per session (default: 3). Failed attempts exceeding thresholds trigger automated user lockouts (`lockout_duration_seconds=900`). Resend operations enforce a cooldown period (`resend_cooldown_seconds=30`) to protect against SMS pumping and denial-of-service.
+- **Pipeline & EventBus Synergy**: Seamlessly wired into the Decision DAG and broadcasts `fraud.challenge.issued`, `fraud.challenge.verified`, `fraud.challenge.failed`, and `fraud.challenge.expired` across the streaming EventBus.
+
+
 ## Extension guidance
 
 

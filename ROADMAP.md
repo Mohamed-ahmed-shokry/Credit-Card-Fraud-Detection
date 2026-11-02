@@ -2213,6 +2213,82 @@ Does not implement external message brokers (Kafka/RabbitMQ/Redis Streams) as ex
 - **Verification Gates**: 100% Green local CI parity, $\ge 97.0\%$ branch coverage, 0 mypy issues, Ruff formatted, pip-audit clean, wheel build and twine valid.
 
 
+## Phase 44 — Risk-Based Step-Up Authentication & Challenge Orchestration (Done)
+
+### Objective
+
+Deliver an in-process, zero-dependency strong customer authentication (SCA) step-up challenge and 3-D Secure (3DS 2.3) orchestration engine (`challenge.py`) for fraud mitigation friction. Support risk-based friction triggers, cryptographically secure OTP generation, constant-time verification, multi-channel challenge methods (`SMS_OTP`, `EMAIL_OTP`, `TOTP`, `BIOMETRIC_PUSH`, `KBA_SECURITY_QUESTIONS`, `OUT_OF_BAND`), brute-force lockout, rate-limited resends, Decision DAG challenge stage node, EventBus challenge event emission, REST API management (`/v1/challenges/*`), Prometheus telemetry metrics, and CLI inspection tools (`challenge-create`, `challenge-verify`, `challenge-inspect`).
+
+### Scope
+
+1. **Domain Models, Challenge Methods & Status Taxonomy (`challenge.py`)**:
+   - `ChallengeError` hierarchy (`ChallengeSessionNotFoundError`, `ChallengeExpiredError`, `ChallengeLockedOutError`, `ChallengeMaxAttemptsExceededError`, `InvalidChallengeTokenError`, `RateLimitExceededError`).
+   - `ChallengeMethod` (`SMS_OTP`, `EMAIL_OTP`, `TOTP`, `BIOMETRIC_PUSH`, `KBA_SECURITY_QUESTIONS`, `OUT_OF_BAND`).
+   - `ChallengeStatus` (`PENDING`, `VERIFIED`, `FAILED`, `EXPIRED`, `LOCKED_OUT`, `CANCELLED`).
+   - `ChallengeSession`: Immutable record tracking `challenge_id`, `transaction_id`, `user_id`, `tenant_id`, `method`, `target_masked`, `token_hash`, `token_salt`, `attempts_count`, `max_attempts`, `status`, `expires_at`, `created_at`, `verified_at`, `metadata`.
+2. **Cryptographic OTP Generation & Timing-Attack Proof Verification (`challenge.py`)**:
+   - Cryptographically secure pseudorandom token/OTP generation (`secrets.SystemRandom`).
+   - Constant-time HMAC-SHA256 token hashing and verification protecting against side-channel and timing attacks.
+   - Channel destination redaction/masking (e.g., `+1 ***-***-1234` or `u***@example.com`).
+3. **Challenge Policy & Thread-Safe Challenge Manager (`challenge.py`)**:
+   - `ChallengePolicy`: Configurable per-tenant TTL, max attempts, lockout duration, and resend cooldown.
+   - `ChallengeStore`: Bounded, thread-safe session store with multi-index lookup (by session, transaction, and user).
+   - `ChallengeManager`: Session lifecycle management (`create_challenge`, `verify_challenge`, `resend_challenge`, `cancel_challenge`, `prune_expired`).
+4. **Decision DAG & EventBus Integration (`pipeline.py`, `events.py`)**:
+   - Extended `EventType` with `CHALLENGE_ISSUED`, `CHALLENGE_VERIFIED`, `CHALLENGE_FAILED`, `CHALLENGE_EXPIRED`.
+   - `ActionAggregatorStageProcessor` / `ChallengeOrchestratorStageProcessor` issuing challenges when pipeline decision action is `CHALLENGE` or `STEP_UP`.
+   - Automated event broadcasting over `EventBus`.
+5. **FastAPI Serving & Observability (`api.py`)**:
+   - REST endpoints: `POST /v1/challenges`, `GET /v1/challenges/{challenge_id}`, `POST /v1/challenges/{challenge_id}/verify`, `POST /v1/challenges/{challenge_id}/resend`.
+   - Prometheus metrics: `fraud_challenges_issued_total`, `fraud_challenges_verified_total`, `fraud_challenges_failed_total`, `fraud_challenge_verification_duration_seconds`.
+6. **CLI Workflows (`cli.py`)**:
+   - `fraud-detect challenge-create`, `fraud-detect challenge-verify`, `fraud-detect challenge-inspect`.
+
+### Acceptance Criteria
+
+1. **AC-1 (Domain Models & Taxonomy)**: `ChallengeSession`, `ChallengeMethod`, and `ChallengeStatus` validate invariants, payload schema, and raise descriptive domain exceptions on bounds violations.
+2. **AC-2 (Cryptographic OTP & Constant-Time Verification)**: Token generation is cryptographically secure, target destinations are masked, and token verification utilizes constant-time comparison immune to timing attacks.
+3. **AC-3 (Thread-Safe Challenge Manager & Policy Lifecycle)**: `ChallengeManager` enforces TTL expiration, max attempts thresholding, brute-force lockout, and resend cooldown periods across concurrent requests.
+4. **AC-4 (Decision DAG & EventBus Integration)**: Pipeline DAG triggers challenge session generation on `CHALLENGE` actions, attaching challenge metadata to decisions and broadcasting `CHALLENGE_*` events to `EventBus`.
+5. **AC-5 (REST API Endpoints & Telemetry)**: FastAPI exposes `/v1/challenges/*` endpoints for issuance, inspection, verification, and resend, exporting Prometheus metrics and adhering to tenant isolation.
+6. **AC-6 (CLI Workflows)**: CLI commands `challenge-create`, `challenge-verify`, and `challenge-inspect` provide deterministic ASCII table and JSON formatting with standard exit codes.
+7. **AC-7 (Quality Standards & 100% Green CI)**: All local CI-parity checks and remote CI workflow runs pass 100%, branch coverage $\ge 97.0\%$, strict mypy 0 issues, Ruff clean, and build/twine valid.
+
+### Validation & CI Plan
+
+- Local CI-parity commands:
+  - `python -m ruff format --check src tests`
+  - `python -m ruff check src tests`
+  - `python -m mypy src`
+  - `python -m pip_audit --skip-editable`
+  - `python -m pytest --cov=fraud_detection --cov-report=term-missing`
+  - `python -m build` & `python -m twine check dist/*`
+- Remote CI workflow runs monitored via `gh run list` and `gh pr checks`.
+
+### Exclusions
+
+Does not implement telecom SMS/Email carrier gateways (Twilio, SendGrid, etc.) as hard runtime dependencies; provides an in-process, pluggable notification adapter interface with built-in mock/memory carrier for hermetic testing and deterministic verification.
+
+### Micro-Task Breakdown
+
+- [x] Task 1: Create `src/fraud_detection/challenge.py` with domain data models (`ChallengeError` hierarchy, `ChallengeMethod`, `ChallengeStatus`, `ChallengeSession`) and unit tests in `tests/test_challenge.py`.
+- [x] Task 2: Implement cryptographic token generation, masking, and constant-time verification in `src/fraud_detection/challenge.py` with unit tests.
+- [x] Task 3: Implement `ChallengePolicy`, `ChallengeStore`, and `ChallengeManager` with lifecycle enforcement in `src/fraud_detection/challenge.py` with unit tests.
+- [x] Task 4: Integrate Challenge Orchestration into Decision DAG (`pipeline.py`) and EventBus (`events.py`) with unit/integration tests.
+- [x] Task 5: Implement `/v1/challenges/*` REST endpoints and Prometheus metrics in `src/fraud_detection/api.py` with integration tests in `tests/test_api.py`.
+- [x] Task 6: Implement CLI commands `challenge-create`, `challenge-verify`, and `challenge-inspect` in `src/fraud_detection/cli.py` with tests in `tests/test_cli.py`.
+- [x] Task 7: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate with 100% Green CI.
+
+### Delivery Record
+
+- **Delivered**: 2026-11-01
+- **Branch**: `phase/challenge-orchestrator`
+- **Pull Request**: [#25](https://github.com/Mohamed-ahmed-shokry/Credit-Card-Fraud-Detection/pull/25)
+- **Primary Modules**: `src/fraud_detection/challenge.py`, `src/fraud_detection/pipeline.py`, `src/fraud_detection/events.py`, `src/fraud_detection/api.py`, `src/fraud_detection/cli.py`
+- **Test Modules**: `tests/test_challenge.py`, `tests/test_api.py`, `tests/test_cli.py`
+- **Verification Gates**: 100% Green local CI parity, $\ge 97.0\%$ branch coverage, 0 mypy issues, Ruff formatted, pip-audit clean, wheel build and twine valid.
+
+
 ## Contributing to the roadmap
 
 Open an issue or a pull request that references the relevant phase item.
