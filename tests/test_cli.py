@@ -8908,3 +8908,425 @@ def test_challenge_cli_error_and_edge_cases(tmp_path: Path) -> None:
     )
     assert res_i_table_empty.exit_code == 0
     assert "No challenge sessions found." in res_i_table_empty.output
+
+
+def test_case_management_cli(tmp_path: Path) -> None:
+    store_file = tmp_path / "cases.json"
+    corrupt_store = tmp_path / "corrupt_cases.json"
+    corrupt_store.write_text("{not valid json", encoding="utf-8")
+    non_list_store = tmp_path / "non_list_cases.json"
+    non_list_store.write_text('{"error": "not a list"}', encoding="utf-8")
+
+    # 1. case-create invalid priority -> exit 2
+    res_c_bad_prio = runner.invoke(
+        app,
+        [
+            "case-create",
+            "-x",
+            "tx_001",
+            "-p",
+            "invalid_priority",
+        ],
+    )
+    assert res_c_bad_prio.exit_code == 2
+    assert "Invalid case priority" in res_c_bad_prio.output
+
+    # 2. case-create store persistence failure -> exit 2
+    bad_dir = tmp_path / "bad_store_dir"
+    bad_dir.mkdir()
+    res_c_fail_persist = runner.invoke(
+        app,
+        [
+            "case-create",
+            "-x",
+            "tx_001",
+            "-s",
+            str(bad_dir),
+        ],
+    )
+    assert res_c_fail_persist.exit_code == 2
+    assert "Failed to persist case to store file" in res_c_fail_persist.output
+
+    # 3. case-create valid JSON output & write to store_file
+    res_c1 = runner.invoke(
+        app,
+        [
+            "case-create",
+            "-x",
+            "tx_1001",
+            "-a",
+            "2500.50",
+            "-c",
+            "USD",
+            "-s",
+            str(store_file),
+            "-t",
+            "fintech_a",
+            "-p",
+            "high",
+            "-u",
+            "analyst_alice",
+            "--fraud-score",
+            "0.92",
+        ],
+    )
+    assert res_c1.exit_code == 0
+    c1_data = json.loads(res_c1.output)
+    case_1_id = c1_data["case_id"]
+    assert c1_data["transaction_id"] == "tx_1001"
+    assert c1_data["priority"] == "high"
+    assert c1_data["assigned_analyst"] == "analyst_alice"
+
+    # 4. case-create table output on existing store file
+    res_c2 = runner.invoke(
+        app,
+        [
+            "case-create",
+            "-x",
+            "tx_1002",
+            "-a",
+            "50.00",
+            "-c",
+            "EUR",
+            "-s",
+            str(store_file),
+            "-t",
+            "fintech_b",
+            "-p",
+            "low",
+            "-u",
+            "analyst_bob",
+            "--fraud-score",
+            "0.25",
+            "-f",
+            "table",
+        ],
+    )
+    assert res_c2.exit_code == 0
+    assert "Case ID:" in res_c2.output
+    assert "Transaction ID: tx_1002" in res_c2.output
+
+    # Parse case_2_id from store_file
+    stored_cases = json.loads(store_file.read_text(encoding="utf-8"))
+    assert len(stored_cases) == 2
+    case_2_id = stored_cases[1]["case_id"]
+
+    # 4b. case-create with non-list existing store file (recovers cleanly)
+    recover_store = tmp_path / "recover_store.json"
+    recover_store.write_text('{"broken": true}', encoding="utf-8")
+    res_c_recover = runner.invoke(
+        app,
+        [
+            "case-create",
+            "-x",
+            "tx_rec",
+            "-s",
+            str(recover_store),
+        ],
+    )
+    assert res_c_recover.exit_code == 0
+    rec_cases = json.loads(recover_store.read_text(encoding="utf-8"))
+    assert len(rec_cases) == 1
+
+    # 5. case-list missing store file -> exit 2
+    res_l_missing = runner.invoke(
+        app,
+        ["case-list", "-s", str(tmp_path / "nonexistent.json")],
+    )
+    assert res_l_missing.exit_code == 2
+
+    # 6. case-list corrupt store file -> exit 2
+    res_l_corrupt = runner.invoke(
+        app,
+        ["case-list", "-s", str(corrupt_store)],
+    )
+    assert res_l_corrupt.exit_code == 2
+
+    # 7. case-list non-list store file -> exit 2
+    res_l_non_list = runner.invoke(
+        app,
+        ["case-list", "-s", str(non_list_store)],
+    )
+    assert res_l_non_list.exit_code == 2
+
+    # 8. case-list table format empty store
+    empty_store = tmp_path / "empty_cases.json"
+    empty_store.write_text("[]", encoding="utf-8")
+    res_l_empty_tbl = runner.invoke(
+        app,
+        ["case-list", "-s", str(empty_store), "-f", "table"],
+    )
+    assert res_l_empty_tbl.exit_code == 0
+    assert "No fraud cases found." in res_l_empty_tbl.output
+
+    # Add a non-dict item and an SLA breached case to store_file
+    stored_cases.append("not_a_dict_case")
+    # Mark case 2 as SLA breached in stored data for filter testing
+    stored_cases[1]["is_sla_breached"] = True
+    store_file.write_text(json.dumps(stored_cases), encoding="utf-8")
+
+    # 9. case-list json format without filters
+    res_l_all = runner.invoke(
+        app,
+        ["case-list", "-s", str(store_file)],
+    )
+    assert res_l_all.exit_code == 0
+    all_data = json.loads(res_l_all.output)
+    assert all_data["total_count"] == 2
+
+    # 10. case-list table format
+    res_l_tbl = runner.invoke(
+        app,
+        ["case-list", "-s", str(store_file), "-f", "table"],
+    )
+    assert res_l_tbl.exit_code == 0
+    assert "CASE ID" in res_l_tbl.output
+    assert "TENANT" in res_l_tbl.output
+    assert "YES" in res_l_tbl.output
+
+    # 11. case-list filters: tenant, status, priority, analyst, sla_breached
+    res_l_tenant = runner.invoke(
+        app,
+        ["case-list", "-s", str(store_file), "-t", "fintech_a"],
+    )
+    assert json.loads(res_l_tenant.output)["total_count"] == 1
+
+    res_l_status = runner.invoke(
+        app,
+        ["case-list", "-s", str(store_file), "--status", "investigating"],
+    )
+    assert json.loads(res_l_status.output)["total_count"] == 2
+
+    res_l_prio = runner.invoke(
+        app,
+        ["case-list", "-s", str(store_file), "-p", "low"],
+    )
+    assert json.loads(res_l_prio.output)["total_count"] == 1
+
+    res_l_analyst = runner.invoke(
+        app,
+        ["case-list", "-s", str(store_file), "-u", "analyst_bob"],
+    )
+    assert json.loads(res_l_analyst.output)["total_count"] == 1
+
+    res_l_breached = runner.invoke(
+        app,
+        ["case-list", "-s", str(store_file), "--sla-breached-only"],
+    )
+    assert json.loads(res_l_breached.output)["total_count"] == 1
+
+    # 12. case-inspect errors
+    res_i_missing = runner.invoke(
+        app,
+        ["case-inspect", "-s", str(tmp_path / "none.json"), "-c", "c_1"],
+    )
+    assert res_i_missing.exit_code == 2
+
+    res_i_corrupt = runner.invoke(
+        app,
+        ["case-inspect", "-s", str(corrupt_store), "-c", "c_1"],
+    )
+    assert res_i_corrupt.exit_code == 2
+
+    res_i_non_list = runner.invoke(
+        app,
+        ["case-inspect", "-s", str(non_list_store), "-c", "c_1"],
+    )
+    assert res_i_non_list.exit_code == 2
+
+    res_i_not_found = runner.invoke(
+        app,
+        ["case-inspect", "-s", str(store_file), "-c", "nonexistent_case"],
+    )
+    assert res_i_not_found.exit_code == 2
+    assert "not found in store file" in res_i_not_found.output
+
+    # 13. case-inspect success (json and table)
+    res_i_json = runner.invoke(
+        app,
+        ["case-inspect", "-s", str(store_file), "-c", case_1_id],
+    )
+    assert res_i_json.exit_code == 0
+    assert json.loads(res_i_json.output)["case_id"] == case_1_id
+
+    res_i_tbl = runner.invoke(
+        app,
+        ["case-inspect", "-s", str(store_file), "-c", case_1_id, "-f", "table"],
+    )
+    assert res_i_tbl.exit_code == 0
+    assert f"Case ID:        {case_1_id}" in res_i_tbl.output
+
+    # 14. case-resolve errors
+    res_r_bad_disp = runner.invoke(
+        app,
+        [
+            "case-resolve",
+            "-s",
+            str(store_file),
+            "-c",
+            case_1_id,
+            "-d",
+            "invalid_disp",
+        ],
+    )
+    assert res_r_bad_disp.exit_code == 2
+    assert "Invalid disposition" in res_r_bad_disp.output
+
+    res_r_missing = runner.invoke(
+        app,
+        [
+            "case-resolve",
+            "-s",
+            str(tmp_path / "none.json"),
+            "-c",
+            case_1_id,
+            "-d",
+            "confirmed_fraud",
+        ],
+    )
+    assert res_r_missing.exit_code == 2
+
+    res_r_corrupt = runner.invoke(
+        app,
+        [
+            "case-resolve",
+            "-s",
+            str(corrupt_store),
+            "-c",
+            case_1_id,
+            "-d",
+            "confirmed_fraud",
+        ],
+    )
+    assert res_r_corrupt.exit_code == 2
+
+    res_r_non_list = runner.invoke(
+        app,
+        [
+            "case-resolve",
+            "-s",
+            str(non_list_store),
+            "-c",
+            case_1_id,
+            "-d",
+            "confirmed_fraud",
+        ],
+    )
+    assert res_r_non_list.exit_code == 2
+
+    res_r_not_found = runner.invoke(
+        app,
+        [
+            "case-resolve",
+            "-s",
+            str(store_file),
+            "-c",
+            "nonexistent_case",
+            "-d",
+            "confirmed_fraud",
+        ],
+    )
+    assert res_r_not_found.exit_code == 2
+
+    # 15. case-resolve success (json and table)
+    res_r_json = runner.invoke(
+        app,
+        [
+            "case-resolve",
+            "-s",
+            str(store_file),
+            "-c",
+            case_1_id,
+            "-d",
+            "confirmed_fraud",
+            "--actor",
+            "lead_analyst",
+            "-n",
+            "Confirmed account takeover.",
+        ],
+    )
+    assert res_r_json.exit_code == 0
+    r_json_data = json.loads(res_r_json.output)
+    assert r_json_data["status"] == "resolved"
+    assert r_json_data["disposition"] == "confirmed_fraud"
+
+    res_r_tbl = runner.invoke(
+        app,
+        [
+            "case-resolve",
+            "-s",
+            str(store_file),
+            "-c",
+            case_2_id,
+            "-d",
+            "false_positive",
+            "-f",
+            "table",
+        ],
+    )
+    assert res_r_tbl.exit_code == 0
+    assert "Disposition: false_positive" in res_r_tbl.output
+
+    # 16. case-evidence errors
+    res_e_missing = runner.invoke(
+        app,
+        ["case-evidence", "-s", str(tmp_path / "none.json"), "-c", case_1_id],
+    )
+    assert res_e_missing.exit_code == 2
+
+    res_e_corrupt = runner.invoke(
+        app,
+        ["case-evidence", "-s", str(corrupt_store), "-c", case_1_id],
+    )
+    assert res_e_corrupt.exit_code == 2
+
+    res_e_non_list = runner.invoke(
+        app,
+        ["case-evidence", "-s", str(non_list_store), "-c", case_1_id],
+    )
+    assert res_e_non_list.exit_code == 2
+
+    res_e_not_found = runner.invoke(
+        app,
+        ["case-evidence", "-s", str(store_file), "-c", "unknown_c"],
+    )
+    assert res_e_not_found.exit_code == 2
+
+    # 17. case-evidence success (json, table, output file)
+    evidence_file = tmp_path / "evidence_export.json"
+    res_e_json = runner.invoke(
+        app,
+        [
+            "case-evidence",
+            "-s",
+            str(store_file),
+            "-c",
+            case_1_id,
+            "-o",
+            str(evidence_file),
+        ],
+    )
+    assert res_e_json.exit_code == 0
+    e_data = json.loads(res_e_json.output)
+    assert e_data["case_id"] == case_1_id
+    assert "sha256_fingerprint" in e_data
+    assert evidence_file.is_file()
+    assert (
+        json.loads(evidence_file.read_text(encoding="utf-8"))["package_id"] == e_data["package_id"]
+    )
+
+    res_e_tbl = runner.invoke(
+        app,
+        [
+            "case-evidence",
+            "-s",
+            str(store_file),
+            "-c",
+            case_1_id,
+            "-f",
+            "table",
+        ],
+    )
+    assert res_e_tbl.exit_code == 0
+    assert f"Case ID:      {case_1_id}" in res_e_tbl.output
+    assert "Integrity:    True" in res_e_tbl.output
