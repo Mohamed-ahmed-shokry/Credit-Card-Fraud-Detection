@@ -8916,6 +8916,14 @@ def case_create(
             help="Transaction amount.",
         ),
     ] = 0.0,
+    currency: Annotated[
+        str,
+        typer.Option(
+            "--currency",
+            "-c",
+            help="Transaction currency (e.g. USD, EUR).",
+        ),
+    ] = "USD",
     fraud_score: Annotated[
         float,
         typer.Option(
@@ -8988,6 +8996,7 @@ def case_create(
             transaction_id=transaction_id,
             fraud_score=fraud_score,
             amount=amount,
+            currency=currency,
             tenant_id=tenant_id,
             priority=prio_enum,
             sla_deadline_hours=sla_hours,
@@ -9098,9 +9107,9 @@ def case_list(
             continue
         if tenant_id and item.get("tenant_id") != tenant_id:
             continue
-        if status and item.get("status") != status:
+        if status and str(item.get("status", "")).upper() != status.upper():
             continue
-        if priority and item.get("priority") != priority:
+        if priority and str(item.get("priority", "")).upper() != priority.upper():
             continue
         if analyst and item.get("assigned_analyst") != analyst:
             continue
