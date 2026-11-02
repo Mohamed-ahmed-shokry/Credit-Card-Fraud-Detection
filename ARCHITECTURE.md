@@ -592,6 +592,48 @@ flowchart TD
 - **Pipeline & EventBus Synergy**: Seamlessly wired into the Decision DAG and broadcasts `fraud.challenge.issued`, `fraud.challenge.verified`, `fraud.challenge.failed`, and `fraud.challenge.expired` across the streaming EventBus.
 
 
+## Fraud Case Management, Investigation SLA Tracking & Dispute Evidence Packaging Engine (Phase 45)
+
+The platform incorporates an in-process, zero-dependency Fraud Case Management, Analyst Workflow, SLA Tracking, and Dispute Evidence Packaging Engine (`cases.py`). Suspicious transactions flagged for manual review (`final_action == "REVIEW"` in `pipeline.py`) or charged-back transactions are tracked through a formalized investigation lifecycle with SLA timers, audit trails, and cryptographically fingerprinted dispute dossiers suitable for card network representment.
+
+```mermaid
+flowchart TD
+    subgraph Trigger & Creation
+        DAG["Decision DAG Pipeline\n(Action == REVIEW)"] -->|Auto-Create Case| CM["CaseManager"]
+        Manual["Analyst API / CLI\nPOST /v1/cases"] -->|Create Case| CM
+    end
+
+    subgraph Case Lifecycle & SLA
+        CM --> Store[("CaseStore\n(Thread-Safe Multi-Index)")]
+        Store --> Prioritization["compute_priority\n(Score x Amount Matrix)"]
+        Prioritization --> Lifecycle["Lifecycle State Machine\nOPEN -> INVESTIGATING -> PENDING_CUSTOMER\n-> REPRESENTED -> RESOLVED -> CLOSED"]
+        Lifecycle --> SLATimer["SLA Tracking & Breach Monitor\n(sla_deadline_hours, is_sla_breached)"]
+    end
+
+    subgraph Dispute Evidence Packaging
+        CM --> Compiler["compile_evidence_package\n(DisputeEvidencePackage)"]
+        Compiler --> Modals["Multi-Modal Evidence Aggregation\n- Transaction Context & Amount\n- Risk & Model Decision Score\n- Device Signals (Phase 40)\n- Geolocation Velocities (Phase 39)\n- 3DS Challenge Verification Proof (Phase 44)"]
+        Modals --> Canonical["Deterministic Canonical JSON\n(rfc8785 strict keys & format)"]
+        Canonical --> Fingerprint["SHA-256 Package Fingerprint\n(Visa CE3.0 / Mastercard First-Party Trust)"]
+    end
+
+    subgraph Event Broadcasting & Operations
+        CM -->|Emit CASE_CREATED / ASSIGNED / RESOLVED / EVIDENCE_PACKAGED| Bus["EventBus"]
+        Store --> API["FastAPI /v1/cases/*\nPrometheus Metrics"]
+        Store --> CLI["CLI: case-create, case-list,\ncase-inspect, case-resolve, case-evidence"]
+    end
+```
+
+### Key Components
+
+- **Domain Models & Taxonomy (`cases.py`)**: `FraudCase`, `CasePriority` (`LOW`, `MEDIUM`, `HIGH`, `CRITICAL`), `CaseStatus` (`OPEN`, `INVESTIGATING`, `PENDING_CUSTOMER`, `REPRESENTED`, `RESOLVED`, `CLOSED`), `CaseDisposition` (`CONFIRMED_FRAUD`, `FALSE_POSITIVE`, `MERCHANT_ERROR`, `ACCOUNT_TAKEOVER`, `FRIENDLY_FRAUD`, `UNRESOLVED`), and append-only `CaseNote`.
+- **Dynamic Priority & Invariant Validation**: Automatically calculates priority using an empirical severity matrix combining fraud probability and monetary exposure. Enforces strict lifecycle state machines preventing invalid transitions (e.g. directly closing an uninvestigated case).
+- **Tamper-Evident Dispute Evidence Dossiers**: `DisputeEvidencePackage` compiles multi-modal transaction context, risk scores, device anomalies, geolocation travel velocities, and 3DS step-up verification proofs into a canonicalized JSON payload hashed with SHA-256 for network chargeback representment.
+- **SLA Countdown & Breach Surveillance**: Computes SLA deadlines and dynamically evaluates SLA breach status, supporting priority-based operational queues and automated breach escalation counters.
+- **Thread-Safe Storage & Manager**: `CaseStore` provides multi-index querying (by `case_id`, `transaction_id`, `tenant_id`, `status`, `priority`, `assigned_analyst`, and SLA breach). `CaseManager` coordinates safe concurrent state updates with thread-level re-entrant locks.
+- **API, CLI & Telemetry Integration**: Exposes REST endpoints (`/v1/cases/*`), CLI commands (`case-create`, `case-list`, `case-inspect`, `case-resolve`, `case-evidence`), and Prometheus counters (`fraud_cases_total`, `fraud_cases_resolved_total`, `fraud_case_sla_breaches_total`, `fraud_evidence_packages_generated_total`).
+
+
 ## Extension guidance
 
 

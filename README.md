@@ -1879,6 +1879,56 @@ FastAPI step-up challenge REST endpoints:
 - `DELETE /v1/challenges/{challenge_id}`: Cancel a pending challenge session.
 - Prometheus metrics: `fraud_challenges_issued_total`, `fraud_challenges_verified_total`, and `fraud_challenges_failed_total`.
 
+## Fraud Case Management & Dispute Evidence Packaging Engine (Phase 45)
+
+Manage operational investigation queues, analyst notes, SLA timers, and generate tamper-evident dispute evidence dossiers for card network representment (`cases.py`):
+
+```bash
+# Create a new fraud investigation case
+fraud-detect case-create \
+  --transaction-id tx_90412 \
+  --amount 1450.00 \
+  --currency USD \
+  --priority high \
+  --assign analyst_alice \
+  --fraud-score 0.94 \
+  --store-file cases.json \
+  --format table
+
+# List stored cases with multi-criteria filters
+fraud-detect case-list --store-file cases.json --status investigating --priority high --format table
+
+# Inspect full case details, notes, and audit trail
+fraud-detect case-inspect --store-file cases.json --case-id case_83f2a1b9 --format table
+
+# Resolve an investigation case with an analyst conclusion
+fraud-detect case-resolve \
+  --store-file cases.json \
+  --case-id case_83f2a1b9 \
+  --disposition confirmed_fraud \
+  --actor analyst_alice \
+  --notes "Cardholder confirmed stolen credentials." \
+  --format table
+
+# Compile and export a tamper-evident dispute evidence dossier
+fraud-detect case-evidence \
+  --store-file cases.json \
+  --case-id case_83f2a1b9 \
+  --output dispute_evidence.json \
+  --format table
+```
+
+FastAPI Case Management REST endpoints:
+- `POST /v1/cases`: Manually create a new fraud investigation case with SLA timers.
+- `GET /v1/cases`: Query stored cases with multi-criteria filtering (`tenant_id`, `status`, `priority`, `assigned_analyst`, `sla_breached_only`).
+- `GET /v1/cases/summary`: Aggregate metrics breakdown (total, open, resolved, breached counts).
+- `GET /v1/cases/{case_id}`: Retrieve full case record with audit log and analyst notes.
+- `PATCH /v1/cases/{case_id}`: Update case status or assign/reassign to an analyst.
+- `POST /v1/cases/{case_id}/notes`: Append an immutable investigation note to the audit trail.
+- `POST /v1/cases/{case_id}/resolve`: Close a case with a final disposition and conclusion notes.
+- `GET /v1/cases/{case_id}/evidence`: Compile and export a canonicalized SHA-256 fingerprinted dispute evidence dossier (Visa CE3.0 / Mastercard First-Party Trust ready).
+- Prometheus metrics: `fraud_cases_total`, `fraud_cases_resolved_total`, `fraud_case_sla_breaches_total`, `fraud_evidence_packages_generated_total`.
+
 ## Reference label-delay analysis
 
 
@@ -1917,6 +1967,8 @@ Project layout:
 src/fraud_detection/
 ├── api.py            # versioned online prediction service, circuit breakers, and traffic shadowing
 ├── audit.py          # structured JSONL audit logs with Luhn PAN redaction and log replay
+├── cases.py          # fraud case management, SLA tracking, and dispute evidence packaging
+├── challenge.py      # step-up authentication, 3DS challenge orchestration, and token verification
 ├── cli.py            # training, comparison, surveillance, profiling, simulation, and serving CLI
 ├── data.py           # ingestion, schema validation, and synthetic data
 ├── device.py         # adaptive browser/device fingerprinting, simhash clustering, and bot detection
