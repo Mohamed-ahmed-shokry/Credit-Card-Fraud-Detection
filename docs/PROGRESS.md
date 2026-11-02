@@ -7,7 +7,7 @@
 - **Pull Request**: [#28](https://github.com/Mohamed-ahmed-shokry/Credit-Card-Fraud-Detection/pull/28)
 
 ## Task Status
-- [ ] Task 1: Create `src/fraud_detection/cases.py` with domain data models (`CaseError` hierarchy, `CasePriority`, `CaseStatus`, `CaseDisposition`, `CaseNote`, `FraudCase`) and unit tests in `tests/test_cases.py`.
+- [x] Task 1: Create `src/fraud_detection/cases.py` with domain data models (`CaseError` hierarchy, `CasePriority`, `CaseStatus`, `CaseDisposition`, `CaseNote`, `FraudCase`) and unit tests in `tests/test_cases.py`.
 - [ ] Task 2: Implement `DisputeEvidencePackage` compiler and canonical SHA-256 fingerprint generation in `src/fraud_detection/cases.py` with unit tests.
 - [ ] Task 3: Implement `CaseStore` and `CaseManager` with lifecycle enforcement, note auditing, and SLA query in `src/fraud_detection/cases.py` with unit tests.
 - [ ] Task 4: Integrate Case Management into Decision DAG (`pipeline.py`) and EventBus (`events.py`) with unit/integration tests.
@@ -18,7 +18,7 @@
 ## Acceptance Criteria Status
 | Criterion | Status | Evidence |
 |-----------|--------|----------|
-| AC-1 (Domain Models & Taxonomy) | PENDING | Pending Task 1 implementation & unit tests. |
+| AC-1 (Domain Models & Taxonomy) | PASSED | 6 unit tests in `tests/test_cases.py` verifying `FraudCase`, `CasePriority`, `CaseStatus`, `CaseDisposition`, `CaseNote`, SLA deadline calculations, and validation rules. |
 | AC-2 (Dispute Evidence Packaging & SHA-256 Digest) | PENDING | Pending Task 2 implementation & unit tests. |
 | AC-3 (Thread-Safe Case Store & Case Manager) | PENDING | Pending Task 3 implementation & unit tests. |
 | AC-4 (Decision DAG & EventBus Integration) | PENDING | Pending Task 4 implementation & integration tests. |

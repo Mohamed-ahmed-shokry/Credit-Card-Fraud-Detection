@@ -2346,7 +2346,7 @@ Does not implement direct merchant payment processor API webhooks for card netwo
 
 ### Micro-Task Breakdown
 
-- [ ] Task 1: Create `src/fraud_detection/cases.py` with domain data models (`CaseError` hierarchy, `CasePriority`, `CaseStatus`, `CaseDisposition`, `CaseNote`, `FraudCase`) and unit tests in `tests/test_cases.py`.
+- [x] Task 1: Create `src/fraud_detection/cases.py` with domain data models (`CaseError` hierarchy, `CasePriority`, `CaseStatus`, `CaseDisposition`, `CaseNote`, `FraudCase`) and unit tests in `tests/test_cases.py`.
 - [ ] Task 2: Implement `DisputeEvidencePackage` compiler and canonical SHA-256 fingerprint generation in `src/fraud_detection/cases.py` with unit tests.
 - [ ] Task 3: Implement `CaseStore` and `CaseManager` with lifecycle enforcement, note auditing, and SLA query in `src/fraud_detection/cases.py` with unit tests.
 - [ ] Task 4: Integrate Case Management into Decision DAG (`pipeline.py`) and EventBus (`events.py`) with unit/integration tests.
