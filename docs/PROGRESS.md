@@ -9,7 +9,7 @@
 ## Task Status
 - [x] Task 1: Create `src/fraud_detection/cases.py` with domain data models (`CaseError` hierarchy, `CasePriority`, `CaseStatus`, `CaseDisposition`, `CaseNote`, `FraudCase`) and unit tests in `tests/test_cases.py`.
 - [x] Task 2: Implement `DisputeEvidencePackage` compiler and canonical SHA-256 fingerprint generation in `src/fraud_detection/cases.py` with unit tests.
-- [ ] Task 3: Implement `CaseStore` and `CaseManager` with lifecycle enforcement, note auditing, and SLA query in `src/fraud_detection/cases.py` with unit tests.
+- [x] Task 3: Implement `CaseStore` and `CaseManager` with lifecycle enforcement, note auditing, and SLA query in `src/fraud_detection/cases.py` with unit tests.
 - [ ] Task 4: Integrate Case Management into Decision DAG (`pipeline.py`) and EventBus (`events.py`) with unit/integration tests.
 - [ ] Task 5: Implement `/v1/cases/*` REST endpoints and Prometheus metrics in `src/fraud_detection/api.py` with integration tests in `tests/test_api.py`.
 - [ ] Task 6: Implement CLI commands `case-create`, `case-list`, `case-inspect`, `case-resolve`, and `case-evidence` in `src/fraud_detection/cli.py` with tests in `tests/test_cli.py`.
@@ -20,7 +20,7 @@
 |-----------|--------|----------|
 | AC-1 (Domain Models & Taxonomy) | PASSED | 6 unit tests in `tests/test_cases.py` verifying `FraudCase`, `CasePriority`, `CaseStatus`, `CaseDisposition`, `CaseNote`, SLA deadline calculations, and validation rules. |
 | AC-2 (Dispute Evidence Packaging & SHA-256 Digest) | PASSED | 3 unit tests in `tests/test_cases.py` verifying multi-modal evidence aggregation, deterministic canonical JSON hashing, and tamper detection. |
-| AC-3 (Thread-Safe Case Store & Case Manager) | PENDING | Pending Task 3 implementation & unit tests. |
+| AC-3 (Thread-Safe Case Store & Case Manager) | PASSED | 3 unit tests in `tests/test_cases.py` verifying store indexing, filtering, analyst assignment, status state machine, audit log appending, and resolution. |
 | AC-4 (Decision DAG & EventBus Integration) | PENDING | Pending Task 4 implementation & integration tests. |
 | AC-5 (REST API Endpoints & Observability) | PENDING | Pending Task 5 implementation & integration tests. |
 | AC-6 (CLI Workflows) | PENDING | Pending Task 6 implementation & integration tests. |
