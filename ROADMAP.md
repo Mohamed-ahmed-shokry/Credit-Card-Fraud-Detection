@@ -2289,6 +2289,72 @@ Does not implement telecom SMS/Email carrier gateways (Twilio, SendGrid, etc.) a
 - **Verification Gates**: 100% Green local CI parity, $\ge 97.0\%$ branch coverage, 0 mypy issues, Ruff formatted, pip-audit clean, wheel build and twine valid.
 
 
+## Phase 45 — Fraud Case Management, Investigation SLA Tracking & Dispute Evidence Packaging Engine (In Progress)
+
+### Objective
+
+Deliver an in-process, zero-dependency Fraud Case Management, Analyst Workflow, SLA Tracking, and Dispute Evidence Packaging Engine (`cases.py`) for operational investigation of suspicious transactions and chargeback representment. Support automated case creation on `REVIEW` or high-friction decisions, case prioritization and SLA timers, analyst assignment, status workflows, audit notes trail, cryptographic dispute evidence packaging (`DisputeEvidencePackage` with SHA-256 fingerprint), Decision DAG and EventBus integration, REST API endpoints (`/v1/cases/*`), Prometheus metrics, and CLI investigation tools (`case-create`, `case-list`, `case-inspect`, `case-resolve`, `case-evidence`).
+
+### Scope
+
+1. **Domain Models, Case Taxonomy & Invariant Lifecycle (`cases.py`)**:
+   - `CasePriority` (`LOW`, `MEDIUM`, `HIGH`, `CRITICAL`) with automatic severity calculation.
+   - `CaseStatus` (`OPEN`, `INVESTIGATING`, `PENDING_CUSTOMER`, `REPRESENTED`, `RESOLVED_FRAUD`, `RESOLVED_LEGITIMATE`, `AUTO_CLOSED`).
+   - `CaseDisposition` (`CONFIRMED_FRAUD`, `FALSE_POSITIVE`, `MERCHANT_ERROR`, `ACCOUNT_TAKEOVER`, `FRIENDLY_FRAUD`, `UNRESOLVED`).
+   - `CaseNote`: Immutable analyst note with `note_id`, `author`, `text`, `timestamp`.
+   - `FraudCase`: Complete data model with `case_id`, `transaction_id`, `tenant_id`, `assigned_analyst`, `status`, `priority`, `fraud_score`, `disposition`, `notes`, `audit_trail`, `created_at`, `updated_at`, `sla_deadline_hours`, `sla_expires_at`, `is_sla_breached`, `metadata`.
+2. **Dispute Evidence Packaging & Cryptographic Hashing (`cases.py`)**:
+   - `DisputeEvidencePackage`: Structured evidence bundle aggregating transaction context, model score, device fingerprint indicators (from `device.py`), geolocation speed-of-travel metrics (from `geolocation.py`), 3DS challenge session verification proof (from `challenge.py`), and customer history.
+   - Deterministic JSON canonicalization and SHA-256 evidence fingerprint generation ensuring tamper-evident integrity for network dispute submission (Visa CE3.0 / Mastercard First-Party Trust).
+3. **Thread-Safe Case Store & Case Manager (`cases.py`)**:
+   - `CaseStore`: Bounded, thread-safe session store with multi-index lookup (by `case_id`, `transaction_id`, `tenant_id`, `status`, `priority`, `assigned_analyst`, and SLA breach).
+   - `CaseManager`: Lifecycle operations: `create_case`, `assign_case`, `update_status`, `add_note`, `resolve_case`, `generate_evidence_package`, `query_sla_breaches`, `get_case_summary`.
+4. **Decision DAG & EventBus Integration (`pipeline.py`, `events.py`)**:
+   - Extended `EventType` with `CASE_CREATED`, `CASE_ASSIGNED`, `CASE_STATUS_CHANGED`, `CASE_RESOLVED`, `EVIDENCE_PACKAGED`.
+   - `ActionAggregatorStageProcessor` issuing automated fraud cases when pipeline decision action is `REVIEW` or friction is triggered and `case_manager` is configured in context metadata.
+   - Automated event broadcasting over `EventBus`.
+5. **FastAPI Serving & Observability (`api.py`)**:
+   - REST endpoints: `POST /v1/cases`, `GET /v1/cases`, `GET /v1/cases/{case_id}`, `PATCH /v1/cases/{case_id}`, `POST /v1/cases/{case_id}/notes`, `POST /v1/cases/{case_id}/resolve`, `GET /v1/cases/{case_id}/evidence`.
+   - Prometheus metrics: `fraud_cases_total`, `fraud_cases_resolved_total`, `fraud_case_sla_breaches_total`, `fraud_evidence_packages_generated_total`.
+6. **CLI Workflows (`cli.py`)**:
+   - `fraud-detect case-create`, `fraud-detect case-list`, `fraud-detect case-inspect`, `fraud-detect case-resolve`, `fraud-detect case-evidence`.
+
+### Acceptance Criteria
+
+1. **AC-1 (Domain Models & Taxonomy)**: `FraudCase`, `CasePriority`, `CaseStatus`, and `CaseDisposition` enforce strict invariants, SLA deadline timestamps, and JSON serialization.
+2. **AC-2 (Dispute Evidence Packaging & SHA-256 Digest)**: `DisputeEvidencePackage` compiles multi-modal evidence across device, geo, 3DS challenge, and model scores into a canonicalized SHA-256 fingerprinted payload.
+3. **AC-3 (Thread-Safe Case Store & Case Manager)**: `CaseManager` and `CaseStore` safely manage concurrent lifecycle state transitions, analyst assignments, notes, resolution dispositions, and SLA breach querying.
+4. **AC-4 (Decision DAG & EventBus Integration)**: Pipeline DAG triggers case creation on `REVIEW` actions and broadcasts domain events (`CASE_CREATED`, `CASE_RESOLVED`, etc.) across `EventBus`.
+5. **AC-5 (REST API Endpoints & Observability)**: FastAPI exposes `/v1/cases/*` endpoints for listing, inspection, status update, note creation, resolution, and evidence dossier export with Prometheus metrics.
+6. **AC-6 (CLI Workflows)**: CLI commands provide robust ASCII table and JSON formatting with standard exit codes for case operations.
+7. **AC-7 (Quality Standards & 100% Green CI)**: All local CI-parity checks and remote CI workflow runs pass 100%, branch coverage $\ge 97.0\%$, strict mypy 0 issues, Ruff clean, and build/twine valid.
+
+### Validation & CI Plan
+
+- Local CI-parity commands:
+  - `python -m ruff format --check src tests`
+  - `python -m ruff check src tests`
+  - `python -m mypy src`
+  - `python -m pip_audit --skip-editable`
+  - `python -m pytest --cov=fraud_detection --cov-report=term-missing`
+  - `python -m build` & `python -m twine check dist/*`
+- Remote CI workflow runs monitored via `gh run list` and `gh pr checks`.
+
+### Exclusions
+
+Does not implement direct merchant payment processor API webhooks for card network portals (e.g. Visa Resolve Online / VROL or Mastercard MasterCom); provides complete, standards-compliant evidence dossiers ready for ingest and transmission by payment adapters.
+
+### Micro-Task Breakdown
+
+- [ ] Task 1: Create `src/fraud_detection/cases.py` with domain data models (`CaseError` hierarchy, `CasePriority`, `CaseStatus`, `CaseDisposition`, `CaseNote`, `FraudCase`) and unit tests in `tests/test_cases.py`.
+- [ ] Task 2: Implement `DisputeEvidencePackage` compiler and canonical SHA-256 fingerprint generation in `src/fraud_detection/cases.py` with unit tests.
+- [ ] Task 3: Implement `CaseStore` and `CaseManager` with lifecycle enforcement, note auditing, and SLA query in `src/fraud_detection/cases.py` with unit tests.
+- [ ] Task 4: Integrate Case Management into Decision DAG (`pipeline.py`) and EventBus (`events.py`) with unit/integration tests.
+- [ ] Task 5: Implement `/v1/cases/*` REST endpoints and Prometheus metrics in `src/fraud_detection/api.py` with integration tests in `tests/test_api.py`.
+- [ ] Task 6: Implement CLI commands `case-create`, `case-list`, `case-inspect`, `case-resolve`, and `case-evidence` in `src/fraud_detection/cli.py` with tests in `tests/test_cli.py`.
+- [ ] Task 7: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate with 100% Green CI.
+
+
 ## Contributing to the roadmap
 
 Open an issue or a pull request that references the relevant phase item.
