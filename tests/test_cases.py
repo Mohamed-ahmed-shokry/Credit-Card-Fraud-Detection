@@ -513,3 +513,150 @@ def test_pipeline_case_integration_without_bus() -> None:
     case = case_mgr.get_case(case_id)
     assert case.transaction_id == "tx_pipe_nobus_202"
     assert case.amount == 850.0
+
+
+def test_case_store_and_manager_edge_cases() -> None:
+    """Cover edge branches in FraudCase, CaseStore, and CaseManager."""
+    # 1. Invalid created_at triggers fallback in __post_init__
+    c_fallback = FraudCase(transaction_id="tx_fb", created_at="invalid-date")
+    assert c_fallback.sla_expires_at is not None
+
+    # 2. SLA breached with naive datetime (no tzinfo)
+    c_naive = FraudCase(transaction_id="tx_naive")
+    c_naive.sla_expires_at = (datetime.now(UTC).replace(tzinfo=None) - timedelta(hours=2)).strftime(
+        "%Y-%m-%dT%H:%M:%S"
+    )
+    assert c_naive.is_sla_breached is True
+
+    # 3. SLA breached with invalid sla_expires_at format returns False
+    c_invalid_sla = FraudCase(transaction_id="tx_inv_sla")
+    c_invalid_sla.sla_expires_at = "not-iso-date"
+    assert c_invalid_sla.is_sla_breached is False
+
+    # 4. CaseStore delete non-existent and existing
+    store = CaseStore()
+    assert store.delete("non_existent_case_id") is False
+    c1 = FraudCase(transaction_id="tx_del_1", tenant_id="tenant_x")
+    store.put(c1)
+    assert store.get_by_transaction("tx_del_1") is not None
+    assert store.delete(c1.case_id) is True
+    assert store.get(c1.case_id) is None
+    assert store.get_by_transaction("tx_del_1") is None
+
+    # 5. CaseStore list_cases with limit and non-matching filters
+    store.clear()
+    c_open = FraudCase(transaction_id="tx_o", status=CaseStatus.OPEN, assigned_analyst="alice")
+    c_inv = FraudCase(
+        transaction_id="tx_i", status=CaseStatus.INVESTIGATING, assigned_analyst="bob"
+    )
+    store.put(c_open)
+    store.put(c_inv)
+    limited = store.list_cases(limit=1)
+    assert len(limited) == 1
+
+    # Filter with non-matching status and non-matching analyst
+    res_status = store.list_cases(status=CaseStatus.CLOSED)
+    assert len(res_status) == 0
+    res_analyst = store.list_cases(assigned_analyst="charlie")
+    assert len(res_analyst) == 0
+
+    # 6. CaseStore evidence package indexing and deduplication
+    pkg = DisputeEvidencePackage(
+        case_id=c_open.case_id,
+        transaction_id=c_open.transaction_id,
+        tenant_id=c_open.tenant_id,
+        evidence_items=[{"data": 1}],
+    )
+    store.put_evidence_package(pkg)
+    # Put again to test idempotency/duplicate avoidance in _pkg_by_case
+    store.put_evidence_package(pkg)
+    assert store.get_evidence_package(pkg.package_id) == pkg
+    pkgs = store.list_evidence_packages(c_open.case_id)
+    assert len(pkgs) == 1
+    assert pkgs[0].package_id == pkg.package_id
+
+    # 7. CaseManager assign_case when already investigating
+    mgr = CaseManager(store=store)
+    mgr.assign_case(c_inv.case_id, "bob_reassigned", actor="lead")
+    assert store.get(c_inv.case_id).assigned_analyst == "bob_reassigned"
+
+    # 8. CaseManager update_status when new_status == current_status
+    curr = mgr.update_status(c_inv.case_id, CaseStatus.INVESTIGATING, actor="lead")
+    assert curr.status == CaseStatus.INVESTIGATING
+
+    # 9. CaseManager update_status to RESOLVED directly from INVESTIGATING
+    res_case = mgr.update_status(c_inv.case_id, CaseStatus.RESOLVED, actor="lead")
+    assert res_case.status == CaseStatus.RESOLVED
+    assert res_case.resolved_at is not None
+
+    # 10. CaseManager resolve_case with empty notes and already resolved
+    resolved_again = mgr.resolve_case(
+        c_inv.case_id,
+        disposition=CaseDisposition.FALSE_POSITIVE,
+        actor="lead",
+        notes="",
+    )
+    assert resolved_again.disposition == CaseDisposition.FALSE_POSITIVE
+
+    # 11. CaseManager get_summary with SLA breached case
+    c_breached = FraudCase(transaction_id="tx_br")
+    c_breached.sla_expires_at = (datetime.now(UTC) - timedelta(hours=5)).isoformat()
+    store.put(c_breached)
+    summary = mgr.get_summary()
+    assert summary["sla_breached_count"] >= 1
+
+    # 12. CaseManager create_case with auto_assign
+    c_assigned = mgr.create_case(
+        transaction_id="tx_auto_assign",
+        auto_assign="analyst_charlie",
+    )
+    assert c_assigned.assigned_analyst == "analyst_charlie"
+    assert c_assigned.status == CaseStatus.INVESTIGATING
+
+    # 13. CaseStore delete when transaction_id points to another case
+    c_tx1 = mgr.create_case(transaction_id="tx_shared")
+    c_tx2 = mgr.create_case(transaction_id="tx_shared")
+    # Delete older case
+    assert store.delete(c_tx1.case_id) is True
+    # Store still has c_tx2 as latest for tx_shared
+    assert store.get_by_transaction("tx_shared").case_id == c_tx2.case_id
+
+
+def test_pipeline_case_creation_amount_parsing_fallback() -> None:
+    """Verify ActionAggregatorStageProcessor safely handles non-numeric amounts."""
+    from fraud_detection.pipeline import (
+        ActionAggregatorStageProcessor,
+        PipelineContext,
+        StageExecutionResult,
+        StageStatus,
+        StageType,
+    )
+
+    case_mgr = CaseManager()
+    processor = ActionAggregatorStageProcessor()
+
+    context = PipelineContext(
+        transaction={"amount": "not_a_valid_number"},
+        metadata={
+            "case_manager": case_mgr,
+            "transaction_id": "tx_pipe_fallback_amt",
+            "tenant_id": "tenant_test",
+        },
+    )
+    context.results["rules"] = StageExecutionResult(
+        node_name="rules",
+        stage_type=StageType.RULES,
+        status=StageStatus.SUCCESS,
+        latency_ms=1.0,
+        output={
+            "matched_rule_id": "rule_review",
+            "action": "REVIEW",
+        },
+    )
+
+    out = processor(context)
+    assert out["decision"] == "REVIEW"
+    assert out["case"] is not None
+    case_id = out["case"]["case_id"]
+    case = case_mgr.get_case(case_id)
+    assert case.amount == 0.0

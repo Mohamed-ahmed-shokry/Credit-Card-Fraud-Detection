@@ -5885,7 +5885,9 @@ def test_case_api_endpoints_and_lifecycle(api_context: tuple[Path, Any, Path]) -
 
 def test_case_api_error_branches(api_context: tuple[Path, Any, Path]) -> None:
     """Verify error branches, 404s, 400s, and uninitialized manager for /v1/cases/*."""
-    from fraud_detection.cases import CaseManager
+    from unittest.mock import patch
+
+    from fraud_detection.cases import CaseManager, EvidencePackagingError
 
     _, model, _ = api_context
 
@@ -5992,3 +5994,24 @@ def test_case_api_error_branches(api_context: tuple[Path, Any, Path]) -> None:
             ).status_code
             == 400
         )
+
+        # Successful patch priority
+        res_patch_prio = client.patch(
+            f"/v1/cases/{c_id}",
+            json={"priority": "critical", "actor": "lead_analyst", "reason": "VIP escalation"},
+        )
+        assert res_patch_prio.status_code == 200
+        assert res_patch_prio.json()["priority"] == "critical"
+
+        # EvidencePackagingError -> 400
+        with patch.object(
+            CaseManager,
+            "generate_evidence_package",
+            side_effect=EvidencePackagingError("Forced packaging failure"),
+        ):
+            res_ev_fail = client.post(
+                f"/v1/cases/{c_id}/evidence",
+                json={"transaction_data": {"amount": 100.0}},
+            )
+            assert res_ev_fail.status_code == 400
+            assert "Forced packaging failure" in res_ev_fail.json()["detail"]

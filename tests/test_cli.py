@@ -8931,6 +8931,34 @@ def test_case_management_cli(tmp_path: Path) -> None:
     assert res_c_bad_prio.exit_code == 2
     assert "Invalid case priority" in res_c_bad_prio.output
 
+    # 1b. case-create validation error (negative amount) -> exit 2
+    res_c_bad_amt = runner.invoke(
+        app,
+        [
+            "case-create",
+            "-x",
+            "tx_bad_amt",
+            "-a",
+            "-50.0",
+        ],
+    )
+    assert res_c_bad_amt.exit_code == 2
+    assert "Failed to create case" in res_c_bad_amt.output
+
+    # 1c. case-create without store_file -> exit 0
+    res_c_no_store = runner.invoke(
+        app,
+        [
+            "case-create",
+            "-x",
+            "tx_no_store",
+            "-a",
+            "100.0",
+        ],
+    )
+    assert res_c_no_store.exit_code == 0
+    assert "case_id" in json.loads(res_c_no_store.output)
+
     # 2. case-create store persistence failure -> exit 2
     bad_dir = tmp_path / "bad_store_dir"
     bad_dir.mkdir()
@@ -9227,6 +9255,28 @@ def test_case_management_cli(tmp_path: Path) -> None:
         ],
     )
     assert res_r_not_found.exit_code == 2
+
+    # 14b. case-resolve CaseError exception handling -> exit 2
+    from fraud_detection.cases import CaseValidationError
+
+    with patch(
+        "fraud_detection.cli.CaseManager.resolve_case",
+        side_effect=CaseValidationError("Forced resolution failure"),
+    ):
+        res_r_fail = runner.invoke(
+            app,
+            [
+                "case-resolve",
+                "-s",
+                str(store_file),
+                "-c",
+                case_1_id,
+                "-d",
+                "confirmed_fraud",
+            ],
+        )
+        assert res_r_fail.exit_code == 2
+        assert "Failed to resolve case" in res_r_fail.output
 
     # 15. case-resolve success (json and table)
     res_r_json = runner.invoke(
