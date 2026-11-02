@@ -412,3 +412,104 @@ def test_case_manager_error_paths() -> None:
     c = mgr.create_case(transaction_id="tx_err")
     with pytest.raises(CaseAssignmentError, match="Analyst identifier cannot be empty"):
         mgr.assign_case(c.case_id, analyst="   ")
+
+
+def test_pipeline_and_eventbus_case_integration() -> None:
+    """Verify ActionAggregatorStageProcessor creates cases on REVIEW and broadcasts to EventBus."""
+    from fraud_detection.events import EventBus, EventType, FraudDomainEvent
+    from fraud_detection.pipeline import (
+        ActionAggregatorStageProcessor,
+        PipelineContext,
+        StageExecutionResult,
+        StageStatus,
+        StageType,
+    )
+
+    event_bus = EventBus()
+    captured_events: list[FraudDomainEvent] = []
+
+    def on_event(ev: FraudDomainEvent) -> None:
+        captured_events.append(ev)
+
+    event_bus.subscribe(on_event)
+
+    case_mgr = CaseManager()
+    processor = ActionAggregatorStageProcessor()
+
+    context = PipelineContext(
+        transaction={"Amount": 349.99, "Time": 120.0},
+        metadata={
+            "event_bus": event_bus,
+            "case_manager": case_mgr,
+            "transaction_id": "tx_pipe_case_101",
+            "tenant_id": "tenant_risk_corp",
+            "synchronous_event_publish": True,
+        },
+    )
+    context.results["rules"] = StageExecutionResult(
+        node_name="rules",
+        stage_type=StageType.RULES,
+        status=StageStatus.SUCCESS,
+        latency_ms=1.0,
+        output={
+            "matched_rule_id": "rule_analyst_review_flag",
+            "action": "REVIEW",
+        },
+    )
+
+    out = processor(context)
+    assert out["decision"] == "REVIEW"
+    assert out["case"] is not None
+    ch_case_id = out["case"]["case_id"]
+
+    case = case_mgr.get_case(ch_case_id)
+    assert case.transaction_id == "tx_pipe_case_101"
+    assert case.tenant_id == "tenant_risk_corp"
+    assert case.amount == 349.99
+
+    # Verify event published to EventBus
+    event_types = [e.event_type for e in captured_events]
+    assert EventType.DECISION_REVIEW in event_types
+    assert EventType.CASE_CREATED in event_types
+    event_bus.close()
+
+
+def test_pipeline_case_integration_without_bus() -> None:
+    """Verify ActionAggregatorStageProcessor auto-creates cases when EventBus is absent."""
+    from fraud_detection.pipeline import (
+        ActionAggregatorStageProcessor,
+        PipelineContext,
+        StageExecutionResult,
+        StageStatus,
+        StageType,
+    )
+
+    case_mgr = CaseManager()
+    processor = ActionAggregatorStageProcessor()
+
+    context = PipelineContext(
+        transaction={"amount": 850.0, "Time": 50.0},
+        metadata={
+            "case_manager": case_mgr,
+            "transaction_id": "tx_pipe_nobus_202",
+            "tenant_id": "tenant_nobus",
+        },
+    )
+    context.results["rules"] = StageExecutionResult(
+        node_name="rules",
+        stage_type=StageType.RULES,
+        status=StageStatus.SUCCESS,
+        latency_ms=1.0,
+        output={
+            "matched_rule_id": "rule_large_transaction_review",
+            "action": "REVIEW",
+        },
+    )
+
+    out = processor(context)
+    assert out["decision"] == "REVIEW"
+    assert out["case"] is not None
+    case_id = out["case"]["case_id"]
+    case = case_mgr.get_case(case_id)
+    assert case.transaction_id == "tx_pipe_nobus_202"
+    assert case.amount == 850.0

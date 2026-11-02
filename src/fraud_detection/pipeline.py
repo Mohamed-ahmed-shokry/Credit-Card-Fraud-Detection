@@ -1588,6 +1588,59 @@ class ActionAggregatorStageProcessor:
                             synchronous=sync_pub,
                         )
 
+        case_info: dict[str, Any] | None = None
+        if final_action == "REVIEW":
+            case_mgr = context.metadata.get("case_manager")
+            if case_mgr is not None:
+                with contextlib.suppress(Exception):
+                    tx_id = str(context.metadata.get("transaction_id") or uuid4().hex)
+                    t_id = str(context.metadata.get("tenant_id") or "default")
+                    tx_amt_raw = (
+                        context.transaction.get("Amount")
+                        or context.transaction.get("amount")
+                        or 0.0
+                    )
+                    try:
+                        tx_amt = float(tx_amt_raw)
+                    except (ValueError, TypeError):
+                        tx_amt = 0.0
+                    auto_case = case_mgr.create_case(
+                        transaction_id=tx_id,
+                        fraud_score=round(final_prob, 5),
+                        amount=tx_amt,
+                        tenant_id=t_id,
+                        metadata={
+                            "matched_rule": matched_rule,
+                            "rule_action": rule_action,
+                            "decision": final_action,
+                        },
+                    )
+                    case_info = {
+                        "case_id": auto_case.case_id,
+                        "case_status": auto_case.status.value,
+                        "case_priority": auto_case.priority.value,
+                        "sla_expires_at": auto_case.sla_expires_at,
+                    }
+                    if bus is not None:
+                        from fraud_detection.events import EventType, FraudDomainEvent
+
+                        bus.publish(
+                            FraudDomainEvent(
+                                event_type=EventType.CASE_CREATED,
+                                tenant_id=t_id,
+                                payload={
+                                    "case_id": auto_case.case_id,
+                                    "transaction_id": tx_id,
+                                    "priority": auto_case.priority.value,
+                                    "status": auto_case.status.value,
+                                    "fraud_score": auto_case.fraud_score,
+                                    "amount": auto_case.amount,
+                                    "sla_expires_at": auto_case.sla_expires_at,
+                                },
+                            ),
+                            synchronous=sync_pub,
+                        )
+
         return {
             "decision": final_action,
             "is_fraud": is_fraud,
@@ -1600,6 +1653,7 @@ class ActionAggregatorStageProcessor:
             "review_threshold": effective_review,
             "deny_threshold": effective_deny,
             "challenge": challenge_info,
+            "case": case_info,
         }
 
 
