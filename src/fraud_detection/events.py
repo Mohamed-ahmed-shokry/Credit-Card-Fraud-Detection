@@ -92,6 +92,11 @@ class EventType(StrEnum):
     CHALLENGE_VERIFIED = "fraud.challenge.verified"
     CHALLENGE_FAILED = "fraud.challenge.failed"
     CHALLENGE_EXPIRED = "fraud.challenge.expired"
+    CASE_CREATED = "fraud.case.created"
+    CASE_ASSIGNED = "fraud.case.assigned"
+    CASE_STATUS_CHANGED = "fraud.case.status_changed"
+    CASE_RESOLVED = "fraud.case.resolved"
+    EVIDENCE_PACKAGED = "fraud.case.evidence_packaged"
 
 
 class EventDeliveryStatus(StrEnum):

@@ -5781,3 +5781,237 @@ def test_challenge_api_error_branches(api_context: tuple[Path, Any, Path]) -> No
         )
         # Resending cancelled -> 400
         assert client.post(f"/v1/challenges/{ch_canc_id}/resend", json={}).status_code == 400
+
+
+def test_case_api_endpoints_and_lifecycle(api_context: tuple[Path, Any, Path]) -> None:
+    """Validate /v1/cases/* REST endpoints: creation, assignment, notes, and resolution."""
+    from fraud_detection.cases import CaseManager
+
+    _, model, _ = api_context
+    case_mgr = CaseManager()
+
+    with TestClient(create_app(model=model, case_manager=case_mgr)) as client:
+        # 1. GET /v1/cases: initially empty
+        res = client.get("/v1/cases")
+        assert res.status_code == 200
+        assert res.json()["total_count"] == 0
+
+        # 2. POST /v1/cases: create case
+        req_payload = {
+            "transaction_id": "tx_api_case_001",
+            "fraud_score": 0.82,
+            "amount": 1400.0,
+            "currency": "USD",
+            "tenant_id": "fintech_gamma",
+            "priority": "high",
+            "sla_deadline_hours": 12.0,
+        }
+        create_res = client.post("/v1/cases", json=req_payload)
+        assert create_res.status_code == 201
+        created = create_res.json()
+        case_id = created["case_id"]
+        assert case_id.startswith("case_")
+        assert created["status"] == "open"
+        assert created["priority"] == "high"
+        assert created["amount"] == 1400.0
+
+        # 3. GET /v1/cases/{case_id}: retrieve case details
+        get_res = client.get(f"/v1/cases/{case_id}")
+        assert get_res.status_code == 200
+        assert get_res.json()["case_id"] == case_id
+
+        # 4. PATCH /v1/cases/{case_id}: assign analyst
+        patch_res = client.patch(
+            f"/v1/cases/{case_id}",
+            json={"assigned_analyst": "analyst_dave", "actor": "manager"},
+        )
+        assert patch_res.status_code == 200
+        assert patch_res.json()["assigned_analyst"] == "analyst_dave"
+        assert patch_res.json()["status"] == "investigating"
+
+        # 5. POST /v1/cases/{case_id}/notes: add analyst note
+        note_res = client.post(
+            f"/v1/cases/{case_id}/notes",
+            json={"author": "analyst_dave", "text": "Customer confirmed device unrecognized."},
+        )
+        assert note_res.status_code == 201
+        assert note_res.json()["author"] == "analyst_dave"
+
+        # 6. POST /v1/cases/{case_id}/evidence: generate evidence package
+        ev_payload = {
+            "transaction_data": {"amount": 1400.0, "currency": "USD"},
+            "device_data": {"device_id": "dev_test_99", "vpn_detected": True},
+            "geo_data": {"country": "DE", "speed_kmh": 1450.0},
+            "challenge_data": {"method": "sms_otp", "status": "failed"},
+            "actor": "analyst_dave",
+        }
+        ev_res = client.post(f"/v1/cases/{case_id}/evidence", json=ev_payload)
+        assert ev_res.status_code == 201
+        pkg_data = ev_res.json()
+        assert pkg_data["package_id"].startswith("evpkg_")
+        assert len(pkg_data["sha256_fingerprint"]) == 64
+
+        # 7. GET /v1/cases/{case_id}/evidence: list evidence packages
+        list_ev_res = client.get(f"/v1/cases/{case_id}/evidence")
+        assert list_ev_res.status_code == 200
+        assert len(list_ev_res.json()) == 1
+
+        # 8. POST /v1/cases/{case_id}/resolve: finalize case
+        resolve_res = client.post(
+            f"/v1/cases/{case_id}/resolve",
+            json={
+                "disposition": "confirmed_fraud",
+                "actor": "analyst_dave",
+                "notes": "Stolen credentials confirmed via travel & failed SMS challenge.",
+            },
+        )
+        assert resolve_res.status_code == 200
+        assert resolve_res.json()["status"] == "resolved"
+        assert resolve_res.json()["disposition"] == "confirmed_fraud"
+
+        # 9. GET /v1/cases/summary: check aggregate metrics
+        sum_res = client.get("/v1/cases/summary?tenant_id=fintech_gamma")
+        assert sum_res.status_code == 200
+        assert sum_res.json()["total_cases"] == 1
+        assert sum_res.json()["by_status"]["resolved"] == 1
+
+        # 10. Check Prometheus metrics
+        metrics_res = client.get("/metrics")
+        assert metrics_res.status_code == 200
+        assert "fraud_cases_total{" in metrics_res.text
+        assert "fraud_cases_resolved_total{" in metrics_res.text
+        assert "fraud_evidence_packages_total{" in metrics_res.text
+
+
+def test_case_api_error_branches(api_context: tuple[Path, Any, Path]) -> None:
+    """Verify error branches, 404s, 400s, and uninitialized manager for /v1/cases/*."""
+    from unittest.mock import patch
+
+    from fraud_detection.cases import CaseManager, EvidencePackagingError
+
+    _, model, _ = api_context
+
+    # 1. Uninitialized manager
+    uninit_app = create_app(model=model)
+    with TestClient(uninit_app) as uninit_client:
+        uninit_client.app.state.case_manager = None
+        assert uninit_client.get("/v1/cases").json() == {"total_count": 0, "cases": []}
+        assert uninit_client.get("/v1/cases/summary").status_code == 500
+        assert (
+            uninit_client.post(
+                "/v1/cases",
+                json={"transaction_id": "tx1"},
+            ).status_code
+            == 500
+        )
+        assert uninit_client.get("/v1/cases/c1").status_code == 500
+        assert uninit_client.patch("/v1/cases/c1", json={}).status_code == 500
+        assert (
+            uninit_client.post("/v1/cases/c1/notes", json={"author": "a", "text": "t"}).status_code
+            == 500
+        )
+        assert (
+            uninit_client.post(
+                "/v1/cases/c1/resolve", json={"disposition": "confirmed_fraud", "actor": "a"}
+            ).status_code
+            == 500
+        )
+        assert uninit_client.post("/v1/cases/c1/evidence", json={}).status_code == 500
+        assert uninit_client.get("/v1/cases/c1/evidence").status_code == 500
+
+    # 2. Initialized manager with invalid inputs & 404s
+    case_mgr = CaseManager()
+    with TestClient(create_app(model=model, case_manager=case_mgr)) as client:
+        # 404 on missing case
+        assert client.get("/v1/cases/case_nonexistent").status_code == 404
+        assert (
+            client.patch("/v1/cases/case_nonexistent", json={"status": "closed"}).status_code == 404
+        )
+        assert (
+            client.post(
+                "/v1/cases/case_nonexistent/notes", json={"author": "a", "text": "t"}
+            ).status_code
+            == 404
+        )
+        assert (
+            client.post(
+                "/v1/cases/case_nonexistent/resolve",
+                json={"disposition": "confirmed_fraud", "actor": "a"},
+            ).status_code
+            == 404
+        )
+        assert client.post("/v1/cases/case_nonexistent/evidence", json={}).status_code == 404
+        assert client.get("/v1/cases/case_nonexistent/evidence").status_code == 404
+
+        # 400 on invalid priority in create
+        res_bad_prio = client.post(
+            "/v1/cases", json={"transaction_id": "tx1", "priority": "ultra_extreme"}
+        )
+        assert res_bad_prio.status_code == 400
+
+        # 400 on validation error in create (e.g. negative amount)
+        res_bad_amt = client.post("/v1/cases", json={"transaction_id": "tx1", "amount": -50.0})
+        assert res_bad_amt.status_code == 400
+
+        # 400 on invalid status or priority query filters
+        assert client.get("/v1/cases?status=invalid_st").status_code == 400
+        assert client.get("/v1/cases?priority=invalid_prio").status_code == 400
+
+        # Create valid case for patch and note error tests
+        c_res = client.post("/v1/cases", json={"transaction_id": "tx_err_test"})
+        c_id = c_res.json()["case_id"]
+
+        # 400 on invalid status in patch
+        assert (
+            client.patch(f"/v1/cases/{c_id}", json={"status": "invalid_status"}).status_code == 400
+        )
+        # 400 on invalid priority in patch
+        assert (
+            client.patch(f"/v1/cases/{c_id}", json={"priority": "invalid_prio"}).status_code == 400
+        )
+        # 400 on illegal transition (OPEN directly to RESOLVED)
+        assert client.patch(f"/v1/cases/{c_id}", json={"status": "resolved"}).status_code == 400
+        # 400 on empty analyst assignment
+        assert client.patch(f"/v1/cases/{c_id}", json={"assigned_analyst": "  "}).status_code == 400
+
+        # 400 on empty note text
+        assert (
+            client.post(f"/v1/cases/{c_id}/notes", json={"author": "a", "text": "  "}).status_code
+            == 400
+        )
+
+        # 400 on invalid disposition in resolve
+        assert (
+            client.post(
+                f"/v1/cases/{c_id}/resolve", json={"disposition": "invalid_disp", "actor": "a"}
+            ).status_code
+            == 400
+        )
+        # 400 on UNRESOLVED disposition in resolve
+        assert (
+            client.post(
+                f"/v1/cases/{c_id}/resolve", json={"disposition": "unresolved", "actor": "a"}
+            ).status_code
+            == 400
+        )
+
+        # Successful patch priority
+        res_patch_prio = client.patch(
+            f"/v1/cases/{c_id}",
+            json={"priority": "critical", "actor": "lead_analyst", "reason": "VIP escalation"},
+        )
+        assert res_patch_prio.status_code == 200
+        assert res_patch_prio.json()["priority"] == "critical"
+
+        # EvidencePackagingError -> 400
+        with patch.object(
+            CaseManager,
+            "generate_evidence_package",
+            side_effect=EvidencePackagingError("Forced packaging failure"),
+        ):
+            res_ev_fail = client.post(
+                f"/v1/cases/{c_id}/evidence",
+                json={"transaction_data": {"amount": 100.0}},
+            )
+            assert res_ev_fail.status_code == 400
+            assert "Forced packaging failure" in res_ev_fail.json()["detail"]

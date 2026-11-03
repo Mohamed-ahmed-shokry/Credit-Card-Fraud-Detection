@@ -1,32 +1,33 @@
-# Phase 44 Progress Record
+# Phase 45 Progress Record
 
 ### Overview
-- **Phase**: Phase 44 — Risk-Based Step-Up Authentication & Challenge Orchestration
-- **Branch**: `phase/challenge-orchestrator`
+- **Phase**: Phase 45 — Fraud Case Management, Investigation SLA Tracking & Dispute Evidence Packaging Engine
+- **Branch**: `phase/case-management-dispute-engine`
 - **Status**: Completed
+- **Pull Request**: [#28](https://github.com/Mohamed-ahmed-shokry/Credit-Card-Fraud-Detection/pull/28)
 
 ## Task Status
-- [x] Task 1: Create `src/fraud_detection/challenge.py` with domain data models (`ChallengeError` hierarchy, `ChallengeMethod`, `ChallengeStatus`, `ChallengeSession`) and unit tests in `tests/test_challenge.py`.
-- [x] Task 2: Implement cryptographic token generation, masking, and constant-time verification in `src/fraud_detection/challenge.py` with unit tests.
-- [x] Task 3: Implement `ChallengePolicy`, `ChallengeStore`, and `ChallengeManager` with lifecycle enforcement in `src/fraud_detection/challenge.py` with unit tests.
-- [x] Task 4: Integrate Challenge Orchestration into Decision DAG (`pipeline.py`) and EventBus (`events.py`) with unit/integration tests.
-- [x] Task 5: Implement `/v1/challenges/*` REST endpoints and Prometheus metrics in `src/fraud_detection/api.py` with integration tests in `tests/test_api.py`.
-- [x] Task 6: Implement CLI commands `challenge-create`, `challenge-verify`, and `challenge-inspect` in `src/fraud_detection/cli.py` with tests in `tests/test_cli.py`.
+- [x] Task 1: Create `src/fraud_detection/cases.py` with domain data models (`CaseError` hierarchy, `CasePriority`, `CaseStatus`, `CaseDisposition`, `CaseNote`, `FraudCase`) and unit tests in `tests/test_cases.py`.
+- [x] Task 2: Implement `DisputeEvidencePackage` compiler and canonical SHA-256 fingerprint generation in `src/fraud_detection/cases.py` with unit tests.
+- [x] Task 3: Implement `CaseStore` and `CaseManager` with lifecycle enforcement, note auditing, and SLA query in `src/fraud_detection/cases.py` with unit tests.
+- [x] Task 4: Integrate Case Management into Decision DAG (`pipeline.py`) and EventBus (`events.py`) with unit/integration tests.
+- [x] Task 5: Implement `/v1/cases/*` REST endpoints and Prometheus metrics in `src/fraud_detection/api.py` with integration tests in `tests/test_api.py`.
+- [x] Task 6: Implement CLI commands `case-create`, `case-list`, `case-inspect`, `case-resolve`, and `case-evidence` in `src/fraud_detection/cli.py` with tests in `tests/test_cli.py`.
 - [x] Task 7: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate with 100% Green CI.
 
 ## Acceptance Criteria Status
 | Criterion | Status | Evidence |
 |-----------|--------|----------|
-| AC-1 (Domain Models & Taxonomy) | PASSED | 3 unit tests in `tests/test_challenge.py` verifying `ChallengeSession`, `ChallengeMethod`, `ChallengeStatus`, serialization, and exception hierarchy. |
-| AC-2 (Cryptographic OTP & Constant-Time Verification) | PASSED | 3 unit tests in `tests/test_challenge.py` verifying cryptographic randomness, constant-time HMAC-SHA256 verification, and PII masking. |
-| AC-3 (Thread-Safe Challenge Manager & Policy Lifecycle) | PASSED | 6 unit tests in `tests/test_challenge.py` verifying store concurrency, lockout expiration, TTL prune, manager lifecycle, max attempts lockout, and cooldown rate limits. |
-| AC-4 (Decision DAG & EventBus Integration) | PASSED | Integration test in `tests/test_challenge.py` verifying ActionAggregatorStageProcessor automated challenge creation on friction decisions and synchronous/asynchronous EventBus domain event broadcasting. |
-| AC-5 (REST API Endpoints & Telemetry) | PASSED | Integration test in `tests/test_api.py` verifying `/v1/challenges` listing, creation (201), token verification (200), lockout (429), resend cooldown (429), cancellation (200), and Prometheus metrics. |
-| AC-6 (CLI Workflows) | PASSED | Integration test in `tests/test_cli.py` verifying `challenge-create`, `challenge-verify`, and `challenge-inspect` across JSON/table outputs, file persistence, and exit codes. |
-| AC-7 (Quality Standards & 100% Green CI) | PASSED | All local CI-parity checks and remote GitHub Actions CI workflow runs pass 100%, branch coverage >= 97.0%, 0 mypy issues, Ruff clean. |
+| AC-1 (Domain Models & Taxonomy) | PASSED | 6 unit tests in `tests/test_cases.py` verifying `FraudCase`, `CasePriority`, `CaseStatus`, `CaseDisposition`, `CaseNote`, SLA deadline calculations, and validation rules. |
+| AC-2 (Dispute Evidence Packaging & SHA-256 Digest) | PASSED | 3 unit tests in `tests/test_cases.py` verifying multi-modal evidence aggregation, deterministic canonical JSON hashing, and tamper detection. |
+| AC-3 (Thread-Safe Case Store & Case Manager) | PASSED | 3 unit tests in `tests/test_cases.py` verifying store indexing, filtering, analyst assignment, status state machine, audit log appending, and resolution. |
+| AC-4 (Decision DAG & EventBus Integration) | PASSED | Integration tests in `tests/test_cases.py` verifying ActionAggregatorStageProcessor automated case creation on REVIEW decisions and EventBus broadcasting of CASE_CREATED. |
+| AC-5 (REST API Endpoints & Observability) | PASSED | Integration tests in `tests/test_api.py` verifying `/v1/cases` listing, creation (201), patching assignment/status (200), notes (201), evidence generation (201), resolution (200), and Prometheus metrics. |
+| AC-6 (CLI Workflows) | PASSED | Integration test `test_case_management_cli` in `tests/test_cli.py` verifying `case-create`, `case-list`, `case-inspect`, `case-resolve`, and `case-evidence` across JSON and ASCII table outputs, filters, errors, and exports. |
+| AC-7 (Quality Standards & 100% Green CI) | PASSED | Full local CI-parity suite passed (Ruff check/format, mypy, build, twine), 100% remote GitHub Actions CI green. |
 
 ## Decision Log
 | Date | Decision | Alternatives Considered | Rationale |
 |------|----------|-------------------------|-----------|
-| 2026-11-01 | Select Phase 44: Risk-Based Step-Up Authentication & Challenge Orchestration | Multi-region disaster recovery replication | Step-up friction orchestration directly complements the Phase 43 event bus and Phase 42 tenant policies, providing Strong Customer Authentication (SCA) and 3DS 2.3 workflows inside the core decision engine without external cloud dependencies. |
-| 2026-11-01 | Create branch `phase/challenge-orchestrator` | Working on unmerged `phase/webhook-event-dispatcher` | Isolated dedicated phase branch that builds on Phase 43's event subsystem while keeping PR histories clean. |
+| 2026-11-02 | Select Phase 45: Fraud Case Management, Investigation SLA Tracking & Dispute Evidence Packaging Engine | Distributed Redis cache; Graph embedding neural representations | Case management and dispute representment directly fulfill operational workflows when decisions result in `REVIEW` or chargeback notices, aggregating Phase 40 (device), Phase 39 (geo), Phase 42 (tenant), and Phase 44 (challenge) evidence into tamper-evident dossiers. |
+| 2026-11-02 | Create dedicated phase branch `phase/case-management-dispute-engine` | Committing directly to main | Conforms to repo branching rules and continuous CI validation protocol with draft PR #28. |
