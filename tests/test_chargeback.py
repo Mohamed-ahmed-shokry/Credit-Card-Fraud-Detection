@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import pytest
 
@@ -182,7 +183,7 @@ def test_chargeback_dispute_expiration_and_terminal() -> None:
     d_naive.response_deadline = (
         datetime.now(UTC).replace(tzinfo=None) - timedelta(days=2)
     ).strftime("%Y-%m-%dT%H:%M:%S")
-    assert d_past.is_expired is True
+    assert d_naive.is_expired is True
 
     # Invalid deadline format returns False
     d_inv = ChargebackDispute(transaction_id="tx_inv")
@@ -190,9 +191,13 @@ def test_chargeback_dispute_expiration_and_terminal() -> None:
     assert d_inv.is_expired is False
 
     # Terminal disputes are not flagged as active-expired
-    d_past.stage = ChargebackStage.RESOLVED_WON
-    assert d_past.is_expired is False
-    assert d_past.is_terminal is True
+    d_resolved = ChargebackDispute(
+        transaction_id="tx_resolved",
+        stage=ChargebackStage.RESOLVED_WON,
+        response_deadline=(datetime.now(UTC) - timedelta(days=2)).isoformat(),
+    )
+    assert d_resolved.is_expired is False
+    assert d_resolved.is_terminal is True
 
 
 def test_representment_viability_engine_3ds_and_ce3() -> None:
@@ -546,3 +551,114 @@ def test_chargeback_edge_cases_and_branch_coverage() -> None:
     summary = mgr.get_summary()
     assert summary["expired_count"] >= 1
     assert summary["high_winnability_count"] >= 1
+
+
+def test_chargeback_event_bus_and_feedback_integration() -> None:
+    """Verify EventBus domain event publishing and LabelIngestionStore integration."""
+    from fraud_detection.chargeback import ChargebackManager, ChargebackStore
+    from fraud_detection.events import EventBus, EventType, FraudDomainEvent
+    from fraud_detection.feedback import DelayedLabelRecord, DisputeType, LabelIngestionStore
+
+    published_events: list[FraudDomainEvent] = []
+    bus = EventBus()
+    bus.subscribe(lambda ev: published_events.append(ev))
+
+    store = ChargebackStore()
+    mgr = ChargebackManager(store=store, event_bus=bus)
+
+    # 1. Ingest chargeback publishes CHARGEBACK_INGESTED
+    dispute = mgr.ingest_chargeback(
+        transaction_id="tx_event_1",
+        scheme=CardScheme.VISA,
+        reason_code="10.4",
+        disputed_amount=120.0,
+        tenant_id="tenant_alpha",
+    )
+    assert any(
+        ev.event_type == EventType.CHARGEBACK_INGESTED
+        and ev.tenant_id == "tenant_alpha"
+        and ev.payload["dispute_id"] == dispute.dispute_id
+        for ev in published_events
+    )
+
+    # 2. Represent dispute publishes CHARGEBACK_REPRESENTED
+    mgr.represent_dispute(
+        dispute.dispute_id,
+        package_id="pkg_test",
+        evidence_fingerprint="f" * 64,
+        notes="Strong proof",
+    )
+    assert any(
+        ev.event_type == EventType.CHARGEBACK_REPRESENTED
+        and ev.payload["dispute_id"] == dispute.dispute_id
+        for ev in published_events
+    )
+
+    # 3. Resolve dispute publishes CHARGEBACK_RESOLVED
+    mgr.resolve_dispute(
+        dispute.dispute_id,
+        outcome=ChargebackStage.RESOLVED_LOST,
+        notes="Issuer rejected representment",
+    )
+    assert any(
+        ev.event_type == EventType.CHARGEBACK_RESOLVED
+        and ev.payload["stage"] == ChargebackStage.RESOLVED_LOST.value
+        for ev in published_events
+    )
+
+    # 4. Feedback label publication for fraud dispute resolved lost
+    label_store = LabelIngestionStore()
+    record1 = mgr.publish_feedback_label(dispute.dispute_id, label_store=label_store)
+    assert isinstance(record1, DelayedLabelRecord)
+    assert record1.is_fraud is True
+    assert record1.dispute_type == DisputeType.FRAUD_DISPUTE
+    assert record1.amount == 120.0
+    assert record1.transaction_id == "tx_event_1"
+
+    # 5. Non-fraud category (consumer dispute) resolves to is_fraud=False
+    dispute_consumer = mgr.ingest_chargeback(
+        transaction_id="tx_event_consumer",
+        scheme=CardScheme.MASTERCARD,
+        reason_code="4853",
+        disputed_amount=75.0,
+    )
+    record2 = mgr.publish_feedback_label(dispute_consumer.dispute_id, label_store=label_store)
+    assert record2.is_fraud is False
+    assert record2.dispute_type == DisputeType.CHARGEBACK
+
+    # 6. Fraud dispute resolved won yields is_fraud=False
+    dispute_won = mgr.ingest_chargeback(
+        transaction_id="tx_event_won",
+        scheme=CardScheme.VISA,
+        reason_code="10.4",
+        disputed_amount=250.0,
+    )
+    mgr.represent_dispute(dispute_won.dispute_id)
+    mgr.resolve_dispute(dispute_won.dispute_id, outcome=ChargebackStage.RESOLVED_WON)
+    record3 = mgr.publish_feedback_label(dispute_won.dispute_id, label_store=label_store)
+    assert record3.is_fraud is False
+
+    # 7. Explicit is_fraud override and future event timestamp clamped
+    future_ts = 9999999999.0
+    record4 = mgr.publish_feedback_label(
+        dispute_won.dispute_id,
+        label_store=label_store,
+        is_fraud=True,
+        event_timestamp=future_ts,
+    )
+    assert record4.is_fraud is True
+    assert record4.event_timestamp <= record4.label_timestamp
+
+    # 8. Resilience when event_bus raises an exception
+    class FailingBus:
+        def publish(self, _event: Any) -> None:
+            raise RuntimeError("Kafka broker down")
+
+    failing_mgr = ChargebackManager(event_bus=FailingBus())
+    d_fail = failing_mgr.ingest_chargeback(
+        transaction_id="tx_bus_fail",
+        scheme=CardScheme.AMEX,
+        reason_code="FR2",
+        disputed_amount=30.0,
+    )
+    assert d_fail.transaction_id == "tx_bus_fail"
