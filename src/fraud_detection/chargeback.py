@@ -519,3 +519,178 @@ class ChargebackDispute:
             created_at=str(d.get("created_at", "")),
             updated_at=str(d.get("updated_at", "")),
         )
+
+
+# ---------------------------------------------------------------------------
+# Representment Viability Engine (Liability Shift & CE3.0 / First-Party Trust)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RepresentmentViability:
+    """Outcome of evaluating dispute winnability, liability shift, and evidence."""
+
+    winnability_score: float
+    liability_shift_proven: bool
+    compelling_evidence_qualified: bool
+    recommended_action: RepresentmentAction
+    reasons: list[str] = field(default_factory=list)
+    evidence_requirements: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "winnability_score": round(self.winnability_score, 4),
+            "liability_shift_proven": self.liability_shift_proven,
+            "compelling_evidence_qualified": self.compelling_evidence_qualified,
+            "recommended_action": self.recommended_action.value,
+            "reasons": self.reasons,
+            "evidence_requirements": self.evidence_requirements,
+        }
+
+
+def evaluate_representment_viability(
+    dispute: ChargebackDispute,
+    transaction_context: dict[str, Any] | None = None,
+    challenge_session: dict[str, Any] | None = None,
+    prior_customer_transactions: list[Any] | None = None,
+    evidence_package: dict[str, Any] | None = None,
+    registry: ReasonCodeRegistry | None = None,
+) -> RepresentmentViability:
+    """Evaluate dispute winnability, liability shift, and representment recommendation.
+
+    Analyzes 3DS/SCA authentication cryptograms (ECI indicators), Visa Compelling
+    Evidence 3.0 (CE3.0) and Mastercard First-Party Trust qualifying historical transactions,
+    and compiled dispute evidence dossiers. Updates the dispute record in place.
+    """
+    reg = registry or DEFAULT_REASON_REGISTRY
+    defn = reg.find_or_fallback(dispute.scheme, dispute.reason_code, dispute.category)
+
+    score: float = 0.0
+    reasons: list[str] = []
+    requirements: list[str] = []
+    liability_shift = False
+    ce3_qualified = False
+
+    tx_ctx = transaction_context or {}
+    ch_sess = challenge_session or {}
+
+    # 1. Evaluate 3-D Secure Liability Shift
+    # Valid ECIs: 05/5 (Visa/Amex full 3DS), 02/2 (Mastercard full 3DS), 06/6, 01/1 (attempted)
+    eci = str(tx_ctx.get("eci", "")).strip().zfill(2)
+    is_3ds_verified = (
+        ch_sess.get("status") == "verified" or tx_ctx.get("is_3ds_authenticated") is True
+    )
+    has_valid_eci = eci in ("05", "02", "06", "01")
+
+    if is_3ds_verified or has_valid_eci:
+        liability_shift = True
+        score += 0.55
+        scheme_name = dispute.scheme.value.upper()
+        eci_desc = eci or "verified"
+        reasons.append(f"Liability shift proven under {scheme_name} 3DS rules (ECI: {eci_desc})")
+    else:
+        requirements.append("3DS authentication proof or ECI cryptogram")
+
+    # 2. Evaluate Compelling Evidence (Visa CE3.0 / Mastercard First-Party Trust)
+    # Applicable for fraud reason codes (e.g. Visa 10.4, Mastercard 4837)
+    if defn.compelling_evidence_eligible and prior_customer_transactions:
+        qualifying_txs = 0
+        current_dev = tx_ctx.get("device_id") or tx_ctx.get("fingerprint_hash")
+        current_ip = tx_ctx.get("ip_address") or tx_ctx.get("client_ip")
+        current_user = tx_ctx.get("user_id") or tx_ctx.get("customer_id")
+
+        for prior in prior_customer_transactions:
+            if not isinstance(prior, dict):
+                continue
+            # Must be prior non-fraud transaction
+            if prior.get("is_fraud") or prior.get("chargeback") or prior.get("disputed"):
+                continue
+
+            matches = 0
+            if current_dev and prior.get("device_id") == current_dev:
+                matches += 1
+            if current_ip and prior.get("ip_address") == current_ip:
+                matches += 1
+            if current_user and prior.get("user_id") == current_user:
+                matches += 1
+
+            if matches >= 1:
+                qualifying_txs += 1
+
+        # CE3.0 / First-Party Trust requires at least 2 qualifying prior transactions
+        if qualifying_txs >= 2:
+            ce3_qualified = True
+            score += 0.35
+            reasons.append(
+                f"Qualified for CE3.0/First-Party Trust ({qualifying_txs} matching prior records)"
+            )
+        else:
+            requirements.append(
+                f"Requires at least 2 qualifying prior transactions (found {qualifying_txs})"
+            )
+    elif defn.compelling_evidence_eligible:
+        requirements.append("Prior customer transaction history for CE3.0/First-Party Trust")
+
+    # 3. Evaluate Dispute Evidence Package Dossier (cases.py)
+    if evidence_package is not None:
+        has_fp = bool(
+            evidence_package.get("evidence_fingerprint")
+            or evidence_package.get("package_fingerprint")
+            or evidence_package.get("sha256_fingerprint")
+        )
+        if has_fp:
+            score += 0.20
+            reasons.append("Tamper-evident canonical SHA-256 dispute evidence dossier attached")
+        else:
+            score += 0.10
+            reasons.append("Dispute evidence package provided without cryptographic fingerprint")
+    else:
+        requirements.append("DisputeEvidencePackage compiled dossier")
+
+    # 4. Reason Category Baseline Adjustments
+    if dispute.category == ChargebackCategory.AUTHORIZATION_ERROR:
+        if tx_ctx.get("auth_code"):
+            score += 0.40
+            reasons.append(f"Valid authorization code provided ({tx_ctx.get('auth_code')})")
+        else:
+            requirements.append("Issuer authorization code proof")
+    elif dispute.category == ChargebackCategory.CONSUMER_DISPUTE:
+        if tx_ctx.get("tracking_number") or tx_ctx.get("delivery_confirmation"):
+            score += 0.35
+            reasons.append("Proof of delivery / tracking number available")
+        else:
+            requirements.append("Proof of merchandise delivery or service fulfillment")
+
+    final_score = round(min(1.0, max(0.0, score)), 4)
+
+    if final_score >= 0.70:
+        recommended_action = RepresentmentAction.SUBMIT_REPRESENTMENT
+    elif final_score >= 0.35:
+        recommended_action = RepresentmentAction.REQUEST_MORE_INFO
+    else:
+        recommended_action = RepresentmentAction.ACCEPT_LIABILITY
+
+    # Update dispute model attributes
+    dispute.winnability_score = final_score
+    dispute.liability_shift_proven = liability_shift
+    dispute.recommended_action = recommended_action
+    if reasons:
+        dispute.add_audit_entry(
+            action="viability_evaluated",
+            actor="system",
+            details={
+                "score": round(final_score, 4),
+                "liability_shift": liability_shift,
+                "ce3_qualified": ce3_qualified,
+                "recommended_action": recommended_action.value,
+            },
+        )
+
+    return RepresentmentViability(
+        winnability_score=final_score,
+        liability_shift_proven=liability_shift,
+        compelling_evidence_qualified=ce3_qualified,
+        recommended_action=recommended_action,
+        reasons=reasons,
+        evidence_requirements=requirements,
+    )
