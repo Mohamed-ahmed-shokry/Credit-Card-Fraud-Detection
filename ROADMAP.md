@@ -2366,7 +2366,7 @@ Does not implement direct merchant payment processor API webhooks for card netwo
 - Comprehensive unit and integration test coverage across `tests/test_cases.py`, `tests/test_api.py`, `tests/test_cli.py`, and `tests/test_pipeline.py`.
 
 
-## Phase 46 — Card Scheme Chargeback Ingestion, Reason Code Taxonomy & Automated Representment Gateway (In Progress)
+## Phase 46 — Card Scheme Chargeback Ingestion, Reason Code Taxonomy & Automated Representment Gateway (Done)
 
 ### Objective
 
@@ -2430,7 +2430,17 @@ Does not implement proprietary mTLS VPN connections to Visa VROL or Mastercard M
 - [x] Task 4: Integrate Chargeback Engine with `feedback.py` (ground truth ingestion) and `events.py` (domain event publishing) with unit/integration tests.
 - [x] Task 5: Implement `/v1/chargebacks/*` REST endpoints, webhook ingestion, and Prometheus metrics in `src/fraud_detection/api.py` with integration tests in `tests/test_api.py`.
 - [x] Task 6: Implement CLI commands `chargeback-ingest`, `chargeback-list`, `chargeback-inspect`, `chargeback-represent`, and `chargeback-resolve` in `src/fraud_detection/cli.py` with tests in `tests/test_cli.py`.
-- [ ] Task 7: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate with 100% Green CI.
+- [x] Task 7: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate with 100% Green CI.
+
+### Delivered Summary
+
+- Implemented `CardScheme`, `ChargebackCategory`, `ChargebackStage`, `RepresentmentAction`, `ReasonCodeDefinition`, and `ReasonCodeRegistry` in `src/fraud_detection/chargeback.py` covering Visa, Mastercard, American Express, and Discover taxonomies.
+- Implemented `ChargebackDispute` tracking financial exposures, deadlines, audit trail, and `evaluate_representment_viability` decisioning 3DS liability shift and Visa CE3.0 / First-Party Trust qualification with winnability scoring.
+- Implemented thread-safe `ChargebackStore` (with secondary indexing and capacity eviction) and `ChargebackManager` lifecycle transition and financial exposure aggregation engine.
+- Integrated dispute events (`CHARGEBACK_INGESTED`, `CHARGEBACK_REPRESENTED`, `CHARGEBACK_RESOLVED`) into `EventType` and `EventBus` (`events.py`), and wired terminal dispute resolution outcomes directly into feedback `LabelIngestionStore` (`feedback.py`) as `DelayedLabelRecord`.
+- Implemented FastAPI REST endpoints under `/v1/chargebacks/*` and `/v1/chargebacks/webhook` with rate-limiting bypass and Prometheus telemetry (`fraud_chargebacks_received_total`, `fraud_chargebacks_represented_total`, `fraud_chargebacks_won_total`, `fraud_chargebacks_lost_total`, `fraud_chargeback_financial_exposure_amount`).
+- Implemented Typer CLI commands (`chargeback-ingest`, `chargeback-list`, `chargeback-inspect`, `chargeback-represent`, `chargeback-resolve`) with JSON and ASCII table outputs, persistent store support, and standard error handling.
+- Comprehensive test coverage across `tests/test_chargeback.py`, `tests/test_api.py`, and `tests/test_cli.py` with $\ge 97.0\%$ branch coverage.
 
 
 ## Contributing to the roadmap
