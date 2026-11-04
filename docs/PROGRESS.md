@@ -11,7 +11,7 @@
 - [x] Task 2: Implement representment viability engine (liability shift and CE3.0 / First-Party Trust evaluation) in `src/fraud_detection/chargeback.py` with unit tests.
 - [x] Task 3: Implement `ChargebackStore` and `ChargebackManager` lifecycle engine in `src/fraud_detection/chargeback.py` with unit tests.
 - [x] Task 4: Integrate Chargeback Engine with `feedback.py` (ground truth ingestion) and `events.py` (domain event publishing) with unit/integration tests.
-- [ ] Task 5: Implement `/v1/chargebacks/*` REST endpoints, webhook ingestion, and Prometheus metrics in `src/fraud_detection/api.py` with integration tests in `tests/test_api.py`.
+- [x] Task 5: Implement `/v1/chargebacks/*` REST endpoints, webhook ingestion, and Prometheus metrics in `src/fraud_detection/api.py` with integration tests in `tests/test_api.py`.
 - [ ] Task 6: Implement CLI commands `chargeback-ingest`, `chargeback-list`, `chargeback-inspect`, `chargeback-represent`, and `chargeback-resolve` in `src/fraud_detection/cli.py` with tests in `tests/test_cli.py`.
 - [ ] Task 7: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate with 100% Green CI.
 
@@ -22,7 +22,8 @@
 | AC-2 (Dispute Models & Representment Viability Engine) | PASSED | 2 unit tests in `tests/test_chargeback.py` verifying `evaluate_representment_viability` for 3DS liability shift (ECI / challenge verification), CE3.0 / First-Party Trust qualification, and winnability scoring. |
 | AC-3 (Thread-Safe Chargeback Store & Gateway) | PASSED | 3 unit tests in `tests/test_chargeback.py` verifying `ChargebackStore` secondary index lookups, capacity eviction, deletion, and `ChargebackManager` stage transitions, representment, and financial exposure summaries. |
 | AC-4 (Feedback Ingestion & EventBus Integration) | PASSED | Unit/integration test in `tests/test_chargeback.py` verifying `EventType.CHARGEBACK_INGESTED`, `CHARGEBACK_REPRESENTED`, `CHARGEBACK_RESOLVED` publishing on `EventBus` and `publish_feedback_label` forwarding into `feedback.py` `LabelIngestionStore`. |
-| AC-5 (REST API Endpoints & Observability) | PENDING | Pending Task 5 implementation & integration tests. |
+| AC-5 (REST API Endpoints & Observability) | PASSED | 2 integration tests in `tests/test_api.py` verifying dispute ingestion, gateway webhook handling, representment, terminal resolution, metrics instrumentation, and error handling. |
+| AC-6 (CLI Workflows) | PENDING | Pending Task 6 implementation & integration tests. |
 | AC-6 (CLI Workflows) | PENDING | Pending Task 6 implementation & integration tests. |
 | AC-7 (Quality Standards & 100% Green CI) | PENDING | Pending full test suite, local CI parity, and remote GitHub Actions checks. |
 
