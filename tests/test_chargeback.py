@@ -662,3 +662,58 @@ def test_chargeback_event_bus_and_feedback_integration() -> None:
         disputed_amount=30.0,
     )
     assert d_fail.transaction_id == "tx_bus_fail"
+
+
+def test_chargeback_full_branch_closure() -> None:
+    """Cover remaining edge branches: fallback deadline, mismatched txs, and limits."""
+    from unittest.mock import patch
+
+    from fraud_detection.chargeback import (
+        DEFAULT_REASON_REGISTRY,
+        ChargebackDispute,
+        ChargebackStore,
+        ReasonCodeNotFoundError,
+        evaluate_representment_viability,
+    )
+
+    # 1. Fallback deadline when registry lookup raises error (lines 390-391)
+    with patch.object(
+        DEFAULT_REASON_REGISTRY,
+        "find_or_fallback",
+        side_effect=ReasonCodeNotFoundError("Simulated error"),
+    ):
+        d_err = ChargebackDispute(
+            transaction_id="tx_cov_err",
+            scheme=CardScheme.VISA,
+            reason_code="10.4",
+        )
+        assert d_err.response_deadline != ""
+
+    # 2. Prior transactions with non-matching device, ip, user (lines 612->614, 619->604)
+    d_mismatch = ChargebackDispute(transaction_id="tx_cov_mismatch")
+    evaluate_representment_viability(
+        d_mismatch,
+        transaction_context={
+            "device_id": "current_dev",
+            "ip_address": "1.1.1.1",
+            "user_id": "user_a",
+        },
+        prior_customer_transactions=[
+            {"device_id": "other_dev", "ip_address": "2.2.2.2", "user_id": "user_b"}
+        ],
+    )
+    assert d_mismatch.winnability_score < 0.50
+
+    # 3. Delete dispute with scheme_dispute_id=None (lines 761->765)
+    store = ChargebackStore()
+    d_no_scheme = ChargebackDispute(transaction_id="tx_no_scheme", scheme_dispute_id=None)
+    store.put(d_no_scheme)
+    assert store.delete(d_no_scheme.dispute_id) is True
+
+    # 4. Store list_disputes limit hit (line 793)
+    d_a = ChargebackDispute(transaction_id="tx_lim_a")
+    d_b = ChargebackDispute(transaction_id="tx_lim_b")
+    store.put(d_a)
+    store.put(d_b)
+    limited = store.list_disputes(limit=1)
+    assert len(limited) == 1
