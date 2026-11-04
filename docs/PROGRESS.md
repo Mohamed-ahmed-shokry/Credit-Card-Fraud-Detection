@@ -7,7 +7,7 @@
 - **Pull Request**: [#29](https://github.com/Mohamed-ahmed-shokry/Credit-Card-Fraud-Detection/pull/29)
 
 ## Task Status
-- [ ] Task 1: Create `src/fraud_detection/chargeback.py` with domain data models, scheme reason code registry, and unit tests in `tests/test_chargeback.py`.
+- [x] Task 1: Create `src/fraud_detection/chargeback.py` with domain data models, scheme reason code registry, and unit tests in `tests/test_chargeback.py`.
 - [ ] Task 2: Implement representment viability engine (liability shift and CE3.0 / First-Party Trust evaluation) in `src/fraud_detection/chargeback.py` with unit tests.
 - [ ] Task 3: Implement `ChargebackStore` and `ChargebackManager` lifecycle engine in `src/fraud_detection/chargeback.py` with unit tests.
 - [ ] Task 4: Integrate Chargeback Engine with `feedback.py` (ground truth ingestion) and `events.py` (domain event publishing) with unit/integration tests.
@@ -18,7 +18,7 @@
 ## Acceptance Criteria Status
 | Criterion | Status | Evidence |
 |-----------|--------|----------|
-| AC-1 (Scheme Taxonomy & Reason Code Registry) | PENDING | Pending Task 1 implementation & unit tests. |
+| AC-1 (Scheme Taxonomy & Reason Code Registry) | PASSED | 6 unit tests in `tests/test_chargeback.py` verifying `CardScheme`, `ChargebackCategory`, `ChargebackStage`, `ReasonCodeRegistry` lookups, custom registrations, fallback resolution, and dispute model invariants. |
 | AC-2 (Dispute Models & Representment Viability Engine) | PENDING | Pending Task 2 implementation & unit tests. |
 | AC-3 (Thread-Safe Chargeback Store & Gateway) | PENDING | Pending Task 3 implementation & unit tests. |
 | AC-4 (Feedback Ingestion & EventBus Integration) | PENDING | Pending Task 4 implementation & integration tests. |
