@@ -9754,3 +9754,74 @@ def test_chargeback_cli_commands(tmp_path: Path) -> None:
     d2_resolved = json.loads(res_res_lost.output)
     assert d2_resolved["stage"] == "resolved_lost"
     assert d2_resolved["is_terminal"] is True
+
+    # 9. chargeback-ingest when store_file already has non-list content (line 9517)
+    non_list_file = tmp_path / "cb_non_list.json"
+    non_list_file.write_text('{"not": "a list"}', encoding="utf-8")
+    res_ingest_nl = runner.invoke(
+        app,
+        [
+            "chargeback-ingest",
+            "-x",
+            "tx_nl_01",
+            "--scheme",
+            "visa",
+            "-r",
+            "10.4",
+            "-s",
+            str(non_list_file),
+        ],
+    )
+    assert res_ingest_nl.exit_code == 0
+    nl_content = json.loads(non_list_file.read_text(encoding="utf-8"))
+    assert isinstance(nl_content, list)
+    assert len(nl_content) == 1
+
+    # 10. Corrupt / non-list store handling in inspect, represent, and resolve
+    assert (
+        runner.invoke(app, ["chargeback-inspect", "-s", str(corrupt_store), "-d", d1_id]).exit_code
+        == 2
+    )
+    assert (
+        runner.invoke(app, ["chargeback-inspect", "-s", str(non_list_store), "-d", d1_id]).exit_code
+        == 2
+    )
+    assert (
+        runner.invoke(
+            app, ["chargeback-represent", "-s", str(corrupt_store), "-d", d1_id]
+        ).exit_code
+        == 2
+    )
+    assert (
+        runner.invoke(
+            app, ["chargeback-represent", "-s", str(non_list_store), "-d", d1_id]
+        ).exit_code
+        == 2
+    )
+    assert (
+        runner.invoke(
+            app,
+            ["chargeback-resolve", "-s", str(corrupt_store), "-d", d1_id, "-o", "resolved_won"],
+        ).exit_code
+        == 2
+    )
+    assert (
+        runner.invoke(
+            app,
+            ["chargeback-resolve", "-s", str(non_list_store), "-d", d1_id, "-o", "resolved_won"],
+        ).exit_code
+        == 2
+    )
+
+    # 11. chargeback-list with non-dict records in store (line 9608) and stage mismatch (line 9614)
+    mixed_store = tmp_path / "mixed.json"
+    mixed_store.write_text(json.dumps(["string_item", 42, stored_records[0]]), encoding="utf-8")
+    res_l_mixed = runner.invoke(app, ["chargeback-list", "-s", str(mixed_store)])
+    assert res_l_mixed.exit_code == 0
+    assert json.loads(res_l_mixed.output)["total_count"] == 1
+
+    res_l_stage_mismatch = runner.invoke(
+        app, ["chargeback-list", "-s", str(mixed_store), "--stage", "arbitration"]
+    )
+    assert res_l_stage_mismatch.exit_code == 0
+    assert json.loads(res_l_stage_mismatch.output)["total_count"] == 0
