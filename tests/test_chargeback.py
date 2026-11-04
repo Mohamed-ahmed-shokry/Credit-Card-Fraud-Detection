@@ -300,3 +300,249 @@ def test_representment_viability_auth_and_consumer_disputes() -> None:
     )
     assert v_cons_tracking.winnability_score >= 0.45
     assert v_cons_tracking.recommended_action == RepresentmentAction.REQUEST_MORE_INFO
+
+
+def test_chargeback_store_indexing_and_eviction() -> None:
+    """Verify ChargebackStore indices, filtering, capacity eviction, and deletion."""
+    from fraud_detection.chargeback import ChargebackStore
+
+    store = ChargebackStore(max_capacity=3)
+
+    d1 = ChargebackDispute(
+        transaction_id="tx_s1",
+        tenant_id="tenant_a",
+        scheme=CardScheme.VISA,
+        scheme_dispute_id="vrol_1001",
+        disputed_amount=100.0,
+    )
+    d2 = ChargebackDispute(
+        transaction_id="tx_s2",
+        tenant_id="tenant_b",
+        scheme=CardScheme.MASTERCARD,
+        scheme_dispute_id="mcom_2002",
+        disputed_amount=250.0,
+    )
+    store.put(d1)
+    store.put(d2)
+
+    assert store.count() == 2
+    assert store.count("tenant_a") == 1
+    assert store.get(d1.dispute_id) == d1
+    assert store.get_by_transaction("tx_s1") == d1
+    assert store.get_by_scheme_id(CardScheme.VISA, "vrol_1001") == d1
+
+    # Filtered list
+    res_a = store.list_disputes(tenant_id="tenant_a")
+    assert len(res_a) == 1
+    assert res_a[0].dispute_id == d1.dispute_id
+
+    res_mc = store.list_disputes(scheme=CardScheme.MASTERCARD)
+    assert len(res_mc) == 1
+
+    # Capacity eviction
+    d3 = ChargebackDispute(transaction_id="tx_s3", disputed_amount=50.0)
+    d4 = ChargebackDispute(transaction_id="tx_s4", disputed_amount=75.0)
+    store.put(d3)
+    assert store.count() == 3
+    store.put(d4)  # Evicts d1
+    assert store.count() == 3
+    assert store.get(d1.dispute_id) is None
+    assert store.get_by_transaction("tx_s1") is None
+    assert store.get_by_scheme_id(CardScheme.VISA, "vrol_1001") is None
+
+    # Delete
+    assert store.delete("nonexistent_id") is False
+    assert store.delete(d2.dispute_id) is True
+    assert store.get(d2.dispute_id) is None
+    assert store.get_by_scheme_id(CardScheme.MASTERCARD, "mcom_2002") is None
+
+    # Clear
+    store.clear()
+    assert store.count() == 0
+
+
+def test_chargeback_manager_lifecycle_and_resolution() -> None:
+    """Verify ChargebackManager ingestion, stage transitions, representment, and summary."""
+    from fraud_detection.chargeback import (
+        ChargebackManager,
+        ChargebackStore,
+    )
+
+    store = ChargebackStore()
+    mgr = ChargebackManager(store=store)
+
+    # 1. Ingest with auto-evaluation
+    disp = mgr.ingest_chargeback(
+        transaction_id="tx_life_001",
+        scheme=CardScheme.VISA,
+        reason_code="10.4",
+        disputed_amount=450.0,
+        currency="USD",
+        tenant_id="fintech_us",
+        scheme_dispute_id="vrol_life_1",
+        transaction_context={"eci": "05", "is_3ds_authenticated": True},
+    )
+    assert disp.dispute_id.startswith("dsp_")
+    assert disp.liability_shift_proven is True
+    assert disp.stage == ChargebackStage.FIRST_CHARGEBACK
+    assert mgr.get_dispute(disp.dispute_id) == disp
+
+    # Missing dispute raises DisputeNotFoundError
+    with pytest.raises(DisputeNotFoundError, match="Chargeback dispute 'unknown' not found"):
+        mgr.get_dispute("unknown")
+
+    # 2. Stage transition: same stage is no-op
+    curr = mgr.update_stage(disp.dispute_id, ChargebackStage.FIRST_CHARGEBACK)
+    assert curr.stage == ChargebackStage.FIRST_CHARGEBACK
+
+    # 3. Invalid transition (FIRST_CHARGEBACK directly to RESOLVED_WON)
+    with pytest.raises(InvalidDisputeStateTransitionError, match="Illegal transition"):
+        mgr.update_stage(disp.dispute_id, ChargebackStage.RESOLVED_WON)
+
+    # 4. Represent dispute
+    disp_rep = mgr.represent_dispute(
+        disp.dispute_id,
+        package_id="pkg_represent_001",
+        evidence_fingerprint="f" * 64,
+        notes="Representing with 3DS ECI 05 evidence.",
+        actor="senior_analyst",
+    )
+    assert disp_rep.stage == ChargebackStage.REPRESENTED
+    assert disp_rep.representment_package_id == "pkg_represent_001"
+    assert disp_rep.represented_at is not None
+
+    # 5. Resolve dispute with won outcome
+    disp_won = mgr.resolve_dispute(
+        disp.dispute_id,
+        outcome=ChargebackStage.RESOLVED_WON,
+        actor="visa_network",
+        notes="Issuer conceded liability.",
+    )
+    assert disp_won.stage == ChargebackStage.RESOLVED_WON
+    assert disp_won.resolved_at is not None
+    assert disp_won.is_terminal is True
+
+    # 6. Representing a terminal dispute raises InvalidDisputeStateTransitionError
+    with pytest.raises(
+        InvalidDisputeStateTransitionError, match="Cannot represent terminal dispute"
+    ):
+        mgr.represent_dispute(disp.dispute_id)
+
+    # 7. Invalid resolution outcome
+    d_unres = mgr.ingest_chargeback(
+        transaction_id="tx_unres",
+        scheme=CardScheme.MASTERCARD,
+        reason_code="4837",
+        disputed_amount=120.0,
+    )
+    with pytest.raises(DisputeValidationError, match="Invalid outcome 'first_chargeback'"):
+        mgr.resolve_dispute(d_unres.dispute_id, outcome=ChargebackStage.FIRST_CHARGEBACK)
+
+    # 8. Summary aggregation
+    summary = mgr.get_summary()
+    assert summary["total_disputes"] == 2
+    assert summary["total_disputed_amount"] == 570.0
+    assert summary["by_stage"]["resolved_won"] == 1
+    assert summary["by_stage"]["first_chargeback"] == 1
+    assert summary["by_scheme"]["visa"] == 1
+    assert summary["by_scheme"]["mastercard"] == 1
+
+
+def test_chargeback_edge_cases_and_branch_coverage() -> None:
+    """Cover edge cases across dispute parsing, store deletion, filters, and summary metrics."""
+    from fraud_detection.chargeback import (
+        ChargebackManager,
+        ChargebackStore,
+        evaluate_representment_viability,
+    )
+
+    # 1. Fallback when filing_date is unparseable
+    d_bad_date = ChargebackDispute(transaction_id="tx_bad_date", filing_date="not-a-valid-date")
+    assert d_bad_date.response_deadline != ""
+
+    # 2. is_expired with naive deadline (tzinfo is None)
+    d_naive = ChargebackDispute(transaction_id="tx_naive_exp")
+    d_naive.response_deadline = (
+        datetime.now(UTC).replace(tzinfo=None) - timedelta(days=5)
+    ).strftime("%Y-%m-%dT%H:%M:%S")
+    assert d_naive.is_expired is True
+
+    # 3. Viability with only 1 matching prior transaction (not meeting CE3.0 >=2 requirement)
+    d_fraud = ChargebackDispute(
+        transaction_id="tx_ce3_one",
+        scheme=CardScheme.VISA,
+        reason_code="10.4",
+        category=ChargebackCategory.FRAUD_CARD_NOT_PRESENT,
+    )
+    v_one = evaluate_representment_viability(
+        d_fraud,
+        transaction_context={"device_id": "dev_one", "ip_address": "9.9.9.9", "user_id": "u_one"},
+        prior_customer_transactions=[
+            {"transaction_id": "tx_prev", "device_id": "dev_one"},  # Only 1 match
+        ],
+    )
+    assert v_one.compelling_evidence_qualified is False
+    assert any(
+        "Requires at least 2 qualifying prior transactions" in r
+        for r in v_one.evidence_requirements
+    )
+
+    # 4. Viability consumer dispute without tracking or delivery confirmation
+    d_cons_notrack = ChargebackDispute(
+        transaction_id="tx_notrack",
+        scheme=CardScheme.VISA,
+        reason_code="13.1",
+        category=ChargebackCategory.CONSUMER_DISPUTE,
+    )
+    v_notrack = evaluate_representment_viability(d_cons_notrack)
+    assert any("Proof of merchandise delivery" in r for r in v_notrack.evidence_requirements)
+
+    # 5. Store delete index collision edge cases
+    store = ChargebackStore()
+    d_shared1 = ChargebackDispute(transaction_id="tx_shared_del", scheme_dispute_id="dup_id")
+    d_shared2 = ChargebackDispute(transaction_id="tx_shared_del", scheme_dispute_id="dup_id")
+    store.put(d_shared1)
+    store.put(d_shared2)  # Overwrites tx and scheme indices to point to d_shared2
+    assert store.delete(d_shared1.dispute_id) is True  # Delete d_shared1 without breaking d_shared2
+    assert store.get_by_transaction("tx_shared_del") == d_shared2
+
+    # 6. Store list_disputes with category, stage, and expired_only filters
+    d_exp = ChargebackDispute(
+        transaction_id="tx_exp_store",
+        category=ChargebackCategory.PROCESSING_ERROR,
+        stage=ChargebackStage.PRE_ARBITRATION,
+    )
+    d_exp.response_deadline = (datetime.now(UTC) - timedelta(days=1)).isoformat()
+    store.put(d_exp)
+
+    res_cat = store.list_disputes(category=ChargebackCategory.PROCESSING_ERROR)
+    assert len(res_cat) == 1
+    res_stage = store.list_disputes(stage=ChargebackStage.PRE_ARBITRATION)
+    assert len(res_stage) == 1
+    res_exp = store.list_disputes(expired_only=True)
+    assert len(res_exp) == 1
+
+    # 7. Ingest with auto_evaluate=False
+    mgr = ChargebackManager(store=store)
+    d_no_eval = mgr.ingest_chargeback(
+        transaction_id="tx_no_eval",
+        scheme=CardScheme.AMEX,
+        reason_code="FR2",
+        disputed_amount=50.0,
+        auto_evaluate=False,
+    )
+    assert d_no_eval.winnability_score == 0.0
+
+    # 8. Summary counting expired disputes and high winnability disputes
+    d_high = mgr.ingest_chargeback(
+        transaction_id="tx_high_win",
+        scheme=CardScheme.VISA,
+        reason_code="10.4",
+        disputed_amount=300.0,
+        transaction_context={"eci": "05", "is_3ds_authenticated": True},
+        evidence_package={"package_id": "pkg_win", "evidence_fingerprint": "a" * 64},
+    )
+    assert d_high.winnability_score >= 0.70
+    summary = mgr.get_summary()
+    assert summary["expired_count"] >= 1
+    assert summary["high_winnability_count"] >= 1
