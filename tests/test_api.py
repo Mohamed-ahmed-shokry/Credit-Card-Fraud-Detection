@@ -6157,7 +6157,7 @@ def test_chargeback_api_error_branches_and_edge_cases(
     """Verify error branches, 404s, 400s, and uninitialized manager for /v1/chargebacks/*."""
     from unittest.mock import patch
 
-    from fraud_detection.chargeback import ChargebackManager, DisputeValidationError
+    from fraud_detection.chargeback import CardScheme, ChargebackManager, DisputeValidationError
 
     _, model, _ = api_context
 
@@ -6311,3 +6311,62 @@ def test_chargeback_api_error_branches_and_edge_cases(
             )
             assert res_wh_err.status_code == 400
             assert "Forced validation error" in res_wh_err.json()["detail"]
+
+        # 8. Feedback label publishing error during resolve is handled gracefully
+        d_res_lbl = mgr.ingest_chargeback(
+            transaction_id="tx_lbl_err",
+            scheme=CardScheme.VISA,
+            reason_code="10.4",
+            disputed_amount=80.0,
+        )
+        mgr.represent_dispute(d_res_lbl.dispute_id)
+        with patch.object(
+            mgr,
+            "publish_feedback_label",
+            side_effect=RuntimeError("Label store write failed"),
+        ):
+            res_resolve_lbl_err = client.post(
+                f"/v1/chargebacks/{d_res_lbl.dispute_id}/resolve",
+                json={"outcome": "resolved_won"},
+            )
+            assert res_resolve_lbl_err.status_code == 200
+            assert res_resolve_lbl_err.json()["stage"] == "resolved_won"
+
+        # 9. Illegal resolution transition (resolving already terminal dispute) returns 400
+        res_already_term = client.post(
+            f"/v1/chargebacks/{d_res_lbl.dispute_id}/resolve",
+            json={"outcome": "resolved_lost"},
+        )
+        assert res_already_term.status_code == 400
+
+        # 10. Operations when metrics counters/gauges are None on app.state
+        cast(Any, client.app).state.chargebacks_received_counter = None
+        cast(Any, client.app).state.chargebacks_represented_counter = None
+        cast(Any, client.app).state.chargebacks_won_counter = None
+        cast(Any, client.app).state.chargebacks_lost_counter = None
+        cast(Any, client.app).state.chargeback_exposure_gauge = None
+        cast(Any, client.app).state.label_store = None
+
+        res_no_metric_ingest = client.post(
+            "/v1/chargebacks",
+            json={
+                "transaction_id": "tx_no_metrics",
+                "scheme": "visa",
+                "reason_code": "10.4",
+                "disputed_amount": 90.0,
+            },
+        )
+        assert res_no_metric_ingest.status_code == 201
+        d_no_metric_id = res_no_metric_ingest.json()["dispute_id"]
+
+        res_no_metric_rep = client.post(
+            f"/v1/chargebacks/{d_no_metric_id}/represent",
+            json={"notes": "defended without metrics"},
+        )
+        assert res_no_metric_rep.status_code == 200
+
+        res_no_metric_res = client.post(
+            f"/v1/chargebacks/{d_no_metric_id}/resolve",
+            json={"outcome": "resolved_lost"},
+        )
+        assert res_no_metric_res.status_code == 200
