@@ -78,6 +78,16 @@ from fraud_detection.challenge import (
     InvalidChallengeTokenError,
     RateLimitExceededError,
 )
+from fraud_detection.chargeback import (
+    CardScheme,
+    ChargebackCategory,
+    ChargebackDispute,
+    ChargebackManager,
+    ChargebackStage,
+    DisputeNotFoundError,
+    DisputeValidationError,
+    InvalidDisputeStateTransitionError,
+)
 from fraud_detection.device import (
     DeviceFeatureExtractor,
     DeviceFingerprint,
@@ -290,6 +300,10 @@ OPERATIONAL_PATHS = frozenset(
         "/v1/cases",
         "/v1/cases/",
         "/v1/cases/summary",
+        "/v1/chargebacks",
+        "/v1/chargebacks/",
+        "/v1/chargebacks/summary",
+        "/v1/chargebacks/webhook",
     }
 )
 UNMATCHED_ROUTE_LABEL = "unmatched"
@@ -1732,6 +1746,138 @@ class DisputeEvidenceResponse(BaseModel):
     sha256_fingerprint: str
 
 
+class ChargebackIngestRequest(BaseModel):
+    """Payload for manual or automated scheme chargeback ingestion."""
+
+    transaction_id: str
+    scheme: str
+    reason_code: str
+    disputed_amount: float
+    currency: str = "USD"
+    tenant_id: str = "default"
+    scheme_dispute_id: str | None = None
+    filing_date: str | None = None
+    response_deadline: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    auto_evaluate: bool = True
+    transaction_context: dict[str, Any] | None = None
+    challenge_session: dict[str, Any] | None = None
+    prior_customer_transactions: list[dict[str, Any]] | None = None
+    evidence_package: dict[str, Any] | None = None
+
+
+class ChargebackWebhookRequest(BaseModel):
+    """Inbound webhook payload from card schemes or payment gateways."""
+
+    event_type: str = "chargeback.created"
+    scheme: str
+    scheme_dispute_id: str
+    transaction_id: str
+    reason_code: str
+    amount: float
+    currency: str = "USD"
+    filing_date: str | None = None
+    response_deadline: str | None = None
+    tenant_id: str = "default"
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ChargebackRepresentRequest(BaseModel):
+    """Payload for submitting dispute representment with defense evidence."""
+
+    package_id: str | None = None
+    evidence_fingerprint: str | None = None
+    notes: str = ""
+    actor: str = "analyst"
+
+
+class ChargebackResolveRequest(BaseModel):
+    """Payload for finalizing dispute outcome."""
+
+    outcome: str
+    actor: str = "analyst"
+    notes: str = ""
+
+
+class ChargebackDisputeResponse(BaseModel):
+    """Serialized representation of a card scheme dispute."""
+
+    dispute_id: str
+    transaction_id: str
+    tenant_id: str
+    scheme: str
+    reason_code: str
+    category: str
+    stage: str
+    disputed_amount: float
+    currency: str
+    filing_date: str
+    response_deadline: str
+    is_expired: bool
+    is_terminal: bool
+    liability_shift_proven: bool
+    winnability_score: float
+    recommended_action: str
+    representment_package_id: str | None = None
+    evidence_fingerprint: str | None = None
+    represented_at: str | None = None
+    resolved_at: str | None = None
+    audit_trail: list[dict[str, Any]] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    created_at: str
+    updated_at: str
+
+
+class ChargebackListResponse(BaseModel):
+    """Collection response for multi-criteria dispute queries."""
+
+    total_count: int
+    disputes: list[ChargebackDisputeResponse]
+
+
+class ChargebackSummaryResponse(BaseModel):
+    """Aggregated portfolio statistics across all scheme disputes."""
+
+    total_disputes: int
+    total_disputed_amount: float
+    by_stage: dict[str, int]
+    by_scheme: dict[str, int]
+    by_category: dict[str, int]
+    expired_count: int
+    liability_shift_proven_count: int
+    high_winnability_count: int
+
+
+def _dispute_to_response(dispute: ChargebackDispute) -> ChargebackDisputeResponse:
+    """Helper to convert ChargebackDispute dataclass to ChargebackDisputeResponse Pydantic model."""
+    return ChargebackDisputeResponse(
+        dispute_id=dispute.dispute_id,
+        transaction_id=dispute.transaction_id,
+        tenant_id=dispute.tenant_id,
+        scheme=dispute.scheme.value,
+        reason_code=dispute.reason_code,
+        category=dispute.category.value,
+        stage=dispute.stage.value,
+        disputed_amount=dispute.disputed_amount,
+        currency=dispute.currency,
+        filing_date=dispute.filing_date,
+        response_deadline=dispute.response_deadline,
+        is_expired=dispute.is_expired,
+        is_terminal=dispute.is_terminal,
+        liability_shift_proven=dispute.liability_shift_proven,
+        winnability_score=dispute.winnability_score,
+        recommended_action=dispute.recommended_action.value,
+        representment_package_id=dispute.representment_package_id,
+        evidence_fingerprint=dispute.evidence_fingerprint,
+        represented_at=dispute.represented_at,
+        resolved_at=dispute.resolved_at,
+        audit_trail=dispute.audit_trail,
+        metadata=dispute.metadata,
+        created_at=dispute.created_at,
+        updated_at=dispute.updated_at,
+    )
+
+
 def create_app(
     *,
     model: FraudModel | None = None,
@@ -1814,6 +1960,7 @@ def create_app(
     event_bus: EventBus | None = None,
     challenge_manager: ChallengeManager | None = None,
     case_manager: CaseManager | None = None,
+    chargeback_manager: ChargebackManager | None = None,
 ) -> FastAPI:
     """Create an application using an injected model or a trusted artifact path.
 
@@ -2220,6 +2367,36 @@ def create_app(
     evidence_packages_counter = Counter(
         "fraud_evidence_packages_total",
         "Total dispute evidence packages compiled.",
+        ["tenant_id"],
+        registry=metrics_registry,
+    )
+    chargebacks_received_counter = Counter(
+        "fraud_chargebacks_received_total",
+        "Total card scheme chargebacks received by scheme and category.",
+        ["tenant_id", "scheme", "category"],
+        registry=metrics_registry,
+    )
+    chargebacks_represented_counter = Counter(
+        "fraud_chargebacks_represented_total",
+        "Total card scheme disputes represented with evidence packages.",
+        ["tenant_id", "scheme"],
+        registry=metrics_registry,
+    )
+    chargebacks_won_counter = Counter(
+        "fraud_chargebacks_won_total",
+        "Total card scheme disputes successfully won in representment.",
+        ["tenant_id", "scheme"],
+        registry=metrics_registry,
+    )
+    chargebacks_lost_counter = Counter(
+        "fraud_chargebacks_lost_total",
+        "Total card scheme disputes resolved as lost or accepted liability.",
+        ["tenant_id", "scheme"],
+        registry=metrics_registry,
+    )
+    chargeback_exposure_gauge = Gauge(
+        "fraud_chargeback_financial_exposure_amount",
+        "Total disputed exposure amount across active chargeback disputes.",
         ["tenant_id"],
         registry=metrics_registry,
     )
@@ -2766,6 +2943,15 @@ def create_app(
         application.state.cases_created_counter = cases_created_counter
         application.state.cases_resolved_counter = cases_resolved_counter
         application.state.evidence_packages_counter = evidence_packages_counter
+        resolved_chargeback_manager = chargeback_manager or ChargebackManager(
+            event_bus=resolved_event_bus
+        )
+        application.state.chargeback_manager = resolved_chargeback_manager
+        application.state.chargebacks_received_counter = chargebacks_received_counter
+        application.state.chargebacks_represented_counter = chargebacks_represented_counter
+        application.state.chargebacks_won_counter = chargebacks_won_counter
+        application.state.chargebacks_lost_counter = chargebacks_lost_counter
+        application.state.chargeback_exposure_gauge = chargeback_exposure_gauge
         application.state.audit_sink = resolved_audit_sink
         application.state.explanation_provider = explanation_provider
         application.state.fallback_mode = resolved_fallback_mode
@@ -2873,6 +3059,7 @@ def create_app(
                 "/v1/webhooks/",
                 "/v1/challenges/",
                 "/v1/cases/",
+                "/v1/chargebacks/",
             )
         )
         if (
@@ -2902,6 +3089,7 @@ def create_app(
                 "/v1/webhooks/",
                 "/v1/challenges/",
                 "/v1/cases/",
+                "/v1/chargebacks/",
             )
         )
         if rate_limiter is None or is_operational:
@@ -5963,6 +6151,359 @@ def create_app(
             return [_evidence_to_response(p) for p in packages]
         except CaseNotFoundError as exc:
             return JSONResponse(status_code=404, content={"detail": str(exc)})
+
+    @application.get(
+        "/v1/chargebacks/summary",
+        response_model=ChargebackSummaryResponse,
+        tags=["chargebacks"],
+    )
+    async def chargeback_summary_endpoint(
+        request: Request,
+        tenant_id: str | None = None,
+    ) -> ChargebackSummaryResponse | JSONResponse:
+        """Retrieve aggregated portfolio statistics across all scheme disputes."""
+        mgr: ChargebackManager | None = getattr(request.app.state, "chargeback_manager", None)
+        if mgr is None:
+            return JSONResponse(
+                status_code=500, content={"detail": "ChargebackManager not initialized"}
+            )
+        summary = mgr.get_summary(tenant_id=tenant_id)
+        return ChargebackSummaryResponse(
+            total_disputes=summary["total_disputes"],
+            total_disputed_amount=summary["total_disputed_amount"],
+            by_stage=summary["by_stage"],
+            by_scheme=summary["by_scheme"],
+            by_category=summary["by_category"],
+            expired_count=summary["expired_count"],
+            liability_shift_proven_count=summary["liability_shift_proven_count"],
+            high_winnability_count=summary["high_winnability_count"],
+        )
+
+    @application.get(
+        "/v1/chargebacks",
+        response_model=ChargebackListResponse,
+        tags=["chargebacks"],
+    )
+    async def list_chargebacks_endpoint(
+        request: Request,
+        tenant_id: str | None = None,
+        scheme: str | None = None,
+        stage: str | None = None,
+        category: str | None = None,
+        expired_only: bool = False,
+        limit: int = 100,
+    ) -> ChargebackListResponse | JSONResponse:
+        """Query and filter card scheme chargebacks with multi-criteria search."""
+        mgr: ChargebackManager | None = getattr(request.app.state, "chargeback_manager", None)
+        if mgr is None:
+            return ChargebackListResponse(total_count=0, disputes=[])
+
+        scheme_enum = None
+        if scheme:
+            try:
+                scheme_enum = CardScheme(scheme.lower())
+            except ValueError:
+                return JSONResponse(
+                    status_code=400,
+                    content={"detail": f"Invalid card scheme '{scheme}'"},
+                )
+
+        stage_enum = None
+        if stage:
+            try:
+                stage_enum = ChargebackStage(stage.lower())
+            except ValueError:
+                return JSONResponse(
+                    status_code=400,
+                    content={"detail": f"Invalid chargeback stage '{stage}'"},
+                )
+
+        category_enum = None
+        if category:
+            try:
+                category_enum = ChargebackCategory(category.lower())
+            except ValueError:
+                return JSONResponse(
+                    status_code=400,
+                    content={"detail": f"Invalid chargeback category '{category}'"},
+                )
+
+        disputes = mgr.store.list_disputes(
+            tenant_id=tenant_id,
+            scheme=scheme_enum,
+            stage=stage_enum,
+            category=category_enum,
+            expired_only=expired_only,
+            limit=limit,
+        )
+        return ChargebackListResponse(
+            total_count=len(disputes),
+            disputes=[_dispute_to_response(d) for d in disputes],
+        )
+
+    @application.post(
+        "/v1/chargebacks",
+        response_model=ChargebackDisputeResponse,
+        status_code=201,
+        responses={
+            400: {"description": "Invalid chargeback parameters."},
+            500: {"description": "ChargebackManager not initialized."},
+        },
+        tags=["chargebacks"],
+    )
+    async def ingest_chargeback_endpoint(
+        request: Request,
+        payload: ChargebackIngestRequest,
+    ) -> ChargebackDisputeResponse | JSONResponse:
+        """Ingest, evaluate, and index an incoming scheme chargeback dispute."""
+        mgr: ChargebackManager | None = getattr(request.app.state, "chargeback_manager", None)
+        if mgr is None:
+            return JSONResponse(
+                status_code=500, content={"detail": "ChargebackManager not initialized"}
+            )
+
+        try:
+            scheme_enum = CardScheme(payload.scheme.lower())
+        except ValueError:
+            return JSONResponse(
+                status_code=400,
+                content={"detail": f"Invalid card scheme '{payload.scheme}'"},
+            )
+
+        try:
+            dispute = mgr.ingest_chargeback(
+                transaction_id=payload.transaction_id,
+                scheme=scheme_enum,
+                reason_code=payload.reason_code,
+                disputed_amount=payload.disputed_amount,
+                currency=payload.currency,
+                tenant_id=payload.tenant_id,
+                scheme_dispute_id=payload.scheme_dispute_id,
+                filing_date=payload.filing_date,
+                response_deadline=payload.response_deadline,
+                metadata=payload.metadata,
+                auto_evaluate=payload.auto_evaluate,
+                transaction_context=payload.transaction_context,
+                challenge_session=payload.challenge_session,
+                prior_customer_transactions=payload.prior_customer_transactions,
+                evidence_package=payload.evidence_package,
+            )
+            rcv_counter = getattr(request.app.state, "chargebacks_received_counter", None)
+            if rcv_counter is not None:
+                rcv_counter.labels(
+                    tenant_id=dispute.tenant_id,
+                    scheme=dispute.scheme.value,
+                    category=dispute.category.value,
+                ).inc()
+            exp_gauge = getattr(request.app.state, "chargeback_exposure_gauge", None)
+            if exp_gauge is not None:
+                summary = mgr.get_summary(tenant_id=dispute.tenant_id)
+                exp_gauge.labels(tenant_id=dispute.tenant_id).set(summary["total_disputed_amount"])
+            return _dispute_to_response(dispute)
+        except DisputeValidationError as exc:
+            return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+    @application.post(
+        "/v1/chargebacks/webhook",
+        response_model=ChargebackDisputeResponse,
+        status_code=201,
+        responses={
+            400: {"description": "Invalid webhook payload."},
+            500: {"description": "ChargebackManager not initialized."},
+        },
+        tags=["chargebacks"],
+    )
+    async def chargeback_webhook_endpoint(
+        request: Request,
+        payload: ChargebackWebhookRequest,
+    ) -> ChargebackDisputeResponse | JSONResponse:
+        """Process inbound payment gateway/scheme chargeback webhook event."""
+        mgr: ChargebackManager | None = getattr(request.app.state, "chargeback_manager", None)
+        if mgr is None:
+            return JSONResponse(
+                status_code=500, content={"detail": "ChargebackManager not initialized"}
+            )
+
+        try:
+            scheme_enum = CardScheme(payload.scheme.lower())
+        except ValueError:
+            return JSONResponse(
+                status_code=400,
+                content={"detail": f"Invalid card scheme '{payload.scheme}'"},
+            )
+
+        try:
+            meta = dict(payload.metadata)
+            meta["webhook_event_type"] = payload.event_type
+            dispute = mgr.ingest_chargeback(
+                transaction_id=payload.transaction_id,
+                scheme=scheme_enum,
+                reason_code=payload.reason_code,
+                disputed_amount=payload.amount,
+                currency=payload.currency,
+                tenant_id=payload.tenant_id,
+                scheme_dispute_id=payload.scheme_dispute_id,
+                filing_date=payload.filing_date,
+                response_deadline=payload.response_deadline,
+                metadata=meta,
+                auto_evaluate=True,
+            )
+            rcv_counter = getattr(request.app.state, "chargebacks_received_counter", None)
+            if rcv_counter is not None:
+                rcv_counter.labels(
+                    tenant_id=dispute.tenant_id,
+                    scheme=dispute.scheme.value,
+                    category=dispute.category.value,
+                ).inc()
+            exp_gauge = getattr(request.app.state, "chargeback_exposure_gauge", None)
+            if exp_gauge is not None:
+                summary = mgr.get_summary(tenant_id=dispute.tenant_id)
+                exp_gauge.labels(tenant_id=dispute.tenant_id).set(summary["total_disputed_amount"])
+            return _dispute_to_response(dispute)
+        except DisputeValidationError as exc:
+            return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+    @application.get(
+        "/v1/chargebacks/{dispute_id}",
+        response_model=ChargebackDisputeResponse,
+        responses={
+            404: {"description": "Chargeback dispute not found."},
+            500: {"description": "ChargebackManager not initialized."},
+        },
+        tags=["chargebacks"],
+    )
+    async def get_chargeback_endpoint(
+        dispute_id: str,
+        request: Request,
+    ) -> ChargebackDisputeResponse | JSONResponse:
+        """Retrieve full dispute record including audit trail and representment status."""
+        mgr: ChargebackManager | None = getattr(request.app.state, "chargeback_manager", None)
+        if mgr is None:
+            return JSONResponse(
+                status_code=500, content={"detail": "ChargebackManager not initialized"}
+            )
+
+        try:
+            dispute = mgr.get_dispute(dispute_id)
+            return _dispute_to_response(dispute)
+        except DisputeNotFoundError as exc:
+            return JSONResponse(status_code=404, content={"detail": str(exc)})
+
+    @application.post(
+        "/v1/chargebacks/{dispute_id}/represent",
+        response_model=ChargebackDisputeResponse,
+        responses={
+            400: {"description": "Dispute cannot be represented."},
+            404: {"description": "Chargeback dispute not found."},
+            500: {"description": "ChargebackManager not initialized."},
+        },
+        tags=["chargebacks"],
+    )
+    async def represent_chargeback_endpoint(
+        dispute_id: str,
+        request: Request,
+        payload: ChargebackRepresentRequest,
+    ) -> ChargebackDisputeResponse | JSONResponse:
+        """Submit representment package and defense evidence to card network."""
+        mgr: ChargebackManager | None = getattr(request.app.state, "chargeback_manager", None)
+        if mgr is None:
+            return JSONResponse(
+                status_code=500, content={"detail": "ChargebackManager not initialized"}
+            )
+
+        try:
+            dispute = mgr.represent_dispute(
+                dispute_id=dispute_id,
+                package_id=payload.package_id,
+                evidence_fingerprint=payload.evidence_fingerprint,
+                notes=payload.notes,
+                actor=payload.actor,
+            )
+            rep_counter = getattr(request.app.state, "chargebacks_represented_counter", None)
+            if rep_counter is not None:
+                rep_counter.labels(
+                    tenant_id=dispute.tenant_id,
+                    scheme=dispute.scheme.value,
+                ).inc()
+            return _dispute_to_response(dispute)
+        except DisputeNotFoundError as exc:
+            return JSONResponse(status_code=404, content={"detail": str(exc)})
+        except (InvalidDisputeStateTransitionError, DisputeValidationError) as exc:
+            return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+    @application.post(
+        "/v1/chargebacks/{dispute_id}/resolve",
+        response_model=ChargebackDisputeResponse,
+        responses={
+            400: {"description": "Invalid outcome or illegal resolution transition."},
+            404: {"description": "Chargeback dispute not found."},
+            500: {"description": "ChargebackManager not initialized."},
+        },
+        tags=["chargebacks"],
+    )
+    async def resolve_chargeback_endpoint(
+        dispute_id: str,
+        request: Request,
+        payload: ChargebackResolveRequest,
+    ) -> ChargebackDisputeResponse | JSONResponse:
+        """Finalize dispute with terminal outcome and forward realized label to feedback engine."""
+        mgr: ChargebackManager | None = getattr(request.app.state, "chargeback_manager", None)
+        if mgr is None:
+            return JSONResponse(
+                status_code=500, content={"detail": "ChargebackManager not initialized"}
+            )
+
+        try:
+            outcome_enum = ChargebackStage(payload.outcome.lower())
+        except ValueError:
+            return JSONResponse(
+                status_code=400,
+                content={"detail": f"Invalid resolution outcome '{payload.outcome}'"},
+            )
+
+        try:
+            dispute = mgr.resolve_dispute(
+                dispute_id=dispute_id,
+                outcome=outcome_enum,
+                actor=payload.actor,
+                notes=payload.notes,
+            )
+            if outcome_enum == ChargebackStage.RESOLVED_WON:
+                won_counter = getattr(request.app.state, "chargebacks_won_counter", None)
+                if won_counter is not None:
+                    won_counter.labels(
+                        tenant_id=dispute.tenant_id,
+                        scheme=dispute.scheme.value,
+                    ).inc()
+            else:
+                lost_counter = getattr(request.app.state, "chargebacks_lost_counter", None)
+                if lost_counter is not None:
+                    lost_counter.labels(
+                        tenant_id=dispute.tenant_id,
+                        scheme=dispute.scheme.value,
+                    ).inc()
+
+            label_store = getattr(request.app.state, "label_store", None)
+            if label_store is not None:
+                try:
+                    mgr.publish_feedback_label(dispute.dispute_id, label_store=label_store)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Failed to publish feedback label for dispute %s: %s",
+                        dispute_id,
+                        exc,
+                    )
+
+            exp_gauge = getattr(request.app.state, "chargeback_exposure_gauge", None)
+            if exp_gauge is not None:
+                summary = mgr.get_summary(tenant_id=dispute.tenant_id)
+                exp_gauge.labels(tenant_id=dispute.tenant_id).set(summary["total_disputed_amount"])
+
+            return _dispute_to_response(dispute)
+        except DisputeNotFoundError as exc:
+            return JSONResponse(status_code=404, content={"detail": str(exc)})
+        except (InvalidDisputeStateTransitionError, DisputeValidationError) as exc:
+            return JSONResponse(status_code=400, content={"detail": str(exc)})
 
     @application.get(
         "/v1/routing/status",
