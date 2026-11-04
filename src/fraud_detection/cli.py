@@ -44,6 +44,14 @@ from fraud_detection.challenge import (
     ChallengeSession,
     ChallengeStore,
 )
+from fraud_detection.chargeback import (
+    CardScheme,
+    ChargebackDispute,
+    ChargebackError,
+    ChargebackManager,
+    ChargebackStage,
+    ChargebackStore,
+)
 from fraud_detection.data import (
     DEFAULT_TARGET,
     DataValidationError,
@@ -9393,6 +9401,531 @@ def case_evidence(
         typer.echo(f"Integrity:    {pkg.verify_integrity()}")
     else:
         typer.echo(json.dumps(pkg.to_dict(), indent=2))
+
+
+@app.command("chargeback-ingest")
+def chargeback_ingest(
+    transaction_id: Annotated[
+        str,
+        typer.Option(
+            "--transaction-id",
+            "-x",
+            help="Transaction identifier subject to chargeback.",
+        ),
+    ],
+    scheme: Annotated[
+        str,
+        typer.Option(
+            "--scheme",
+            help="Card scheme (visa, mastercard, amex, discover).",
+        ),
+    ],
+    reason_code: Annotated[
+        str,
+        typer.Option(
+            "--reason-code",
+            "-r",
+            help="Card network chargeback reason code.",
+        ),
+    ],
+    amount: Annotated[
+        float,
+        typer.Option(
+            "--amount",
+            "-a",
+            help="Disputed transaction amount.",
+        ),
+    ] = 0.0,
+    currency: Annotated[
+        str,
+        typer.Option(
+            "--currency",
+            "-c",
+            help="Transaction currency (e.g. USD, EUR).",
+        ),
+    ] = "USD",
+    tenant_id: Annotated[
+        str,
+        typer.Option(
+            "--tenant-id",
+            "-t",
+            help="Tenant identifier.",
+        ),
+    ] = "default",
+    scheme_dispute_id: Annotated[
+        str | None,
+        typer.Option(
+            "--scheme-dispute-id",
+            help="Scheme or gateway dispute reference.",
+        ),
+    ] = None,
+    deadline: Annotated[
+        str | None,
+        typer.Option(
+            "--deadline",
+            help="ISO timestamp representment deadline.",
+        ),
+    ] = None,
+    store_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--store-file",
+            "-s",
+            help="Optional path to persistent JSON file to append dispute record.",
+        ),
+    ] = None,
+    output_format: Annotated[
+        str,
+        typer.Option(
+            "--format",
+            "-f",
+            help="Output format: 'json' or 'table'.",
+        ),
+    ] = "json",
+) -> None:
+    """Ingest a new card scheme chargeback dispute."""
+    try:
+        scheme_enum = CardScheme(scheme.lower())
+    except ValueError:
+        valid_opts = [s.value for s in CardScheme]
+        _abort(f"Invalid card scheme '{scheme}'. Valid options: {valid_opts}")
+
+    store = ChargebackStore()
+    manager = ChargebackManager(store=store)
+
+    try:
+        dispute = manager.ingest_chargeback(
+            transaction_id=transaction_id,
+            scheme=scheme_enum,
+            reason_code=reason_code,
+            disputed_amount=amount,
+            currency=currency,
+            tenant_id=tenant_id,
+            scheme_dispute_id=scheme_dispute_id,
+            response_deadline=deadline,
+        )
+    except ChargebackError as exc:
+        _abort(f"Failed to ingest chargeback: {exc}")
+
+    if store_file is not None:
+        try:
+            records: list[dict[str, Any]] = []
+            if store_file.is_file():
+                raw = store_file.read_text(encoding="utf-8")
+                records = json.loads(raw) if raw.strip() else []
+                if not isinstance(records, list):
+                    records = []
+            records.append(dispute.to_dict())
+            _atomic_write_text(json.dumps(records, indent=2), store_file)
+        except (OSError, json.JSONDecodeError) as exc:
+            _abort(f"Failed to persist chargeback to store file: {exc}")
+
+    if output_format.lower() == "table":
+        typer.echo(f"Dispute ID:     {dispute.dispute_id}")
+        typer.echo(f"Transaction ID: {dispute.transaction_id}")
+        typer.echo(f"Scheme:         {dispute.scheme.value}")
+        typer.echo(f"Reason Code:    {dispute.reason_code}")
+        typer.echo(f"Category:       {dispute.category.value}")
+        typer.echo(f"Stage:          {dispute.stage.value}")
+        typer.echo(f"Amount:         {dispute.disputed_amount} {dispute.currency}")
+        typer.echo(f"Deadline:       {dispute.response_deadline}")
+        typer.echo(f"Winnability:    {dispute.winnability_score:.2f}")
+        typer.echo(f"Recommendation: {dispute.recommended_action.value}")
+    else:
+        typer.echo(json.dumps(dispute.to_dict(), indent=2))
+
+
+@app.command("chargeback-list")
+def chargeback_list(
+    store_file: Annotated[
+        Path,
+        typer.Option(
+            "--store-file",
+            "-s",
+            help="Path to JSON file containing dispute records.",
+        ),
+    ],
+    tenant_id: Annotated[
+        str | None,
+        typer.Option(
+            "--tenant-id",
+            "-t",
+            help="Filter by tenant ID.",
+        ),
+    ] = None,
+    scheme: Annotated[
+        str | None,
+        typer.Option(
+            "--scheme",
+            help="Filter by card scheme.",
+        ),
+    ] = None,
+    stage: Annotated[
+        str | None,
+        typer.Option(
+            "--stage",
+            help="Filter by chargeback stage.",
+        ),
+    ] = None,
+    category: Annotated[
+        str | None,
+        typer.Option(
+            "--category",
+            help="Filter by normalized chargeback category.",
+        ),
+    ] = None,
+    expired_only: Annotated[
+        bool,
+        typer.Option(
+            "--expired-only",
+            help="Filter to show only deadline-expired disputes.",
+        ),
+    ] = False,
+    output_format: Annotated[
+        str,
+        typer.Option(
+            "--format",
+            "-f",
+            help="Output format: 'json' or 'table'.",
+        ),
+    ] = "json",
+) -> None:
+    """List stored card scheme disputes with optional multi-criteria filters."""
+    if not store_file.is_file():
+        _abort(f"Store file not found: {store_file}")
+
+    try:
+        raw = store_file.read_text(encoding="utf-8")
+        records = json.loads(raw)
+        if not isinstance(records, list):
+            _abort("Invalid store file format: expected a JSON array of dispute objects.")
+    except (OSError, json.JSONDecodeError) as exc:
+        _abort(f"Could not read store file: {exc}")
+
+    matched: list[dict[str, Any]] = []
+    for item in records:
+        if not isinstance(item, dict):
+            continue
+        if tenant_id and item.get("tenant_id") != tenant_id:
+            continue
+        if scheme and str(item.get("scheme", "")).lower() != scheme.lower():
+            continue
+        if stage and str(item.get("stage", "")).lower() != stage.lower():
+            continue
+        if category and str(item.get("category", "")).lower() != category.lower():
+            continue
+        if expired_only and not item.get("is_expired"):
+            continue
+        matched.append(item)
+
+    if output_format.lower() == "table":
+        if not matched:
+            typer.echo("No chargeback disputes found.")
+            return
+        header = (
+            f"{'DISPUTE ID':<18}  {'TX ID':<16}  {'SCHEME':<10}  "
+            f"{'REASON':<8}  {'STAGE':<18}  {'AMOUNT':<10}  {'WINNABILITY':<11}"
+        )
+        typer.echo(header)
+        typer.echo("-" * len(header))
+        for m in matched:
+            d_id = str(m.get("dispute_id", ""))
+            tx_id = str(m.get("transaction_id", ""))
+            sc = str(m.get("scheme", ""))
+            rc = str(m.get("reason_code", ""))
+            st = str(m.get("stage", ""))
+            amt = f"{m.get('disputed_amount', 0.0):.2f}"
+            win = f"{m.get('winnability_score', 0.0):.2f}"
+            typer.echo(
+                f"{d_id:<18}  {tx_id:<16}  {sc:<10}  {rc:<8}  {st:<18}  {amt:<10}  {win:<11}"
+            )
+    else:
+        typer.echo(json.dumps({"total_count": len(matched), "disputes": matched}, indent=2))
+
+
+@app.command("chargeback-inspect")
+def chargeback_inspect(
+    store_file: Annotated[
+        Path,
+        typer.Option(
+            "--store-file",
+            "-s",
+            help="Path to JSON file containing dispute records.",
+        ),
+    ],
+    dispute_id: Annotated[
+        str,
+        typer.Option(
+            "--dispute-id",
+            "-d",
+            help="Dispute ID to inspect.",
+        ),
+    ],
+    output_format: Annotated[
+        str,
+        typer.Option(
+            "--format",
+            "-f",
+            help="Output format: 'json' or 'table'.",
+        ),
+    ] = "json",
+) -> None:
+    """Inspect full details, audit trail, and representment readiness of a dispute."""
+    if not store_file.is_file():
+        _abort(f"Store file not found: {store_file}")
+
+    try:
+        raw = store_file.read_text(encoding="utf-8")
+        records = json.loads(raw)
+        if not isinstance(records, list):
+            _abort("Invalid store file format: expected a JSON array of dispute objects.")
+    except (OSError, json.JSONDecodeError) as exc:
+        _abort(f"Could not read store file: {exc}")
+
+    target: dict[str, Any] | None = None
+    for item in records:
+        if isinstance(item, dict) and item.get("dispute_id") == dispute_id:
+            target = item
+            break
+
+    if target is None:
+        _abort(f"Dispute '{dispute_id}' not found in store file.")
+
+    if output_format.lower() == "table":
+        typer.echo(f"Dispute ID:      {target.get('dispute_id')}")
+        typer.echo(f"Transaction ID:  {target.get('transaction_id')}")
+        typer.echo(f"Tenant ID:       {target.get('tenant_id')}")
+        typer.echo(f"Scheme:          {target.get('scheme')}")
+        typer.echo(f"Reason Code:     {target.get('reason_code')}")
+        typer.echo(f"Category:        {target.get('category')}")
+        typer.echo(f"Stage:           {target.get('stage')}")
+        typer.echo(f"Amount:          {target.get('disputed_amount')} {target.get('currency')}")
+        typer.echo(f"Filing Date:     {target.get('filing_date')}")
+        typer.echo(f"Deadline:        {target.get('response_deadline')}")
+        typer.echo(f"Expired:         {target.get('is_expired')}")
+        typer.echo(f"Terminal:        {target.get('is_terminal')}")
+        typer.echo(f"Liability Shift: {target.get('liability_shift_proven')}")
+        typer.echo(f"Winnability:     {target.get('winnability_score')}")
+        typer.echo(f"Recommendation:  {target.get('recommended_action')}")
+        typer.echo(f"Package ID:      {target.get('representment_package_id') or 'None'}")
+        typer.echo(f"Audit Entries:   {len(target.get('audit_trail') or [])}")
+    else:
+        typer.echo(json.dumps(target, indent=2))
+
+
+@app.command("chargeback-represent")
+def chargeback_represent(
+    store_file: Annotated[
+        Path,
+        typer.Option(
+            "--store-file",
+            "-s",
+            help="Path to JSON file containing dispute records.",
+        ),
+    ],
+    dispute_id: Annotated[
+        str,
+        typer.Option(
+            "--dispute-id",
+            "-d",
+            help="Dispute ID to represent.",
+        ),
+    ],
+    package_id: Annotated[
+        str | None,
+        typer.Option(
+            "--package-id",
+            "-p",
+            help="Evidence package reference ID.",
+        ),
+    ] = None,
+    evidence_fingerprint: Annotated[
+        str | None,
+        typer.Option(
+            "--fingerprint",
+            help="Cryptographic SHA-256 fingerprint of evidence package.",
+        ),
+    ] = None,
+    notes: Annotated[
+        str,
+        typer.Option(
+            "--notes",
+            "-n",
+            help="Representment defense narrative or notes.",
+        ),
+    ] = "",
+    actor: Annotated[
+        str,
+        typer.Option(
+            "--actor",
+            help="Analyst or automated agent submitting representment.",
+        ),
+    ] = "analyst",
+    output_format: Annotated[
+        str,
+        typer.Option(
+            "--format",
+            "-f",
+            help="Output format: 'json' or 'table'.",
+        ),
+    ] = "json",
+) -> None:
+    """Submit dispute representment attaching evidence package and cryptographic digest."""
+    if not store_file.is_file():
+        _abort(f"Store file not found: {store_file}")
+
+    try:
+        raw = store_file.read_text(encoding="utf-8")
+        records = json.loads(raw)
+        if not isinstance(records, list):
+            _abort("Invalid store file format: expected a JSON array of dispute objects.")
+    except (OSError, json.JSONDecodeError) as exc:
+        _abort(f"Could not read store file: {exc}")
+
+    target_idx: int | None = None
+    target_dispute: ChargebackDispute | None = None
+    for idx, item in enumerate(records):
+        if isinstance(item, dict) and item.get("dispute_id") == dispute_id:
+            target_idx = idx
+            target_dispute = ChargebackDispute.from_dict(item)
+            break
+
+    if target_dispute is None or target_idx is None:
+        _abort(f"Dispute '{dispute_id}' not found in store file.")
+
+    store = ChargebackStore()
+    store.put(target_dispute)
+    manager = ChargebackManager(store=store)
+
+    try:
+        updated = manager.represent_dispute(
+            dispute_id=dispute_id,
+            package_id=package_id,
+            evidence_fingerprint=evidence_fingerprint,
+            notes=notes,
+            actor=actor,
+        )
+        records[target_idx] = updated.to_dict()
+        _atomic_write_text(json.dumps(records, indent=2), store_file)
+    except ChargebackError as exc:
+        _abort(f"Failed to represent dispute: {exc}")
+
+    if output_format.lower() == "table":
+        typer.echo(f"Dispute ID:     {updated.dispute_id}")
+        typer.echo(f"Stage:          {updated.stage.value}")
+        typer.echo(f"Package ID:     {updated.representment_package_id}")
+        typer.echo(f"Fingerprint:    {updated.evidence_fingerprint}")
+        typer.echo(f"Represented At: {updated.represented_at}")
+    else:
+        typer.echo(json.dumps(updated.to_dict(), indent=2))
+
+
+@app.command("chargeback-resolve")
+def chargeback_resolve(
+    store_file: Annotated[
+        Path,
+        typer.Option(
+            "--store-file",
+            "-s",
+            help="Path to JSON file containing dispute records.",
+        ),
+    ],
+    dispute_id: Annotated[
+        str,
+        typer.Option(
+            "--dispute-id",
+            "-d",
+            help="Dispute ID to resolve.",
+        ),
+    ],
+    outcome: Annotated[
+        str,
+        typer.Option(
+            "--outcome",
+            "-o",
+            help="Resolution outcome: resolved_won, resolved_lost, or accepted_liability.",
+        ),
+    ],
+    actor: Annotated[
+        str,
+        typer.Option(
+            "--actor",
+            help="Analyst or system resolving the dispute.",
+        ),
+    ] = "system",
+    notes: Annotated[
+        str,
+        typer.Option(
+            "--notes",
+            "-n",
+            help="Resolution explanation notes.",
+        ),
+    ] = "",
+    output_format: Annotated[
+        str,
+        typer.Option(
+            "--format",
+            "-f",
+            help="Output format: 'json' or 'table'.",
+        ),
+    ] = "json",
+) -> None:
+    """Finalize dispute with a terminal resolution outcome."""
+    try:
+        stage_enum = ChargebackStage(outcome.lower())
+    except ValueError:
+        valid_opts = [
+            ChargebackStage.RESOLVED_WON.value,
+            ChargebackStage.RESOLVED_LOST.value,
+            ChargebackStage.ACCEPTED_LIABILITY.value,
+        ]
+        _abort(f"Invalid outcome '{outcome}'. Valid options: {valid_opts}")
+
+    if not store_file.is_file():
+        _abort(f"Store file not found: {store_file}")
+
+    try:
+        raw = store_file.read_text(encoding="utf-8")
+        records = json.loads(raw)
+        if not isinstance(records, list):
+            _abort("Invalid store file format: expected a JSON array of dispute objects.")
+    except (OSError, json.JSONDecodeError) as exc:
+        _abort(f"Could not read store file: {exc}")
+
+    target_idx: int | None = None
+    target_dispute: ChargebackDispute | None = None
+    for idx, item in enumerate(records):
+        if isinstance(item, dict) and item.get("dispute_id") == dispute_id:
+            target_idx = idx
+            target_dispute = ChargebackDispute.from_dict(item)
+            break
+
+    if target_dispute is None or target_idx is None:
+        _abort(f"Dispute '{dispute_id}' not found in store file.")
+
+    store = ChargebackStore()
+    store.put(target_dispute)
+    manager = ChargebackManager(store=store)
+
+    try:
+        resolved = manager.resolve_dispute(
+            dispute_id=dispute_id,
+            outcome=stage_enum,
+            actor=actor,
+            notes=notes,
+        )
+        records[target_idx] = resolved.to_dict()
+        _atomic_write_text(json.dumps(records, indent=2), store_file)
+    except ChargebackError as exc:
+        _abort(f"Failed to resolve dispute: {exc}")
+
+    if output_format.lower() == "table":
+        typer.echo(f"Dispute ID:  {resolved.dispute_id}")
+        typer.echo(f"Stage:       {resolved.stage.value}")
+        typer.echo(f"Resolved At: {resolved.resolved_at}")
+        typer.echo(f"Terminal:    {resolved.is_terminal}")
+    else:
+        typer.echo(json.dumps(resolved.to_dict(), indent=2))
 
 
 def _abort(message: str) -> NoReturn:
