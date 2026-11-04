@@ -8,6 +8,7 @@ Trust compelling evidence qualification, and thread-safe dispute lifecycle manag
 from __future__ import annotations
 
 import logging
+import threading
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -694,3 +695,334 @@ def evaluate_representment_viability(
         reasons=reasons,
         evidence_requirements=requirements,
     )
+
+
+# ---------------------------------------------------------------------------
+# Thread-Safe Chargeback Store & Manager
+# ---------------------------------------------------------------------------
+
+
+class ChargebackStore:
+    """Thread-safe, multi-index repository for card scheme disputes."""
+
+    def __init__(self, max_capacity: int = 10000) -> None:
+        self._max_capacity = max_capacity
+        self._lock = threading.RLock()
+        self._disputes: dict[str, ChargebackDispute] = {}
+        self._by_tx: dict[str, str] = {}
+        self._by_scheme_id: dict[tuple[CardScheme, str], str] = {}
+
+    def put(self, dispute: ChargebackDispute) -> None:
+        """Store or update a dispute record with multi-index synchronization."""
+        with self._lock:
+            if (
+                len(self._disputes) >= self._max_capacity
+                and dispute.dispute_id not in self._disputes
+            ):
+                oldest_id = next(iter(self._disputes))
+                self.delete(oldest_id)
+
+            self._disputes[dispute.dispute_id] = dispute
+            self._by_tx[dispute.transaction_id] = dispute.dispute_id
+            if dispute.scheme_dispute_id:
+                self._by_scheme_id[(dispute.scheme, dispute.scheme_dispute_id)] = dispute.dispute_id
+
+    def get(self, dispute_id: str) -> ChargebackDispute | None:
+        """Retrieve a dispute by dispute ID."""
+        with self._lock:
+            return self._disputes.get(dispute_id)
+
+    def get_by_transaction(self, transaction_id: str) -> ChargebackDispute | None:
+        """Retrieve the latest dispute linked to a transaction ID."""
+        with self._lock:
+            d_id = self._by_tx.get(transaction_id)
+            if d_id:
+                return self._disputes.get(d_id)
+            return None
+
+    def get_by_scheme_id(
+        self, scheme: CardScheme, scheme_dispute_id: str
+    ) -> ChargebackDispute | None:
+        """Retrieve a dispute by card scheme and scheme reference identifier."""
+        with self._lock:
+            d_id = self._by_scheme_id.get((scheme, scheme_dispute_id))
+            if d_id:
+                return self._disputes.get(d_id)
+            return None
+
+    def delete(self, dispute_id: str) -> bool:
+        """Remove a dispute from all indices."""
+        with self._lock:
+            dispute = self._disputes.pop(dispute_id, None)
+            if dispute is not None:
+                if self._by_tx.get(dispute.transaction_id) == dispute_id:
+                    self._by_tx.pop(dispute.transaction_id, None)
+                if dispute.scheme_dispute_id:
+                    key = (dispute.scheme, dispute.scheme_dispute_id)
+                    if self._by_scheme_id.get(key) == dispute_id:
+                        self._by_scheme_id.pop(key, None)
+                return True
+            return False
+
+    def list_disputes(
+        self,
+        tenant_id: str | None = None,
+        scheme: CardScheme | None = None,
+        category: ChargebackCategory | None = None,
+        stage: ChargebackStage | None = None,
+        expired_only: bool = False,
+        limit: int = 100,
+    ) -> list[ChargebackDispute]:
+        """Query stored disputes with multi-criteria filtering."""
+        with self._lock:
+            results: list[ChargebackDispute] = []
+            for d in self._disputes.values():
+                if tenant_id and d.tenant_id != tenant_id:
+                    continue
+                if scheme and d.scheme != scheme:
+                    continue
+                if category and d.category != category:
+                    continue
+                if stage and d.stage != stage:
+                    continue
+                if expired_only and not d.is_expired:
+                    continue
+                results.append(d)
+                if len(results) >= limit:
+                    break
+            results.sort(key=lambda item: item.created_at, reverse=True)
+            return results
+
+    def count(self, tenant_id: str | None = None) -> int:
+        """Return total stored dispute count, optionally filtered by tenant."""
+        with self._lock:
+            if tenant_id is None:
+                return len(self._disputes)
+            return sum(1 for d in self._disputes.values() if d.tenant_id == tenant_id)
+
+    def clear(self) -> None:
+        """Flush all stored dispute records and secondary indices."""
+        with self._lock:
+            self._disputes.clear()
+            self._by_tx.clear()
+            self._by_scheme_id.clear()
+
+
+class ChargebackManager:
+    """Orchestrates dispute ingestion, representment viability, and lifecycle state."""
+
+    def __init__(
+        self,
+        store: ChargebackStore | None = None,
+        registry: ReasonCodeRegistry | None = None,
+    ) -> None:
+        self.store = store or ChargebackStore()
+        self.registry = registry or DEFAULT_REASON_REGISTRY
+        self._lock = threading.RLock()
+
+    def ingest_chargeback(
+        self,
+        transaction_id: str,
+        scheme: CardScheme,
+        reason_code: str,
+        disputed_amount: float,
+        currency: str = "USD",
+        tenant_id: str = "default",
+        scheme_dispute_id: str | None = None,
+        filing_date: str | None = None,
+        response_deadline: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        auto_evaluate: bool = True,
+        transaction_context: dict[str, Any] | None = None,
+        challenge_session: dict[str, Any] | None = None,
+        prior_customer_transactions: list[Any] | None = None,
+        evidence_package: dict[str, Any] | None = None,
+    ) -> ChargebackDispute:
+        """Ingest, validate, and optionally evaluate an incoming card scheme chargeback."""
+        with self._lock:
+            defn = self.registry.find_or_fallback(scheme, reason_code)
+            dispute = ChargebackDispute(
+                transaction_id=transaction_id,
+                tenant_id=tenant_id,
+                scheme=scheme,
+                reason_code=reason_code,
+                category=defn.category,
+                disputed_amount=disputed_amount,
+                currency=currency,
+                scheme_dispute_id=scheme_dispute_id,
+                filing_date=filing_date or "",
+                response_deadline=response_deadline or "",
+                metadata=metadata or {},
+            )
+
+            if auto_evaluate:
+                evaluate_representment_viability(
+                    dispute=dispute,
+                    transaction_context=transaction_context,
+                    challenge_session=challenge_session,
+                    prior_customer_transactions=prior_customer_transactions,
+                    evidence_package=evidence_package,
+                    registry=self.registry,
+                )
+
+            self.store.put(dispute)
+            logger.info(
+                "Ingested chargeback dispute %s for tx %s (scheme: %s, code: %s, amount: %s %s)",
+                dispute.dispute_id,
+                dispute.transaction_id,
+                dispute.scheme.value,
+                dispute.reason_code,
+                dispute.disputed_amount,
+                dispute.currency,
+            )
+            return dispute
+
+    def get_dispute(self, dispute_id: str) -> ChargebackDispute:
+        """Retrieve a dispute or raise DisputeNotFoundError."""
+        with self._lock:
+            dispute = self.store.get(dispute_id)
+            if dispute is None:
+                raise DisputeNotFoundError(f"Chargeback dispute '{dispute_id}' not found")
+            return dispute
+
+    def update_stage(
+        self,
+        dispute_id: str,
+        new_stage: ChargebackStage,
+        actor: str = "system",
+        notes: str = "",
+    ) -> ChargebackDispute:
+        """Transition dispute to a new lifecycle stage enforcing state machine rules."""
+        with self._lock:
+            dispute = self.get_dispute(dispute_id)
+            if new_stage == dispute.stage:
+                return dispute
+
+            allowed = ALLOWED_DISPUTE_TRANSITIONS.get(dispute.stage, set())
+            if new_stage not in allowed:
+                raise InvalidDisputeStateTransitionError(
+                    f"Illegal transition from '{dispute.stage.value}' to '{new_stage.value}'. "
+                    f"Allowed transitions: {[s.value for s in allowed]}"
+                )
+
+            old_stage = dispute.stage
+            dispute.stage = new_stage
+            if dispute.is_terminal and not dispute.resolved_at:
+                dispute.resolved_at = datetime.now(UTC).isoformat()
+
+            dispute.add_audit_entry(
+                action="stage_transitioned",
+                actor=actor,
+                details={
+                    "old_stage": old_stage.value,
+                    "new_stage": new_stage.value,
+                    "notes": notes,
+                },
+            )
+            self.store.put(dispute)
+            return dispute
+
+    def represent_dispute(
+        self,
+        dispute_id: str,
+        package_id: str | None = None,
+        evidence_fingerprint: str | None = None,
+        notes: str = "",
+        actor: str = "analyst",
+    ) -> ChargebackDispute:
+        """Submit dispute representment attaching evidence package and cryptographic digest."""
+        with self._lock:
+            dispute = self.get_dispute(dispute_id)
+            if dispute.is_terminal:
+                stage_val = dispute.stage.value
+                raise InvalidDisputeStateTransitionError(
+                    f"Cannot represent terminal dispute '{dispute_id}' in stage '{stage_val}'"
+                )
+
+            dispute = self.update_stage(
+                dispute_id,
+                ChargebackStage.REPRESENTED,
+                actor=actor,
+                notes=notes,
+            )
+            dispute.representment_package_id = package_id
+            dispute.evidence_fingerprint = evidence_fingerprint
+            dispute.representment_notes = notes
+            dispute.represented_at = datetime.now(UTC).isoformat()
+
+            dispute.add_audit_entry(
+                action="dispute_represented",
+                actor=actor,
+                details={
+                    "package_id": package_id,
+                    "evidence_fingerprint": evidence_fingerprint,
+                    "notes": notes,
+                },
+            )
+            self.store.put(dispute)
+            return dispute
+
+    def resolve_dispute(
+        self,
+        dispute_id: str,
+        outcome: ChargebackStage,
+        actor: str = "system",
+        notes: str = "",
+    ) -> ChargebackDispute:
+        """Finalize dispute with a terminal resolution outcome."""
+        with self._lock:
+            valid_terminal = [
+                ChargebackStage.RESOLVED_WON.value,
+                ChargebackStage.RESOLVED_LOST.value,
+                ChargebackStage.ACCEPTED_LIABILITY.value,
+            ]
+            if outcome not in (
+                ChargebackStage.RESOLVED_WON,
+                ChargebackStage.RESOLVED_LOST,
+                ChargebackStage.ACCEPTED_LIABILITY,
+            ):
+                raise DisputeValidationError(
+                    f"Invalid outcome '{outcome.value}'. Allowed: {valid_terminal}"
+                )
+
+            dispute = self.update_stage(dispute_id, outcome, actor=actor, notes=notes)
+            dispute.resolved_at = datetime.now(UTC).isoformat()
+            self.store.put(dispute)
+            return dispute
+
+    def get_summary(self, tenant_id: str | None = None) -> dict[str, Any]:
+        """Aggregate financial exposure, win rates, and stage counts across disputes."""
+        with self._lock:
+            disputes = self.store.list_disputes(tenant_id=tenant_id, limit=100000)
+            total_count = len(disputes)
+            total_disputed_amount = sum(d.disputed_amount for d in disputes)
+
+            by_stage = {s.value: 0 for s in ChargebackStage}
+            by_scheme = {sc.value: 0 for sc in CardScheme}
+            by_category = {c.value: 0 for c in ChargebackCategory}
+
+            expired_count = 0
+            liability_shift_count = 0
+            ce3_qualified_count = 0
+
+            for d in disputes:
+                by_stage[d.stage.value] = by_stage.get(d.stage.value, 0) + 1
+                by_scheme[d.scheme.value] = by_scheme.get(d.scheme.value, 0) + 1
+                by_category[d.category.value] = by_category.get(d.category.value, 0) + 1
+                if d.is_expired:
+                    expired_count += 1
+                if d.liability_shift_proven:
+                    liability_shift_count += 1
+                if d.winnability_score >= 0.70:
+                    ce3_qualified_count += 1
+
+            return {
+                "total_disputes": total_count,
+                "total_disputed_amount": round(total_disputed_amount, 2),
+                "by_stage": by_stage,
+                "by_scheme": by_scheme,
+                "by_category": by_category,
+                "expired_count": expired_count,
+                "liability_shift_proven_count": liability_shift_count,
+                "high_winnability_count": ce3_qualified_count,
+            }
