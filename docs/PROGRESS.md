@@ -4,7 +4,7 @@
 - **Phase**: Phase 46 — Card Scheme Chargeback Ingestion, Reason Code Taxonomy & Automated Representment Gateway
 - **Branch**: `phase/chargeback-representment-gateway`
 - **Status**: In Progress
-- **Pull Request**: Draft PR to be opened
+- **Pull Request**: [#29](https://github.com/Mohamed-ahmed-shokry/Credit-Card-Fraud-Detection/pull/29)
 
 ## Task Status
 - [ ] Task 1: Create `src/fraud_detection/chargeback.py` with domain data models, scheme reason code registry, and unit tests in `tests/test_chargeback.py`.
