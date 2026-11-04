@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -815,10 +816,28 @@ class ChargebackManager:
         self,
         store: ChargebackStore | None = None,
         registry: ReasonCodeRegistry | None = None,
+        event_bus: Any | None = None,
     ) -> None:
         self.store = store or ChargebackStore()
         self.registry = registry or DEFAULT_REASON_REGISTRY
+        self.event_bus = event_bus
         self._lock = threading.RLock()
+
+    def _publish_event(self, event_type_str: str, dispute: ChargebackDispute) -> None:
+        """Publish domain event over streaming EventBus if configured."""
+        if self.event_bus is not None:
+            try:
+                from fraud_detection.events import EventType, FraudDomainEvent
+
+                ev_type = EventType(event_type_str)
+                event = FraudDomainEvent(
+                    event_type=ev_type,
+                    tenant_id=dispute.tenant_id,
+                    payload=dispute.to_dict(),
+                )
+                self.event_bus.publish(event)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to publish chargeback event %s: %s", event_type_str, exc)
 
     def ingest_chargeback(
         self,
@@ -866,6 +885,7 @@ class ChargebackManager:
                 )
 
             self.store.put(dispute)
+            self._publish_event("fraud.chargeback.ingested", dispute)
             logger.info(
                 "Ingested chargeback dispute %s for tx %s (scheme: %s, code: %s, amount: %s %s)",
                 dispute.dispute_id,
@@ -960,6 +980,7 @@ class ChargebackManager:
                 },
             )
             self.store.put(dispute)
+            self._publish_event("fraud.chargeback.represented", dispute)
             return dispute
 
     def resolve_dispute(
@@ -988,7 +1009,53 @@ class ChargebackManager:
             dispute = self.update_stage(dispute_id, outcome, actor=actor, notes=notes)
             dispute.resolved_at = datetime.now(UTC).isoformat()
             self.store.put(dispute)
+            self._publish_event("fraud.chargeback.resolved", dispute)
             return dispute
+
+    def publish_feedback_label(
+        self,
+        dispute_id: str,
+        label_store: Any,
+        is_fraud: bool | None = None,
+        event_timestamp: float | None = None,
+    ) -> Any:
+        """Forward confirmed dispute outcome to feedback LabelIngestionStore."""
+        fraud_categories = {
+            ChargebackCategory.FRAUD_CARD_NOT_PRESENT,
+            ChargebackCategory.FRAUD_CARD_PRESENT,
+            ChargebackCategory.FRIENDLY_FRAUD_FIRST_PARTY,
+            ChargebackCategory.UNRECOGNIZED_TRANSACTION,
+        }
+        with self._lock:
+            dispute = self.get_dispute(dispute_id)
+            is_fraud_cat = dispute.category in fraud_categories
+            if is_fraud is None:
+                is_fraud = dispute.stage != ChargebackStage.RESOLVED_WON if is_fraud_cat else False
+
+            now = time.time()
+            ev_ts = event_timestamp if event_timestamp is not None else now
+            if ev_ts > now:
+                ev_ts = now
+
+            from fraud_detection.feedback import DelayedLabelRecord, DisputeType, LabelSource
+
+            dispute_type = DisputeType.FRAUD_DISPUTE if is_fraud_cat else DisputeType.CHARGEBACK
+            notes_str = (
+                f"Dispute {dispute.dispute_id} | Stage: {dispute.stage.value} | "
+                f"Scheme: {dispute.scheme.value} {dispute.reason_code}"
+            )
+            record = DelayedLabelRecord(
+                transaction_id=dispute.transaction_id,
+                event_timestamp=ev_ts,
+                label_timestamp=now,
+                dispute_type=dispute_type,
+                is_fraud=is_fraud,
+                amount=dispute.disputed_amount,
+                label_source=LabelSource.NETWORK_REPORT,
+                notes=notes_str,
+            )
+            label_store.ingest_record(record)
+            return record
 
     def get_summary(self, tenant_id: str | None = None) -> dict[str, Any]:
         """Aggregate financial exposure, win rates, and stage counts across disputes."""
