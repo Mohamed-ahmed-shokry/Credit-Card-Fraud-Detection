@@ -193,3 +193,110 @@ def test_chargeback_dispute_expiration_and_terminal() -> None:
     d_past.stage = ChargebackStage.RESOLVED_WON
     assert d_past.is_expired is False
     assert d_past.is_terminal is True
+
+
+def test_representment_viability_engine_3ds_and_ce3() -> None:
+    """Verify representment viability evaluation for 3DS liability shift and CE3.0."""
+    from fraud_detection.chargeback import (
+        RepresentmentViability,
+        evaluate_representment_viability,
+    )
+
+    dispute = ChargebackDispute(
+        transaction_id="tx_viability_1",
+        scheme=CardScheme.VISA,
+        reason_code="10.4",
+        category=ChargebackCategory.FRAUD_CARD_NOT_PRESENT,
+        disputed_amount=150.0,
+    )
+
+    # 1. Low score / Accept liability with no evidence
+    v_empty = evaluate_representment_viability(dispute)
+    assert isinstance(v_empty, RepresentmentViability)
+    assert v_empty.winnability_score == 0.0
+    assert v_empty.liability_shift_proven is False
+    assert v_empty.compelling_evidence_qualified is False
+    assert v_empty.recommended_action == RepresentmentAction.ACCEPT_LIABILITY
+    assert len(v_empty.evidence_requirements) >= 2
+    assert "winnability_score" in v_empty.to_dict()
+
+    # 2. 3DS liability shift with ECI 05
+    v_3ds = evaluate_representment_viability(
+        dispute,
+        transaction_context={"eci": "05", "is_3ds_authenticated": True},
+    )
+    assert v_3ds.liability_shift_proven is True
+    assert v_3ds.winnability_score >= 0.55
+    assert dispute.liability_shift_proven is True
+    assert v_3ds.recommended_action == RepresentmentAction.REQUEST_MORE_INFO
+
+    # 3. 3DS verified challenge session + CE3.0 qualifying transactions + fingerprinted evidence
+    priors = [
+        {
+            "transaction_id": "tx_old_1",
+            "device_id": "dev_abc",
+            "ip_address": "1.2.3.4",
+            "user_id": "u_99",
+        },
+        {
+            "transaction_id": "tx_old_2",
+            "device_id": "dev_abc",
+            "ip_address": "1.2.3.4",
+            "user_id": "u_99",
+        },
+        {"transaction_id": "tx_fraud", "device_id": "dev_abc", "is_fraud": True},  # Ignored
+        "not_a_dict_prior",  # Skipped safely
+    ]
+    evidence_pkg = {
+        "package_id": "pkg_123",
+        "sha256_fingerprint": "a" * 64,
+    }
+    v_full = evaluate_representment_viability(
+        dispute,
+        transaction_context={"device_id": "dev_abc", "ip_address": "1.2.3.4", "user_id": "u_99"},
+        challenge_session={"status": "verified"},
+        prior_customer_transactions=priors,
+        evidence_package=evidence_pkg,
+    )
+    assert v_full.liability_shift_proven is True
+    assert v_full.compelling_evidence_qualified is True
+    assert v_full.winnability_score >= 0.70
+    assert v_full.recommended_action == RepresentmentAction.SUBMIT_REPRESENTMENT
+    assert dispute.winnability_score == v_full.winnability_score
+
+
+def test_representment_viability_auth_and_consumer_disputes() -> None:
+    """Verify viability scoring for authorization and consumer delivery disputes."""
+    from fraud_detection.chargeback import evaluate_representment_viability
+
+    # Authorization error dispute
+    d_auth = ChargebackDispute(
+        transaction_id="tx_auth_1",
+        scheme=CardScheme.MASTERCARD,
+        reason_code="4808",
+        category=ChargebackCategory.AUTHORIZATION_ERROR,
+    )
+    v_auth_no_code = evaluate_representment_viability(d_auth)
+    assert v_auth_no_code.recommended_action == RepresentmentAction.ACCEPT_LIABILITY
+
+    v_auth_with_code = evaluate_representment_viability(
+        d_auth,
+        transaction_context={"auth_code": "AUTH_99124"},
+    )
+    assert v_auth_with_code.winnability_score >= 0.40
+    assert v_auth_with_code.recommended_action == RepresentmentAction.REQUEST_MORE_INFO
+
+    # Consumer dispute (Goods Not Received)
+    d_consumer = ChargebackDispute(
+        transaction_id="tx_consumer_1",
+        scheme=CardScheme.VISA,
+        reason_code="13.1",
+        category=ChargebackCategory.CONSUMER_DISPUTE,
+    )
+    v_cons_tracking = evaluate_representment_viability(
+        d_consumer,
+        transaction_context={"tracking_number": "1Z9999999999999999"},
+        evidence_package={"package_id": "pkg_unhashed"},  # Unfingerprinted package branch
+    )
+    assert v_cons_tracking.winnability_score >= 0.45
+    assert v_cons_tracking.recommended_action == RepresentmentAction.REQUEST_MORE_INFO
