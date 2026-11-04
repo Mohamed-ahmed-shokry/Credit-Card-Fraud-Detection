@@ -340,9 +340,10 @@ def test_cost_controller_properties_and_window_expiry() -> None:
     assert controller.tokens_consumed == 5
     assert controller.record_tokens(6) is False  # exceeds budget
 
-    # Window expiry
-    controller._timestamps.append(time.time() - 100.0)  # noqa: SLF001
-    allowed, err = controller.check_and_record(tokens_used=1)
+    # Window expiry on a fresh rate-limited controller
+    rate_ctrl = CostController(max_requests_per_minute=1)
+    rate_ctrl._timestamps.append(time.time() - 100.0)  # noqa: SLF001
+    allowed, err = rate_ctrl.check_and_record(tokens_used=0)
     assert allowed is True
     assert err is None
 
