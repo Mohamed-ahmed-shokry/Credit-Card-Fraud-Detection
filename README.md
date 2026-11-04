@@ -1929,6 +1929,59 @@ FastAPI Case Management REST endpoints:
 - `GET /v1/cases/{case_id}/evidence`: Compile and export a canonicalized SHA-256 fingerprinted dispute evidence dossier (Visa CE3.0 / Mastercard First-Party Trust ready).
 - Prometheus metrics: `fraud_cases_total`, `fraud_cases_resolved_total`, `fraud_case_sla_breaches_total`, `fraud_evidence_packages_generated_total`.
 
+## Card Scheme Chargeback & Automated Representment Gateway (Phase 46)
+
+Ingest inbound card scheme chargebacks, normalize network reason codes (Visa, Mastercard, Amex, Discover), evaluate representment viability (3DS liability shift and CE3.0 / First-Party Trust rules), defend disputes, and forward realized labels to continuous learning (`chargeback.py`):
+
+```bash
+# Ingest an incoming Visa chargeback dispute
+fraud-detect chargeback-ingest \
+  --transaction-id tx_88129 \
+  --scheme visa \
+  --reason-code 10.4 \
+  --amount 350.00 \
+  --currency USD \
+  --tenant-id default \
+  --scheme-dispute-id vrol_9812 \
+  --store-file chargebacks.json \
+  --format table
+
+# List stored disputes with multi-criteria filters
+fraud-detect chargeback-list --store-file chargebacks.json --scheme visa --stage first_chargeback --format table
+
+# Inspect full dispute details, viability score, liability shift, and audit history
+fraud-detect chargeback-inspect --store-file chargebacks.json --dispute-id dsp_38f2a1b9 --format table
+
+# Submit dispute representment with evidence package and cryptographic fingerprint
+fraud-detect chargeback-represent \
+  --store-file chargebacks.json \
+  --dispute-id dsp_38f2a1b9 \
+  --package-id pkg_rep_101 \
+  --fingerprint a4b8c9...64chars \
+  --notes "Visa CE3.0 compelling evidence attached: 2 prior undisputed matching transactions." \
+  --actor senior_analyst \
+  --format table
+
+# Finalize dispute resolution with terminal outcome
+fraud-detect chargeback-resolve \
+  --store-file chargebacks.json \
+  --dispute-id dsp_38f2a1b9 \
+  --outcome resolved_won \
+  --actor scheme_gateway \
+  --notes "Issuer arbitration concluded in merchant favor." \
+  --format table
+```
+
+FastAPI Chargeback Gateway REST endpoints:
+- `POST /v1/chargebacks`: Ingest, validate, and evaluate an incoming dispute with 3DS/CE3.0 viability engine.
+- `POST /v1/chargebacks/webhook`: Automated inbound webhook receiver from card scheme APIs or payment gateways.
+- `GET /v1/chargebacks`: Multi-criteria query interface (`tenant_id`, `scheme`, `stage`, `category`, `expired_only`).
+- `GET /v1/chargebacks/summary`: Portfolio-level aggregation (dispute counts, disputed amounts, stage & category breakdowns).
+- `GET /v1/chargebacks/{dispute_id}`: Retrieve detailed dispute state, deadlines, liability shift status, and audit trail.
+- `POST /v1/chargebacks/{dispute_id}/represent`: Submit representment evidence package and transition to `represented`.
+- `POST /v1/chargebacks/{dispute_id}/resolve`: Terminal dispute finalization (`resolved_won`, `resolved_lost`, `accepted_liability`) with automatic feedback label publication to `feedback.py`.
+- Prometheus metrics: `fraud_chargebacks_received_total`, `fraud_chargebacks_represented_total`, `fraud_chargebacks_won_total`, `fraud_chargebacks_lost_total`, `fraud_chargeback_financial_exposure_amount`.
+
 ## Reference label-delay analysis
 
 
@@ -1968,6 +2021,7 @@ src/fraud_detection/
 ├── api.py            # versioned online prediction service, circuit breakers, and traffic shadowing
 ├── audit.py          # structured JSONL audit logs with Luhn PAN redaction and log replay
 ├── cases.py          # fraud case management, SLA tracking, and dispute evidence packaging
+├── chargeback.py     # card scheme dispute ingestion, reason code taxonomy, and automated representment
 ├── challenge.py      # step-up authentication, 3DS challenge orchestration, and token verification
 ├── cli.py            # training, comparison, surveillance, profiling, simulation, and serving CLI
 ├── data.py           # ingestion, schema validation, and synthetic data
