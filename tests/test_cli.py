@@ -9380,3 +9380,377 @@ def test_case_management_cli(tmp_path: Path) -> None:
     assert res_e_tbl.exit_code == 0
     assert f"Case ID:      {case_1_id}" in res_e_tbl.output
     assert "Integrity:    True" in res_e_tbl.output
+
+
+def test_chargeback_cli_commands(tmp_path: Path) -> None:
+    """Validate all chargeback-* CLI commands: ingest, list, inspect, represent, resolve."""
+    from fraud_detection.cli import app
+
+    runner = CliRunner()
+    store_file = tmp_path / "chargebacks.json"
+
+    # 1. chargeback-ingest: invalid scheme -> exit 2
+    res_bad_scheme = runner.invoke(
+        app,
+        [
+            "chargeback-ingest",
+            "-x",
+            "tx1",
+            "--scheme",
+            "invalid_scheme",
+            "-r",
+            "10.4",
+        ],
+    )
+    assert res_bad_scheme.exit_code == 2
+    assert "Invalid card scheme" in res_bad_scheme.output
+
+    # 1b. chargeback-ingest: validation error (negative amount) -> exit 2
+    res_bad_amt = runner.invoke(
+        app,
+        [
+            "chargeback-ingest",
+            "-x",
+            "tx1",
+            "--scheme",
+            "visa",
+            "-r",
+            "10.4",
+            "-a",
+            "-50.0",
+        ],
+    )
+    assert res_bad_amt.exit_code == 2
+    assert "Failed to ingest chargeback" in res_bad_amt.output
+
+    # 1c. chargeback-ingest: without store_file -> exit 0
+    res_no_store = runner.invoke(
+        app,
+        [
+            "chargeback-ingest",
+            "-x",
+            "tx_no_store",
+            "--scheme",
+            "visa",
+            "-r",
+            "10.4",
+            "-a",
+            "200.0",
+        ],
+    )
+    assert res_no_store.exit_code == 0
+    parsed_no_store = json.loads(res_no_store.output)
+    assert parsed_no_store["transaction_id"] == "tx_no_store"
+    assert parsed_no_store["dispute_id"].startswith("dsp_")
+
+    # 2. chargeback-ingest: valid ingest writing to store_file
+    res_ingest_1 = runner.invoke(
+        app,
+        [
+            "chargeback-ingest",
+            "-x",
+            "tx_cli_001",
+            "--scheme",
+            "visa",
+            "-r",
+            "10.4",
+            "-a",
+            "450.0",
+            "-c",
+            "USD",
+            "-t",
+            "tenant_omega",
+            "--scheme-dispute-id",
+            "vrol_99",
+            "-s",
+            str(store_file),
+        ],
+    )
+    assert res_ingest_1.exit_code == 0
+    d1 = json.loads(res_ingest_1.output)
+    d1_id = d1["dispute_id"]
+    assert d1_id.startswith("dsp_")
+    assert store_file.is_file()
+
+    # 3. chargeback-ingest: table format
+    res_ingest_2 = runner.invoke(
+        app,
+        [
+            "chargeback-ingest",
+            "-x",
+            "tx_cli_002",
+            "--scheme",
+            "mastercard",
+            "-r",
+            "4853",
+            "-a",
+            "120.0",
+            "-t",
+            "tenant_omega",
+            "-s",
+            str(store_file),
+            "-f",
+            "table",
+        ],
+    )
+    assert res_ingest_2.exit_code == 0
+    assert "Dispute ID:" in res_ingest_2.output
+    assert "Scheme:         mastercard" in res_ingest_2.output
+    assert "Category:       consumer_dispute" in res_ingest_2.output
+
+    # Read back records from store_file
+    stored_records = json.loads(store_file.read_text(encoding="utf-8"))
+    assert len(stored_records) == 2
+    d2_id = stored_records[1]["dispute_id"]
+
+    # 4. chargeback-list: invalid / missing store file -> exit 2
+    res_l_missing = runner.invoke(app, ["chargeback-list", "-s", str(tmp_path / "none.json")])
+    assert res_l_missing.exit_code == 2
+
+    corrupt_store = tmp_path / "corrupt.json"
+    corrupt_store.write_text("{corrupt", encoding="utf-8")
+    res_l_corrupt = runner.invoke(app, ["chargeback-list", "-s", str(corrupt_store)])
+    assert res_l_corrupt.exit_code == 2
+
+    non_list_store = tmp_path / "non_list.json"
+    non_list_store.write_text('{"key": "val"}', encoding="utf-8")
+    res_l_non_list = runner.invoke(app, ["chargeback-list", "-s", str(non_list_store)])
+    assert res_l_non_list.exit_code == 2
+
+    # 5. chargeback-list: filters
+    res_l_all = runner.invoke(app, ["chargeback-list", "-s", str(store_file)])
+    assert res_l_all.exit_code == 0
+    assert json.loads(res_l_all.output)["total_count"] == 2
+
+    res_l_visa = runner.invoke(
+        app,
+        ["chargeback-list", "-s", str(store_file), "--scheme", "visa"],
+    )
+    assert res_l_visa.exit_code == 0
+    assert json.loads(res_l_visa.output)["total_count"] == 1
+
+    res_l_cat = runner.invoke(
+        app,
+        ["chargeback-list", "-s", str(store_file), "--category", "consumer_dispute"],
+    )
+    assert res_l_cat.exit_code == 0
+    assert json.loads(res_l_cat.output)["total_count"] == 1
+
+    res_l_tenant = runner.invoke(
+        app,
+        ["chargeback-list", "-s", str(store_file), "-t", "tenant_omega"],
+    )
+    assert res_l_tenant.exit_code == 0
+    assert json.loads(res_l_tenant.output)["total_count"] == 2
+
+    res_l_stage = runner.invoke(
+        app,
+        ["chargeback-list", "-s", str(store_file), "--stage", "first_chargeback"],
+    )
+    assert res_l_stage.exit_code == 0
+    assert json.loads(res_l_stage.output)["total_count"] == 2
+
+    res_l_exp = runner.invoke(
+        app,
+        ["chargeback-list", "-s", str(store_file), "--expired-only"],
+    )
+    assert res_l_exp.exit_code == 0
+    assert json.loads(res_l_exp.output)["total_count"] == 0
+
+    # Table format list
+    res_l_tbl = runner.invoke(
+        app,
+        ["chargeback-list", "-s", str(store_file), "-f", "table"],
+    )
+    assert res_l_tbl.exit_code == 0
+    assert "DISPUTE ID" in res_l_tbl.output
+    assert "WINNABILITY" in res_l_tbl.output
+
+    # Table format empty match
+    res_l_empty = runner.invoke(
+        app,
+        ["chargeback-list", "-s", str(store_file), "-t", "nonexistent_tenant", "-f", "table"],
+    )
+    assert res_l_empty.exit_code == 0
+    assert "No chargeback disputes found." in res_l_empty.output
+
+    # 6. chargeback-inspect: missing / not found / valid
+    res_i_missing = runner.invoke(
+        app,
+        ["chargeback-inspect", "-s", str(tmp_path / "none.json"), "-d", d1_id],
+    )
+    assert res_i_missing.exit_code == 2
+
+    res_i_not_found = runner.invoke(
+        app,
+        ["chargeback-inspect", "-s", str(store_file), "-d", "dsp_nonexistent"],
+    )
+    assert res_i_not_found.exit_code == 2
+    assert "not found in store file" in res_i_not_found.output
+
+    res_i_json = runner.invoke(
+        app,
+        ["chargeback-inspect", "-s", str(store_file), "-d", d1_id],
+    )
+    assert res_i_json.exit_code == 0
+    assert json.loads(res_i_json.output)["dispute_id"] == d1_id
+
+    res_i_tbl = runner.invoke(
+        app,
+        ["chargeback-inspect", "-s", str(store_file), "-d", d1_id, "-f", "table"],
+    )
+    assert res_i_tbl.exit_code == 0
+    assert f"Dispute ID:      {d1_id}" in res_i_tbl.output
+    assert "Scheme:          visa" in res_i_tbl.output
+
+    # 7. chargeback-represent: missing / not found / valid
+    res_rep_missing = runner.invoke(
+        app,
+        ["chargeback-represent", "-s", str(tmp_path / "none.json"), "-d", d1_id],
+    )
+    assert res_rep_missing.exit_code == 2
+
+    res_rep_not_found = runner.invoke(
+        app,
+        ["chargeback-represent", "-s", str(store_file), "-d", "dsp_nonexistent"],
+    )
+    assert res_rep_not_found.exit_code == 2
+
+    res_rep_valid = runner.invoke(
+        app,
+        [
+            "chargeback-represent",
+            "-s",
+            str(store_file),
+            "-d",
+            d1_id,
+            "-p",
+            "pkg_cli_01",
+            "--fingerprint",
+            "f" * 64,
+            "-n",
+            "Compelling evidence attached",
+            "--actor",
+            "analyst_bob",
+            "-f",
+            "table",
+        ],
+    )
+    assert res_rep_valid.exit_code == 0
+    assert "Stage:          represented" in res_rep_valid.output
+    assert "Package ID:     pkg_cli_01" in res_rep_valid.output
+
+    # Represent second dispute with JSON format
+    res_rep_d2 = runner.invoke(
+        app,
+        [
+            "chargeback-represent",
+            "-s",
+            str(store_file),
+            "-d",
+            d2_id,
+            "-p",
+            "pkg_cli_02",
+        ],
+    )
+    assert res_rep_d2.exit_code == 0
+    assert json.loads(res_rep_d2.output)["stage"] == "represented"
+
+    # 8. chargeback-resolve: invalid outcome / missing / not found / valid
+    res_res_bad_outcome = runner.invoke(
+        app,
+        [
+            "chargeback-resolve",
+            "-s",
+            str(store_file),
+            "-d",
+            d1_id,
+            "-o",
+            "invalid_stage",
+        ],
+    )
+    assert res_res_bad_outcome.exit_code == 2
+    assert "Invalid outcome" in res_res_bad_outcome.output
+
+    res_res_missing = runner.invoke(
+        app,
+        [
+            "chargeback-resolve",
+            "-s",
+            str(tmp_path / "none.json"),
+            "-d",
+            d1_id,
+            "-o",
+            "resolved_won",
+        ],
+    )
+    assert res_res_missing.exit_code == 2
+
+    res_res_not_found = runner.invoke(
+        app,
+        [
+            "chargeback-resolve",
+            "-s",
+            str(store_file),
+            "-d",
+            "dsp_nonexistent",
+            "-o",
+            "resolved_won",
+        ],
+    )
+    assert res_res_not_found.exit_code == 2
+
+    # Resolve d1 as resolved_won
+    res_res_won = runner.invoke(
+        app,
+        [
+            "chargeback-resolve",
+            "-s",
+            str(store_file),
+            "-d",
+            d1_id,
+            "-o",
+            "resolved_won",
+            "--actor",
+            "scheme_gateway",
+            "-n",
+            "Merchant victory",
+            "-f",
+            "table",
+        ],
+    )
+    assert res_res_won.exit_code == 0
+    assert "Stage:       resolved_won" in res_res_won.output
+    assert "Terminal:    True" in res_res_won.output
+
+    # Cannot represent an already resolved dispute
+    res_rep_resolved = runner.invoke(
+        app,
+        [
+            "chargeback-represent",
+            "-s",
+            str(store_file),
+            "-d",
+            d1_id,
+        ],
+    )
+    assert res_rep_resolved.exit_code == 2
+    assert "Failed to represent dispute" in res_rep_resolved.output
+
+    # Resolve d2 as resolved_lost
+    res_res_lost = runner.invoke(
+        app,
+        [
+            "chargeback-resolve",
+            "-s",
+            str(store_file),
+            "-d",
+            d2_id,
+            "-o",
+            "resolved_lost",
+        ],
+    )
+    assert res_res_lost.exit_code == 0
+    d2_resolved = json.loads(res_res_lost.output)
+    assert d2_resolved["stage"] == "resolved_lost"
+    assert d2_resolved["is_terminal"] is True
