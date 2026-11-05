@@ -402,3 +402,24 @@ def test_resolve_tenant_ruleset_inherit_and_override() -> None:
     assert overridden_rule.action == RuleAction.DENY
     assert overridden_rule.priority == 15
     assert overridden_rule.name == "Tenant override of base rule 1"
+
+
+def test_tenant_registry_edge_cases() -> None:
+    """Validate invalid config, nonexistent updates, and capacity eviction edge cases."""
+    with pytest.raises(TenantValidationError, match="max_tenants must be positive"):
+        TenantRegistryConfig(max_tenants=0)
+
+    with pytest.raises(TenantValidationError, match="Invalid default_tenant_id"):
+        TenantRegistryConfig(default_tenant_id="invalid spaces")
+
+    reg = TenantRegistry()
+    with pytest.raises(TenantNotFoundError, match="not found for status update"):
+        reg.update_status("nonexistent", TenantStatus.SUSPENDED)
+
+    with pytest.raises(TenantNotFoundError, match="not found for profile update"):
+        reg.update_risk_profile("nonexistent", TenantRiskProfile())
+
+    # Eviction when only default tenant exists at capacity
+    cap_reg = TenantRegistry(config=TenantRegistryConfig(max_tenants=1))
+    cap_reg.register(TenantContext(tenant_id="new-tenant"))
+    assert cap_reg.count() == 2

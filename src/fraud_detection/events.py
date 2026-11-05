@@ -97,6 +97,9 @@ class EventType(StrEnum):
     CASE_STATUS_CHANGED = "fraud.case.status_changed"
     CASE_RESOLVED = "fraud.case.resolved"
     EVIDENCE_PACKAGED = "fraud.case.evidence_packaged"
+    CHARGEBACK_INGESTED = "fraud.chargeback.ingested"
+    CHARGEBACK_REPRESENTED = "fraud.chargeback.represented"
+    CHARGEBACK_RESOLVED = "fraud.chargeback.resolved"
 
 
 class EventDeliveryStatus(StrEnum):

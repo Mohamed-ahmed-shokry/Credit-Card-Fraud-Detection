@@ -6015,3 +6015,358 @@ def test_case_api_error_branches(api_context: tuple[Path, Any, Path]) -> None:
             )
             assert res_ev_fail.status_code == 400
             assert "Forced packaging failure" in res_ev_fail.json()["detail"]
+
+
+def test_chargeback_api_endpoints_and_lifecycle(api_context: tuple[Path, Any, Path]) -> None:
+    """Validate /v1/chargebacks/* REST endpoints: ingest, webhook, represent, resolve."""
+    from fraud_detection.chargeback import ChargebackManager
+
+    _, model, _ = api_context
+    mgr = ChargebackManager()
+
+    with TestClient(create_app(model=model, chargeback_manager=mgr)) as client:
+        # 1. GET /v1/chargebacks/summary: initially empty
+        res = client.get("/v1/chargebacks/summary")
+        assert res.status_code == 200
+        summary = res.json()
+        assert summary["total_disputes"] == 0
+        assert summary["total_disputed_amount"] == 0.0
+
+        # 2. GET /v1/chargebacks: initially empty
+        res_list = client.get("/v1/chargebacks")
+        assert res_list.status_code == 200
+        assert res_list.json()["total_count"] == 0
+
+        # 3. POST /v1/chargebacks: ingest card scheme chargeback
+        ingest_payload = {
+            "transaction_id": "tx_cb_api_001",
+            "scheme": "visa",
+            "reason_code": "10.4",
+            "disputed_amount": 350.0,
+            "currency": "USD",
+            "tenant_id": "tenant_api_beta",
+            "scheme_dispute_id": "vrol_disp_991",
+            "transaction_context": {"eci": "05", "is_3ds_authenticated": True},
+            "evidence_package": {"package_id": "pkg_api_01", "evidence_fingerprint": "a" * 64},
+        }
+        create_res = client.post("/v1/chargebacks", json=ingest_payload)
+        assert create_res.status_code == 201
+        created = create_res.json()
+        dispute_id = created["dispute_id"]
+        assert dispute_id.startswith("dsp_")
+        assert created["scheme"] == "visa"
+        assert created["category"] == "fraud_card_not_present"
+        assert created["stage"] == "first_chargeback"
+        assert created["winnability_score"] >= 0.70
+        assert created["liability_shift_proven"] is True
+
+        # 4. GET /v1/chargebacks/{dispute_id}: retrieve dispute details
+        get_res = client.get(f"/v1/chargebacks/{dispute_id}")
+        assert get_res.status_code == 200
+        assert get_res.json()["dispute_id"] == dispute_id
+
+        # 5. POST /v1/chargebacks/webhook: gateway webhook notification
+        webhook_payload = {
+            "event_type": "chargeback.created",
+            "scheme": "mastercard",
+            "scheme_dispute_id": "mcom_disp_772",
+            "transaction_id": "tx_cb_api_002",
+            "reason_code": "4853",
+            "amount": 125.0,
+            "currency": "USD",
+            "tenant_id": "tenant_api_beta",
+            "metadata": {"source": "webhook"},
+        }
+        webhook_res = client.post("/v1/chargebacks/webhook", json=webhook_payload)
+        assert webhook_res.status_code == 201
+        webhook_data = webhook_res.json()
+        assert webhook_data["scheme"] == "mastercard"
+        assert webhook_data["category"] == "consumer_dispute"
+        dispute_id_mc = webhook_data["dispute_id"]
+
+        # 6. Filter queries on GET /v1/chargebacks
+        list_visa = client.get("/v1/chargebacks?scheme=visa")
+        assert list_visa.status_code == 200
+        assert list_visa.json()["total_count"] == 1
+
+        list_cat = client.get("/v1/chargebacks?category=consumer_dispute")
+        assert list_cat.status_code == 200
+        assert list_cat.json()["total_count"] == 1
+
+        # 7. POST /v1/chargebacks/{dispute_id}/represent: submit representment
+        rep_payload = {
+            "package_id": "pkg_rep_100",
+            "evidence_fingerprint": "f" * 64,
+            "notes": "3DS Liability shift evidence submitted",
+            "actor": "senior_analyst",
+        }
+        rep_res = client.post(f"/v1/chargebacks/{dispute_id}/represent", json=rep_payload)
+        assert rep_res.status_code == 200
+        represented = rep_res.json()
+        assert represented["stage"] == "represented"
+        assert represented["representment_package_id"] == "pkg_rep_100"
+
+        # 8. POST /v1/chargebacks/{dispute_id}/resolve: finalize dispute
+        resolve_payload = {
+            "outcome": "resolved_won",
+            "actor": "scheme_gateway",
+            "notes": "Arbitration concluded in merchant favor",
+        }
+        res_res = client.post(f"/v1/chargebacks/{dispute_id}/resolve", json=resolve_payload)
+        assert res_res.status_code == 200
+        resolved = res_res.json()
+        assert resolved["stage"] == "resolved_won"
+        assert resolved["is_terminal"] is True
+
+        # Represent then resolve the second dispute as resolved_lost
+        client.post(f"/v1/chargebacks/{dispute_id_mc}/represent", json={"notes": "Defended"})
+        resolve_lost_payload = {
+            "outcome": "resolved_lost",
+            "actor": "scheme_gateway",
+            "notes": "Issuer upheld dispute after representment",
+        }
+        res_lost = client.post(
+            f"/v1/chargebacks/{dispute_id_mc}/resolve", json=resolve_lost_payload
+        )
+        assert res_lost.status_code == 200
+        assert res_lost.json()["stage"] == "resolved_lost"
+
+        # 9. GET /v1/chargebacks/summary: verify aggregate counts
+        sum_after = client.get("/v1/chargebacks/summary?tenant_id=tenant_api_beta")
+        assert sum_after.status_code == 200
+        sum_data = sum_after.json()
+        assert sum_data["total_disputes"] == 2
+        assert sum_data["total_disputed_amount"] == 475.0
+        assert sum_data["by_stage"]["resolved_won"] == 1
+        assert sum_data["by_stage"]["resolved_lost"] == 1
+
+        # 10. Check Prometheus metrics
+        metrics_res = client.get("/metrics")
+        assert metrics_res.status_code == 200
+        metrics_text = metrics_res.text
+        assert "fraud_chargebacks_received_total" in metrics_text
+        assert "fraud_chargebacks_represented_total" in metrics_text
+        assert "fraud_chargebacks_won_total" in metrics_text
+        assert "fraud_chargebacks_lost_total" in metrics_text
+        assert "fraud_chargeback_financial_exposure_amount" in metrics_text
+
+
+def test_chargeback_api_error_branches_and_edge_cases(
+    api_context: tuple[Path, Any, Path],
+) -> None:
+    """Verify error branches, 404s, 400s, and uninitialized manager for /v1/chargebacks/*."""
+    from unittest.mock import patch
+
+    from fraud_detection.chargeback import CardScheme, ChargebackManager, DisputeValidationError
+
+    _, model, _ = api_context
+
+    # 1. Uninitialized manager returns 500 (or empty list)
+    with TestClient(create_app(model=model, chargeback_manager=None)) as uninit_client:
+        cast(Any, uninit_client.app).state.chargeback_manager = None
+        assert uninit_client.get("/v1/chargebacks").json() == {"total_count": 0, "disputes": []}
+        assert uninit_client.get("/v1/chargebacks/summary").status_code == 500
+        assert (
+            uninit_client.post(
+                "/v1/chargebacks",
+                json={
+                    "transaction_id": "tx1",
+                    "scheme": "visa",
+                    "reason_code": "10.4",
+                    "disputed_amount": 50.0,
+                },
+            ).status_code
+            == 500
+        )
+        assert (
+            uninit_client.post(
+                "/v1/chargebacks/webhook",
+                json={
+                    "scheme": "visa",
+                    "scheme_dispute_id": "d1",
+                    "transaction_id": "tx1",
+                    "reason_code": "10.4",
+                    "amount": 50.0,
+                },
+            ).status_code
+            == 500
+        )
+        assert uninit_client.get("/v1/chargebacks/disp_none").status_code == 500
+        assert (
+            uninit_client.post(
+                "/v1/chargebacks/disp_none/represent",
+                json={},
+            ).status_code
+            == 500
+        )
+        assert (
+            uninit_client.post(
+                "/v1/chargebacks/disp_none/resolve",
+                json={"outcome": "resolved_won"},
+            ).status_code
+            == 500
+        )
+
+    mgr = ChargebackManager()
+    with TestClient(create_app(model=model, chargeback_manager=mgr)) as client:
+        # 2. 404 for nonexistent dispute
+        assert client.get("/v1/chargebacks/disp_nonexistent").status_code == 404
+        assert client.post("/v1/chargebacks/disp_nonexistent/represent", json={}).status_code == 404
+        assert (
+            client.post(
+                "/v1/chargebacks/disp_nonexistent/resolve",
+                json={"outcome": "resolved_won"},
+            ).status_code
+            == 404
+        )
+
+        # 3. 400 for invalid query parameters
+        assert client.get("/v1/chargebacks?scheme=invalid_scheme").status_code == 400
+        assert client.get("/v1/chargebacks?stage=invalid_stage").status_code == 400
+        assert client.get("/v1/chargebacks?category=invalid_cat").status_code == 400
+
+        # 4. 400 for invalid payload parameters in ingest
+        res_bad_scheme = client.post(
+            "/v1/chargebacks",
+            json={
+                "transaction_id": "tx_bad",
+                "scheme": "unsupported_scheme",
+                "reason_code": "10.4",
+                "disputed_amount": 100.0,
+            },
+        )
+        assert res_bad_scheme.status_code == 400
+
+        res_bad_amt = client.post(
+            "/v1/chargebacks",
+            json={
+                "transaction_id": "tx_bad",
+                "scheme": "visa",
+                "reason_code": "10.4",
+                "disputed_amount": -100.0,
+            },
+        )
+        assert res_bad_amt.status_code == 400
+
+        # 5. 400 for invalid scheme in webhook
+        res_bad_wh = client.post(
+            "/v1/chargebacks/webhook",
+            json={
+                "scheme": "unknown_network",
+                "scheme_dispute_id": "d1",
+                "transaction_id": "tx1",
+                "reason_code": "10.4",
+                "amount": 50.0,
+            },
+        )
+        assert res_bad_wh.status_code == 400
+
+        # 6. Ingest valid dispute and test illegal transitions
+        ingest_res = client.post(
+            "/v1/chargebacks",
+            json={
+                "transaction_id": "tx_err_test",
+                "scheme": "discover",
+                "reason_code": "4837",
+                "disputed_amount": 75.0,
+            },
+        )
+        assert ingest_res.status_code == 201
+        d_id = ingest_res.json()["dispute_id"]
+
+        # Invalid outcome in resolve
+        res_bad_out = client.post(
+            f"/v1/chargebacks/{d_id}/resolve",
+            json={"outcome": "invalid_outcome"},
+        )
+        assert res_bad_out.status_code == 400
+
+        # Resolve to terminal accepted_liability
+        res_term = client.post(
+            f"/v1/chargebacks/{d_id}/resolve",
+            json={"outcome": "accepted_liability"},
+        )
+        assert res_term.status_code == 200
+        assert res_term.json()["stage"] == "accepted_liability"
+
+        # Cannot represent a terminal dispute
+        res_term_rep = client.post(f"/v1/chargebacks/{d_id}/represent", json={})
+        assert res_term_rep.status_code == 400
+
+        # 7. Mock DisputeValidationError in webhook
+        with patch.object(
+            mgr,
+            "ingest_chargeback",
+            side_effect=DisputeValidationError("Forced validation error"),
+        ):
+            res_wh_err = client.post(
+                "/v1/chargebacks/webhook",
+                json={
+                    "scheme": "visa",
+                    "scheme_dispute_id": "d_err",
+                    "transaction_id": "tx_wh_err",
+                    "reason_code": "10.4",
+                    "amount": 50.0,
+                },
+            )
+            assert res_wh_err.status_code == 400
+            assert "Forced validation error" in res_wh_err.json()["detail"]
+
+        # 8. Feedback label publishing error during resolve is handled gracefully
+        d_res_lbl = mgr.ingest_chargeback(
+            transaction_id="tx_lbl_err",
+            scheme=CardScheme.VISA,
+            reason_code="10.4",
+            disputed_amount=80.0,
+        )
+        mgr.represent_dispute(d_res_lbl.dispute_id)
+        with patch.object(
+            mgr,
+            "publish_feedback_label",
+            side_effect=RuntimeError("Label store write failed"),
+        ):
+            res_resolve_lbl_err = client.post(
+                f"/v1/chargebacks/{d_res_lbl.dispute_id}/resolve",
+                json={"outcome": "resolved_won"},
+            )
+            assert res_resolve_lbl_err.status_code == 200
+            assert res_resolve_lbl_err.json()["stage"] == "resolved_won"
+
+        # 9. Illegal resolution transition (resolving already terminal dispute) returns 400
+        res_already_term = client.post(
+            f"/v1/chargebacks/{d_res_lbl.dispute_id}/resolve",
+            json={"outcome": "resolved_lost"},
+        )
+        assert res_already_term.status_code == 400
+
+        # 10. Operations when metrics counters/gauges are None on app.state
+        cast(Any, client.app).state.chargebacks_received_counter = None
+        cast(Any, client.app).state.chargebacks_represented_counter = None
+        cast(Any, client.app).state.chargebacks_won_counter = None
+        cast(Any, client.app).state.chargebacks_lost_counter = None
+        cast(Any, client.app).state.chargeback_exposure_gauge = None
+        cast(Any, client.app).state.label_store = None
+
+        res_no_metric_ingest = client.post(
+            "/v1/chargebacks",
+            json={
+                "transaction_id": "tx_no_metrics",
+                "scheme": "visa",
+                "reason_code": "10.4",
+                "disputed_amount": 90.0,
+            },
+        )
+        assert res_no_metric_ingest.status_code == 201
+        d_no_metric_id = res_no_metric_ingest.json()["dispute_id"]
+
+        res_no_metric_rep = client.post(
+            f"/v1/chargebacks/{d_no_metric_id}/represent",
+            json={"notes": "defended without metrics"},
+        )
+        assert res_no_metric_rep.status_code == 200
+
+        res_no_metric_res = client.post(
+            f"/v1/chargebacks/{d_no_metric_id}/resolve",
+            json={"outcome": "resolved_lost"},
+        )
+        assert res_no_metric_res.status_code == 200

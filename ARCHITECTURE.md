@@ -634,6 +634,50 @@ flowchart TD
 - **API, CLI & Telemetry Integration**: Exposes REST endpoints (`/v1/cases/*`), CLI commands (`case-create`, `case-list`, `case-inspect`, `case-resolve`, `case-evidence`), and Prometheus counters (`fraud_cases_total`, `fraud_cases_resolved_total`, `fraud_case_sla_breaches_total`, `fraud_evidence_packages_generated_total`).
 
 
+## Card Scheme Chargeback Ingestion, Reason Code Taxonomy & Automated Representment Gateway (Phase 46)
+
+The platform incorporates an in-process, zero-dependency Card Scheme Chargeback Ingestion, Reason Code Taxonomy, Representment Viability Engine, and Representment Gateway (`chargeback.py`). Inbound post-authorization dispute notices across major networks (Visa, Mastercard, American Express, Discover) are classified, evaluated for liability shift and network deflection rules (Visa CE3.0 / Mastercard First-Party Trust), defended with cryptographic evidence packages, and forwarded into the continuous learning feedback pipeline.
+
+```mermaid
+flowchart TD
+    subgraph Ingestion & Taxonomy
+        Webhook["Gateway Webhook\nPOST /v1/chargebacks/webhook"] --> CM["ChargebackManager"]
+        Manual["Analyst API / CLI\nPOST /v1/chargebacks"] --> CM
+        CM --> Reg["ReasonCodeRegistry\n(Visa, Mastercard, Amex, Discover)"]
+        Reg --> Cat["Normalized ChargebackCategory\n(Fraud CNP/CP, Friendly Fraud, Consumer, Auth)"]
+    end
+
+    subgraph Representment Viability Engine
+        CM --> Viability["evaluate_representment_viability"]
+        Viability --> ThreeDS["3DS Liability Shift Check\n(ECI 05/02/06 / CAVV Verification)"]
+        Viability --> CE3["CE3.0 / First-Party Trust Rules\n(>=2 Qualifying Undisputed Prior Txns\nDevice / IP / Account Hash Match)"]
+        Viability --> Score["Winnability Score & Action\n(REPRESENT, ACCEPT_LIABILITY, PRE_ARBITRATION)"]
+    end
+
+    subgraph Dispute Lifecycle & Store
+        CM --> Store[("ChargebackStore\n(Thread-Safe Multi-Index)")]
+        Store --> StateMachine["Dispute State Machine\nFIRST_CHARGEBACK -> REPRESENTED\n-> PRE_ARBITRATION -> ARBITRATION\n-> RESOLVED_WON / RESOLVED_LOST / EXPIRED"]
+        Store --> ExpireTimer["Response Deadline Surveillance\n(is_expired, days_remaining)"]
+    end
+
+    subgraph Continuous Learning & Interfaces
+        CM -->|Publish CHARGEBACK_INGESTED / REPRESENTED / RESOLVED| Bus["EventBus"]
+        CM -->|Forward Realized Labels on Resolution| Feedback["Feedback LabelIngestionStore\n(DelayedLabelRecord)"]
+        Store --> API["FastAPI /v1/chargebacks/*\nPrometheus Exposure & Win Metrics"]
+        Store --> CLI["Typer CLI: chargeback-ingest, chargeback-list,\nchargeback-inspect, chargeback-represent, chargeback-resolve"]
+    end
+```
+
+### Key Components
+
+- **Card Scheme Reason Code Taxonomy (`chargeback.py`)**: `ReasonCodeRegistry` provides standard network taxonomies for Visa (e.g., 10.4 Fraud CNP, 13.1 Merchandise Not Received), Mastercard (e.g., 4837 Fraud CNP, 4853 Cardholder Dispute), American Express (e.g., FR2, C08), and Discover (e.g., 4837, 4853). Automatically infers network-specific response windows (e.g. 30 days Visa/MC, 20 days Amex) and maps reasons into normalized categories.
+- **Representment Viability & Liability Shift Engine**: Calculates objective representment winnability scores ($0.0$ to $1.0$) based on protocol verification proofs. Analyzes 3D-Secure Electronic Commerce Indicators (ECI `05` / `02` for fully authenticated liability shift; `06` / `01` for merchant liability protection attempts) and generates representment recommendations.
+- **Visa Compelling Evidence 3.0 (CE3.0) & Mastercard First-Party Trust Qualification**: Defends against first-party/friendly fraud claims by auditing prior transaction history for at least 2 qualifying historical undisputed purchases ($\ge 120$ days prior) matching IP address, device fingerprint, or customer credentials.
+- **Thread-Safe Dispute Store & Lifecycle Gateway**: `ChargebackStore` manages secondary indexes by `dispute_id`, `transaction_id`, `scheme_dispute_id`, and `tenant_id` with bounded capacity eviction. `ChargebackManager` enforces network state transition constraints, deadline tracking, audit logging, and evidence attachment.
+- **Continuous Learning Feedback Loop**: When chargebacks reach terminal resolution (`resolved_won`, `resolved_lost`, `accepted_liability`), `publish_feedback_label` converts outcomes into `DelayedLabelRecord` and submits them to `feedback.py` (`LabelIngestionStore`), updating realized precision/recall surveillance and triggering automated model retraining.
+- **API, CLI & Telemetry Integration**: Exposes REST endpoints (`/v1/chargebacks/*`, `/v1/chargebacks/webhook`), Typer CLI commands (`chargeback-ingest`, `chargeback-list`, `chargeback-inspect`, `chargeback-represent`, `chargeback-resolve`), and Prometheus metrics (`fraud_chargebacks_received_total`, `fraud_chargebacks_represented_total`, `fraud_chargebacks_won_total`, `fraud_chargebacks_lost_total`, `fraud_chargeback_financial_exposure_amount`).
+
+
 ## Extension guidance
 
 
