@@ -168,3 +168,158 @@ def test_ato_risk_assessment_validation_and_serialization() -> None:
     assert AtoRiskFactor.IMPOSSIBLE_TRAVEL in rebuilt.factors_triggered
     assert rebuilt.impossible_travel_kmh == 1250.5
     assert rebuilt.quarantined is True
+
+
+def test_credential_stuffing_ip_spraying() -> None:
+    """Test detection of an IP spraying failed passwords across multiple accounts."""
+    from datetime import timedelta
+
+    from fraud_detection.ato import CredentialStuffingDetector
+
+    detector = CredentialStuffingDetector(window_seconds=300, ip_spray_user_threshold=3)
+    now = datetime(2026, 11, 8, 14, 0, 0, tzinfo=UTC)
+
+    # 1st failure: user_1
+    detector.record_attempt(
+        LoginEvent(
+            user_id="user_1",
+            ip_address="203.0.113.5",
+            outcome=LoginOutcome.FAILED_CREDENTIALS,
+            timestamp=now,
+        )
+    )
+    is_spray, score, count = detector.check_ip_spraying("203.0.113.5", now)
+    assert not is_spray
+    assert count == 1
+    assert score == 0.0
+
+    # 2nd failure: user_2
+    detector.record_attempt(
+        LoginEvent(
+            user_id="user_2",
+            ip_address="203.0.113.5",
+            outcome=LoginOutcome.FAILED_CREDENTIALS,
+            timestamp=now + timedelta(seconds=10),
+        )
+    )
+    is_spray, score, count = detector.check_ip_spraying("203.0.113.5", now + timedelta(seconds=10))
+    assert not is_spray
+    assert count == 2
+
+    # 3rd failure: user_3 -> triggers threshold
+    detector.record_attempt(
+        LoginEvent(
+            user_id="user_3",
+            ip_address="203.0.113.5",
+            outcome=LoginOutcome.FAILED_CREDENTIALS,
+            timestamp=now + timedelta(seconds=20),
+        )
+    )
+    is_spray, score, count = detector.check_ip_spraying("203.0.113.5", now + timedelta(seconds=20))
+    assert is_spray
+    assert count == 3
+    assert score >= 0.5
+
+    # Evaluation returns PASSWORD_SPRAYING factor
+    eval_event = LoginEvent(
+        user_id="user_4",
+        ip_address="203.0.113.5",
+        outcome=LoginOutcome.FAILED_CREDENTIALS,
+        timestamp=now + timedelta(seconds=25),
+    )
+    eval_score, factors = detector.evaluate_stuffing_risk(eval_event)
+    assert AtoRiskFactor.PASSWORD_SPRAYING in factors
+    assert eval_score >= 0.5
+
+
+def test_credential_stuffing_distributed_brute_force() -> None:
+    """Test detection of a single user attacked from multiple distinct IPs."""
+    from datetime import timedelta
+
+    from fraud_detection.ato import CredentialStuffingDetector
+
+    detector = CredentialStuffingDetector(window_seconds=300, distributed_user_ip_threshold=3)
+    now = datetime(2026, 11, 8, 14, 0, 0, tzinfo=UTC)
+
+    # User targeted from 3 different IPs
+    for i in range(3):
+        detector.record_attempt(
+            LoginEvent(
+                user_id="target_vip",
+                ip_address=f"192.0.2.{10 + i}",
+                outcome=LoginOutcome.FAILED_CREDENTIALS,
+                timestamp=now + timedelta(seconds=i * 5),
+            )
+        )
+
+    is_bf, score, count = detector.check_distributed_brute_force(
+        "target_vip", now + timedelta(seconds=20)
+    )
+    assert is_bf
+    assert count == 3
+    assert score >= 0.5
+
+    eval_event = LoginEvent(
+        user_id="target_vip",
+        ip_address="192.0.2.99",
+        timestamp=now + timedelta(seconds=20),
+    )
+    eval_score, factors = detector.evaluate_stuffing_risk(eval_event)
+    assert AtoRiskFactor.CREDENTIAL_STUFFING_BURST in factors
+    assert eval_score >= 0.5
+
+
+def test_credential_stuffing_subnet_burst_and_window_expiry() -> None:
+    """Test subnet-level burst detection and window expiry."""
+    from datetime import timedelta
+
+    from fraud_detection.ato import CredentialStuffingDetector
+
+    detector = CredentialStuffingDetector(window_seconds=60, subnet_spray_threshold=3)
+    t0 = datetime(2026, 11, 8, 15, 0, 0, tzinfo=UTC)
+
+    # 3 failures across different IPs in 198.51.100.0/24 targeting 3 distinct users
+    for i in range(3):
+        detector.record_attempt(
+            LoginEvent(
+                user_id=f"user_{i}",
+                ip_address=f"198.51.100.{10 + i}",
+                outcome=LoginOutcome.FAILED_CREDENTIALS,
+                timestamp=t0 + timedelta(seconds=i * 2),
+            )
+        )
+
+    is_sub, score, count = detector.check_subnet_burst("198.51.100.50", t0 + timedelta(seconds=10))
+    assert is_sub
+    assert count == 3
+    assert score >= 0.4
+
+    # Test window expiry: at t0 + 120 seconds, previous attempts are pruned
+    t_later = t0 + timedelta(seconds=120)
+    is_sub_expired, score_expired, count_expired = detector.check_subnet_burst(
+        "198.51.100.50", t_later
+    )
+    assert not is_sub_expired
+    assert count_expired == 0
+    assert score_expired == 0.0
+
+    # Test IPv6 subnet extraction
+    detector.record_attempt(
+        LoginEvent(
+            user_id="ipv6_victim",
+            ip_address="2001:db8:85a3::8a2e:370:7334",
+            outcome=LoginOutcome.FAILED_CREDENTIALS,
+            timestamp=t_later,
+        )
+    )
+    is_sub_v6, _, _ = detector.check_subnet_burst("2001:db8:85a3::1", t_later)
+    assert not is_sub_v6  # only 1 attempt, below threshold of 3
+
+    # Test invalid IP fallback
+    invalid_sub = detector._extract_subnet("not-an-ip")  # noqa: SLF001
+    assert invalid_sub == "not-an-ip"
+
+    # Querying unrecorded IP / user
+    assert detector.check_ip_spraying("10.0.0.1")[0] is False
+    assert detector.check_distributed_brute_force("unknown_user")[0] is False
+    assert detector.check_subnet_burst("10.0.0.1")[0] is False
