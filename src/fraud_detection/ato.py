@@ -7,8 +7,11 @@ thread-safe store with automated defense orchestration (challenge/quarantine).
 
 from __future__ import annotations
 
+import ipaddress
+import threading
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Any
 from uuid import uuid4
@@ -259,3 +262,148 @@ class AtoRiskAssessment:
             timestamp=ts,
             details=dict(data.get("details", {})),
         )
+
+
+class CredentialStuffingDetector:
+    """Sliding-window credential stuffing, password spraying and brute force detector."""
+
+    def __init__(
+        self,
+        window_seconds: int = 300,
+        ip_spray_user_threshold: int = 3,
+        distributed_user_ip_threshold: int = 3,
+        subnet_spray_threshold: int = 5,
+    ) -> None:
+        self.window_seconds = window_seconds
+        self.ip_spray_user_threshold = ip_spray_user_threshold
+        self.distributed_user_ip_threshold = distributed_user_ip_threshold
+        self.subnet_spray_threshold = subnet_spray_threshold
+        self._lock = threading.RLock()
+        self._ip_events: dict[str, deque[LoginEvent]] = defaultdict(deque)
+        self._user_events: dict[str, deque[LoginEvent]] = defaultdict(deque)
+        self._subnet_events: dict[str, deque[LoginEvent]] = defaultdict(deque)
+
+    def _extract_subnet(self, ip_str: str) -> str:
+        """Extract /24 for IPv4 or /48 for IPv6 subnet prefix."""
+        try:
+            ip = ipaddress.ip_address(ip_str)
+            if ip.version == 4:
+                return str(ipaddress.ip_network(f"{ip}/24", strict=False))
+            return str(ipaddress.ip_network(f"{ip}/48", strict=False))
+        except ValueError:
+            return ip_str
+
+    def _prune_deque(self, q: deque[LoginEvent], cutoff: datetime) -> None:
+        """Prune events older than cutoff from front of deque."""
+        while q and q[0].timestamp < cutoff:
+            q.popleft()
+
+    def record_attempt(self, event: LoginEvent) -> None:
+        """Record an authentication event and maintain sliding window."""
+        with self._lock:
+            cutoff = event.timestamp - timedelta(seconds=self.window_seconds)
+            subnet = self._extract_subnet(event.ip_address)
+
+            ip_q = self._ip_events[event.ip_address]
+            ip_q.append(event)
+            self._prune_deque(ip_q, cutoff)
+
+            usr_q = self._user_events[event.user_id]
+            usr_q.append(event)
+            self._prune_deque(usr_q, cutoff)
+
+            sub_q = self._subnet_events[subnet]
+            sub_q.append(event)
+            self._prune_deque(sub_q, cutoff)
+
+    def check_ip_spraying(
+        self, ip_address: str, at_time: datetime | None = None
+    ) -> tuple[bool, float, int]:
+        """Check if an IP is spraying credentials across multiple user accounts."""
+        ref_time = at_time or datetime.now(UTC)
+        cutoff = ref_time - timedelta(seconds=self.window_seconds)
+
+        with self._lock:
+            q = self._ip_events.get(ip_address)
+            if not q:
+                return False, 0.0, 0
+            self._prune_deque(q, cutoff)
+
+            # Count distinct users failed from this IP
+            failed_users = {
+                e.user_id
+                for e in q
+                if e.outcome in (LoginOutcome.FAILED_CREDENTIALS, LoginOutcome.FAILED_MFA)
+            }
+            count = len(failed_users)
+            if count >= self.ip_spray_user_threshold:
+                score = min(1.0, 0.5 + 0.1 * (count - self.ip_spray_user_threshold))
+                return True, score, count
+            return False, 0.0, count
+
+    def check_distributed_brute_force(
+        self, user_id: str, at_time: datetime | None = None
+    ) -> tuple[bool, float, int]:
+        """Check if a single user account is being brute-forced from multiple IPs."""
+        ref_time = at_time or datetime.now(UTC)
+        cutoff = ref_time - timedelta(seconds=self.window_seconds)
+
+        with self._lock:
+            q = self._user_events.get(user_id)
+            if not q:
+                return False, 0.0, 0
+            self._prune_deque(q, cutoff)
+
+            failed_ips = {
+                e.ip_address
+                for e in q
+                if e.outcome in (LoginOutcome.FAILED_CREDENTIALS, LoginOutcome.FAILED_MFA)
+            }
+            count = len(failed_ips)
+            if count >= self.distributed_user_ip_threshold:
+                score = min(1.0, 0.5 + 0.1 * (count - self.distributed_user_ip_threshold))
+                return True, score, count
+            return False, 0.0, count
+
+    def check_subnet_burst(
+        self, ip_address: str, at_time: datetime | None = None
+    ) -> tuple[bool, float, int]:
+        """Check if a subnet (/24 or /48) is performing a distributed burst attack."""
+        ref_time = at_time or datetime.now(UTC)
+        cutoff = ref_time - timedelta(seconds=self.window_seconds)
+        subnet = self._extract_subnet(ip_address)
+
+        with self._lock:
+            q = self._subnet_events.get(subnet)
+            if not q:
+                return False, 0.0, 0
+            self._prune_deque(q, cutoff)
+
+            failed_users = {
+                e.user_id
+                for e in q
+                if e.outcome in (LoginOutcome.FAILED_CREDENTIALS, LoginOutcome.FAILED_MFA)
+            }
+            count = len(failed_users)
+            if count >= self.subnet_spray_threshold:
+                score = min(1.0, 0.4 + 0.1 * (count - self.subnet_spray_threshold))
+                return True, score, count
+            return False, 0.0, count
+
+    def evaluate_stuffing_risk(self, event: LoginEvent) -> tuple[float, list[AtoRiskFactor]]:
+        """Evaluate credential stuffing risk for an event and return triggered factors."""
+        factors: list[AtoRiskFactor] = []
+        is_spray, spray_score, _ = self.check_ip_spraying(event.ip_address, event.timestamp)
+        if is_spray:
+            factors.append(AtoRiskFactor.PASSWORD_SPRAYING)
+
+        is_bf, bf_score, _ = self.check_distributed_brute_force(event.user_id, event.timestamp)
+        if is_bf:
+            factors.append(AtoRiskFactor.CREDENTIAL_STUFFING_BURST)
+
+        is_sub, sub_score, _ = self.check_subnet_burst(event.ip_address, event.timestamp)
+        if is_sub and AtoRiskFactor.CREDENTIAL_STUFFING_BURST not in factors:
+            factors.append(AtoRiskFactor.CREDENTIAL_STUFFING_BURST)
+
+        max_score = max(spray_score, bf_score, sub_score)
+        return max_score, factors
