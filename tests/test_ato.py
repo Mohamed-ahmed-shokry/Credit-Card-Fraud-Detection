@@ -649,3 +649,171 @@ def test_ato_event_bus_integration() -> None:
     engine.release_account("user_event_test", "Identity verified via telephone")
     types = [e.event_type for e in received_events]
     assert EventType.ATO_ACCOUNT_RELEASED in types
+
+
+def test_ato_edge_cases_and_branch_coverage() -> None:
+    """Verify serialization corner cases, filters, dormancy, and stuffing bus events."""
+    from datetime import timedelta
+
+    from fraud_detection.ato import (
+        AccountMutationRecord,
+        AccountProfile,
+        AccountProfileTracker,
+        AtoAction,
+        AtoEngine,
+        AtoRiskAssessment,
+        AtoRiskFactor,
+        AtoStore,
+        CredentialStuffingDetector,
+        LoginEvent,
+    )
+    from fraud_detection.events import EventBus, EventType, FraudDomainEvent
+
+    now_utc = datetime(2026, 11, 8, 12, 0, 0, tzinfo=UTC)
+    now_naive = datetime(2026, 11, 8, 12, 0, 0)  # noqa: DTZ001
+
+    # 1. AccountMutationRecord from_dict with datetime instances
+    m1 = AccountMutationRecord.from_dict({"timestamp": now_naive})
+    assert m1.timestamp.tzinfo == UTC
+    m2 = AccountMutationRecord.from_dict({"timestamp": now_utc})
+    assert m2.timestamp.tzinfo == UTC
+
+    # 2. LoginEvent from_dict with datetime instances and string without tz
+    l1 = LoginEvent.from_dict({"user_id": "u1", "timestamp": now_naive})
+    assert l1.timestamp.tzinfo == UTC
+    l2 = LoginEvent.from_dict({"user_id": "u1", "timestamp": now_utc})
+    assert l2.timestamp.tzinfo == UTC
+    l3 = LoginEvent.from_dict({"user_id": "u1", "timestamp": "2026-11-08T12:00:00"})
+    assert l3.timestamp.tzinfo == UTC
+
+    # 3. AtoRiskAssessment from_dict with datetime instances and string without tz
+    a1 = AtoRiskAssessment.from_dict(
+        {"assessment_id": "a1", "user_id": "u1", "risk_score": 0.2, "timestamp": now_naive}
+    )
+    assert a1.timestamp.tzinfo == UTC
+    a2 = AtoRiskAssessment.from_dict(
+        {"assessment_id": "a2", "user_id": "u1", "risk_score": 0.2, "timestamp": now_utc}
+    )
+    assert a2.timestamp.tzinfo == UTC
+    a3 = AtoRiskAssessment.from_dict(
+        {
+            "assessment_id": "a3",
+            "user_id": "u1",
+            "risk_score": 0.2,
+            "timestamp": "2026-11-08T12:00:00",
+        }
+    )
+    assert a3.timestamp.tzinfo == UTC
+    a4 = AtoRiskAssessment.from_dict(
+        {"assessment_id": "a4", "user_id": "u1", "risk_score": 0.2, "timestamp": None}
+    )
+    assert a4.timestamp.tzinfo == UTC
+
+    # 4. AccountProfile from_dict with datetime instances
+    p1 = AccountProfile.from_dict(
+        {
+            "user_id": "u1",
+            "last_active_at": now_naive,
+            "created_at": now_utc,
+            "quarantined_at": now_naive,
+            "released_at": now_utc,
+        }
+    )
+    assert p1.last_active_at and p1.last_active_at.tzinfo == UTC
+    assert p1.quarantined_at and p1.quarantined_at.tzinfo == UTC
+
+    # 5. AtoStore list_assessments tenant filter and list_events user filter
+    store = AtoStore()
+    asmt_a = AtoRiskAssessment(
+        assessment_id="a_tenant1",
+        user_id="u1",
+        tenant_id="tenant_1",
+        risk_score=0.1,
+        recommended_action=AtoAction.ALLOW,
+        factors_triggered=(),
+        score_breakdown={},
+    )
+    asmt_b = AtoRiskAssessment(
+        assessment_id="a_tenant2",
+        user_id="u2",
+        tenant_id="tenant_2",
+        risk_score=0.9,
+        recommended_action=AtoAction.BLOCK,
+        factors_triggered=(),
+        score_breakdown={},
+    )
+    store.record_assessment(asmt_a)
+    store.record_assessment(asmt_b)
+    assert len(store.list_assessments(tenant_id="tenant_1")) == 1
+    assert store.list_assessments(tenant_id="tenant_1")[0].assessment_id == "a_tenant1"
+
+    ev_1 = LoginEvent(user_id="u1", tenant_id="tenant_1")
+    ev_2 = LoginEvent(user_id="u2", tenant_id="tenant_2")
+    store.record_event(ev_1)
+    store.record_event(ev_2)
+    assert len(store.list_events(user_id="u1")) == 1
+    assert store.list_events(user_id="u1")[0].user_id == "u1"
+
+    # 6. CredentialStuffingDetector subnet burst triggering factor in evaluate_stuffing_risk
+    detector = CredentialStuffingDetector(subnet_spray_threshold=2)
+    for i in range(3):
+        detector.record_attempt(
+            LoginEvent(
+                user_id=f"sub_victim_{i}",
+                ip_address=f"192.168.1.{i + 10}",
+                outcome=LoginOutcome.FAILED_CREDENTIALS,
+                timestamp=now_utc,
+            )
+        )
+    score, factors = detector.evaluate_stuffing_risk(
+        LoginEvent(
+            user_id="target_victim",
+            ip_address="192.168.1.99",
+            outcome=LoginOutcome.FAILED_CREDENTIALS,
+            timestamp=now_utc,
+        )
+    )
+    assert AtoRiskFactor.CREDENTIAL_STUFFING_BURST in factors
+    assert score > 0.0
+
+    # 7. Dormancy reactivation & event bus credential stuffing burst event publishing
+    bus = EventBus()
+    stuffing_events: list[FraudDomainEvent] = []
+    bus.subscribe(
+        lambda ev: stuffing_events.append(ev),
+        event_type=EventType.ATO_CREDENTIAL_STUFFING_BURST,
+    )
+
+    tracker = AccountProfileTracker(dormancy_threshold_days=30)
+    engine = AtoEngine(
+        profile_tracker=tracker,
+        event_bus=bus,
+        quarantine_threshold=0.85,
+    )
+    # Seed dormant profile
+    prof = engine.profile_tracker.get_or_create_profile("dormant_user")
+    prof.last_active_at = now_utc - timedelta(days=45)
+    prof.known_devices.add("fp_old_phone")
+
+    # Sprayed attempts on same ip
+    for idx in range(15):
+        engine.evaluate_attempt(
+            LoginEvent(
+                user_id=f"spray_tgt_{idx}",
+                ip_address="198.51.100.99",
+                outcome=LoginOutcome.FAILED_CREDENTIALS,
+                timestamp=now_utc,
+            )
+        )
+
+    # Now evaluate dormant user logging in from sprayed ip
+    res_dormant = engine.evaluate_attempt(
+        LoginEvent(
+            user_id="dormant_user",
+            ip_address="198.51.100.99",
+            device_fingerprint="fp_old_phone",
+            timestamp=now_utc,
+        )
+    )
+    assert AtoRiskFactor.DORMANT_ACCOUNT_REACTIVE in res_dormant.factors_triggered
+    assert len(stuffing_events) >= 1
