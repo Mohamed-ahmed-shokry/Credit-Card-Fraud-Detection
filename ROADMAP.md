@@ -53,7 +53,8 @@ and graph feature aggregation (Phase 38), real-time geographic geolocation anoma
 velocity speed-of-travel calculations, and in-process IP geocoding (Phase 39), adaptive
 device and browser fingerprinting with anomaly clustering (Phase 40), real-time merchant
 and MCC risk profiling, chargeback surveillance, and bust-out anomaly detection (Phase 41),
-and multi-tenant policy partitioning, dynamic rule federation, and account isolation (Phase 42).
+and multi-tenant policy partitioning, dynamic rule federation, and account isolation (Phase 42),
+and account takeover (ATO) detection, credential stuffing defense, and identity session anomaly scoring (Phase 47).
 
 ## Phase 1 — Distribution
 
@@ -2443,7 +2444,7 @@ Does not implement proprietary mTLS VPN connections to Visa VROL or Mastercard M
 - Comprehensive test coverage across `tests/test_chargeback.py`, `tests/test_api.py`, and `tests/test_cli.py` with $\ge 97.0\%$ branch coverage.
 
 
-## Phase 47 — Account Takeover (ATO) Detection, Credential Stuffing Defense & Identity Session Anomaly Engine (In progress)
+## Phase 47 — Account Takeover (ATO) Detection, Credential Stuffing Defense & Identity Session Anomaly Engine (Done)
 
 ### Objective
 
@@ -2518,7 +2519,7 @@ Does not implement biometric keystroke dynamics machine learning models; provide
 - [x] Task 5: Integrate ATO Engine with `events.py` (domain events) with unit/integration tests.
 - [x] Task 6: Implement `/v1/ato/*` REST endpoints and Prometheus metrics in `src/fraud_detection/api.py` with integration tests in `tests/test_api.py`.
 - [x] Task 7: Implement CLI commands `ato-login`, `ato-eval`, `ato-inspect`, `ato-quarantine`, `ato-release`, and `ato-mutation` in `src/fraud_detection/cli.py` with tests in `tests/test_cli.py`.
-- [ ] Task 8: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate with 100% Green CI.
+- [x] Task 8: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate with 100% Green CI.
 
 
 ## Contributing to the roadmap
