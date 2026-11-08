@@ -678,6 +678,58 @@ flowchart TD
 - **API, CLI & Telemetry Integration**: Exposes REST endpoints (`/v1/chargebacks/*`, `/v1/chargebacks/webhook`), Typer CLI commands (`chargeback-ingest`, `chargeback-list`, `chargeback-inspect`, `chargeback-represent`, `chargeback-resolve`), and Prometheus metrics (`fraud_chargebacks_received_total`, `fraud_chargebacks_represented_total`, `fraud_chargebacks_won_total`, `fraud_chargebacks_lost_total`, `fraud_chargeback_financial_exposure_amount`).
 
 
+## Phase 47 — Account Takeover (ATO) Detection, Credential Stuffing Defense & Identity Session Anomaly Engine
+
+Phase 47 introduces an in-process, zero-external-dependency Account Takeover (ATO) Detection, Credential Stuffing Defense, and Identity Session Anomaly Engine (`ato.py`). It analyzes authentication attempts, sensitive account profile mutations (password, email, phone, and MFA resets), device recognition, and impossible travel velocity to prevent account hijacking before fraudulent card charges occur.
+
+```mermaid
+flowchart TD
+    subgraph Authentication & Telemetry Ingestion
+        LoginReq["Login Event\nPOST /v1/ato/login / CLI"] --> Engine["AtoEngine"]
+        ActionReq["Action / Txn Eval\nPOST /v1/ato/evaluate"] --> Engine
+        MutationReq["Profile Mutation\nPOST /v1/ato/accounts/{id}/mutations"] --> Tracker["AccountProfileTracker"]
+    end
+
+    subgraph Multi-Factor ATO Scoring Engine
+        Engine --> Stuffing["CredentialStuffingDetector\n(Sliding Window IP Spraying\nDistributed Brute Force / Subnet Bursts)"]
+        Engine --> Geo["Impossible Travel Calculation\n(Haversine Distance > 800 km/h)"]
+        Engine --> Device["Device Recognition\n(Known Device Fingerprints)"]
+        Engine --> Mutation["Mutation Risk Decay\n(Password/MFA Reset < 1h: +0.40, < 24h: +0.20)"]
+        Engine --> Dormant["Dormancy Spike Detection\n(Inactive > 90 Days Sudden Active)"]
+        Stuffing --> Score["Composite Calibrated Risk Score\n[0.0, 1.0]"]
+        Geo --> Score
+        Device --> Score
+        Mutation --> Score
+        Dormant --> Score
+    end
+
+    subgraph Enforcement & Store
+        Score --> Policy{"Policy Decision"}
+        Policy -->|< 0.40| Allow["ALLOW\nUpdate Profile Baseline"]
+        Policy -->|0.40 - 0.74| Challenge["CHALLENGE\nStep-Up MFA Trigger"]
+        Policy -->|>= 0.75| Quarantine["QUARANTINE_ACCOUNT / BLOCK\nLock User Account & Audit"]
+        Quarantine --> Store[("AtoStore\n(Thread-Safe Multi-Index)")]
+        Allow --> Store
+        Challenge --> Store
+    end
+
+    subgraph Interfaces & Continuous Surveillance
+        Engine -->|Publish ATO_LOGIN_EVALUATED / QUARANTINED| Bus["EventBus"]
+        Store --> API["FastAPI /v1/ato/*\nPrometheus ATO Counters"]
+        Store --> CLI["Typer CLI: ato-login, ato-eval,\nato-inspect, ato-quarantine, ato-release, ato-mutation"]
+    end
+```
+
+### Key Components
+
+- **ATO Risk Factors & Decision Policies (`ato.py`)**: `AtoRiskFactor` categorizes compromise indicators (`NEW_DEVICE`, `IMPOSSIBLE_TRAVEL`, `RECENT_CREDENTIAL_CHANGE`, `RECENT_MFA_RESET`, `CREDENTIAL_STUFFING_BURST`, `PASSWORD_SPRAYING`, `DORMANT_ACCOUNT_REACTIVE`, `ACCOUNT_QUARANTINED`). `AtoAction` provides deterministic enforcement (`ALLOW`, `CHALLENGE`, `QUARANTINE_ACCOUNT`, `BLOCK`).
+- **Sliding-Window Credential Stuffing & Spraying Detection (`CredentialStuffingDetector`)**: Maintains sliding windows of authentication failures across IPs, user accounts, and `/24` or `/48` subnet prefixes to detect distributed password spraying botnets and multi-IP brute force attacks.
+- **Account Behavioral Baselines & Mutation Decay (`AccountProfileTracker`)**: Maintains known device fingerprints, geolocation centroids, dormancy history, and time-decayed penalties for sensitive mutations (e.g., password change within 1 hour adds a severe risk penalty).
+- **Impossible Travel Velocity**: Calculates spherical Haversine distances between sequential user events and computes implied travel speed ($km/h$). Velocities exceeding commercial aircraft thresholds ($800\text{ km/h}$) automatically trigger `IMPOSSIBLE_TRAVEL`.
+- **Thread-Safe ATO Store & EventBus Streaming**: `AtoStore` provides concurrent, multi-indexed storage with capacity eviction. Lifecycle transitions publish domain events (`ATO_LOGIN_EVALUATED`, `ATO_ACCOUNT_QUARANTINED`, `ATO_ACCOUNT_RELEASED`, `ATO_CREDENTIAL_STUFFING_BURST`) across `EventBus`.
+- **API, CLI & Observability**: Exposes FastAPI endpoints (`/v1/ato/login`, `/v1/ato/evaluate`, `/v1/ato/accounts/{user_id}`, `/v1/ato/accounts/{user_id}/mutations`, `/v1/ato/accounts/{user_id}/quarantine`, `/v1/ato/accounts/{user_id}/release`, `/v1/ato/assessments`), Typer CLI subcommands (`ato-login`, `ato-eval`, `ato-inspect`, `ato-quarantine`, `ato-release`, `ato-mutation`), and Prometheus metrics (`fraud_ato_login_attempts_total`, `fraud_ato_risk_assessments_total`, `fraud_ato_quarantines_total`).
+
+
 ## Extension guidance
 
 
