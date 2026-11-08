@@ -14,8 +14,11 @@ from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
+
+if TYPE_CHECKING:
+    from fraud_detection.events import EventBus
 
 
 class AtoRiskFactor(StrEnum):
@@ -719,6 +722,7 @@ class AtoEngine:
         stuffing_detector: CredentialStuffingDetector | None = None,
         profile_tracker: AccountProfileTracker | None = None,
         store: AtoStore | None = None,
+        event_bus: EventBus | None = None,
         auto_quarantine: bool = True,
         challenge_threshold: float = 0.40,
         quarantine_threshold: float = 0.75,
@@ -727,11 +731,42 @@ class AtoEngine:
         self.stuffing_detector = stuffing_detector or CredentialStuffingDetector()
         self.profile_tracker = profile_tracker or AccountProfileTracker()
         self.store = store or AtoStore()
+        self.event_bus = event_bus
         self.auto_quarantine = auto_quarantine
         self.challenge_threshold = challenge_threshold
         self.quarantine_threshold = quarantine_threshold
         self.impossible_travel_speed_kmh = impossible_travel_speed_kmh
         self._lock = threading.RLock()
+
+    def quarantine_account(self, user_id: str, reason: str, tenant_id: str = "default") -> None:
+        """Manually quarantine an account and publish domain event."""
+        from fraud_detection.events import EventType, FraudDomainEvent
+
+        with self._lock:
+            self.profile_tracker.quarantine_account(user_id, reason, tenant_id)
+            if self.event_bus is not None:
+                self.event_bus.publish(
+                    FraudDomainEvent(
+                        event_type=EventType.ATO_ACCOUNT_QUARANTINED,
+                        payload={"user_id": user_id, "reason": reason},
+                        tenant_id=tenant_id,
+                    )
+                )
+
+    def release_account(self, user_id: str, reason: str, tenant_id: str = "default") -> None:
+        """Release an account from quarantine and publish domain event."""
+        from fraud_detection.events import EventType, FraudDomainEvent
+
+        with self._lock:
+            self.profile_tracker.release_account(user_id, reason, tenant_id)
+            if self.event_bus is not None:
+                self.event_bus.publish(
+                    FraudDomainEvent(
+                        event_type=EventType.ATO_ACCOUNT_RELEASED,
+                        payload={"user_id": user_id, "reason": reason},
+                        tenant_id=tenant_id,
+                    )
+                )
 
     def evaluate_attempt(
         self,
@@ -881,4 +916,45 @@ class AtoEngine:
 
             self.store.record_assessment(assessment)
             self.store.record_event(event)
+
+            if self.event_bus is not None:
+                from fraud_detection.events import EventType, FraudDomainEvent
+
+                self.event_bus.publish(
+                    FraudDomainEvent(
+                        event_type=EventType.ATO_LOGIN_EVALUATED,
+                        payload=assessment.to_dict(),
+                        tenant_id=assessment.tenant_id,
+                    )
+                )
+                if assessment.recommended_action == AtoAction.QUARANTINE_ACCOUNT:
+                    self.event_bus.publish(
+                        FraudDomainEvent(
+                            event_type=EventType.ATO_ACCOUNT_QUARANTINED,
+                            payload={
+                                "user_id": assessment.user_id,
+                                "risk_score": assessment.risk_score,
+                                "factors": [f.value for f in assessment.factors_triggered],
+                            },
+                            tenant_id=assessment.tenant_id,
+                        )
+                    )
+                if any(
+                    f in assessment.factors_triggered
+                    for f in (
+                        AtoRiskFactor.CREDENTIAL_STUFFING_BURST,
+                        AtoRiskFactor.PASSWORD_SPRAYING,
+                    )
+                ):
+                    self.event_bus.publish(
+                        FraudDomainEvent(
+                            event_type=EventType.ATO_CREDENTIAL_STUFFING_BURST,
+                            payload={
+                                "user_id": assessment.user_id,
+                                "factors": [f.value for f in assessment.factors_triggered],
+                            },
+                            tenant_id=assessment.tenant_id,
+                        )
+                    )
+
             return assessment
