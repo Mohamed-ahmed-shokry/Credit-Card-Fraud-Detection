@@ -323,3 +323,161 @@ def test_credential_stuffing_subnet_burst_and_window_expiry() -> None:
     assert detector.check_ip_spraying("10.0.0.1")[0] is False
     assert detector.check_distributed_brute_force("unknown_user")[0] is False
     assert detector.check_subnet_burst("10.0.0.1")[0] is False
+
+
+def test_account_profile_tracker_devices_and_locations() -> None:
+    """Test AccountProfileTracker tracking known devices and locations."""
+    from fraud_detection.ato import AccountProfileTracker
+
+    tracker = AccountProfileTracker()
+    now = datetime(2026, 11, 8, 16, 0, 0, tzinfo=UTC)
+
+    # Initial state: unknown device
+    assert tracker.is_device_recognized("user_alice", "dev_laptop") is False
+
+    # Record login
+    login_ev = LoginEvent(
+        user_id="user_alice",
+        ip_address="198.51.100.12",
+        outcome=LoginOutcome.SUCCESS,
+        device_fingerprint="dev_laptop",
+        latitude=37.7749,
+        longitude=-122.4194,
+        timestamp=now,
+    )
+    tracker.record_login_success(login_ev)
+
+    # Now recognized
+    assert tracker.is_device_recognized("user_alice", "dev_laptop") is True
+    assert tracker.is_device_recognized("user_alice", "dev_phone") is False
+    assert tracker.is_device_recognized("user_alice", None) is False
+
+    profile = tracker.get_or_create_profile("user_alice")
+    assert profile.last_known_ip == "198.51.100.12"
+    assert profile.last_known_location == (37.7749, -122.4194)
+    assert (37.7749, -122.4194) in profile.known_locations
+    assert profile.last_active_at == now
+
+    # Roundtrip serialization of AccountProfile
+    dict_rep = profile.to_dict()
+    assert dict_rep["user_id"] == "user_alice"
+    assert "dev_laptop" in dict_rep["known_devices"]
+    rebuilt_profile = type(profile).from_dict(dict_rep)
+    assert rebuilt_profile.user_id == "user_alice"
+    assert "dev_laptop" in rebuilt_profile.known_devices
+    assert rebuilt_profile.last_known_location == (37.7749, -122.4194)
+
+
+def test_account_profile_tracker_mutation_penalties() -> None:
+    """Test time-decayed mutation risk penalties."""
+    from datetime import timedelta
+
+    from fraud_detection.ato import AccountProfileTracker
+
+    tracker = AccountProfileTracker(mutation_risk_window_hours=72.0)
+    now = datetime(2026, 11, 8, 16, 0, 0, tzinfo=UTC)
+
+    # No mutations -> 0 penalty
+    penalty, hrs, factors = tracker.calculate_mutation_penalty("user_bob", now)
+    assert penalty == 0.0
+    assert hrs is None
+    assert factors == []
+
+    # Mutation 30 minutes ago (<= 1.0 hour) -> penalty 0.40
+    mut1 = AccountMutationRecord(
+        mutation_type=AccountMutationType.PASSWORD_CHANGE,
+        timestamp=now - timedelta(minutes=30),
+    )
+    tracker.record_mutation("user_bob", mut1)
+    penalty, hrs, factors = tracker.calculate_mutation_penalty("user_bob", now)
+    assert penalty == 0.40
+    assert hrs is not None and hrs < 1.0
+    assert AtoRiskFactor.RECENT_CREDENTIAL_CHANGE in factors
+
+    # Mutation 12 hours ago (<= 24.0 hours) -> penalty 0.20
+    mut2 = AccountMutationRecord(
+        mutation_type=AccountMutationType.MFA_RESET,
+        timestamp=now - timedelta(hours=12),
+    )
+    tracker = AccountProfileTracker(mutation_risk_window_hours=72.0)
+    tracker.record_mutation("user_charlie", mut2)
+    penalty, hrs, factors = tracker.calculate_mutation_penalty("user_charlie", now)
+    assert penalty == 0.20
+    assert hrs is not None and 11.0 < hrs < 13.0
+    assert AtoRiskFactor.RECENT_MFA_RESET in factors
+
+    # Mutation 48 hours ago (<= 72.0 hours) -> penalty 0.10
+    mut3 = AccountMutationRecord(
+        mutation_type=AccountMutationType.EMAIL_CHANGE,
+        timestamp=now - timedelta(hours=48),
+    )
+    tracker = AccountProfileTracker(mutation_risk_window_hours=72.0)
+    tracker.record_mutation("user_david", mut3)
+    penalty, hrs, factors = tracker.calculate_mutation_penalty("user_david", now)
+    assert penalty == 0.10
+    assert hrs is not None and 47.0 < hrs < 49.0
+    assert AtoRiskFactor.RECENT_CREDENTIAL_CHANGE in factors
+
+    # Mutation 100 hours ago (> 72 hours) -> 0.0
+    mut4 = AccountMutationRecord(
+        mutation_type=AccountMutationType.PASSWORD_CHANGE,
+        timestamp=now - timedelta(hours=100),
+    )
+    tracker = AccountProfileTracker(mutation_risk_window_hours=72.0)
+    tracker.record_mutation("user_eve", mut4)
+    penalty, hrs, factors = tracker.calculate_mutation_penalty("user_eve", now)
+    assert penalty == 0.0
+    assert hrs is None
+    assert factors == []
+
+
+def test_account_profile_tracker_dormancy_and_quarantine() -> None:
+    """Test dormancy detection and quarantine lifecycle."""
+    from datetime import timedelta
+
+    from fraud_detection.ato import AccountProfileTracker
+
+    tracker = AccountProfileTracker(dormancy_threshold_days=90)
+    now = datetime(2026, 11, 8, 16, 0, 0, tzinfo=UTC)
+
+    # Fresh account without last_active_at
+    is_dormant, penalty = tracker.is_dormant_reactivation("user_fresh", now)
+    assert not is_dormant
+    assert penalty == 0.0
+
+    # Account active 100 days ago
+    login_old = LoginEvent(
+        user_id="user_dormant",
+        timestamp=now - timedelta(days=100),
+    )
+    tracker.record_login_success(login_old)
+
+    is_dormant, penalty = tracker.is_dormant_reactivation("user_dormant", now)
+    assert is_dormant
+    assert penalty == 0.15
+
+    # Account active 10 days ago
+    login_recent = LoginEvent(
+        user_id="user_active",
+        timestamp=now - timedelta(days=10),
+    )
+    tracker.record_login_success(login_recent)
+    is_dormant, penalty = tracker.is_dormant_reactivation("user_active", now)
+    assert not is_dormant
+    assert penalty == 0.0
+
+    # Quarantine and release
+    assert tracker.is_quarantined("user_compromised") is False
+    tracker.quarantine_account("user_compromised", "Credential stuffing detection confirmed")
+    assert tracker.is_quarantined("user_compromised") is True
+
+    profile = tracker.get_or_create_profile("user_compromised")
+    assert profile.is_quarantined is True
+    assert profile.quarantine_reason == "Credential stuffing detection confirmed"
+    assert profile.quarantined_at is not None
+
+    tracker.release_account("user_compromised", "Identity verified via analyst")
+    assert tracker.is_quarantined("user_compromised") is False
+    assert profile.is_quarantined is False
+    assert profile.quarantine_reason is None
+    assert profile.released_at is not None
