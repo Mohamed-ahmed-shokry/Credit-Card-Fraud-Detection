@@ -651,17 +651,16 @@ class CircuitBreaker:
                 logger.warning(
                     "CircuitBreaker probe failed (%s); transitioned back to open.", reason
                 )
-            elif self.state == "closed":
-                if self.consecutive_failures >= self.failure_threshold:
-                    self.state = "open"
-                    self.last_state_change = now
-                    if self.on_trip is not None:
-                        self.on_trip()
-                    logger.warning(
-                        "CircuitBreaker tripped to open after %d consecutive failures (%s).",
-                        self.consecutive_failures,
-                        reason,
-                    )
+            elif self.state == "closed" and self.consecutive_failures >= self.failure_threshold:
+                self.state = "open"
+                self.last_state_change = now
+                if self.on_trip is not None:
+                    self.on_trip()
+                logger.warning(
+                    "CircuitBreaker tripped to open after %d consecutive failures (%s).",
+                    self.consecutive_failures,
+                    reason,
+                )
 
     def trip(self) -> None:
         """Force the circuit breaker to OPEN state."""
