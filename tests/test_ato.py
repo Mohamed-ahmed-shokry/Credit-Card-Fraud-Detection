@@ -608,3 +608,44 @@ def test_ato_engine_full_evaluation_flow() -> None:
     assert res4.recommended_action == AtoAction.BLOCK
     assert res4.risk_score == 1.0
     assert AtoRiskFactor.ACCOUNT_QUARANTINED in res4.factors_triggered
+
+
+def test_ato_event_bus_integration() -> None:
+    """Test publishing of ATO lifecycle domain events across EventBus."""
+    from fraud_detection.ato import AtoEngine
+    from fraud_detection.events import EventBus, EventType, FraudDomainEvent
+
+    bus = EventBus()
+    received_events: list[FraudDomainEvent] = []
+
+    def handle_event(event: FraudDomainEvent) -> None:
+        received_events.append(event)
+
+    bus.subscribe(handle_event, event_type=EventType.ATO_LOGIN_EVALUATED)
+    bus.subscribe(handle_event, event_type=EventType.ATO_ACCOUNT_QUARANTINED)
+    bus.subscribe(handle_event, event_type=EventType.ATO_ACCOUNT_RELEASED)
+    bus.subscribe(handle_event, event_type=EventType.ATO_CREDENTIAL_STUFFING_BURST)
+
+    engine = AtoEngine(event_bus=bus, auto_quarantine=True, quarantine_threshold=0.50)
+    now = datetime.now(UTC)
+
+    # 1. Normal login -> ATO_LOGIN_EVALUATED
+    ev1 = LoginEvent(
+        user_id="user_event_test",
+        device_fingerprint="device_1",
+        timestamp=now,
+    )
+    engine.evaluate_attempt(ev1)
+    assert len(received_events) >= 1
+    types = [e.event_type for e in received_events]
+    assert EventType.ATO_LOGIN_EVALUATED in types
+
+    # 2. Manual quarantine -> ATO_ACCOUNT_QUARANTINED
+    engine.quarantine_account("user_event_test", "Analyst confirmed suspicion")
+    types = [e.event_type for e in received_events]
+    assert EventType.ATO_ACCOUNT_QUARANTINED in types
+
+    # 3. Release account -> ATO_ACCOUNT_RELEASED
+    engine.release_account("user_event_test", "Identity verified via telephone")
+    types = [e.event_type for e in received_events]
+    assert EventType.ATO_ACCOUNT_RELEASED in types
