@@ -1,33 +1,35 @@
-# Phase 46 Progress Record
+# Phase 47 Progress Record
 
 ### Overview
-- **Phase**: Phase 46 — Card Scheme Chargeback Ingestion, Reason Code Taxonomy & Automated Representment Gateway
-- **Branch**: `phase/chargeback-representment-gateway`
-- **Status**: Completed
-- **Pull Request**: [#29](https://github.com/Mohamed-ahmed-shokry/Credit-Card-Fraud-Detection/pull/29)
+- **Phase**: Phase 47 — Account Takeover (ATO) Detection, Credential Stuffing Defense & Identity Session Anomaly Engine
+- **Branch**: `phase/account-takeover-defense`
+- **Status**: In progress
+- **Pull Request**: Pending creation
 
 ## Task Status
-- [x] Task 1: Create `src/fraud_detection/chargeback.py` with domain data models, scheme reason code registry, and unit tests in `tests/test_chargeback.py`.
-- [x] Task 2: Implement representment viability engine (liability shift and CE3.0 / First-Party Trust evaluation) in `src/fraud_detection/chargeback.py` with unit tests.
-- [x] Task 3: Implement `ChargebackStore` and `ChargebackManager` lifecycle engine in `src/fraud_detection/chargeback.py` with unit tests.
-- [x] Task 4: Integrate Chargeback Engine with `feedback.py` (ground truth ingestion) and `events.py` (domain event publishing) with unit/integration tests.
-- [x] Task 5: Implement `/v1/chargebacks/*` REST endpoints, webhook ingestion, and Prometheus metrics in `src/fraud_detection/api.py` with integration tests in `tests/test_api.py`.
-- [x] Task 6: Implement CLI commands `chargeback-ingest`, `chargeback-list`, `chargeback-inspect`, `chargeback-represent`, and `chargeback-resolve` in `src/fraud_detection/cli.py` with tests in `tests/test_cli.py`.
-- [x] Task 7: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate with 100% Green CI.
+- [ ] Task 1: Create `src/fraud_detection/ato.py` with domain data models, enums, mutation records, and unit tests in `tests/test_ato.py`.
+- [ ] Task 2: Implement `CredentialStuffingDetector` (sliding-window IP spraying and distributed brute-force detection) in `src/fraud_detection/ato.py` with unit tests.
+- [ ] Task 3: Implement `AccountProfileTracker` (baselines, known devices/locations, mutation decay, quarantine) in `src/fraud_detection/ato.py` with unit tests.
+- [ ] Task 4: Implement `AtoEngine` (multi-factor risk scoring, policy evaluation, challenge & case integration) and thread-safe `AtoStore` in `src/fraud_detection/ato.py` with unit tests.
+- [ ] Task 5: Integrate ATO Engine with `events.py` (domain events) with unit/integration tests.
+- [ ] Task 6: Implement `/v1/ato/*` REST endpoints and Prometheus metrics in `src/fraud_detection/api.py` with integration tests in `tests/test_api.py`.
+- [ ] Task 7: Implement CLI commands `ato-login`, `ato-eval`, `ato-inspect`, `ato-quarantine`, `ato-release`, and `ato-mutation` in `src/fraud_detection/cli.py` with tests in `tests/test_cli.py`.
+- [ ] Task 8: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate with 100% Green CI.
 
 ## Acceptance Criteria Status
 | Criterion | Status | Evidence |
 |-----------|--------|----------|
-| AC-1 (Scheme Taxonomy & Reason Code Registry) | PASSED | 6 unit tests in `tests/test_chargeback.py` verifying `CardScheme`, `ChargebackCategory`, `ChargebackStage`, `ReasonCodeRegistry` lookups, custom registrations, fallback resolution, and dispute model invariants. |
-| AC-2 (Dispute Models & Representment Viability Engine) | PASSED | 2 unit tests in `tests/test_chargeback.py` verifying `evaluate_representment_viability` for 3DS liability shift (ECI / challenge verification), CE3.0 / First-Party Trust qualification, and winnability scoring. |
-| AC-3 (Thread-Safe Chargeback Store & Gateway) | PASSED | 3 unit tests in `tests/test_chargeback.py` verifying `ChargebackStore` secondary index lookups, capacity eviction, deletion, and `ChargebackManager` stage transitions, representment, and financial exposure summaries. |
-| AC-4 (Feedback Ingestion & EventBus Integration) | PASSED | Unit/integration test in `tests/test_chargeback.py` verifying `EventType.CHARGEBACK_INGESTED`, `CHARGEBACK_REPRESENTED`, `CHARGEBACK_RESOLVED` publishing on `EventBus` and `publish_feedback_label` forwarding into `feedback.py` `LabelIngestionStore`. |
-| AC-5 (REST API Endpoints & Observability) | PASSED | 2 integration tests in `tests/test_api.py` verifying dispute ingestion, gateway webhook handling, representment, terminal resolution, metrics instrumentation, and error handling. |
-| AC-6 (CLI Workflows) | PASSED | Comprehensive CLI integration tests in `tests/test_cli.py` verifying `chargeback-ingest`, `chargeback-list`, `chargeback-inspect`, `chargeback-represent`, and `chargeback-resolve` with JSON/table outputs, file persistence, and error exit codes. |
-| AC-7 (Quality Standards & 100% Green CI) | PASSED | Local CI parity checks and remote GitHub Actions runs verified 100% Green, branch coverage >= 97.0%, strict mypy 0 issues, Ruff clean, and build/twine valid. |
+| AC-1 (Domain Models & Risk Factor Taxonomy) | PENDING | Models, enums, records in `src/fraud_detection/ato.py` |
+| AC-2 (Credential Stuffing & Spraying Detection) | PENDING | Sliding-window detector in `src/fraud_detection/ato.py` |
+| AC-3 (Account Baseline & Mutation Tracking) | PENDING | Baselines and mutation penalty decay in `src/fraud_detection/ato.py` |
+| AC-4 (ATO Engine & Policy Decisioning) | PENDING | Composite risk evaluation and policies in `src/fraud_detection/ato.py` |
+| AC-5 (Thread-Safe Store & EventBus Streaming) | PENDING | In-memory store and `events.py` domain event dispatch |
+| AC-6 (REST API & Observability) | PENDING | `/v1/ato/*` FastAPI endpoints and Prometheus metrics in `api.py` |
+| AC-7 (CLI Workflows) | PENDING | Typer subcommands `ato-*` in `cli.py` |
+| AC-8 (Quality Standards & 100% Green CI) | PENDING | Coverage >= 97.0%, mypy 0 issues, ruff clean, GitHub Actions 100% Green |
 
 ## Decision Log
 | Date | Decision | Alternatives Considered | Rationale |
 |---|---|---|---|
-| 2026-11-04 | Select Phase 46: Card Scheme Chargeback Ingestion, Reason Code Taxonomy & Automated Representment Gateway | Third-party chargeback SaaS webhook consumer; Custom SQL schema | Completes the operational lifecycle from detection and step-up friction through case management to chargeback resolution and feedback-driven model retraining, while adhering to zero-external-dependency standard. |
-| 2026-11-04 | Create dedicated phase branch `phase/chargeback-representment-gateway` | Committing directly to main | Conforms to repository branching protocol and continuous CI validation. |
+| 2026-11-08 | Select Phase 47: Account Takeover (ATO) Detection, Credential Stuffing Defense & Identity Session Anomaly Engine | Synthetic Identity Fraud (SIF); Anti-Money Laundering (AML) Transaction Monitoring | ATO directly links authentication attacks to payment fraud, closing the loop between `device.py`, `geolocation.py`, `challenge.py`, and `cases.py` with zero external dependencies. |
+| 2026-11-08 | Create dedicated phase branch `phase/account-takeover-defense` | Reusing previous phase branch; committing directly to main | Conforms to strict branching protocol and isolated remote CI tracking. |
