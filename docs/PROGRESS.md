@@ -13,7 +13,7 @@
 - [x] Task 4: Implement `AtoEngine` (multi-factor risk scoring, policy evaluation, challenge & case integration) and thread-safe `AtoStore` in `src/fraud_detection/ato.py` with unit tests.
 - [x] Task 5: Integrate ATO Engine with `events.py` (domain events) with unit/integration tests.
 - [x] Task 6: Implement `/v1/ato/*` REST endpoints and Prometheus metrics in `src/fraud_detection/api.py` with integration tests in `tests/test_api.py`.
-- [ ] Task 7: Implement CLI commands `ato-login`, `ato-eval`, `ato-inspect`, `ato-quarantine`, `ato-release`, and `ato-mutation` in `src/fraud_detection/cli.py` with tests in `tests/test_cli.py`.
+- [x] Task 7: Implement CLI commands `ato-login`, `ato-eval`, `ato-inspect`, `ato-quarantine`, `ato-release`, and `ato-mutation` in `src/fraud_detection/cli.py` with tests in `tests/test_cli.py`.
 - [ ] Task 8: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate with 100% Green CI.
 
 ## Acceptance Criteria Status
@@ -25,7 +25,7 @@
 | AC-4 (ATO Engine & Policy Decisioning) | PASSED | Multi-factor risk scoring, impossible travel, and quarantine enforcement verified in `tests/test_ato.py` |
 | AC-5 (Thread-Safe Store & EventBus Streaming) | PASSED | Thread-safe `AtoStore` and `EventBus` domain event dispatch verified in `tests/test_ato.py` |
 | AC-6 (REST API & Observability) | PASSED | `/v1/ato/*` endpoints, lifecycle actions, and Prometheus metrics verified in `tests/test_api.py` |
-| AC-7 (CLI Workflows) | PENDING | Typer subcommands `ato-*` in `cli.py` |
+| AC-7 (CLI Workflows) | PASSED | `ato-*` commands for login, eval, inspection, quarantine, release, and mutations verified in `tests/test_cli.py` |
 | AC-8 (Quality Standards & 100% Green CI) | PENDING | Coverage >= 97.0%, mypy 0 issues, ruff clean, GitHub Actions 100% Green |
 
 ## Decision Log
