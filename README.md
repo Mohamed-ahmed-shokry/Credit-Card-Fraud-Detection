@@ -1982,6 +1982,72 @@ FastAPI Chargeback Gateway REST endpoints:
 - `POST /v1/chargebacks/{dispute_id}/resolve`: Terminal dispute finalization (`resolved_won`, `resolved_lost`, `accepted_liability`) with automatic feedback label publication to `feedback.py`.
 - Prometheus metrics: `fraud_chargebacks_received_total`, `fraud_chargebacks_represented_total`, `fraud_chargebacks_won_total`, `fraud_chargebacks_lost_total`, `fraud_chargeback_financial_exposure_amount`.
 
+## Account Takeover (ATO) Detection & Credential Stuffing Defense (Phase 47)
+
+Ingest authentication events, track user behavioral baselines (known devices, locations, dormancy), detect distributed credential stuffing and password spraying attacks, calculate impossible travel velocities, and enforce automated account defense actions (`ato.py`):
+
+```bash
+# Ingest and evaluate an authentication attempt
+fraud-detect ato-login \
+  --user-id usr_9012 \
+  --ip-address 198.51.100.42 \
+  --outcome success \
+  --device dev_trusted_laptop \
+  --latitude 40.7128 \
+  --longitude -74.0060 \
+  --store-file data/ato_store.json \
+  --format table
+
+# Record a sensitive account mutation (password, email, or MFA reset)
+fraud-detect ato-mutation \
+  --user-id usr_9012 \
+  --type password_change \
+  --channel web \
+  --store-file data/ato_store.json \
+  --format table
+
+# Inspect account profile, known devices, locations, and quarantine state
+fraud-detect ato-inspect \
+  --user-id usr_9012 \
+  --store-file data/ato_store.json \
+  --format table
+
+# Evaluate an ongoing transaction or session action
+fraud-detect ato-eval \
+  --user-id usr_9012 \
+  --action-type checkout \
+  --amount 850.00 \
+  --ip-address 203.0.113.15 \
+  --device dev_unrecognized_device \
+  --store-file data/ato_store.json \
+  --format table
+
+# Administratively quarantine a compromised account
+fraud-detect ato-quarantine \
+  --user-id usr_9012 \
+  --reason "SOC flagged credential stuffing burst" \
+  --store-file data/ato_store.json \
+  --format table
+
+# Administratively release a verified account
+fraud-detect ato-release \
+  --user-id usr_9012 \
+  --reason "User identity verified via secondary phone challenge" \
+  --store-file data/ato_store.json \
+  --format table
+```
+
+FastAPI Account Takeover REST endpoints:
+- `POST /v1/ato/login`: Ingest authentication event and evaluate takeover risk.
+- `POST /v1/ato/evaluate`: Evaluate transaction or session action context for takeover indicators.
+- `GET /v1/ato/accounts/{user_id}`: Retrieve account behavioral profile, known devices, and security state.
+- `POST /v1/ato/accounts/{user_id}/mutations`: Log sensitive profile mutations for time-decay surveillance.
+- `POST /v1/ato/accounts/{user_id}/quarantine`: Place an account under security quarantine.
+- `POST /v1/ato/accounts/{user_id}/release`: Release an account from security quarantine.
+- `GET /v1/ato/assessments`: Query and filter historical ATO risk assessments.
+- `GET /v1/ato/assessments/{assessment_id}`: Retrieve detailed risk score breakdown, impossible travel speed, and factor telemetry.
+- Prometheus metrics: `fraud_ato_login_attempts_total`, `fraud_ato_risk_assessments_total`, `fraud_ato_quarantines_total`.
+
 ## Reference label-delay analysis
 
 
@@ -2019,6 +2085,7 @@ Project layout:
 ```text
 src/fraud_detection/
 ├── api.py            # versioned online prediction service, circuit breakers, and traffic shadowing
+├── ato.py            # account takeover detection, credential stuffing defense, and identity session anomalies
 ├── audit.py          # structured JSONL audit logs with Luhn PAN redaction and log replay
 ├── cases.py          # fraud case management, SLA tracking, and dispute evidence packaging
 ├── chargeback.py     # card scheme dispute ingestion, reason code taxonomy, and automated representment
