@@ -481,3 +481,130 @@ def test_account_profile_tracker_dormancy_and_quarantine() -> None:
     assert profile.is_quarantined is False
     assert profile.quarantine_reason is None
     assert profile.released_at is not None
+
+
+def test_haversine_distance_calculation() -> None:
+    """Test haversine distance calculation between known coordinates."""
+    from fraud_detection.ato import calculate_haversine_distance_km
+
+    # London (51.5074, -0.1278) to Paris (48.8566, 2.3522) ~ 343 km
+    dist = calculate_haversine_distance_km(51.5074, -0.1278, 48.8566, 2.3522)
+    assert 340.0 < dist < 350.0
+
+    # Same location -> 0 km
+    assert calculate_haversine_distance_km(40.0, -74.0, 40.0, -74.0) == 0.0
+
+
+def test_ato_store_crud_and_indexing() -> None:
+    """Test AtoStore persistence, capacity eviction, and user indexing."""
+    from fraud_detection.ato import AtoStore
+
+    store = AtoStore(max_capacity=5)
+    now = datetime.now(UTC)
+
+    # Record 6 assessments to trigger capacity eviction of oldest
+    for i in range(6):
+        assessment = AtoRiskAssessment(
+            user_id="user_store_test",
+            risk_score=0.1 * i,
+            recommended_action=AtoAction.ALLOW,
+            timestamp=now,
+        )
+        store.record_assessment(assessment)
+
+    # Store size capped at 5
+    assessments = store.list_assessments()
+    assert len(assessments) == 5
+
+    # Check user assessments query
+    user_assessments = store.get_user_assessments("user_store_test", limit=3)
+    assert len(user_assessments) == 3
+
+    # Check event logging
+    ev = LoginEvent(user_id="user_store_test", timestamp=now)
+    store.record_event(ev)
+    assert len(store.list_events(user_id="user_store_test")) == 1
+    assert len(store.list_events(user_id="other_user")) == 0
+
+
+def test_ato_engine_full_evaluation_flow() -> None:
+    """Test AtoEngine multi-factor risk scoring, impossible travel, and auto-quarantine."""
+    from datetime import timedelta
+
+    from fraud_detection.ato import AccountProfileTracker, AtoEngine, CredentialStuffingDetector
+
+    profile_tracker = AccountProfileTracker(dormancy_threshold_days=60)
+    stuffing_detector = CredentialStuffingDetector()
+    engine = AtoEngine(
+        stuffing_detector=stuffing_detector,
+        profile_tracker=profile_tracker,
+        auto_quarantine=True,
+        challenge_threshold=0.35,
+        quarantine_threshold=0.70,
+    )
+    t0 = datetime(2026, 11, 8, 12, 0, 0, tzinfo=UTC)
+
+    # Step 1: Normal initial login from London (success, recognized device created)
+    ev1 = LoginEvent(
+        user_id="user_traveler",
+        device_fingerprint="device_laptop_win",
+        latitude=51.5074,
+        longitude=-0.1278,
+        timestamp=t0,
+        outcome=LoginOutcome.SUCCESS,
+    )
+    res1 = engine.evaluate_attempt(ev1)
+    assert res1.recommended_action == AtoAction.ALLOW
+    assert not res1.quarantined
+
+    # Step 2: 30 minutes later, login from Tokyo (35.6762, 139.6503) from a new device!
+    # Distance is ~9560 km, elapsed time 0.5 hours -> speed ~ 19,120 km/h -> IMPOSSIBLE TRAVEL!
+    t1 = t0 + timedelta(minutes=30)
+    ev2 = LoginEvent(
+        user_id="user_traveler",
+        device_fingerprint="device_unknown_hacker",
+        latitude=35.6762,
+        longitude=139.6503,
+        timestamp=t1,
+        outcome=LoginOutcome.SUCCESS,
+    )
+    res2 = engine.evaluate_attempt(ev2)
+    assert AtoRiskFactor.NEW_DEVICE in res2.factors_triggered
+    assert AtoRiskFactor.IMPOSSIBLE_TRAVEL in res2.factors_triggered
+    assert res2.impossible_travel_kmh is not None and res2.impossible_travel_kmh > 10_000.0
+    assert res2.risk_score >= 0.50
+    assert res2.recommended_action in (AtoAction.CHALLENGE, AtoAction.QUARANTINE_ACCOUNT)
+
+    # Step 3: Add recent password change mutation -> pushes score over quarantine threshold!
+    profile_tracker.record_mutation(
+        "user_traveler",
+        AccountMutationRecord(
+            mutation_type=AccountMutationType.PASSWORD_CHANGE,
+            timestamp=t1 - timedelta(minutes=20),
+        ),
+    )
+    t2 = t1 + timedelta(minutes=5)
+    ev3 = LoginEvent(
+        user_id="user_traveler",
+        device_fingerprint="device_unknown_hacker",
+        latitude=35.6762,
+        longitude=139.6503,
+        timestamp=t2,
+        outcome=LoginOutcome.SUCCESS,
+    )
+    res3 = engine.evaluate_attempt(ev3)
+    assert res3.risk_score >= 0.70
+    assert res3.recommended_action == AtoAction.QUARANTINE_ACCOUNT
+    assert res3.quarantined is True
+    assert profile_tracker.is_quarantined("user_traveler") is True
+
+    # Step 4: Subsequent attempt while quarantined -> immediate BLOCK
+    t3 = t2 + timedelta(minutes=2)
+    ev4 = LoginEvent(
+        user_id="user_traveler",
+        timestamp=t3,
+    )
+    res4 = engine.evaluate_attempt(ev4)
+    assert res4.recommended_action == AtoAction.BLOCK
+    assert res4.risk_score == 1.0
+    assert AtoRiskFactor.ACCOUNT_QUARANTINED in res4.factors_triggered
