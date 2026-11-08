@@ -8,6 +8,7 @@ thread-safe store with automated defense orchestration (challenge/quarantine).
 from __future__ import annotations
 
 import ipaddress
+import math
 import threading
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
@@ -636,3 +637,248 @@ class AccountProfileTracker:
         with self._lock:
             profile = self._profiles.get(user_id)
             return profile.is_quarantined if profile else False
+
+
+def calculate_haversine_distance_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Calculate the great-circle distance between two points in kilometers."""
+    radius_earth_km = 6371.0
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = (
+        math.sin(dlat / 2.0) ** 2
+        + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon / 2.0) ** 2
+    )
+    c = 2.0 * math.atan2(math.sqrt(a), math.sqrt(1.0 - a))
+    return radius_earth_km * c
+
+
+class AtoStore:
+    """Thread-safe storage for ATO assessments, telemetry events, and audit logs."""
+
+    def __init__(self, max_capacity: int = 10_000) -> None:
+        self.max_capacity = max_capacity
+        self._lock = threading.RLock()
+        self._assessments: dict[str, AtoRiskAssessment] = {}
+        self._user_assessments: dict[str, list[str]] = defaultdict(list)
+        self._events: deque[LoginEvent] = deque(maxlen=max_capacity)
+
+    def record_assessment(self, assessment: AtoRiskAssessment) -> None:
+        """Store an assessment and index it by user."""
+        with self._lock:
+            if len(self._assessments) >= self.max_capacity:
+                # Evict oldest entry
+                oldest_id = next(iter(self._assessments))
+                del self._assessments[oldest_id]
+
+            self._assessments[assessment.assessment_id] = assessment
+            self._user_assessments[assessment.user_id].append(assessment.assessment_id)
+
+    def get_assessment(self, assessment_id: str) -> AtoRiskAssessment | None:
+        """Retrieve an assessment by unique identifier."""
+        with self._lock:
+            return self._assessments.get(assessment_id)
+
+    def get_user_assessments(self, user_id: str, limit: int = 50) -> list[AtoRiskAssessment]:
+        """Retrieve recent assessments for a user."""
+        with self._lock:
+            ids = self._user_assessments.get(user_id, [])
+            selected_ids = ids[-limit:] if limit > 0 else ids
+            return [
+                self._assessments[aid] for aid in reversed(selected_ids) if aid in self._assessments
+            ]
+
+    def list_assessments(
+        self, tenant_id: str | None = None, limit: int = 100
+    ) -> list[AtoRiskAssessment]:
+        """List assessments with optional tenant filter."""
+        with self._lock:
+            items = list(self._assessments.values())
+            if tenant_id:
+                items = [a for a in items if a.tenant_id == tenant_id]
+            return items[-limit:] if limit > 0 else items
+
+    def record_event(self, event: LoginEvent) -> None:
+        """Store a telemetry event."""
+        with self._lock:
+            self._events.append(event)
+
+    def list_events(self, user_id: str | None = None, limit: int = 100) -> list[LoginEvent]:
+        """List recent events with optional user filter."""
+        with self._lock:
+            evs = list(self._events)
+            if user_id:
+                evs = [e for e in evs if e.user_id == user_id]
+            return evs[-limit:] if limit > 0 else evs
+
+
+class AtoEngine:
+    """Core multi-factor Account Takeover evaluation and defense orchestration engine."""
+
+    def __init__(
+        self,
+        stuffing_detector: CredentialStuffingDetector | None = None,
+        profile_tracker: AccountProfileTracker | None = None,
+        store: AtoStore | None = None,
+        auto_quarantine: bool = True,
+        challenge_threshold: float = 0.40,
+        quarantine_threshold: float = 0.75,
+        impossible_travel_speed_kmh: float = 800.0,
+    ) -> None:
+        self.stuffing_detector = stuffing_detector or CredentialStuffingDetector()
+        self.profile_tracker = profile_tracker or AccountProfileTracker()
+        self.store = store or AtoStore()
+        self.auto_quarantine = auto_quarantine
+        self.challenge_threshold = challenge_threshold
+        self.quarantine_threshold = quarantine_threshold
+        self.impossible_travel_speed_kmh = impossible_travel_speed_kmh
+        self._lock = threading.RLock()
+
+    def evaluate_attempt(
+        self,
+        event: LoginEvent,
+        action_type: str = "login",
+        transaction_amount: float | None = None,
+    ) -> AtoRiskAssessment:
+        """Evaluate an authentication attempt or transaction for account takeover indicators."""
+        with self._lock:
+            # Check quarantine status first
+            if self.profile_tracker.is_quarantined(event.user_id):
+                assessment = AtoRiskAssessment(
+                    user_id=event.user_id,
+                    tenant_id=event.tenant_id,
+                    risk_score=1.0,
+                    recommended_action=AtoAction.BLOCK,
+                    factors_triggered=(AtoRiskFactor.ACCOUNT_QUARANTINED,),
+                    score_breakdown={"quarantine": 1.0},
+                    quarantined=True,
+                    timestamp=event.timestamp,
+                    details={"reason": "Account is actively quarantined for security breach"},
+                )
+                self.store.record_assessment(assessment)
+                self.store.record_event(event)
+                return assessment
+
+            factors: list[AtoRiskFactor] = []
+            score_breakdown: dict[str, float] = {}
+
+            # 1. Device familiarity
+            is_new_device = False
+            device_score = 0.0
+            if event.device_fingerprint:
+                is_recognized = self.profile_tracker.is_device_recognized(
+                    event.user_id, event.device_fingerprint
+                )
+                if not is_recognized:
+                    is_new_device = True
+                    device_score = 0.25
+                    factors.append(AtoRiskFactor.NEW_DEVICE)
+                    score_breakdown["device"] = device_score
+            else:
+                is_new_device = True
+                device_score = 0.15
+                score_breakdown["device"] = device_score
+
+            # 2. Impossible travel velocity
+            travel_score = 0.0
+            calculated_speed_kmh: float | None = None
+            profile = self.profile_tracker.get_or_create_profile(event.user_id, event.tenant_id)
+
+            if (
+                profile.last_known_location
+                and profile.last_active_at
+                and event.latitude is not None
+                and event.longitude is not None
+            ):
+                dist_km = calculate_haversine_distance_km(
+                    profile.last_known_location[0],
+                    profile.last_known_location[1],
+                    event.latitude,
+                    event.longitude,
+                )
+                time_diff_hours = (
+                    event.timestamp - profile.last_active_at
+                ).total_seconds() / 3600.0
+
+                if time_diff_hours > 0.0:
+                    speed_kmh = dist_km / time_diff_hours
+                    calculated_speed_kmh = speed_kmh
+                    if speed_kmh >= self.impossible_travel_speed_kmh:
+                        factors.append(AtoRiskFactor.IMPOSSIBLE_TRAVEL)
+                        travel_score = min(
+                            0.40, 0.25 + 0.0001 * (speed_kmh - self.impossible_travel_speed_kmh)
+                        )
+                        score_breakdown["travel"] = travel_score
+
+            # 3. Sensitive profile mutation decay penalty
+            mutation_penalty, min_mutation_hrs, mut_factors = (
+                self.profile_tracker.calculate_mutation_penalty(event.user_id, event.timestamp)
+            )
+            if mutation_penalty > 0.0:
+                score_breakdown["mutation"] = mutation_penalty
+                factors.extend(mut_factors)
+
+            # 4. Dormancy sudden reactivation
+            is_dormant, dormant_penalty = self.profile_tracker.is_dormant_reactivation(
+                event.user_id, event.timestamp
+            )
+            if is_dormant:
+                score_breakdown["dormancy"] = dormant_penalty
+                factors.append(AtoRiskFactor.DORMANT_ACCOUNT_REACTIVE)
+
+            # 5. Credential stuffing / password spraying
+            stuffing_score, stuffing_factors = self.stuffing_detector.evaluate_stuffing_risk(event)
+            if stuffing_score > 0.0:
+                score_breakdown["credential_stuffing"] = stuffing_score
+                for sf in stuffing_factors:
+                    if sf not in factors:
+                        factors.append(sf)
+
+            # Aggregate composite risk score [0.0, 1.0]
+            total_score = sum(score_breakdown.values())
+            calibrated_score = min(1.0, max(0.0, total_score))
+
+            # Determine policy action
+            if calibrated_score >= self.quarantine_threshold:
+                action = AtoAction.QUARANTINE_ACCOUNT
+            elif calibrated_score >= self.challenge_threshold:
+                action = AtoAction.CHALLENGE
+            else:
+                action = AtoAction.ALLOW
+
+            quarantined = False
+            if action == AtoAction.QUARANTINE_ACCOUNT and self.auto_quarantine:
+                self.profile_tracker.quarantine_account(
+                    event.user_id,
+                    reason=f"Automated quarantine triggered (score {calibrated_score:.4f})",
+                    tenant_id=event.tenant_id,
+                )
+                quarantined = True
+
+            # Record event in stuffing detector
+            self.stuffing_detector.record_attempt(event)
+
+            # If outcome is success and action is allow, update profile baseline
+            if event.outcome == LoginOutcome.SUCCESS and action == AtoAction.ALLOW:
+                self.profile_tracker.record_login_success(event)
+
+            assessment = AtoRiskAssessment(
+                user_id=event.user_id,
+                tenant_id=event.tenant_id,
+                risk_score=calibrated_score,
+                recommended_action=action,
+                factors_triggered=tuple(factors),
+                score_breakdown=score_breakdown,
+                impossible_travel_kmh=calculated_speed_kmh,
+                is_new_device=is_new_device,
+                hours_since_last_mutation=min_mutation_hrs,
+                quarantined=quarantined,
+                timestamp=event.timestamp,
+                details={
+                    "action_type": action_type,
+                    "transaction_amount": transaction_amount,
+                },
+            )
+
+            self.store.record_assessment(assessment)
+            self.store.record_event(event)
+            return assessment
