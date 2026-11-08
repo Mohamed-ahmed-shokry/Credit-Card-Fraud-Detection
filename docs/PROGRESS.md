@@ -9,7 +9,7 @@
 ## Task Status
 - [x] Task 1: Create `src/fraud_detection/ato.py` with domain data models, enums, mutation records, and unit tests in `tests/test_ato.py`.
 - [x] Task 2: Implement `CredentialStuffingDetector` (sliding-window IP spraying and distributed brute-force detection) in `src/fraud_detection/ato.py` with unit tests.
-- [ ] Task 3: Implement `AccountProfileTracker` (baselines, known devices/locations, mutation decay, quarantine) in `src/fraud_detection/ato.py` with unit tests.
+- [x] Task 3: Implement `AccountProfileTracker` (baselines, known devices/locations, mutation decay, quarantine) in `src/fraud_detection/ato.py` with unit tests.
 - [ ] Task 4: Implement `AtoEngine` (multi-factor risk scoring, policy evaluation, challenge & case integration) and thread-safe `AtoStore` in `src/fraud_detection/ato.py` with unit tests.
 - [ ] Task 5: Integrate ATO Engine with `events.py` (domain events) with unit/integration tests.
 - [ ] Task 6: Implement `/v1/ato/*` REST endpoints and Prometheus metrics in `src/fraud_detection/api.py` with integration tests in `tests/test_api.py`.
@@ -21,7 +21,7 @@
 |-----------|--------|----------|
 | AC-1 (Domain Models & Risk Factor Taxonomy) | PASSED | Domain models, enums, serialization in `src/fraud_detection/ato.py` verified in `tests/test_ato.py` |
 | AC-2 (Credential Stuffing & Spraying Detection) | PASSED | Sliding-window detector in `src/fraud_detection/ato.py` verified in `tests/test_ato.py` |
-| AC-3 (Account Baseline & Mutation Tracking) | PENDING | Baselines and mutation penalty decay in `src/fraud_detection/ato.py` |
+| AC-3 (Account Baseline & Mutation Tracking) | PASSED | Baseline devices/locations and mutation decay penalties in `src/fraud_detection/ato.py` verified in `tests/test_ato.py` |
 | AC-4 (ATO Engine & Policy Decisioning) | PENDING | Composite risk evaluation and policies in `src/fraud_detection/ato.py` |
 | AC-5 (Thread-Safe Store & EventBus Streaming) | PENDING | In-memory store and `events.py` domain event dispatch |
 | AC-6 (REST API & Observability) | PENDING | `/v1/ato/*` FastAPI endpoints and Prometheus metrics in `api.py` |

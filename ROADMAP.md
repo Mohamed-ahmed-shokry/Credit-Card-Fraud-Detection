@@ -2513,7 +2513,7 @@ Does not implement biometric keystroke dynamics machine learning models; provide
 
 - [x] Task 1: Create `src/fraud_detection/ato.py` with domain data models, enums, mutation records, and unit tests in `tests/test_ato.py`.
 - [x] Task 2: Implement `CredentialStuffingDetector` (sliding-window IP spraying and distributed brute-force detection) in `src/fraud_detection/ato.py` with unit tests.
-- [ ] Task 3: Implement `AccountProfileTracker` (baselines, known devices/locations, mutation decay, quarantine) in `src/fraud_detection/ato.py` with unit tests.
+- [x] Task 3: Implement `AccountProfileTracker` (baselines, known devices/locations, mutation decay, quarantine) in `src/fraud_detection/ato.py` with unit tests.
 - [ ] Task 4: Implement `AtoEngine` (multi-factor risk scoring, policy evaluation, challenge & case integration) and thread-safe `AtoStore` in `src/fraud_detection/ato.py` with unit tests.
 - [ ] Task 5: Integrate ATO Engine with `events.py` (domain events) with unit/integration tests.
 - [ ] Task 6: Implement `/v1/ato/*` REST endpoints and Prometheus metrics in `src/fraud_detection/api.py` with integration tests in `tests/test_api.py`.
