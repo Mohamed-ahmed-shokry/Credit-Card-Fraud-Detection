@@ -19,6 +19,17 @@ import typer
 import uvicorn
 
 from fraud_detection import __version__
+from fraud_detection.ato import (
+    AccountMutationRecord,
+    AccountMutationType,
+    AccountProfile,
+    AccountProfileTracker,
+    AtoEngine,
+    AtoRiskAssessment,
+    AtoStore,
+    LoginEvent,
+    LoginOutcome,
+)
 from fraud_detection.audit import (
     JsonlAuditSink,
     backtest_audit_policy,
@@ -9926,6 +9937,359 @@ def chargeback_resolve(
         typer.echo(f"Terminal:    {resolved.is_terminal}")
     else:
         typer.echo(json.dumps(resolved.to_dict(), indent=2))
+
+
+# =========================================================================
+# Phase 47: Account Takeover (ATO) & Credential Stuffing CLI Commands
+# =========================================================================
+
+
+def _load_ato_state(
+    store_file: Path | None,
+) -> tuple[AccountProfileTracker, AtoStore]:
+    """Load persistent ATO profiles and assessment history from store file."""
+    tracker = AccountProfileTracker()
+    store = AtoStore()
+    if store_file is None or not store_file.exists():
+        return tracker, store
+
+    try:
+        raw = store_file.read_text(encoding="utf-8")
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            _abort("Invalid ATO store file format: expected JSON object with 'profiles'.")
+    except (OSError, json.JSONDecodeError) as exc:
+        _abort(f"Could not read ATO store file: {exc}")
+
+    profiles_data = data.get("profiles", {})
+    if isinstance(profiles_data, dict):
+        for uid, p_data in profiles_data.items():
+            if isinstance(p_data, dict):
+                p = AccountProfile.from_dict(p_data)
+                tracker._profiles[uid] = p  # noqa: SLF001
+
+    assessments_data = data.get("assessments", [])
+    if isinstance(assessments_data, list):
+        for a_data in assessments_data:
+            if isinstance(a_data, dict):
+                a = AtoRiskAssessment.from_dict(a_data)
+                store.record_assessment(a)
+
+    return tracker, store
+
+
+def _save_ato_state(
+    store_file: Path | None,
+    tracker: AccountProfileTracker,
+    store: AtoStore,
+) -> None:
+    """Save persistent ATO profiles and assessment history to store file."""
+    if store_file is None:
+        return
+    data = {
+        "profiles": {uid: p.to_dict() for uid, p in tracker._profiles.items()},  # noqa: SLF001
+        "assessments": [a.to_dict() for a in store.list_assessments(limit=1000)],
+    }
+    _atomic_write_text(json.dumps(data, indent=2), store_file)
+
+
+@app.command("ato-login")
+def ato_login(
+    user_id: Annotated[
+        str,
+        typer.Option("--user-id", "-u", help="User identifier."),
+    ],
+    ip_address: Annotated[
+        str,
+        typer.Option("--ip-address", "-i", help="Client IP address."),
+    ] = "127.0.0.1",
+    outcome: Annotated[
+        str,
+        typer.Option(
+            "--outcome", "-o", help="Authentication outcome (success, failed_credentials)."
+        ),
+    ] = "success",
+    device_fingerprint: Annotated[
+        str | None,
+        typer.Option("--device", "-d", help="Client device fingerprint hash."),
+    ] = None,
+    latitude: Annotated[
+        float | None,
+        typer.Option("--latitude", help="Client geolocation latitude."),
+    ] = None,
+    longitude: Annotated[
+        float | None,
+        typer.Option("--longitude", help="Client geolocation longitude."),
+    ] = None,
+    tenant_id: Annotated[
+        str,
+        typer.Option("--tenant-id", help="Tenant organization partition."),
+    ] = "default",
+    store_file: Annotated[
+        Path | None,
+        typer.Option("--store-file", "-s", help="Path to JSON file storing ATO profiles."),
+    ] = None,
+    output_format: Annotated[
+        str,
+        typer.Option("--format", "-f", help="Output format (table or json)."),
+    ] = "table",
+) -> None:
+    """Evaluate an authentication attempt for Account Takeover risk."""
+    try:
+        outcome_enum = LoginOutcome(outcome.lower())
+    except ValueError:
+        _abort(f"Invalid outcome '{outcome}'. Expected: success, failed_credentials, failed_mfa.")
+
+    tracker, store = _load_ato_state(store_file)
+    engine = AtoEngine(profile_tracker=tracker, store=store, auto_quarantine=True)
+
+    event = LoginEvent(
+        user_id=user_id,
+        tenant_id=tenant_id,
+        ip_address=ip_address,
+        outcome=outcome_enum,
+        device_fingerprint=device_fingerprint,
+        latitude=latitude,
+        longitude=longitude,
+    )
+    assessment = engine.evaluate_attempt(event, action_type="login")
+    _save_ato_state(store_file, tracker, store)
+
+    if output_format.lower() == "table":
+        typer.echo(f"Assessment ID: {assessment.assessment_id}")
+        typer.echo(f"User ID:       {assessment.user_id}")
+        typer.echo(f"Risk Score:    {assessment.risk_score:.4f}")
+        typer.echo(f"Action:        {assessment.recommended_action.value.upper()}")
+        typer.echo(
+            f"Factors:       {', '.join(f.value for f in assessment.factors_triggered) or 'none'}"
+        )
+        typer.echo(f"Quarantined:   {assessment.quarantined}")
+    else:
+        typer.echo(json.dumps(assessment.to_dict(), indent=2))
+
+
+@app.command("ato-eval")
+def ato_eval(
+    user_id: Annotated[
+        str,
+        typer.Option("--user-id", "-u", help="User identifier."),
+    ],
+    action_type: Annotated[
+        str,
+        typer.Option(
+            "--action-type", "-a", help="Action type (transaction, transfer, profile_view)."
+        ),
+    ] = "transaction",
+    amount: Annotated[
+        float | None,
+        typer.Option("--amount", help="Transaction amount if applicable."),
+    ] = None,
+    ip_address: Annotated[
+        str,
+        typer.Option("--ip-address", "-i", help="Client IP address."),
+    ] = "127.0.0.1",
+    device_fingerprint: Annotated[
+        str | None,
+        typer.Option("--device", "-d", help="Client device fingerprint hash."),
+    ] = None,
+    latitude: Annotated[
+        float | None,
+        typer.Option("--latitude", help="Client geolocation latitude."),
+    ] = None,
+    longitude: Annotated[
+        float | None,
+        typer.Option("--longitude", help="Client geolocation longitude."),
+    ] = None,
+    tenant_id: Annotated[
+        str,
+        typer.Option("--tenant-id", help="Tenant organization partition."),
+    ] = "default",
+    store_file: Annotated[
+        Path | None,
+        typer.Option("--store-file", "-s", help="Path to JSON file storing ATO profiles."),
+    ] = None,
+    output_format: Annotated[
+        str,
+        typer.Option("--format", "-f", help="Output format (table or json)."),
+    ] = "table",
+) -> None:
+    """Evaluate an ongoing session action or card transaction for ATO compromise."""
+    tracker, store = _load_ato_state(store_file)
+    engine = AtoEngine(profile_tracker=tracker, store=store, auto_quarantine=True)
+
+    event = LoginEvent(
+        user_id=user_id,
+        tenant_id=tenant_id,
+        ip_address=ip_address,
+        outcome=LoginOutcome.SUCCESS,
+        device_fingerprint=device_fingerprint,
+        latitude=latitude,
+        longitude=longitude,
+    )
+    assessment = engine.evaluate_attempt(event, action_type=action_type, transaction_amount=amount)
+    _save_ato_state(store_file, tracker, store)
+
+    if output_format.lower() == "table":
+        typer.echo(f"Assessment ID: {assessment.assessment_id}")
+        typer.echo(f"User ID:       {assessment.user_id}")
+        typer.echo(f"Risk Score:    {assessment.risk_score:.4f}")
+        typer.echo(f"Action:        {assessment.recommended_action.value.upper()}")
+        typer.echo(
+            f"Factors:       {', '.join(f.value for f in assessment.factors_triggered) or 'none'}"
+        )
+        typer.echo(f"Quarantined:   {assessment.quarantined}")
+    else:
+        typer.echo(json.dumps(assessment.to_dict(), indent=2))
+
+
+@app.command("ato-inspect")
+def ato_inspect(
+    user_id: Annotated[
+        str,
+        typer.Option("--user-id", "-u", help="User identifier."),
+    ],
+    store_file: Annotated[
+        Path,
+        typer.Option("--store-file", "-s", help="Path to JSON file storing ATO profiles."),
+    ],
+    output_format: Annotated[
+        str,
+        typer.Option("--format", "-f", help="Output format (table or json)."),
+    ] = "table",
+) -> None:
+    """Inspect user baseline account profile, known devices, and quarantine status."""
+    tracker, _ = _load_ato_state(store_file)
+    profile = tracker.get_or_create_profile(user_id)
+
+    if output_format.lower() == "table":
+        typer.echo(f"User ID:        {profile.user_id}")
+        typer.echo(f"Known Devices:  {', '.join(sorted(profile.known_devices)) or 'none'}")
+        typer.echo(f"Known Locs:     {len(profile.known_locations)} recorded")
+        typer.echo(f"Last Known IP:  {profile.last_known_ip or 'none'}")
+        typer.echo(f"Quarantined:    {profile.is_quarantined}")
+        if profile.is_quarantined:
+            typer.echo(f"Reason:         {profile.quarantine_reason}")
+        typer.echo(f"Mutations:      {len(profile.mutations)} recorded")
+    else:
+        typer.echo(json.dumps(profile.to_dict(), indent=2))
+
+
+@app.command("ato-quarantine")
+def ato_quarantine(
+    user_id: Annotated[
+        str,
+        typer.Option("--user-id", "-u", help="User identifier."),
+    ],
+    reason: Annotated[
+        str,
+        typer.Option("--reason", "-r", help="Reason for placing account in security quarantine."),
+    ],
+    store_file: Annotated[
+        Path,
+        typer.Option("--store-file", "-s", help="Path to JSON file storing ATO profiles."),
+    ],
+    output_format: Annotated[
+        str,
+        typer.Option("--format", "-f", help="Output format (table or json)."),
+    ] = "table",
+) -> None:
+    """Administratively place a user account under security quarantine."""
+    tracker, store = _load_ato_state(store_file)
+    tracker.quarantine_account(user_id, reason=reason)
+    _save_ato_state(store_file, tracker, store)
+
+    if output_format.lower() == "table":
+        typer.echo(f"User ID:     {user_id}")
+        typer.echo("Status:      QUARANTINED")
+        typer.echo(f"Reason:      {reason}")
+    else:
+        typer.echo(
+            json.dumps({"status": "quarantined", "user_id": user_id, "reason": reason}, indent=2)
+        )
+
+
+@app.command("ato-release")
+def ato_release(
+    user_id: Annotated[
+        str,
+        typer.Option("--user-id", "-u", help="User identifier."),
+    ],
+    reason: Annotated[
+        str,
+        typer.Option("--reason", "-r", help="Reason for releasing account from quarantine."),
+    ],
+    store_file: Annotated[
+        Path,
+        typer.Option("--store-file", "-s", help="Path to JSON file storing ATO profiles."),
+    ],
+    output_format: Annotated[
+        str,
+        typer.Option("--format", "-f", help="Output format (table or json)."),
+    ] = "table",
+) -> None:
+    """Administratively release a user account from security quarantine."""
+    tracker, store = _load_ato_state(store_file)
+    tracker.release_account(user_id, reason=reason)
+    _save_ato_state(store_file, tracker, store)
+
+    if output_format.lower() == "table":
+        typer.echo(f"User ID:     {user_id}")
+        typer.echo("Status:      RELEASED")
+        typer.echo(f"Reason:      {reason}")
+    else:
+        typer.echo(
+            json.dumps({"status": "released", "user_id": user_id, "reason": reason}, indent=2)
+        )
+
+
+@app.command("ato-mutation")
+def ato_mutation(
+    user_id: Annotated[
+        str,
+        typer.Option("--user-id", "-u", help="User identifier."),
+    ],
+    mutation_type: Annotated[
+        str,
+        typer.Option(
+            "--type", "-m", help="Mutation type (password_change, email_change, mfa_reset)."
+        ),
+    ],
+    channel: Annotated[
+        str,
+        typer.Option(
+            "--channel", "-c", help="Channel where mutation occurred (web, mobile, support)."
+        ),
+    ] = "web",
+    store_file: Annotated[
+        Path,
+        typer.Option("--store-file", "-s", help="Path to JSON file storing ATO profiles."),
+    ] = Path("ato_store.json"),
+    output_format: Annotated[
+        str,
+        typer.Option("--format", "-f", help="Output format (table or json)."),
+    ] = "table",
+) -> None:
+    """Record a sensitive profile mutation for ATO surveillance."""
+    try:
+        m_type = AccountMutationType(mutation_type.lower())
+    except ValueError:
+        _abort(
+            f"Invalid mutation type '{mutation_type}'. "
+            "Expected: password_change, email_change, mfa_reset."
+        )
+
+    tracker, store = _load_ato_state(store_file)
+    rec = AccountMutationRecord(mutation_type=m_type, channel=channel)
+    tracker.record_mutation(user_id, rec)
+    _save_ato_state(store_file, tracker, store)
+
+    if output_format.lower() == "table":
+        typer.echo(f"Mutation ID: {rec.mutation_id}")
+        typer.echo(f"User ID:     {user_id}")
+        typer.echo(f"Type:        {rec.mutation_type.value}")
+        typer.echo(f"Channel:     {rec.channel}")
+    else:
+        typer.echo(json.dumps(rec.to_dict(), indent=2))
 
 
 def _abort(message: str) -> NoReturn:
