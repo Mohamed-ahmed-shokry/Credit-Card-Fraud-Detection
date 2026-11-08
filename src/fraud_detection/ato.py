@@ -407,3 +407,232 @@ class CredentialStuffingDetector:
 
         max_score = max(spray_score, bf_score, sub_score)
         return max_score, factors
+
+
+@dataclass
+class AccountProfile:
+    """Historical behavior baseline, known devices/locations, and quarantine state."""
+
+    user_id: str
+    tenant_id: str = "default"
+    known_devices: set[str] = field(default_factory=set)
+    known_locations: list[tuple[float, float]] = field(default_factory=list)
+    last_known_ip: str | None = None
+    last_known_location: tuple[float, float] | None = None
+    last_active_at: datetime | None = None
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    mutations: list[AccountMutationRecord] = field(default_factory=list)
+    is_quarantined: bool = False
+    quarantine_reason: str | None = None
+    quarantined_at: datetime | None = None
+    release_reason: str | None = None
+    released_at: datetime | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize account profile to dictionary."""
+        return {
+            "user_id": self.user_id,
+            "tenant_id": self.tenant_id,
+            "known_devices": sorted(self.known_devices),
+            "known_locations": [list(loc) for loc in self.known_locations],
+            "last_known_ip": self.last_known_ip,
+            "last_known_location": (
+                list(self.last_known_location) if self.last_known_location else None
+            ),
+            "last_active_at": self.last_active_at.isoformat() if self.last_active_at else None,
+            "created_at": self.created_at.isoformat(),
+            "mutations": [m.to_dict() for m in self.mutations],
+            "is_quarantined": self.is_quarantined,
+            "quarantine_reason": self.quarantine_reason,
+            "quarantined_at": self.quarantined_at.isoformat() if self.quarantined_at else None,
+            "release_reason": self.release_reason,
+            "released_at": self.released_at.isoformat() if self.released_at else None,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> AccountProfile:
+        """Instantiate account profile from dictionary."""
+
+        def parse_ts(val: Any) -> datetime | None:
+            if not val:
+                return None
+            if isinstance(val, datetime):
+                return val if val.tzinfo is not None else val.replace(tzinfo=UTC)
+            dt = datetime.fromisoformat(str(val))
+            return dt if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
+
+        devices = set(data.get("known_devices", []))
+        locs = [(float(c[0]), float(c[1])) for c in data.get("known_locations", [])]
+
+        last_loc_raw = data.get("last_known_location")
+        last_loc = (
+            (float(last_loc_raw[0]), float(last_loc_raw[1]))
+            if last_loc_raw and len(last_loc_raw) >= 2
+            else None
+        )
+
+        mutations = [
+            AccountMutationRecord.from_dict(m)
+            for m in data.get("mutations", [])
+            if isinstance(m, dict)
+        ]
+
+        created_at = parse_ts(data.get("created_at")) or datetime.now(UTC)
+
+        return cls(
+            user_id=str(data["user_id"]),
+            tenant_id=str(data.get("tenant_id", "default")),
+            known_devices=devices,
+            known_locations=locs,
+            last_known_ip=data.get("last_known_ip"),
+            last_known_location=last_loc,
+            last_active_at=parse_ts(data.get("last_active_at")),
+            created_at=created_at,
+            mutations=mutations,
+            is_quarantined=bool(data.get("is_quarantined", False)),
+            quarantine_reason=data.get("quarantine_reason"),
+            quarantined_at=parse_ts(data.get("quarantined_at")),
+            release_reason=data.get("release_reason"),
+            released_at=parse_ts(data.get("released_at")),
+        )
+
+
+class AccountProfileTracker:
+    """Maintains user behavioral baselines, known devices/locations, and mutation decay."""
+
+    def __init__(
+        self,
+        mutation_risk_window_hours: float = 72.0,
+        dormancy_threshold_days: int = 90,
+    ) -> None:
+        self.mutation_risk_window_hours = mutation_risk_window_hours
+        self.dormancy_threshold_days = dormancy_threshold_days
+        self._lock = threading.RLock()
+        self._profiles: dict[str, AccountProfile] = {}
+
+    def get_or_create_profile(self, user_id: str, tenant_id: str = "default") -> AccountProfile:
+        """Get or initialize user account profile."""
+        with self._lock:
+            if user_id not in self._profiles:
+                self._profiles[user_id] = AccountProfile(user_id=user_id, tenant_id=tenant_id)
+            return self._profiles[user_id]
+
+    def record_mutation(
+        self,
+        user_id: str,
+        mutation: AccountMutationRecord,
+        tenant_id: str = "default",
+    ) -> None:
+        """Log a sensitive profile mutation for the user."""
+        with self._lock:
+            profile = self.get_or_create_profile(user_id, tenant_id)
+            profile.mutations.append(mutation)
+
+    def record_login_success(self, event: LoginEvent) -> None:
+        """Update user baseline on successful authentication."""
+        with self._lock:
+            profile = self.get_or_create_profile(event.user_id, event.tenant_id)
+            if event.device_fingerprint:
+                profile.known_devices.add(event.device_fingerprint)
+            profile.last_known_ip = event.ip_address
+            if event.latitude is not None and event.longitude is not None:
+                loc = (event.latitude, event.longitude)
+                profile.last_known_location = loc
+                if loc not in profile.known_locations:
+                    profile.known_locations.append(loc)
+            profile.last_active_at = event.timestamp
+
+    def is_device_recognized(self, user_id: str, device_fingerprint: str | None) -> bool:
+        """Check if device fingerprint matches user's known devices."""
+        if not device_fingerprint:
+            return False
+        with self._lock:
+            profile = self._profiles.get(user_id)
+            if not profile:
+                return False
+            return device_fingerprint in profile.known_devices
+
+    def calculate_mutation_penalty(
+        self, user_id: str, at_time: datetime | None = None
+    ) -> tuple[float, float | None, list[AtoRiskFactor]]:
+        """Calculate time-decayed penalty and triggered factors for recent sensitive mutations."""
+        ref_time = at_time or datetime.now(UTC)
+        with self._lock:
+            profile = self._profiles.get(user_id)
+            if not profile or not profile.mutations:
+                return 0.0, None, []
+
+            # Find the most recent mutation
+            most_recent: AccountMutationRecord | None = None
+            min_hours: float | None = None
+
+            for m in profile.mutations:
+                diff_sec = (ref_time - m.timestamp).total_seconds()
+                diff_hrs = max(0.0, diff_sec / 3600.0)
+                if diff_hrs <= self.mutation_risk_window_hours and (
+                    min_hours is None or diff_hrs < min_hours
+                ):
+                    min_hours = diff_hrs
+                    most_recent = m
+
+            if most_recent is None or min_hours is None:
+                return 0.0, None, []
+
+            factors: list[AtoRiskFactor] = []
+            if most_recent.mutation_type in (
+                AccountMutationType.PASSWORD_CHANGE,
+                AccountMutationType.EMAIL_CHANGE,
+                AccountMutationType.PHONE_CHANGE,
+            ):
+                factors.append(AtoRiskFactor.RECENT_CREDENTIAL_CHANGE)
+            elif most_recent.mutation_type == AccountMutationType.MFA_RESET:
+                factors.append(AtoRiskFactor.RECENT_MFA_RESET)
+
+            # Time decay step function
+            if min_hours <= 1.0:
+                penalty = 0.40
+            elif min_hours <= 24.0:
+                penalty = 0.20
+            else:
+                penalty = 0.10
+
+            return penalty, min_hours, factors
+
+    def is_dormant_reactivation(
+        self, user_id: str, current_time: datetime | None = None
+    ) -> tuple[bool, float]:
+        """Detect sudden activity on accounts inactive for longer than threshold."""
+        ref_time = current_time or datetime.now(UTC)
+        with self._lock:
+            profile = self._profiles.get(user_id)
+            if not profile or profile.last_active_at is None:
+                return False, 0.0
+
+            days_inactive = (ref_time - profile.last_active_at).total_seconds() / 86400.0
+            if days_inactive >= self.dormancy_threshold_days:
+                return True, 0.15
+            return False, 0.0
+
+    def quarantine_account(self, user_id: str, reason: str, tenant_id: str = "default") -> None:
+        """Place an account under security quarantine."""
+        with self._lock:
+            profile = self.get_or_create_profile(user_id, tenant_id)
+            profile.is_quarantined = True
+            profile.quarantine_reason = reason
+            profile.quarantined_at = datetime.now(UTC)
+            profile.released_at = None
+
+    def release_account(self, user_id: str, reason: str, tenant_id: str = "default") -> None:
+        """Release an account from quarantine."""
+        with self._lock:
+            profile = self.get_or_create_profile(user_id, tenant_id)
+            profile.is_quarantined = False
+            profile.quarantine_reason = None
+            profile.release_reason = reason
+            profile.released_at = datetime.now(UTC)
+
+    def is_quarantined(self, user_id: str) -> bool:
+        """Check if an account is currently quarantined."""
+        with self._lock:
+            profile = self._profiles.get(user_id)
+            return profile.is_quarantined if profile else False
