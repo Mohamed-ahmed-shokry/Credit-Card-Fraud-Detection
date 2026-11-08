@@ -7,7 +7,7 @@
 - **Pull Request**: [#30](https://github.com/Mohamed-ahmed-shokry/Credit-Card-Fraud-Detection/pull/30)
 
 ## Task Status
-- [ ] Task 1: Create `src/fraud_detection/ato.py` with domain data models, enums, mutation records, and unit tests in `tests/test_ato.py`.
+- [x] Task 1: Create `src/fraud_detection/ato.py` with domain data models, enums, mutation records, and unit tests in `tests/test_ato.py`.
 - [ ] Task 2: Implement `CredentialStuffingDetector` (sliding-window IP spraying and distributed brute-force detection) in `src/fraud_detection/ato.py` with unit tests.
 - [ ] Task 3: Implement `AccountProfileTracker` (baselines, known devices/locations, mutation decay, quarantine) in `src/fraud_detection/ato.py` with unit tests.
 - [ ] Task 4: Implement `AtoEngine` (multi-factor risk scoring, policy evaluation, challenge & case integration) and thread-safe `AtoStore` in `src/fraud_detection/ato.py` with unit tests.
