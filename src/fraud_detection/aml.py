@@ -1333,7 +1333,7 @@ class AmlEngine:
         store: AmlStore | None = None,
         case_manager: CaseManager | None = None,
         event_bus: EventBus | None = None,
-        pass_threshold: float = 0.35,
+        pass_threshold: float = 0.30,
         monitor_threshold: float = 0.70,
         edd_threshold: float = 0.85,
     ) -> None:

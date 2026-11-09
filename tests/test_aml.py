@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from fraud_detection.aml import (
     AmlAction,
     AmlAlert,
+    AmlAssessment,
+    AmlEngine,
     AmlRiskLevel,
+    AmlStore,
     AmlTransactionEvent,
     AmlTypology,
     CircularFlowAlert,
@@ -512,3 +516,189 @@ def test_high_risk_jurisdiction_detector() -> None:
     restored = JurisdictionRiskAssessment.from_dict(d)
     assert restored.country == "IR"
     assert restored.risk_score == 1.0
+
+
+def test_aml_store_lifecycle_and_eviction() -> None:
+    """Verify AmlStore storage, indexing, SAR status updates, and capacity eviction."""
+    store = AmlStore(max_capacity=2)
+    now = datetime.now(UTC)
+
+    # 1. Alert storage & indexing
+    alt1 = AmlAlert(
+        "usr-1",
+        AmlTypology.STRUCTURING_SMURFING,
+        AmlRiskLevel.HIGH,
+        AmlAction.MONITOR,
+        0.50,
+        alert_id="a1",
+    )
+    alt2 = AmlAlert(
+        "usr-2",
+        AmlTypology.RAPID_MOVEMENT_LAYERING,
+        AmlRiskLevel.MEDIUM,
+        AmlAction.MONITOR,
+        0.45,
+        alert_id="a2",
+    )
+    alt3 = AmlAlert(
+        "usr-1",
+        AmlTypology.SANCTION_PEP_MATCH,
+        AmlRiskLevel.CRITICAL,
+        AmlAction.FILE_SAR_BLOCK,
+        1.0,
+        alert_id="a3",
+    )
+
+    store.record_alert(alt1)
+    store.record_alert(alt2)
+    assert store.count_alerts() == 2
+    assert store.get_alert("a1") == alt1
+
+    # Eviction on exceeding capacity
+    store.record_alert(alt3)
+    assert store.count_alerts() == 2
+    assert store.get_alert("a1") is None
+    assert store.get_alert("a3") == alt3
+
+    # Filtered alert list
+    u1_alerts = store.list_alerts(user_id="usr-1")
+    assert len(u1_alerts) == 1
+    assert u1_alerts[0].alert_id == "a3"
+
+    # 2. SAR Dossier storage and status transitions
+    sar1 = SarDossier(
+        user_id="usr-1",
+        narrative="Test SAR narrative",
+        alert_ids=("a3",),
+        sar_id="sar-1",
+        created_at=now,
+        updated_at=now,
+    )
+    store.record_sar(sar1)
+    assert store.count_sars() == 1
+    assert store.get_sar("sar-1") is not None
+
+    # Status update: DRAFT -> PENDING_REVIEW -> FILED
+    updated_review = store.update_sar_status(
+        "sar-1", SarStatus.PENDING_REVIEW, notes="Assigned to officer"
+    )
+    assert updated_review is not None
+    assert updated_review.status == SarStatus.PENDING_REVIEW
+    assert len(updated_review.audit_trail) == 1
+    assert updated_review.audit_trail[0]["from_status"] == "draft"
+
+    updated_filed = store.update_sar_status("sar-1", SarStatus.FILED, notes="Submitted to FinCEN")
+    assert updated_filed is not None
+    assert updated_filed.status == SarStatus.FILED
+    assert updated_filed.filing_date != ""
+    assert len(updated_filed.audit_trail) == 2
+
+    # Querying non-existent
+    assert store.update_sar_status("non-existent", SarStatus.FILED) is None
+    assert store.get_sar("non-existent") is None
+
+    # List with filters
+    filed_sars = store.list_sars(status=SarStatus.FILED)
+    assert len(filed_sars) == 1
+    assert len(store.list_sars(status=SarStatus.DRAFT)) == 0
+
+    # Clear
+    store.clear()
+    assert store.count_alerts() == 0
+    assert store.count_sars() == 0
+
+
+def test_aml_engine_evaluation_policies() -> None:
+    """Verify AmlEngine evaluation, policy decisioning, case escalation, and domain events."""
+    from fraud_detection.cases import CaseManager, CaseStore
+    from fraud_detection.events import EventBus
+
+    bus = EventBus()
+    events_received: list[dict[str, Any]] = []
+    bus.subscribe(lambda evt: events_received.append(evt.to_dict()))
+
+    case_store = CaseStore()
+    case_mgr = CaseManager(store=case_store)
+    engine = AmlEngine(case_manager=case_mgr, event_bus=bus)
+
+    # Pre-populate a watchlist entry
+    engine.screening_engine.add_entry(
+        WatchlistEntry("Viktor Bout", WatchlistType.OFAC_SDN, "RU", entity_id="sdn-bout")
+    )
+
+    now = datetime.now(UTC)
+
+    # 1. Clean transaction -> PASS
+    clean_tx = AmlTransactionEvent(
+        transaction_id="tx-clean",
+        user_id="usr-normal",
+        amount=50.0,
+        country="US",
+        timestamp=now,
+    )
+    res_clean = engine.evaluate_transaction(clean_tx)
+    assert res_clean.recommended_action == AmlAction.PASS
+    assert res_clean.risk_level == AmlRiskLevel.LOW
+    assert res_clean.risk_score == 0.0
+    assert res_clean.case_id is None
+
+    # 2. High-Risk Jurisdiction alone -> MONITOR (0.30 weight)
+    gray_tx = AmlTransactionEvent(
+        transaction_id="tx-gray",
+        user_id="usr-gray",
+        amount=500.0,
+        country="SY",
+        timestamp=now,
+    )
+    res_gray = engine.evaluate_transaction(gray_tx)
+    assert res_gray.recommended_action == AmlAction.MONITOR
+    assert res_gray.risk_level == AmlRiskLevel.MEDIUM
+    assert AmlTypology.HIGH_RISK_JURISDICTION in res_gray.triggered_typologies
+
+    # 3. Structuring + High-Risk Country -> ENHANCED_DUE_DILIGENCE (0.45 + 0.30 = 0.75)
+    # Fire first sub-threshold
+    engine.evaluate_transaction(
+        AmlTransactionEvent("tx-str1", "usr-heavy", 9500.0, country="SY", timestamp=now)
+    )
+    # Fire second sub-threshold
+    res_heavy = engine.evaluate_transaction(
+        AmlTransactionEvent(
+            "tx-str2", "usr-heavy", 9200.0, country="SY", timestamp=now + timedelta(minutes=10)
+        )
+    )
+    assert res_heavy.recommended_action == AmlAction.ENHANCED_DUE_DILIGENCE
+    assert res_heavy.risk_level == AmlRiskLevel.HIGH
+    assert res_heavy.case_id is not None
+    created_case = case_mgr.get_case(res_heavy.case_id)
+    assert created_case is not None
+    assert created_case.metadata["source"] == "aml_engine"
+
+    # 4. Watchlist Hit -> FILE_SAR_BLOCK (1.0 weight)
+    sanction_tx = AmlTransactionEvent(
+        transaction_id="tx-sanction",
+        user_id="usr-arms",
+        counterparty_id="Viktor Bout",
+        amount=50000.0,
+        country="US",
+        timestamp=now + timedelta(minutes=20),
+    )
+    res_sanction = engine.evaluate_transaction(sanction_tx)
+    assert res_sanction.recommended_action == AmlAction.FILE_SAR_BLOCK
+    assert res_sanction.risk_level == AmlRiskLevel.CRITICAL
+    assert res_sanction.risk_score == 1.0
+    assert res_sanction.case_id is not None
+    sanction_case = case_mgr.get_case(res_sanction.case_id)
+    assert sanction_case is not None
+    assert sanction_case.priority.value == "critical"
+
+    # Verify EventBus received domain events
+    event_types = [e["event_type"] for e in events_received]
+    assert "fraud.aml.transaction_monitored" in event_types
+    assert "fraud.aml.alert_triggered" in event_types
+    assert "fraud.aml.sanction_match_detected" in event_types
+
+    # Assessment serialization
+    assessment_dict = res_sanction.to_dict()
+    restored = AmlAssessment.from_dict(assessment_dict)
+    assert restored.transaction_id == "tx-sanction"
+    assert restored.recommended_action == AmlAction.FILE_SAR_BLOCK
