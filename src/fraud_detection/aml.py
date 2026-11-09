@@ -1082,3 +1082,169 @@ class HighRiskJurisdictionDetector:
             self._black_list.discard(code)
             self._gray_list.discard(code)
             return removed_black or removed_gray
+
+
+class AmlStore:
+    """Thread-safe concurrent storage for AML alerts, SAR dossiers, and audit trails."""
+
+    def __init__(self, max_capacity: int = 10_000) -> None:
+        self.max_capacity = max_capacity
+        self._lock = threading.RLock()
+        self._alerts: dict[str, AmlAlert] = {}
+        self._user_alerts: dict[str, list[str]] = defaultdict(list)
+        self._sars: dict[str, SarDossier] = {}
+        self._user_sars: dict[str, list[str]] = defaultdict(list)
+
+    def record_alert(self, alert: AmlAlert) -> None:
+        """Record an AML alert and index by alert ID and user ID."""
+        with self._lock:
+            if len(self._alerts) >= self.max_capacity:
+                oldest_id = next(iter(self._alerts))
+                evicted = self._alerts.pop(oldest_id)
+                user_list = self._user_alerts.get(evicted.user_id, [])
+                if oldest_id in user_list:
+                    user_list.remove(oldest_id)
+
+            self._alerts[alert.alert_id] = alert
+            self._user_alerts[alert.user_id].append(alert.alert_id)
+
+    def get_alert(self, alert_id: str) -> AmlAlert | None:
+        """Retrieve an AML alert by ID."""
+        with self._lock:
+            return self._alerts.get(alert_id)
+
+    def list_alerts(
+        self,
+        user_id: str | None = None,
+        typology: AmlTypology | None = None,
+        risk_level: AmlRiskLevel | None = None,
+        tenant_id: str | None = None,
+        limit: int = 100,
+    ) -> list[AmlAlert]:
+        """Query alerts matching optional filters, sorted by creation time descending."""
+        with self._lock:
+            if user_id:
+                alert_ids = self._user_alerts.get(user_id, [])
+                candidates = [self._alerts[aid] for aid in alert_ids if aid in self._alerts]
+            else:
+                candidates = list(self._alerts.values())
+
+        filtered: list[AmlAlert] = []
+        for alert in candidates:
+            if typology and alert.typology != typology:
+                continue
+            if risk_level and alert.risk_level != risk_level:
+                continue
+            if tenant_id and alert.tenant_id != tenant_id:
+                continue
+            filtered.append(alert)
+
+        filtered.sort(key=lambda a: a.created_at, reverse=True)
+        return filtered[:limit]
+
+    def record_sar(self, sar: SarDossier) -> None:
+        """Record a SAR filing dossier."""
+        with self._lock:
+            if len(self._sars) >= self.max_capacity:
+                oldest_id = next(iter(self._sars))
+                evicted = self._sars.pop(oldest_id)
+                user_list = self._user_sars.get(evicted.user_id, [])
+                if oldest_id in user_list:
+                    user_list.remove(oldest_id)
+
+            self._sars[sar.sar_id] = sar
+            if sar.sar_id not in self._user_sars[sar.user_id]:
+                self._user_sars[sar.user_id].append(sar.sar_id)
+
+    def get_sar(self, sar_id: str) -> SarDossier | None:
+        """Retrieve a SAR filing dossier by ID."""
+        with self._lock:
+            return self._sars.get(sar_id)
+
+    def list_sars(
+        self,
+        user_id: str | None = None,
+        status: SarStatus | None = None,
+        tenant_id: str | None = None,
+        limit: int = 100,
+    ) -> list[SarDossier]:
+        """Query SAR dossiers matching filters, sorted by updated time descending."""
+        with self._lock:
+            if user_id:
+                sar_ids = self._user_sars.get(user_id, [])
+                candidates = [self._sars[sid] for sid in sar_ids if sid in self._sars]
+            else:
+                candidates = list(self._sars.values())
+
+        filtered: list[SarDossier] = []
+        for s in candidates:
+            if status and s.status != status:
+                continue
+            if tenant_id and s.tenant_id != tenant_id:
+                continue
+            filtered.append(s)
+
+        filtered.sort(key=lambda s: s.updated_at, reverse=True)
+        return filtered[:limit]
+
+    def update_sar_status(
+        self,
+        sar_id: str,
+        new_status: SarStatus,
+        notes: str = "",
+        actor: str = "compliance_officer",
+    ) -> SarDossier | None:
+        """Transition the review or filing status of a SAR with an audit record."""
+        with self._lock:
+            sar = self._sars.get(sar_id)
+            if sar is None:
+                return None
+
+            now = datetime.now(UTC)
+            filing_date = (
+                now.strftime("%Y-%m-%d") if new_status == SarStatus.FILED else sar.filing_date
+            )
+            audit_entry = {
+                "timestamp": now.isoformat(),
+                "from_status": sar.status.value,
+                "to_status": new_status.value,
+                "actor": actor,
+                "notes": notes,
+            }
+            new_trail = (*sar.audit_trail, audit_entry)
+
+            updated = SarDossier(
+                sar_id=sar.sar_id,
+                user_id=sar.user_id,
+                narrative=sar.narrative,
+                alert_ids=sar.alert_ids,
+                status=new_status,
+                suspect_details=sar.suspect_details,
+                summary_financials=sar.summary_financials,
+                jurisdictions=sar.jurisdictions,
+                filing_date=filing_date,
+                tenant_id=sar.tenant_id,
+                created_at=sar.created_at,
+                updated_at=now,
+                audit_trail=new_trail,
+            )
+            self._sars[sar_id] = updated
+            return updated
+
+    def count_alerts(self) -> int:
+        """Return total count of recorded alerts."""
+        with self._lock:
+            return len(self._alerts)
+
+    def count_sars(self) -> int:
+        """Return total count of recorded SAR dossiers."""
+        with self._lock:
+            return len(self._sars)
+
+    def clear(self) -> None:
+        """Clear all stored alerts and dossiers."""
+        with self._lock:
+            self._alerts.clear()
+            self._user_alerts.clear()
+            self._sars.clear()
+            self._user_sars.clear()
