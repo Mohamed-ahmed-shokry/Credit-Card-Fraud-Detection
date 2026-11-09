@@ -979,3 +979,106 @@ class CircularFlowDetector:
         """Clear all transfer tracking queues."""
         with self._lock:
             self._transfers.clear()
+
+
+@dataclass(frozen=True)
+class JurisdictionRiskAssessment:
+    """Evaluation of geographic corridor risk under AML regulations."""
+
+    country: str
+    is_high_risk: bool
+    fatf_tier: str
+    risk_score: float
+    description: str
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize jurisdiction risk assessment to dictionary."""
+        return {
+            "country": self.country,
+            "is_high_risk": self.is_high_risk,
+            "fatf_tier": self.fatf_tier,
+            "risk_score": round(self.risk_score, 4),
+            "description": self.description,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> JurisdictionRiskAssessment:
+        """Deserialize jurisdiction risk assessment from dictionary."""
+        return cls(
+            country=str(data["country"]),
+            is_high_risk=bool(data["is_high_risk"]),
+            fatf_tier=str(data["fatf_tier"]),
+            risk_score=float(data["risk_score"]),
+            description=str(data.get("description", "")),
+        )
+
+
+class HighRiskJurisdictionDetector:
+    """Detects transactions flowing through FATF non-cooperative or monitored jurisdictions."""
+
+    DEFAULT_BLACK_LIST: frozenset[str] = frozenset({"KP", "IR", "MM"})
+    DEFAULT_GRAY_LIST: frozenset[str] = frozenset(
+        {"SY", "YE", "SS", "HT", "NG", "ML", "BF", "CD", "MZ"}
+    )
+
+    def __init__(
+        self,
+        custom_black_list: set[str] | None = None,
+        custom_gray_list: set[str] | None = None,
+    ) -> None:
+        self._lock = threading.RLock()
+        self._black_list = set(custom_black_list or self.DEFAULT_BLACK_LIST)
+        self._gray_list = set(custom_gray_list or self.DEFAULT_GRAY_LIST)
+
+    def evaluate(self, country: str) -> JurisdictionRiskAssessment:
+        """Evaluate a country code against FATF non-cooperative and monitored lists."""
+        code = country.strip().upper()
+        with self._lock:
+            if code in self._black_list:
+                return JurisdictionRiskAssessment(
+                    country=code,
+                    is_high_risk=True,
+                    fatf_tier="black_list",
+                    risk_score=1.0,
+                    description=(
+                        f"Jurisdiction {code} is on the FATF High-Risk Call for Action (Blacklist)."
+                    ),
+                )
+            if code in self._gray_list:
+                return JurisdictionRiskAssessment(
+                    country=code,
+                    is_high_risk=True,
+                    fatf_tier="gray_list",
+                    risk_score=0.60,
+                    description=(
+                        f"Jurisdiction {code} is on the FATF Increased Monitoring (Graylist)."
+                    ),
+                )
+            return JurisdictionRiskAssessment(
+                country=code,
+                is_high_risk=False,
+                fatf_tier="standard",
+                risk_score=0.0,
+                description=f"Jurisdiction {code} has standard regulatory compliance standing.",
+            )
+
+    def add_jurisdiction(self, country: str, tier: str = "gray_list") -> None:
+        """Register an additional high-risk jurisdiction."""
+        code = country.strip().upper()
+        with self._lock:
+            if tier == "black_list":
+                self._black_list.add(code)
+                self._gray_list.discard(code)
+            else:
+                self._gray_list.add(code)
+                self._black_list.discard(code)
+
+    def remove_jurisdiction(self, country: str) -> bool:
+        """Remove a jurisdiction from high-risk monitoring."""
+        code = country.strip().upper()
+        with self._lock:
+            removed_black = code in self._black_list
+            removed_gray = code in self._gray_list
+            self._black_list.discard(code)
+            self._gray_list.discard(code)
+            return removed_black or removed_gray
