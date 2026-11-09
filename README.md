@@ -2048,6 +2048,71 @@ FastAPI Account Takeover REST endpoints:
 - `GET /v1/ato/assessments/{assessment_id}`: Retrieve detailed risk score breakdown, impossible travel speed, and factor telemetry.
 - Prometheus metrics: `fraud_ato_login_attempts_total`, `fraud_ato_risk_assessments_total`, `fraud_ato_quarantines_total`.
 
+### Anti-Money Laundering (AML) Transaction Monitoring & Regulatory SAR Engine
+
+Phase 48 introduces autonomous AML transaction monitoring, sub-CTR structuring/smurfing detection, rapid layering flow-through analysis, round-trip circular flow detection, phonetic/fuzzy OFAC/PEP watchlist screening, and FinCEN BSA Suspicious Activity Report (SAR) dossier management:
+
+```bash
+# Screen an individual or entity against OFAC SDN and PEP watchlists
+fraud-detect aml-screen \
+  --name "Vladimir Putin" \
+  --threshold 0.85 \
+  --format table
+
+# Monitor a transaction against all AML typologies and high-risk corridors
+fraud-detect aml-monitor \
+  --user-id usr_aml_101 \
+  --amount 9500.00 \
+  --counterparty-id entity_99 \
+  --country US \
+  --direction outbound \
+  --store-file data/aml_store.json \
+  --format table
+
+# List and filter AML alerts by typology or severity
+fraud-detect aml-alerts \
+  --typology structuring_smurfing \
+  --risk-level high \
+  --store-file data/aml_store.json \
+  --format table
+
+# Compile and package a regulatory SAR filing dossier
+fraud-detect aml-sar-generate \
+  --user-id usr_aml_101 \
+  --alert-ids "alt_structuring_01,alt_structuring_02" \
+  --suspect-name "John Doe" \
+  --narrative "Repeated structured withdrawals under currency transaction reporting threshold." \
+  --store-file data/aml_store.json \
+  --format table
+
+# Query regulatory SAR filing dossiers
+fraud-detect aml-sar-list \
+  --status draft \
+  --store-file data/aml_store.json \
+  --format table
+
+# Transition SAR dossier through compliance review lifecycle
+fraud-detect aml-sar-status \
+  --sar-id sar_84920 \
+  --status pending_review \
+  --reviewer "compliance_officer_jane" \
+  --comment "Escalated for principal officer approval." \
+  --store-file data/aml_store.json \
+  --format table
+```
+
+FastAPI Anti-Money Laundering REST endpoints:
+- `POST /v1/aml/monitor`: Ingest financial transaction and evaluate across structuring, layering, circular flows, sanctions, and FATF corridors.
+- `POST /v1/aml/watchlist/screen`: Screen entity names against watchlists using Soundex, Levenshtein, and Jaro-Winkler fuzzy matching.
+- `GET /v1/aml/alerts`: Query and filter AML surveillance alerts by user, typology, or risk level.
+- `GET /v1/aml/alerts/{alert_id}`: Retrieve detailed AML alert telemetry, evidence transactions, and trigger diagnostics.
+- `POST /v1/aml/sar`: Package and compile a formal FinCEN BSA SAR dossier from verified alerts.
+- `GET /v1/aml/sar`: List and filter SAR filing packages by status or subject user.
+- `GET /v1/aml/sar/{sar_id}`: Retrieve complete SAR dossier, narrative, financials, and audit history.
+- `GET /v1/aml/sar/{sar_id}/xml`: Export SAR dossier into standard FinCEN BSA XML compliant schema.
+- `POST /v1/aml/sar/{sar_id}/status`: Execute validated SAR state transition (`draft` -> `pending_review` -> `approved` -> `filed` / `rejected`).
+- Prometheus metrics: `fraud_aml_transactions_monitored_total`, `fraud_aml_alerts_total`, `fraud_aml_sanction_hits_total`, `fraud_aml_sars_created_total`, `fraud_aml_sars_filed_total`.
+
 ## Reference label-delay analysis
 
 
