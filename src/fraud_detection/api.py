@@ -7449,6 +7449,7 @@ def create_app(
 
     @application.get(
         "/v1/aml/sar/{sar_id}/xml",
+        response_model=None,
         responses={
             404: {"description": "SAR dossier not found."},
             500: {"description": "SarManager not initialized."},
