@@ -13,7 +13,7 @@ from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 from uuid import uuid4
 
 if TYPE_CHECKING:
@@ -1650,3 +1650,183 @@ def generate_sar_narrative(
     )
 
     return "\n".join(lines)
+
+
+class SarManager:
+    """Manages the lifecycle, compilation, audit trails, and export of SAR regulatory dossiers."""
+
+    VALID_TRANSITIONS: ClassVar[dict[SarStatus, set[SarStatus]]] = {
+        SarStatus.DRAFT: {SarStatus.PENDING_REVIEW, SarStatus.REJECTED},
+        SarStatus.PENDING_REVIEW: {SarStatus.APPROVED, SarStatus.REJECTED, SarStatus.DRAFT},
+        SarStatus.APPROVED: {SarStatus.FILED, SarStatus.REJECTED, SarStatus.PENDING_REVIEW},
+        SarStatus.FILED: set(),
+        SarStatus.REJECTED: {SarStatus.DRAFT},
+    }
+
+    def __init__(
+        self,
+        store: AmlStore | None = None,
+        event_bus: EventBus | None = None,
+    ) -> None:
+        self.store = store or AmlStore()
+        self.event_bus = event_bus
+        self._lock = threading.RLock()
+
+    def generate_sar(
+        self,
+        user_id: str,
+        alert_ids: list[str],
+        suspect_name: str = "",
+        suspect_details: dict[str, Any] | None = None,
+        transactions: list[AmlTransactionEvent] | None = None,
+        tenant_id: str = "default",
+        creator: str = "compliance_system",
+    ) -> SarDossier:
+        """Compile a SAR regulatory dossier from recorded alerts and transactional evidence."""
+        with self._lock:
+            alerts: list[AmlAlert] = []
+            for aid in alert_ids:
+                a = self.store.get_alert(aid)
+                if a is not None:
+                    alerts.append(a)
+
+            txs = transactions or []
+            tot_amt = sum(t.amount for t in txs)
+            curr = txs[0].currency if txs else "USD"
+            jurisdictions = {t.country for t in txs if t.country}
+            for a in alerts:
+                if "jurisdiction" in a.trigger_details:
+                    jurisdictions.add(a.trigger_details["jurisdiction"].get("country", "XX"))
+
+            financials = {
+                "total_suspicious_amount": round(tot_amt, 2),
+                "transaction_count": len(txs),
+                "currency": curr,
+                "alert_count": len(alerts),
+            }
+
+            narrative = generate_sar_narrative(
+                user_id=user_id,
+                alerts=alerts,
+                suspect_name=suspect_name,
+                summary_financials=financials,
+            )
+
+            now = datetime.now(UTC)
+            initial_audit = {
+                "timestamp": now.isoformat(),
+                "from_status": "",
+                "to_status": SarStatus.DRAFT.value,
+                "actor": creator,
+                "notes": "SAR dossier compiled from automated AML surveillance alerts.",
+            }
+
+            dossier = SarDossier(
+                user_id=user_id,
+                narrative=narrative,
+                alert_ids=tuple(alert_ids),
+                status=SarStatus.DRAFT,
+                suspect_details=suspect_details or {"full_name": suspect_name},
+                summary_financials=financials,
+                jurisdictions=tuple(sorted(jurisdictions)),
+                tenant_id=tenant_id,
+                created_at=now,
+                updated_at=now,
+                audit_trail=(initial_audit,),
+            )
+            self.store.record_sar(dossier)
+
+            if self.event_bus is not None:
+                from fraud_detection.events import EventType, FraudDomainEvent
+
+                self.event_bus.publish(
+                    FraudDomainEvent(
+                        event_type=EventType.AML_SAR_CREATED,
+                        payload=dossier.to_dict(),
+                        tenant_id=tenant_id,
+                    )
+                )
+
+            return dossier
+
+    def transition_status(
+        self,
+        sar_id: str,
+        new_status: SarStatus,
+        notes: str = "",
+        actor: str = "compliance_officer",
+    ) -> SarDossier:
+        """Validate and execute a state transition on a SAR dossier with audit logging."""
+        with self._lock:
+            sar = self.store.get_sar(sar_id)
+            if sar is None:
+                msg = f"SAR dossier {sar_id} not found."
+                raise KeyError(msg)
+
+            allowed = self.VALID_TRANSITIONS.get(sar.status, set())
+            if new_status not in allowed:
+                msg = (
+                    f"Invalid SAR status transition from {sar.status.value} to {new_status.value}."
+                )
+                raise ValueError(msg)
+
+            updated = self.store.update_sar_status(sar_id, new_status, notes=notes, actor=actor)
+            if updated is None:
+                msg = f"Failed updating SAR dossier {sar_id}."
+                raise RuntimeError(msg)
+
+            if self.event_bus is not None:
+                from fraud_detection.events import EventType, FraudDomainEvent
+
+                self.event_bus.publish(
+                    FraudDomainEvent(
+                        event_type=EventType.AML_SAR_STATUS_UPDATED,
+                        payload={
+                            "sar_id": sar_id,
+                            "user_id": sar.user_id,
+                            "previous_status": sar.status.value,
+                            "new_status": new_status.value,
+                            "actor": actor,
+                            "notes": notes,
+                            "tenant_id": sar.tenant_id,
+                        },
+                        tenant_id=sar.tenant_id,
+                    )
+                )
+
+            return updated
+
+    def export_fincen_xml(self, sar_id: str) -> str:
+        """Export the SAR dossier into standard FinCEN BSA XML compliant representation."""
+        sar = self.store.get_sar(sar_id)
+        if sar is None:
+            msg = f"SAR dossier {sar_id} not found."
+            raise KeyError(msg)
+
+        clean_narrative = (
+            sar.narrative.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        )
+        jurisdictions_xml = "".join(f"<CountryCode>{j}</CountryCode>" for j in sar.jurisdictions)
+        tot_amt = float(sar.summary_financials.get("total_suspicious_amount", 0.0))
+        curr = str(sar.summary_financials.get("currency", "USD"))
+
+        return (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<FinCEN_BSA_SAR version="2.0">\n'
+            f"  <SAR_ID>{sar.sar_id}</SAR_ID>\n"
+            f"  <FilingStatus>{sar.status.value.upper()}</FilingStatus>\n"
+            f"  <FilingDate>{sar.filing_date or 'PENDING'}</FilingDate>\n"
+            f"  <TenantID>{sar.tenant_id}</TenantID>\n"
+            "  <Subject>\n"
+            f"    <SubjectID>{sar.user_id}</SubjectID>\n"
+            f"    <Name>{sar.suspect_details.get('full_name', 'Unknown')}</Name>\n"
+            "  </Subject>\n"
+            "  <FinancialActivity>\n"
+            f'    <TotalAmount currency="{curr}">{tot_amt:.2f}</TotalAmount>\n'
+            f"    <Jurisdictions>{jurisdictions_xml}</Jurisdictions>\n"
+            "  </FinancialActivity>\n"
+            "  <SuspiciousNarrative>\n"
+            f"    <![CDATA[{clean_narrative}]]>\n"
+            "  </SuspiciousNarrative>\n"
+            "</FinCEN_BSA_SAR>"
+        )
