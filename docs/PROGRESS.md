@@ -14,7 +14,7 @@
 - [x] Task 5: Implement `SarManager` (narrative generator, FinCEN/FATF SAR dossier compiler, lifecycle state machine) in `src/fraud_detection/aml.py` with unit tests.
 - [x] Task 6: Integrate AML Engine with `events.py` (domain events) with unit and integration tests.
 - [x] Task 7: Implement `/v1/aml/*` REST endpoints and Prometheus metrics in `src/fraud_detection/api.py` with integration tests in `tests/test_api.py`.
-- [ ] Task 8: Implement CLI commands `aml-monitor`, `aml-screen`, `aml-alerts`, `aml-sar-generate`, `aml-sar-list`, and `aml-sar-status` in `src/fraud_detection/cli.py` with tests in `tests/test_cli.py`.
+- [x] Task 8: Implement CLI commands `aml-monitor`, `aml-screen`, `aml-alerts`, `aml-sar-generate`, `aml-sar-list`, and `aml-sar-status` in `src/fraud_detection/cli.py` with tests in `tests/test_cli.py`.
 - [ ] Task 9: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate with 100% Green CI.
 
 ## Acceptance Criteria Status
@@ -27,7 +27,7 @@
 | AC-5 (Regulatory SAR Packaging & Lifecycle) | PASSED | FinCEN/FATF SAR narratives, dossiers, status lifecycle in `src/fraud_detection/aml.py` verified in `tests/test_aml.py` |
 | AC-6 (Thread-Safe Store & EventBus Streaming) | PASSED | `AmlStore` concurrency, indexes, and `events.py` domain events verified in `tests/test_aml.py` and `tests/test_events.py` |
 | AC-7 (REST API & Observability) | PASSED | `/v1/aml/*` endpoints and Prometheus metrics in `src/fraud_detection/api.py` verified in `tests/test_api.py` |
-| AC-8 (CLI Workflows) | PENDING | `aml-*` commands in `src/fraud_detection/cli.py` |
+| AC-8 (CLI Workflows) | PASSED | `aml-*` commands in `src/fraud_detection/cli.py` verified in `tests/test_cli.py` |
 | AC-9 (Quality Standards & 100% Green CI) | PENDING | 100% local checks, branch coverage >= 97%, zero strict mypy issues, remote CI green |
 
 ## Decision Log
