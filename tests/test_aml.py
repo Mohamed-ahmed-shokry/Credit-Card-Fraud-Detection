@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from fraud_detection.aml import (
     AmlAction,
@@ -10,10 +10,17 @@ from fraud_detection.aml import (
     AmlRiskLevel,
     AmlTransactionEvent,
     AmlTypology,
+    CircularFlowAlert,
+    CircularFlowDetector,
+    HighRiskJurisdictionDetector,
+    JurisdictionRiskAssessment,
+    LayeringAlert,
+    LayeringDetector,
     SarDossier,
     SarStatus,
     ScreeningMatch,
     StructuringAlert,
+    StructuringDetector,
     TransactionDirection,
     WatchlistEntry,
     WatchlistScreeningEngine,
@@ -339,3 +346,169 @@ def test_watchlist_screening_matching_algorithms() -> None:
     # 7. Blank string handling
     assert engine.screen_entity("") == []
     assert engine.screen_entity("   !@#$%   ") == []
+
+
+def test_structuring_detector() -> None:
+    """Verify structuring and smurfing detection logic."""
+    detector = StructuringDetector(reporting_threshold=10000.0, sub_threshold_ratio=0.80)
+    now = datetime.now(UTC)
+
+    # 1. Single transaction under threshold -> no alert
+    tx1 = AmlTransactionEvent(
+        transaction_id="tx-1",
+        user_id="usr-smurf",
+        amount=9500.0,
+        timestamp=now,
+    )
+    assert detector.record_and_evaluate(tx1) is None
+
+    # 2. Second sub-threshold transaction -> triggers StructuringAlert
+    tx2 = AmlTransactionEvent(
+        transaction_id="tx-2",
+        user_id="usr-smurf",
+        amount=9200.0,
+        timestamp=now + timedelta(minutes=15),
+    )
+    alert = detector.record_and_evaluate(tx2)
+    assert alert is not None
+    assert alert.user_id == "usr-smurf"
+    assert alert.transaction_count == 2
+    assert alert.total_amount == 18700.0
+    assert alert.threshold_proximity > 0.90
+    assert alert.to_dict()["transaction_count"] == 2
+
+    # 3. Multiple small transactions accumulating above threshold
+    detector.clear()
+    t_a = AmlTransactionEvent("tx-a", "usr-acc", 3500.0, timestamp=now)
+    t_b = AmlTransactionEvent("tx-b", "usr-acc", 4000.0, timestamp=now + timedelta(minutes=5))
+    t_c = AmlTransactionEvent("tx-c", "usr-acc", 3000.0, timestamp=now + timedelta(minutes=10))
+
+    assert detector.record_and_evaluate(t_a) is None
+    assert detector.record_and_evaluate(t_b) is None
+    alert_acc = detector.record_and_evaluate(t_c)
+    assert alert_acc is not None
+    assert alert_acc.transaction_count == 3
+    assert alert_acc.total_amount == 10500.0
+
+
+def test_layering_detector() -> None:
+    """Verify rapid flow-through layering and dwell time detection."""
+    detector = LayeringDetector(
+        max_dwell_hours=2.0,
+        min_flow_amount=2000.0,
+        min_turnover_ratio=0.80,
+    )
+    now = datetime.now(UTC)
+
+    # Inflow of $10,000
+    inflow = AmlTransactionEvent(
+        transaction_id="in-1",
+        user_id="usr-layer",
+        amount=10000.0,
+        direction=TransactionDirection.INFLOW,
+        timestamp=now,
+    )
+    assert detector.record_and_evaluate(inflow) is None
+
+    # Outflow of $9,500 after 30 minutes (95% turnover, 30 min dwell)
+    outflow = AmlTransactionEvent(
+        transaction_id="out-1",
+        user_id="usr-layer",
+        amount=9500.0,
+        direction=TransactionDirection.OUTFLOW,
+        timestamp=now + timedelta(minutes=30),
+    )
+    alert = detector.record_and_evaluate(outflow)
+    assert alert is not None
+    assert alert.user_id == "usr-layer"
+    assert alert.inflow_amount == 10000.0
+    assert alert.outflow_amount == 9500.0
+    assert alert.turnover_ratio == 0.95
+    assert 29.0 < alert.dwell_minutes < 31.0
+    assert LayeringAlert.from_dict(alert.to_dict()).alert_id == alert.alert_id
+
+    # Low amount outflow should not trigger
+    detector.clear()
+    detector.record_and_evaluate(inflow)
+    small_outflow = AmlTransactionEvent(
+        transaction_id="out-small",
+        user_id="usr-layer",
+        amount=500.0,
+        direction=TransactionDirection.OUTFLOW,
+        timestamp=now + timedelta(minutes=10),
+    )
+    assert detector.record_and_evaluate(small_outflow) is None
+
+
+def test_circular_flow_detector() -> None:
+    """Verify circular and round-trip transaction loop detection."""
+    detector = CircularFlowDetector(window_seconds=86400.0, min_amount=500.0, amount_tolerance=0.10)
+    now = datetime.now(UTC)
+
+    # Alice sends Bob $5,000 (Alice is user, Bob is counterparty)
+    tx_fwd = AmlTransactionEvent(
+        transaction_id="tx-fwd",
+        user_id="Alice",
+        counterparty_id="Bob",
+        amount=5000.0,
+        direction=TransactionDirection.OUTFLOW,
+        timestamp=now,
+    )
+    assert detector.record_and_evaluate(tx_fwd) is None
+
+    # Bob sends Alice $4,900 after 2 hours
+    tx_ret = AmlTransactionEvent(
+        transaction_id="tx-ret",
+        user_id="Bob",
+        counterparty_id="Alice",
+        amount=4900.0,
+        direction=TransactionDirection.OUTFLOW,
+        timestamp=now + timedelta(hours=2),
+    )
+    alert = detector.record_and_evaluate(tx_ret)
+    assert alert is not None
+    assert alert.origin_user_id == "Bob"
+    assert alert.counterparty_id == "Alice"
+    assert alert.forward_amount == 5000.0
+    assert alert.return_amount == 4900.0
+    assert 1.9 < alert.cycle_hours < 2.1
+    assert CircularFlowAlert.from_dict(alert.to_dict()).alert_id == alert.alert_id
+
+    # Clear and verify empty
+    detector.clear()
+    assert detector.record_and_evaluate(tx_ret) is None
+
+
+def test_high_risk_jurisdiction_detector() -> None:
+    """Verify FATF blacklist, graylist, and custom jurisdiction evaluation."""
+    detector = HighRiskJurisdictionDetector()
+
+    # Blacklist evaluation
+    ir_eval = detector.evaluate("IR")
+    assert ir_eval.is_high_risk is True
+    assert ir_eval.fatf_tier == "black_list"
+    assert ir_eval.risk_score == 1.0
+
+    # Graylist evaluation
+    sy_eval = detector.evaluate("SY")
+    assert sy_eval.is_high_risk is True
+    assert sy_eval.fatf_tier == "gray_list"
+    assert sy_eval.risk_score == 0.60
+
+    # Standard jurisdiction evaluation
+    us_eval = detector.evaluate("US")
+    assert us_eval.is_high_risk is False
+    assert us_eval.fatf_tier == "standard"
+    assert us_eval.risk_score == 0.0
+
+    # Custom addition and removal
+    detector.add_jurisdiction("XX", tier="black_list")
+    assert detector.evaluate("XX").fatf_tier == "black_list"
+    assert detector.remove_jurisdiction("XX") is True
+    assert detector.evaluate("XX").is_high_risk is False
+
+    # Serialization
+    d = ir_eval.to_dict()
+    restored = JurisdictionRiskAssessment.from_dict(d)
+    assert restored.country == "IR"
+    assert restored.risk_score == 1.0
