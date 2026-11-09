@@ -16,6 +16,7 @@ from fraud_detection.aml import (
     StructuringAlert,
     TransactionDirection,
     WatchlistEntry,
+    WatchlistScreeningEngine,
     WatchlistType,
     jaro_similarity,
     jaro_winkler_similarity,
@@ -249,3 +250,92 @@ def test_jaro_winkler() -> None:
     assert jaro_winkler_similarity("ALICE", "ALICE") == 1.0
     assert jaro_winkler_similarity("", "") == 1.0
     assert jaro_winkler_similarity("A", "Z") == 0.0
+
+
+def test_watchlist_screening_engine_crud() -> None:
+    """Verify CRUD and listing operations on WatchlistScreeningEngine."""
+    engine = WatchlistScreeningEngine()
+    assert engine.count() == 0
+
+    entry1 = WatchlistEntry(
+        entity_id="sdn-1",
+        name="Viktor Bout",
+        watchlist_type=WatchlistType.OFAC_SDN,
+        country="RU",
+        aliases=("Boris",),
+    )
+    entry2 = WatchlistEntry(
+        entity_id="pep-1",
+        name="Alexander Lukashenko",
+        watchlist_type=WatchlistType.PEP,
+        country="BY",
+    )
+
+    engine.add_entry(entry1)
+    engine.add_entry(entry2)
+    assert engine.count() == 2
+
+    assert engine.get_entry("sdn-1") == entry1
+    assert engine.get_entry("non-existent") is None
+
+    sdn_entries = engine.list_entries(watchlist_type=WatchlistType.OFAC_SDN)
+    assert len(sdn_entries) == 1
+    assert sdn_entries[0].entity_id == "sdn-1"
+
+    all_entries = engine.list_entries()
+    assert len(all_entries) == 2
+
+    assert engine.remove_entry("sdn-1") is True
+    assert engine.remove_entry("sdn-1") is False
+    assert engine.count() == 1
+
+
+def test_watchlist_screening_matching_algorithms() -> None:
+    """Verify exact, token-sorted, typo-fuzzy, and phonetic watchlist matches."""
+    engine = WatchlistScreeningEngine(default_threshold=0.80)
+    entry = WatchlistEntry(
+        entity_id="target-1",
+        name="Osama Bin Laden",
+        watchlist_type=WatchlistType.OFAC_SDN,
+        country="SA",
+        aliases=("Usama Bin Ladin", "The Emir"),
+    )
+    engine.add_entry(entry)
+
+    # 1. Exact match
+    hits = engine.screen_entity("Osama Bin Laden")
+    assert len(hits) == 1
+    assert hits[0].similarity_score == 1.0
+    assert hits[0].match_algorithm == "exact"
+    assert hits[0].risk_level == AmlRiskLevel.CRITICAL
+
+    # 2. Alias match
+    hits_alias = engine.screen_entity("Usama Bin Ladin")
+    assert len(hits_alias) == 1
+    assert hits_alias[0].similarity_score == 1.0
+
+    # 3. Token-sorted match (e.g. inverted name)
+    hits_sorted = engine.screen_entity("Bin Laden Osama")
+    assert len(hits_sorted) == 1
+    assert hits_sorted[0].similarity_score >= 0.98
+
+    # 4. Typo / fuzzy match
+    hits_typo = engine.screen_entity("Osama Bin Ladon", threshold=0.85)
+    assert len(hits_typo) == 1
+    assert hits_typo[0].similarity_score >= 0.90
+    assert hits_typo[0].risk_level in (AmlRiskLevel.HIGH, AmlRiskLevel.CRITICAL)
+
+    # 5. Threshold filter cutoff
+    hits_unrelated = engine.screen_entity("John Smith", threshold=0.85)
+    assert len(hits_unrelated) == 0
+
+    # 6. Country filter
+    hits_wrong_country = engine.screen_entity("Osama Bin Laden", country="US")
+    assert len(hits_wrong_country) == 0
+
+    hits_right_country = engine.screen_entity("Osama Bin Laden", country="SA")
+    assert len(hits_right_country) == 1
+
+    # 7. Blank string handling
+    assert engine.screen_entity("") == []
+    assert engine.screen_entity("   !@#$%   ") == []
