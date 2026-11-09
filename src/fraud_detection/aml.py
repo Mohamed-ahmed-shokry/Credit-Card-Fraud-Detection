@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import re
 import threading
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Any
 from uuid import uuid4
@@ -671,3 +672,78 @@ class WatchlistScreeningEngine:
 
         matches.sort(key=lambda m: m.similarity_score, reverse=True)
         return matches
+
+
+class StructuringDetector:
+    """Sliding-window detector for currency/card transaction structuring and smurfing."""
+
+    def __init__(
+        self,
+        reporting_threshold: float = 10000.0,
+        sub_threshold_ratio: float = 0.80,
+        window_seconds: float = 86400.0,
+        min_sub_threshold_count: int = 2,
+    ) -> None:
+        self.reporting_threshold = reporting_threshold
+        self.sub_threshold_ratio = sub_threshold_ratio
+        self.window_seconds = window_seconds
+        self.min_sub_threshold_count = min_sub_threshold_count
+        self._lock = threading.RLock()
+        self._user_events: dict[str, deque[AmlTransactionEvent]] = defaultdict(deque)
+
+    def record_and_evaluate(
+        self,
+        event: AmlTransactionEvent,
+    ) -> StructuringAlert | None:
+        """Record a transaction and evaluate whether structuring/smurfing patterns match."""
+        with self._lock:
+            queue = self._user_events[event.user_id]
+            queue.append(event)
+            cutoff = event.timestamp - timedelta(seconds=self.window_seconds)
+            while queue and queue[0].timestamp < cutoff:
+                queue.popleft()
+
+            events_in_window = list(queue)
+
+        sub_floor = self.reporting_threshold * self.sub_threshold_ratio
+        sub_ceiling = self.reporting_threshold
+
+        near_threshold_events = [e for e in events_in_window if sub_floor <= e.amount < sub_ceiling]
+        total_sum = sum(e.amount for e in events_in_window)
+
+        is_structuring = False
+        flagged_events: list[AmlTransactionEvent] = []
+
+        if len(near_threshold_events) >= self.min_sub_threshold_count:
+            is_structuring = True
+            flagged_events = near_threshold_events
+        elif (
+            len(events_in_window) >= 3
+            and total_sum >= self.reporting_threshold
+            and all(e.amount < self.reporting_threshold for e in events_in_window)
+        ):
+            is_structuring = True
+            flagged_events = events_in_window
+
+        if not is_structuring:
+            return None
+
+        flagged_sum = sum(e.amount for e in flagged_events)
+        avg_amt = flagged_sum / len(flagged_events)
+        proximity = min(1.0, avg_amt / self.reporting_threshold)
+
+        return StructuringAlert(
+            user_id=event.user_id,
+            transaction_ids=tuple(e.transaction_id for e in flagged_events),
+            total_amount=flagged_sum,
+            transaction_count=len(flagged_events),
+            window_seconds=self.window_seconds,
+            average_amount=avg_amt,
+            threshold_proximity=proximity,
+            detected_at=event.timestamp,
+        )
+
+    def clear(self) -> None:
+        """Clear all sliding window transaction histories."""
+        with self._lock:
+            self._user_events.clear()
