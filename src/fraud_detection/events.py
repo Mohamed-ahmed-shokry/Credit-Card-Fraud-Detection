@@ -100,6 +100,10 @@ class EventType(StrEnum):
     CHARGEBACK_INGESTED = "fraud.chargeback.ingested"
     CHARGEBACK_REPRESENTED = "fraud.chargeback.represented"
     CHARGEBACK_RESOLVED = "fraud.chargeback.resolved"
+    ATO_LOGIN_EVALUATED = "fraud.ato.login_evaluated"
+    ATO_ACCOUNT_QUARANTINED = "fraud.ato.account_quarantined"
+    ATO_ACCOUNT_RELEASED = "fraud.ato.account_released"
+    ATO_CREDENTIAL_STUFFING_BURST = "fraud.ato.credential_stuffing_burst"
 
 
 class EventDeliveryStatus(StrEnum):

@@ -53,7 +53,8 @@ and graph feature aggregation (Phase 38), real-time geographic geolocation anoma
 velocity speed-of-travel calculations, and in-process IP geocoding (Phase 39), adaptive
 device and browser fingerprinting with anomaly clustering (Phase 40), real-time merchant
 and MCC risk profiling, chargeback surveillance, and bust-out anomaly detection (Phase 41),
-and multi-tenant policy partitioning, dynamic rule federation, and account isolation (Phase 42).
+and multi-tenant policy partitioning, dynamic rule federation, and account isolation (Phase 42),
+and account takeover (ATO) detection, credential stuffing defense, and identity session anomaly scoring (Phase 47).
 
 ## Phase 1 — Distribution
 
@@ -2441,6 +2442,84 @@ Does not implement proprietary mTLS VPN connections to Visa VROL or Mastercard M
 - Implemented FastAPI REST endpoints under `/v1/chargebacks/*` and `/v1/chargebacks/webhook` with rate-limiting bypass and Prometheus telemetry (`fraud_chargebacks_received_total`, `fraud_chargebacks_represented_total`, `fraud_chargebacks_won_total`, `fraud_chargebacks_lost_total`, `fraud_chargeback_financial_exposure_amount`).
 - Implemented Typer CLI commands (`chargeback-ingest`, `chargeback-list`, `chargeback-inspect`, `chargeback-represent`, `chargeback-resolve`) with JSON and ASCII table outputs, persistent store support, and standard error handling.
 - Comprehensive test coverage across `tests/test_chargeback.py`, `tests/test_api.py`, and `tests/test_cli.py` with $\ge 97.0\%$ branch coverage.
+
+
+## Phase 47 — Account Takeover (ATO) Detection, Credential Stuffing Defense & Identity Session Anomaly Engine (Done)
+
+### Objective
+
+Deliver an in-process, zero-dependency Account Takeover (ATO) Detection, Credential Stuffing Defense, and Identity Session Anomaly Engine (`ato.py`). Evaluate login attempts, sensitive account profile mutations (password, email, MFA resets), and high-velocity transactional behaviors for compromise indicators. Detect distributed credential stuffing and password spraying attacks across sliding time windows, track account historical baselines (known devices, geolocation centroids, dormancy), enforce automated defense actions (`ALLOW`, `CHALLENGE`, `QUARANTINE_ACCOUNT`, `BLOCK`), integrate with `challenge.py` (step-up MFA orchestration), `cases.py` (automated ATO case investigation), and `events.py` (asynchronous event streaming), expose REST API endpoints with Prometheus metrics (`api.py`), and provide CLI commands (`cli.py`).
+
+### Scope
+
+1. **ATO Domain Models & Risk Factor Taxonomy (`ato.py`)**:
+   - `AtoRiskFactor`: `NEW_DEVICE`, `IMPOSSIBLE_TRAVEL`, `RECENT_CREDENTIAL_CHANGE`, `RECENT_MFA_RESET`, `CREDENTIAL_STUFFING_BURST`, `PASSWORD_SPRAYING`, `DORMANT_ACCOUNT_REACTIVE`, `VELOCITY_SPIKE`.
+   - `AtoAction`: `ALLOW`, `CHALLENGE`, `QUARANTINE_ACCOUNT`, `BLOCK`.
+   - `LoginOutcome`: `SUCCESS`, `FAILED_CREDENTIALS`, `FAILED_MFA`, `BLOCKED`.
+   - `AccountMutationType`: `PASSWORD_CHANGE`, `EMAIL_CHANGE`, `PHONE_CHANGE`, `MFA_RESET`, `SHIPPING_ADDRESS_CHANGE`.
+   - `AccountMutationRecord`: Immutable record of sensitive profile changes with timestamp and channel.
+   - `LoginEvent`: Record of authentication attempts with IP, location, device fingerprint, and outcome.
+   - `AtoRiskAssessment`: Comprehensive evaluation record including calibrated risk score (0.0 to 1.0), recommended action, triggered risk factors, factor breakdown, impossible travel velocity ($km/h$), and quarantine status.
+2. **Credential Stuffing & Password Spraying Detector (`CredentialStuffingDetector` in `ato.py`)**:
+   - Sliding-window tracking of authentication failures across IPs and user accounts.
+   - Distributed spray detection: Single IP failing across $>M$ user accounts within window.
+   - Distributed brute force detection: Single user targeted by $>K$ distinct IPs within window.
+   - Subnet aggregation (`/24` CIDR prefix) for IP rotation botnet defense.
+   - Computes credential stuffing risk contribution ($[0.0, 1.0]$).
+3. **Account Profile & Baseline Tracker (`AccountProfileTracker` in `ato.py`)**:
+   - Maintains user baseline profile: known device fingerprints, historical geo centroids, sensitive mutation history, dormant state, and quarantine lock.
+   - Calculates time-decayed mutation risk (e.g. transaction $<1\text{h}$ after password change $\to$ severe risk penalty).
+   - Manages administrative and automated account quarantine and release lifecycle.
+4. **ATO Scoring Engine & Policy Decisioning (`AtoEngine` in `ato.py`)**:
+   - Synthesizes device recognition (`device.py`), impossible travel speed (`geolocation.py`), mutation decay, dormant reactivation, and stuffing burst indicators.
+   - Deterministic policy routing: low risk $\to$ `ALLOW`, medium risk $\to$ `CHALLENGE`, high risk $\to$ `QUARANTINE_ACCOUNT` / `BLOCK`.
+   - Account quarantine enforcement: immediately blocks transactions from compromised accounts.
+5. **Thread-Safe In-Memory Store & Ecosystem Integration (`AtoStore` in `ato.py`)**:
+   - Thread-safe storage with `threading.RLock()` and secondary indexes by `user_id`, `ip_address`, `tenant_id`, and quarantine status.
+   - EventBus streaming (`events.py`): publishes `ATO_LOGIN_EVALUATED`, `ATO_ACCOUNT_QUARANTINED`, `ATO_ACCOUNT_RELEASED`, `ATO_CREDENTIAL_STUFFING_BURST`.
+   - Case & Challenge triggering: triggers `ChallengeManager` (`challenge.py`) on `CHALLENGE` and `CaseManager` (`cases.py`) on `QUARANTINE_ACCOUNT`.
+6. **FastAPI Endpoints & Prometheus Observability (`api.py`)**:
+   - `POST /v1/ato/login`, `POST /v1/ato/evaluate`, `GET /v1/ato/accounts/{user_id}`, `POST /v1/ato/accounts/{user_id}/quarantine`, `POST /v1/ato/accounts/{user_id}/release`, `POST /v1/ato/accounts/{user_id}/mutations`.
+   - Prometheus metrics: `fraud_ato_login_attempts_total`, `fraud_ato_risk_assessments_total`, `fraud_ato_quarantines_total`, `fraud_ato_stuffing_bursts_total`.
+7. **Typer CLI Workflows (`cli.py`)**:
+   - `fraud-detect ato-login`, `fraud-detect ato-eval`, `fraud-detect ato-inspect`, `fraud-detect ato-quarantine`, `fraud-detect ato-release`, `fraud-detect ato-mutation`.
+
+### Acceptance Criteria
+
+1. **AC-1 (Domain Models & Risk Factor Taxonomy)**: `AtoRiskFactor`, `AtoAction`, `LoginOutcome`, `AccountMutationRecord`, `LoginEvent`, and `AtoRiskAssessment` correctly serialize, validate, and track risk factors.
+2. **AC-2 (Credential Stuffing & Spraying Detection)**: `CredentialStuffingDetector` detects high-frequency distributed spraying across users and brute-force targeting across IPs within configured sliding windows.
+3. **AC-3 (Account Baseline & Mutation Tracking)**: `AccountProfileTracker` tracks known devices, geo centroids, dormant reactivation, and computes time-decayed mutation risk penalties.
+4. **AC-4 (ATO Engine & Policy Decisioning)**: `AtoEngine` calculates calibrated aggregate risk score with explainable breakdown, correctly enforces `ALLOW`, `CHALLENGE`, `QUARANTINE_ACCOUNT`, and `BLOCK` policies, and integrates with `challenge.py` and `cases.py`.
+5. **AC-5 (Thread-Safe Store & EventBus Streaming)**: `AtoStore` provides thread-safe queries and mutations with capacity eviction, and lifecycle transitions publish domain events on `EventBus`.
+6. **AC-6 (REST API & Observability)**: FastAPI exposes `/v1/ato/*` endpoints with Prometheus metrics and rate-limiting enforcement.
+7. **AC-7 (CLI Workflows)**: Typer CLI exposes `ato-*` commands supporting JSON and table formats with standard exit codes.
+8. **AC-8 (Quality Standards & 100% Green CI)**: All local CI-parity checks and remote CI workflow runs pass 100%, branch coverage >= 97.0%, strict mypy 0 issues, Ruff clean, and build/twine valid.
+
+### Validation & CI Plan
+
+- Local CI-parity commands:
+  - `python -m ruff format --check src tests`
+  - `python -m ruff check src tests`
+  - `python -m mypy src`
+  - `python -m pip_audit --skip-editable`
+  - `python -m pytest --cov=fraud_detection --cov-report=term-missing`
+  - `python -m build` & `python -m twine check dist/*`
+- Remote CI workflow runs monitored via `gh run list` and `gh pr checks`.
+
+### Exclusions
+
+Does not implement biometric keystroke dynamics machine learning models; provides deterministic behavioral velocity, impossible travel, device trust scoring, credential stuffing analysis, and profile mutation risk tracking ready for production deployment.
+
+### Micro-Task Breakdown
+
+- [x] Task 1: Create `src/fraud_detection/ato.py` with domain data models, enums, mutation records, and unit tests in `tests/test_ato.py`.
+- [x] Task 2: Implement `CredentialStuffingDetector` (sliding-window IP spraying and distributed brute-force detection) in `src/fraud_detection/ato.py` with unit tests.
+- [x] Task 3: Implement `AccountProfileTracker` (baselines, known devices/locations, mutation decay, quarantine) in `src/fraud_detection/ato.py` with unit tests.
+- [x] Task 4: Implement `AtoEngine` (multi-factor risk scoring, policy evaluation, challenge & case integration) and thread-safe `AtoStore` in `src/fraud_detection/ato.py` with unit tests.
+- [x] Task 5: Integrate ATO Engine with `events.py` (domain events) with unit/integration tests.
+- [x] Task 6: Implement `/v1/ato/*` REST endpoints and Prometheus metrics in `src/fraud_detection/api.py` with integration tests in `tests/test_api.py`.
+- [x] Task 7: Implement CLI commands `ato-login`, `ato-eval`, `ato-inspect`, `ato-quarantine`, `ato-release`, and `ato-mutation` in `src/fraud_detection/cli.py` with tests in `tests/test_cli.py`.
+- [x] Task 8: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate with 100% Green CI.
 
 
 ## Contributing to the roadmap

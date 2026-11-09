@@ -38,6 +38,15 @@ from starlette.middleware.base import RequestResponseEndpoint
 from starlette.responses import Response
 
 from fraud_detection import __version__
+from fraud_detection.ato import (
+    AccountMutationRecord,
+    AccountMutationType,
+    AccountProfile,
+    AtoEngine,
+    AtoRiskAssessment,
+    LoginEvent,
+    LoginOutcome,
+)
 from fraud_detection.audit import (
     AuditSink,
     JsonlAuditSink,
@@ -304,6 +313,9 @@ OPERATIONAL_PATHS = frozenset(
         "/v1/chargebacks/",
         "/v1/chargebacks/summary",
         "/v1/chargebacks/webhook",
+        "/v1/ato/login",
+        "/v1/ato/evaluate",
+        "/v1/ato/assessments",
     }
 )
 UNMATCHED_ROUTE_LABEL = "unmatched"
@@ -651,17 +663,16 @@ class CircuitBreaker:
                 logger.warning(
                     "CircuitBreaker probe failed (%s); transitioned back to open.", reason
                 )
-            elif self.state == "closed":
-                if self.consecutive_failures >= self.failure_threshold:
-                    self.state = "open"
-                    self.last_state_change = now
-                    if self.on_trip is not None:
-                        self.on_trip()
-                    logger.warning(
-                        "CircuitBreaker tripped to open after %d consecutive failures (%s).",
-                        self.consecutive_failures,
-                        reason,
-                    )
+            elif self.state == "closed" and self.consecutive_failures >= self.failure_threshold:
+                self.state = "open"
+                self.last_state_change = now
+                if self.on_trip is not None:
+                    self.on_trip()
+                logger.warning(
+                    "CircuitBreaker tripped to open after %d consecutive failures (%s).",
+                    self.consecutive_failures,
+                    reason,
+                )
 
     def trip(self) -> None:
         """Force the circuit breaker to OPEN state."""
@@ -1878,6 +1889,125 @@ def _dispute_to_response(dispute: ChargebackDispute) -> ChargebackDisputeRespons
     )
 
 
+class AtoLoginRequest(BaseModel):
+    """Payload for authentication attempt ingestion and ATO evaluation."""
+
+    user_id: str
+    tenant_id: str = "default"
+    ip_address: str = "127.0.0.1"
+    outcome: str = "success"
+    device_fingerprint: str | None = None
+    latitude: float | None = None
+    longitude: float | None = None
+    user_agent: str | None = None
+
+
+class AtoEvaluateRequest(BaseModel):
+    """Payload for evaluating an account transaction or action for takeover risk."""
+
+    user_id: str
+    tenant_id: str = "default"
+    action_type: str = "transaction"
+    ip_address: str = "127.0.0.1"
+    device_fingerprint: str | None = None
+    latitude: float | None = None
+    longitude: float | None = None
+    transaction_amount: float | None = None
+
+
+class AtoMutationRequest(BaseModel):
+    """Payload for recording a sensitive account profile mutation."""
+
+    mutation_type: str
+    channel: str = "web"
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class AtoQuarantineRequest(BaseModel):
+    """Payload for administrative account quarantine."""
+
+    reason: str
+    tenant_id: str = "default"
+
+
+class AtoReleaseRequest(BaseModel):
+    """Payload for administrative release from quarantine."""
+
+    reason: str
+    tenant_id: str = "default"
+
+
+class AtoMutationResponse(BaseModel):
+    """Response confirming sensitive mutation recorded."""
+
+    status: str
+    user_id: str
+    mutation_id: str
+
+
+class AtoActionStatusResponse(BaseModel):
+    """Response confirming administrative action (quarantine/release)."""
+
+    status: str
+    user_id: str
+    reason: str
+
+
+class AtoAssessmentResponse(BaseModel):
+    """Serialized response of an ATO risk assessment."""
+
+    assessment_id: str
+    user_id: str
+    tenant_id: str
+    risk_score: float
+    recommended_action: str
+    factors_triggered: list[str]
+    score_breakdown: dict[str, float]
+    impossible_travel_kmh: float | None = None
+    is_new_device: bool
+    hours_since_last_mutation: float | None = None
+    quarantined: bool
+    timestamp: str
+    details: dict[str, Any] = Field(default_factory=dict)
+
+
+class AtoAssessmentListResponse(BaseModel):
+    """Collection response for ATO risk assessments."""
+
+    total_count: int
+    assessments: list[AtoAssessmentResponse]
+
+
+class AtoProfileResponse(BaseModel):
+    """Serialized representation of a user's account baseline and security profile."""
+
+    user_id: str
+    tenant_id: str
+    known_devices: list[str]
+    known_locations: list[list[float]]
+    last_known_ip: str | None = None
+    last_known_location: list[float] | None = None
+    last_active_at: str | None = None
+    created_at: str
+    is_quarantined: bool
+    quarantine_reason: str | None = None
+    quarantined_at: str | None = None
+    released_at: str | None = None
+    mutations: list[dict[str, Any]] = Field(default_factory=list)
+
+
+def _assessment_to_response(assessment: AtoRiskAssessment) -> AtoAssessmentResponse:
+    """Helper to convert AtoRiskAssessment dataclass to AtoAssessmentResponse."""
+    data = assessment.to_dict()
+    return AtoAssessmentResponse(**data)
+
+
+def _profile_to_response(profile: AccountProfile) -> AtoProfileResponse:
+    """Helper to convert AccountProfile dataclass to AtoProfileResponse."""
+    data = profile.to_dict()
+    return AtoProfileResponse(**data)
+
+
 def create_app(
     *,
     model: FraudModel | None = None,
@@ -1961,6 +2091,7 @@ def create_app(
     challenge_manager: ChallengeManager | None = None,
     case_manager: CaseManager | None = None,
     chargeback_manager: ChargebackManager | None = None,
+    ato_engine: AtoEngine | None = None,
 ) -> FastAPI:
     """Create an application using an injected model or a trusted artifact path.
 
@@ -2397,6 +2528,24 @@ def create_app(
     chargeback_exposure_gauge = Gauge(
         "fraud_chargeback_financial_exposure_amount",
         "Total disputed exposure amount across active chargeback disputes.",
+        ["tenant_id"],
+        registry=metrics_registry,
+    )
+    ato_login_attempts_counter = Counter(
+        "fraud_ato_login_attempts_total",
+        "Total authentication attempts evaluated by ATO engine.",
+        ["tenant_id", "outcome", "action"],
+        registry=metrics_registry,
+    )
+    ato_evaluations_counter = Counter(
+        "fraud_ato_risk_assessments_total",
+        "Total ATO risk evaluations executed.",
+        ["tenant_id", "action"],
+        registry=metrics_registry,
+    )
+    ato_quarantines_counter = Counter(
+        "fraud_ato_quarantines_total",
+        "Total user accounts quarantined for ATO security breach.",
         ["tenant_id"],
         registry=metrics_registry,
     )
@@ -2952,6 +3101,11 @@ def create_app(
         application.state.chargebacks_won_counter = chargebacks_won_counter
         application.state.chargebacks_lost_counter = chargebacks_lost_counter
         application.state.chargeback_exposure_gauge = chargeback_exposure_gauge
+        resolved_ato_engine = ato_engine or AtoEngine(event_bus=resolved_event_bus)
+        application.state.ato_engine = resolved_ato_engine
+        application.state.ato_login_attempts_counter = ato_login_attempts_counter
+        application.state.ato_evaluations_counter = ato_evaluations_counter
+        application.state.ato_quarantines_counter = ato_quarantines_counter
         application.state.audit_sink = resolved_audit_sink
         application.state.explanation_provider = explanation_provider
         application.state.fallback_mode = resolved_fallback_mode
@@ -6504,6 +6658,269 @@ def create_app(
             return JSONResponse(status_code=404, content={"detail": str(exc)})
         except (InvalidDisputeStateTransitionError, DisputeValidationError) as exc:
             return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+    # =========================================================================
+    # Phase 47: Account Takeover (ATO) & Credential Stuffing Defense Endpoints
+    # =========================================================================
+
+    @application.post(
+        "/v1/ato/login",
+        response_model=AtoAssessmentResponse,
+        responses={
+            400: {"description": "Invalid authentication event data."},
+            500: {"description": "AtoEngine not initialized."},
+        },
+        tags=["ato"],
+    )
+    async def ato_login_endpoint(
+        request: Request,
+        payload: AtoLoginRequest,
+    ) -> AtoAssessmentResponse | JSONResponse:
+        """Ingest authentication attempt and evaluate Account Takeover risk."""
+        engine: AtoEngine | None = getattr(request.app.state, "ato_engine", None)
+        if engine is None:
+            return JSONResponse(status_code=500, content={"detail": "AtoEngine not initialized"})
+
+        try:
+            outcome_enum = LoginOutcome(payload.outcome.lower())
+        except ValueError:
+            return JSONResponse(
+                status_code=400,
+                content={"detail": f"Invalid login outcome '{payload.outcome}'"},
+            )
+
+        event = LoginEvent(
+            user_id=payload.user_id,
+            tenant_id=payload.tenant_id,
+            ip_address=payload.ip_address,
+            outcome=outcome_enum,
+            device_fingerprint=payload.device_fingerprint,
+            latitude=payload.latitude,
+            longitude=payload.longitude,
+            user_agent=payload.user_agent,
+        )
+
+        assessment = engine.evaluate_attempt(event, action_type="login")
+
+        counter = getattr(request.app.state, "ato_login_attempts_counter", None)
+        if counter is not None:
+            counter.labels(
+                tenant_id=assessment.tenant_id,
+                outcome=outcome_enum.value,
+                action=assessment.recommended_action.value,
+            ).inc()
+
+        if assessment.quarantined:
+            q_counter = getattr(request.app.state, "ato_quarantines_counter", None)
+            if q_counter is not None:
+                q_counter.labels(tenant_id=assessment.tenant_id).inc()
+
+        return _assessment_to_response(assessment)
+
+    @application.post(
+        "/v1/ato/evaluate",
+        response_model=AtoAssessmentResponse,
+        responses={
+            500: {"description": "AtoEngine not initialized."},
+        },
+        tags=["ato"],
+    )
+    async def ato_evaluate_endpoint(
+        request: Request,
+        payload: AtoEvaluateRequest,
+    ) -> AtoAssessmentResponse | JSONResponse:
+        """Evaluate a transactional action or session context for ATO compromise."""
+        engine: AtoEngine | None = getattr(request.app.state, "ato_engine", None)
+        if engine is None:
+            return JSONResponse(status_code=500, content={"detail": "AtoEngine not initialized"})
+
+        event = LoginEvent(
+            user_id=payload.user_id,
+            tenant_id=payload.tenant_id,
+            ip_address=payload.ip_address,
+            outcome=LoginOutcome.SUCCESS,
+            device_fingerprint=payload.device_fingerprint,
+            latitude=payload.latitude,
+            longitude=payload.longitude,
+        )
+
+        assessment = engine.evaluate_attempt(
+            event,
+            action_type=payload.action_type,
+            transaction_amount=payload.transaction_amount,
+        )
+
+        counter = getattr(request.app.state, "ato_evaluations_counter", None)
+        if counter is not None:
+            counter.labels(
+                tenant_id=assessment.tenant_id,
+                action=assessment.recommended_action.value,
+            ).inc()
+
+        if assessment.quarantined:
+            q_counter = getattr(request.app.state, "ato_quarantines_counter", None)
+            if q_counter is not None:
+                q_counter.labels(tenant_id=assessment.tenant_id).inc()
+
+        return _assessment_to_response(assessment)
+
+    @application.get(
+        "/v1/ato/accounts/{user_id}",
+        response_model=AtoProfileResponse,
+        responses={
+            500: {"description": "AtoEngine not initialized."},
+        },
+        tags=["ato"],
+    )
+    async def ato_get_profile_endpoint(
+        user_id: str,
+        request: Request,
+    ) -> AtoProfileResponse | JSONResponse:
+        """Retrieve user baseline account profile, known devices, and security status."""
+        engine: AtoEngine | None = getattr(request.app.state, "ato_engine", None)
+        if engine is None:
+            return JSONResponse(status_code=500, content={"detail": "AtoEngine not initialized"})
+
+        profile = engine.profile_tracker.get_or_create_profile(user_id)
+        return _profile_to_response(profile)
+
+    @application.post(
+        "/v1/ato/accounts/{user_id}/mutations",
+        response_model=AtoMutationResponse,
+        responses={
+            400: {"description": "Invalid mutation type."},
+            500: {"description": "AtoEngine not initialized."},
+        },
+        tags=["ato"],
+    )
+    async def ato_record_mutation_endpoint(
+        user_id: str,
+        payload: AtoMutationRequest,
+        request: Request,
+    ) -> AtoMutationResponse | JSONResponse:
+        """Record a sensitive profile change (password, email, MFA) for takeover surveillance."""
+        engine: AtoEngine | None = getattr(request.app.state, "ato_engine", None)
+        if engine is None:
+            return JSONResponse(status_code=500, content={"detail": "AtoEngine not initialized"})
+
+        try:
+            m_type = AccountMutationType(payload.mutation_type.lower())
+        except ValueError:
+            return JSONResponse(
+                status_code=400,
+                content={"detail": f"Invalid mutation type '{payload.mutation_type}'"},
+            )
+
+        record = AccountMutationRecord(
+            mutation_type=m_type,
+            channel=payload.channel,
+            metadata=payload.metadata,
+        )
+        engine.profile_tracker.record_mutation(user_id, record)
+        return AtoMutationResponse(
+            status="recorded", user_id=user_id, mutation_id=record.mutation_id
+        )
+
+    @application.post(
+        "/v1/ato/accounts/{user_id}/quarantine",
+        response_model=AtoActionStatusResponse,
+        responses={
+            500: {"description": "AtoEngine not initialized."},
+        },
+        tags=["ato"],
+    )
+    async def ato_quarantine_account_endpoint(
+        user_id: str,
+        payload: AtoQuarantineRequest,
+        request: Request,
+    ) -> AtoActionStatusResponse | JSONResponse:
+        """Administratively place an account under quarantine."""
+        engine: AtoEngine | None = getattr(request.app.state, "ato_engine", None)
+        if engine is None:
+            return JSONResponse(status_code=500, content={"detail": "AtoEngine not initialized"})
+
+        engine.quarantine_account(user_id, reason=payload.reason, tenant_id=payload.tenant_id)
+        q_counter = getattr(request.app.state, "ato_quarantines_counter", None)
+        if q_counter is not None:
+            q_counter.labels(tenant_id=payload.tenant_id).inc()
+
+        return AtoActionStatusResponse(status="quarantined", user_id=user_id, reason=payload.reason)
+
+    @application.post(
+        "/v1/ato/accounts/{user_id}/release",
+        response_model=AtoActionStatusResponse,
+        responses={
+            500: {"description": "AtoEngine not initialized."},
+        },
+        tags=["ato"],
+    )
+    async def ato_release_account_endpoint(
+        user_id: str,
+        payload: AtoReleaseRequest,
+        request: Request,
+    ) -> AtoActionStatusResponse | JSONResponse:
+        """Administratively release an account from quarantine."""
+        engine: AtoEngine | None = getattr(request.app.state, "ato_engine", None)
+        if engine is None:
+            return JSONResponse(status_code=500, content={"detail": "AtoEngine not initialized"})
+
+        engine.release_account(user_id, reason=payload.reason, tenant_id=payload.tenant_id)
+        return AtoActionStatusResponse(status="released", user_id=user_id, reason=payload.reason)
+
+    @application.get(
+        "/v1/ato/assessments",
+        response_model=AtoAssessmentListResponse,
+        responses={
+            500: {"description": "AtoEngine not initialized."},
+        },
+        tags=["ato"],
+    )
+    async def ato_list_assessments_endpoint(
+        request: Request,
+        user_id: str | None = None,
+        tenant_id: str | None = None,
+        limit: int = 100,
+    ) -> AtoAssessmentListResponse | JSONResponse:
+        """Query and list recent ATO risk assessments."""
+        engine: AtoEngine | None = getattr(request.app.state, "ato_engine", None)
+        if engine is None:
+            return JSONResponse(status_code=500, content={"detail": "AtoEngine not initialized"})
+
+        if user_id:
+            assessments = engine.store.get_user_assessments(user_id, limit=limit)
+        else:
+            assessments = engine.store.list_assessments(tenant_id=tenant_id, limit=limit)
+
+        return AtoAssessmentListResponse(
+            total_count=len(assessments),
+            assessments=[_assessment_to_response(a) for a in assessments],
+        )
+
+    @application.get(
+        "/v1/ato/assessments/{assessment_id}",
+        response_model=AtoAssessmentResponse,
+        responses={
+            404: {"description": "Assessment not found."},
+            500: {"description": "AtoEngine not initialized."},
+        },
+        tags=["ato"],
+    )
+    async def ato_get_assessment_endpoint(
+        assessment_id: str,
+        request: Request,
+    ) -> AtoAssessmentResponse | JSONResponse:
+        """Retrieve details of a single ATO assessment by ID."""
+        engine: AtoEngine | None = getattr(request.app.state, "ato_engine", None)
+        if engine is None:
+            return JSONResponse(status_code=500, content={"detail": "AtoEngine not initialized"})
+
+        assessment = engine.store.get_assessment(assessment_id)
+        if assessment is None:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": f"ATO assessment '{assessment_id}' not found"},
+            )
+        return _assessment_to_response(assessment)
 
     @application.get(
         "/v1/routing/status",

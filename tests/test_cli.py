@@ -9825,3 +9825,234 @@ def test_chargeback_cli_commands(tmp_path: Path) -> None:
     )
     assert res_l_stage_mismatch.exit_code == 0
     assert json.loads(res_l_stage_mismatch.output)["total_count"] == 0
+
+
+def test_cli_ato_workflow_and_edge_cases(tmp_path: Path) -> None:
+    """Validate ato-* CLI commands: login, eval, mutation, inspect, quarantine, release."""
+    store_file = tmp_path / "ato_store.json"
+
+    # 1. ato-login with table output (no store file)
+    res_lgn_tbl = runner.invoke(
+        app,
+        ["ato-login", "-u", "usr_cli_1", "-i", "192.0.2.1", "-f", "table"],
+    )
+    assert res_lgn_tbl.exit_code == 0
+    assert "Assessment ID:" in res_lgn_tbl.output
+    assert "User ID:       usr_cli_1" in res_lgn_tbl.output
+
+    # 2. ato-login with json output and persistence
+    res_lgn_json = runner.invoke(
+        app,
+        [
+            "ato-login",
+            "-u",
+            "usr_cli_1",
+            "-i",
+            "192.0.2.1",
+            "-d",
+            "dev_cli_laptop",
+            "--latitude",
+            "40.7128",
+            "--longitude",
+            "-74.0060",
+            "-s",
+            str(store_file),
+            "-f",
+            "json",
+        ],
+    )
+    assert res_lgn_json.exit_code == 0
+    lgn_data = json.loads(res_lgn_json.output)
+    assert lgn_data["user_id"] == "usr_cli_1"
+    assert lgn_data["recommended_action"] == "allow"
+    assert store_file.exists()
+
+    # 3. ato-mutation
+    res_mut = runner.invoke(
+        app,
+        [
+            "ato-mutation",
+            "-u",
+            "usr_cli_1",
+            "-m",
+            "password_change",
+            "-c",
+            "web",
+            "-s",
+            str(store_file),
+            "-f",
+            "table",
+        ],
+    )
+    assert res_mut.exit_code == 0
+    assert "Mutation ID:" in res_mut.output
+    assert "Type:        password_change" in res_mut.output
+
+    # 4. ato-inspect (table & json)
+    res_insp_tbl = runner.invoke(
+        app,
+        ["ato-inspect", "-u", "usr_cli_1", "-s", str(store_file), "-f", "table"],
+    )
+    assert res_insp_tbl.exit_code == 0
+    assert "User ID:        usr_cli_1" in res_insp_tbl.output
+    assert "dev_cli_laptop" in res_insp_tbl.output
+
+    res_insp_json = runner.invoke(
+        app,
+        ["ato-inspect", "-u", "usr_cli_1", "-s", str(store_file), "-f", "json"],
+    )
+    assert res_insp_json.exit_code == 0
+    prof = json.loads(res_insp_json.output)
+    assert prof["user_id"] == "usr_cli_1"
+    assert "dev_cli_laptop" in prof["known_devices"]
+    assert len(prof["mutations"]) == 1
+
+    # 5. ato-eval
+    res_eval = runner.invoke(
+        app,
+        [
+            "ato-eval",
+            "-u",
+            "usr_cli_1",
+            "-a",
+            "checkout",
+            "--amount",
+            "150.0",
+            "-s",
+            str(store_file),
+            "-f",
+            "json",
+        ],
+    )
+    assert res_eval.exit_code == 0
+    eval_res = json.loads(res_eval.output)
+    assert eval_res["user_id"] == "usr_cli_1"
+
+    # ato-eval with table output
+    res_eval_tbl = runner.invoke(
+        app,
+        ["ato-eval", "-u", "usr_cli_1", "-f", "table"],
+    )
+    assert res_eval_tbl.exit_code == 0
+    assert "Assessment ID:" in res_eval_tbl.output
+
+    # 6. ato-quarantine (table & json)
+    res_q_tbl = runner.invoke(
+        app,
+        [
+            "ato-quarantine",
+            "-u",
+            "usr_cli_1",
+            "-r",
+            "Security incident 404",
+            "-s",
+            str(store_file),
+            "-f",
+            "table",
+        ],
+    )
+    assert res_q_tbl.exit_code == 0
+    assert "Status:      QUARANTINED" in res_q_tbl.output
+
+    res_q_json = runner.invoke(
+        app,
+        [
+            "ato-quarantine",
+            "-u",
+            "usr_cli_1",
+            "-r",
+            "Suspicious API usage",
+            "-s",
+            str(store_file),
+            "-f",
+            "json",
+        ],
+    )
+    assert res_q_json.exit_code == 0
+    assert json.loads(res_q_json.output)["status"] == "quarantined"
+
+    # Verify quarantine state in inspection
+    res_insp_q = runner.invoke(
+        app,
+        ["ato-inspect", "-u", "usr_cli_1", "-s", str(store_file), "-f", "table"],
+    )
+    assert res_insp_q.exit_code == 0
+    assert "Quarantined:    True" in res_insp_q.output
+
+    # 7. ato-release (table & json)
+    res_rel_tbl = runner.invoke(
+        app,
+        [
+            "ato-release",
+            "-u",
+            "usr_cli_1",
+            "-r",
+            "Identity verified by tier 2",
+            "-s",
+            str(store_file),
+            "-f",
+            "table",
+        ],
+    )
+    assert res_rel_tbl.exit_code == 0
+    assert "Status:      RELEASED" in res_rel_tbl.output
+
+    res_rel_json = runner.invoke(
+        app,
+        [
+            "ato-release",
+            "-u",
+            "usr_cli_1",
+            "-r",
+            "Verified via MFA challenge",
+            "-s",
+            str(store_file),
+            "-f",
+            "json",
+        ],
+    )
+    assert res_rel_json.exit_code == 0
+    assert json.loads(res_rel_json.output)["status"] == "released"
+
+    # 8. ato-mutation with json output
+    res_mut_json = runner.invoke(
+        app,
+        [
+            "ato-mutation",
+            "-u",
+            "usr_cli_1",
+            "-m",
+            "email_change",
+            "-s",
+            str(store_file),
+            "-f",
+            "json",
+        ],
+    )
+    assert res_mut_json.exit_code == 0
+    assert json.loads(res_mut_json.output)["mutation_type"] == "email_change"
+
+    # 9. Error edge cases
+    # Invalid outcome -> exit code 2
+    res_err_outcome = runner.invoke(
+        app,
+        ["ato-login", "-u", "u1", "-o", "invalid_outcome"],
+    )
+    assert res_err_outcome.exit_code == 2
+
+    # Invalid mutation type -> exit code 2
+    res_err_mut = runner.invoke(
+        app,
+        ["ato-mutation", "-u", "u1", "-m", "invalid_mutation", "-s", str(store_file)],
+    )
+    assert res_err_mut.exit_code == 2
+
+    # Corrupt store file -> exit code 2
+    corrupt_file = tmp_path / "corrupt_ato.json"
+    corrupt_file.write_text("{not valid json", encoding="utf-8")
+    assert runner.invoke(app, ["ato-inspect", "-u", "u1", "-s", str(corrupt_file)]).exit_code == 2
+
+    # Non-dict store file -> exit code 2
+    non_dict_file = tmp_path / "non_dict_ato.json"
+    non_dict_file.write_text(json.dumps(["just", "a", "list"]), encoding="utf-8")
+    assert runner.invoke(app, ["ato-inspect", "-u", "u1", "-s", str(non_dict_file)]).exit_code == 2

@@ -6370,3 +6370,191 @@ def test_chargeback_api_error_branches_and_edge_cases(
             json={"outcome": "resolved_lost"},
         )
         assert res_no_metric_res.status_code == 200
+
+
+def test_ato_api_endpoints_and_lifecycle(api_context: tuple[Path, Any, Path]) -> None:
+    """Validate /v1/ato/* REST endpoints: login, evaluate, profile, quarantine, release."""
+    from fraud_detection.ato import AtoEngine
+
+    _, model, _ = api_context
+    ato_engine = AtoEngine(auto_quarantine=True)
+    app = create_app(model=model, ato_engine=ato_engine)
+
+    with TestClient(app) as client:
+        # 1. Ingest normal login attempt
+        login_res = client.post(
+            "/v1/ato/login",
+            json={
+                "user_id": "usr_api_alice",
+                "tenant_id": "corp_test",
+                "ip_address": "198.51.100.25",
+                "outcome": "success",
+                "device_fingerprint": "dev_laptop_1",
+                "latitude": 40.7128,
+                "longitude": -74.0060,
+            },
+        )
+        assert login_res.status_code == 200
+        data1 = login_res.json()
+        assert data1["assessment_id"].startswith("ato_")
+        assert data1["user_id"] == "usr_api_alice"
+        assert data1["recommended_action"] == "allow"
+        assert not data1["quarantined"]
+        assessment_id = data1["assessment_id"]
+
+        # 2. Record sensitive mutation (password change)
+        mut_res = client.post(
+            "/v1/ato/accounts/usr_api_alice/mutations",
+            json={
+                "mutation_type": "password_change",
+                "channel": "web_portal",
+                "metadata": {"ip": "198.51.100.25"},
+            },
+        )
+        assert mut_res.status_code == 200
+        assert mut_res.json()["status"] == "recorded"
+        assert mut_res.json()["user_id"] == "usr_api_alice"
+
+        # 3. Inspect account profile
+        prof_res = client.get("/v1/ato/accounts/usr_api_alice")
+        assert prof_res.status_code == 200
+        prof_data = prof_res.json()
+        assert prof_data["user_id"] == "usr_api_alice"
+        assert "dev_laptop_1" in prof_data["known_devices"]
+        assert len(prof_data["mutations"]) == 1
+
+        # 4. Evaluate high-risk transaction (impossible travel from Tokyo from new device)
+        eval_res = client.post(
+            "/v1/ato/evaluate",
+            json={
+                "user_id": "usr_api_alice",
+                "tenant_id": "corp_test",
+                "action_type": "high_value_wire",
+                "ip_address": "203.0.113.88",
+                "device_fingerprint": "dev_unknown_mobile",
+                "latitude": 35.6762,
+                "longitude": 139.6503,
+                "transaction_amount": 5000.0,
+            },
+        )
+        assert eval_res.status_code == 200
+        eval_data = eval_res.json()
+        assert eval_data["user_id"] == "usr_api_alice"
+        assert "new_device" in eval_data["factors_triggered"]
+        assert eval_data["risk_score"] > 0.40
+
+        # 5. Administratively quarantine account
+        q_res = client.post(
+            "/v1/ato/accounts/usr_api_alice/quarantine",
+            json={"reason": "Security operations center flag", "tenant_id": "corp_test"},
+        )
+        assert q_res.status_code == 200
+        assert q_res.json()["status"] == "quarantined"
+
+        # 6. Verify subsequent attempt returns BLOCK while quarantined
+        blocked_res = client.post(
+            "/v1/ato/login",
+            json={"user_id": "usr_api_alice", "outcome": "success"},
+        )
+        assert blocked_res.status_code == 200
+        assert blocked_res.json()["recommended_action"] == "block"
+        assert blocked_res.json()["quarantined"] is True
+
+        # 7. Release account
+        rel_res = client.post(
+            "/v1/ato/accounts/usr_api_alice/release",
+            json={"reason": "User identity verified", "tenant_id": "corp_test"},
+        )
+        assert rel_res.status_code == 200
+        assert rel_res.json()["status"] == "released"
+
+        # 8. Query assessments list and inspect single assessment
+        list_res = client.get("/v1/ato/assessments?user_id=usr_api_alice")
+        assert list_res.status_code == 200
+        assert list_res.json()["total_count"] >= 2
+
+        single_res = client.get(f"/v1/ato/assessments/{assessment_id}")
+        assert single_res.status_code == 200
+        assert single_res.json()["assessment_id"] == assessment_id
+
+        # 9. Verify Prometheus metrics
+        metrics_res = client.get("/metrics")
+        assert metrics_res.status_code == 200
+        assert "fraud_ato_login_attempts_total" in metrics_res.text
+        assert "fraud_ato_risk_assessments_total" in metrics_res.text
+        assert "fraud_ato_quarantines_total" in metrics_res.text
+
+
+def test_ato_api_error_branches_and_edge_cases(api_context: tuple[Path, Any, Path]) -> None:
+    """Verify 400, 404, 500 error branches and metrics None handling for /v1/ato/* endpoints."""
+    from fraud_detection.ato import AtoEngine
+
+    _, model, _ = api_context
+    ato_engine = AtoEngine()
+    app = create_app(model=model, ato_engine=ato_engine)
+
+    with TestClient(app) as client:
+        # 1. Invalid login outcome -> 400
+        res_bad_outcome = client.post(
+            "/v1/ato/login",
+            json={"user_id": "usr_err", "outcome": "nonexistent_outcome"},
+        )
+        assert res_bad_outcome.status_code == 400
+        assert "Invalid login outcome" in res_bad_outcome.json()["detail"]
+
+        # 2. Invalid mutation type -> 400
+        res_bad_mut = client.post(
+            "/v1/ato/accounts/usr_err/mutations",
+            json={"mutation_type": "nonexistent_mutation"},
+        )
+        assert res_bad_mut.status_code == 400
+        assert "Invalid mutation type" in res_bad_mut.json()["detail"]
+
+        # 3. Missing assessment -> 404
+        res_missing_assessment = client.get("/v1/ato/assessments/ato_does_not_exist")
+        assert res_missing_assessment.status_code == 404
+        assert "not found" in res_missing_assessment.json()["detail"]
+
+        # 4. List assessments without user_id filter
+        res_list_all = client.get("/v1/ato/assessments")
+        assert res_list_all.status_code == 200
+
+        # 5. When metrics counters are None on app.state
+        cast(Any, client.app).state.ato_login_attempts_counter = None
+        cast(Any, client.app).state.ato_evaluations_counter = None
+        cast(Any, client.app).state.ato_quarantines_counter = None
+
+        res_no_metric_login = client.post(
+            "/v1/ato/login",
+            json={"user_id": "usr_no_metrics", "outcome": "success"},
+        )
+        assert res_no_metric_login.status_code == 200
+
+        res_no_metric_eval = client.post(
+            "/v1/ato/evaluate",
+            json={"user_id": "usr_no_metrics"},
+        )
+        assert res_no_metric_eval.status_code == 200
+
+        res_no_metric_q = client.post(
+            "/v1/ato/accounts/usr_no_metrics/quarantine",
+            json={"reason": "test"},
+        )
+        assert res_no_metric_q.status_code == 200
+
+        # 6. When engine is None on app.state -> 500
+        cast(Any, client.app).state.ato_engine = None
+
+        assert client.post("/v1/ato/login", json={"user_id": "u"}).status_code == 500
+        assert client.post("/v1/ato/evaluate", json={"user_id": "u"}).status_code == 500
+        assert client.get("/v1/ato/accounts/u").status_code == 500
+        assert (
+            client.post(
+                "/v1/ato/accounts/u/mutations", json={"mutation_type": "password_change"}
+            ).status_code
+            == 500
+        )
+        assert client.post("/v1/ato/accounts/u/quarantine", json={"reason": "r"}).status_code == 500
+        assert client.post("/v1/ato/accounts/u/release", json={"reason": "r"}).status_code == 500
+        assert client.get("/v1/ato/assessments").status_code == 500
+        assert client.get("/v1/ato/assessments/ato_123").status_code == 500
