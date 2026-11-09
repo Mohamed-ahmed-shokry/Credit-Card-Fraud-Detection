@@ -860,3 +860,122 @@ class LayeringDetector:
         """Clear all inflow queues."""
         with self._lock:
             self._inflows.clear()
+
+
+@dataclass(frozen=True)
+class CircularFlowAlert:
+    """Alert triggered by circular / round-trip transfer loops."""
+
+    origin_user_id: str
+    counterparty_id: str
+    forward_tx_id: str
+    return_tx_id: str
+    forward_amount: float
+    return_amount: float
+    cycle_hours: float
+    alert_id: str = field(default_factory=lambda: str(uuid4()))
+    detected_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize circular flow alert to dictionary."""
+        return {
+            "alert_id": self.alert_id,
+            "origin_user_id": self.origin_user_id,
+            "counterparty_id": self.counterparty_id,
+            "forward_tx_id": self.forward_tx_id,
+            "return_tx_id": self.return_tx_id,
+            "forward_amount": round(self.forward_amount, 2),
+            "return_amount": round(self.return_amount, 2),
+            "cycle_hours": round(self.cycle_hours, 2),
+            "detected_at": self.detected_at.isoformat(),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> CircularFlowAlert:
+        """Deserialize circular flow alert from dictionary."""
+        detected_at_raw = data.get("detected_at")
+        detected_at = (
+            datetime.fromisoformat(detected_at_raw)
+            if isinstance(detected_at_raw, str)
+            else datetime.now(UTC)
+        )
+        return cls(
+            alert_id=str(data.get("alert_id", uuid4())),
+            origin_user_id=str(data["origin_user_id"]),
+            counterparty_id=str(data["counterparty_id"]),
+            forward_tx_id=str(data["forward_tx_id"]),
+            return_tx_id=str(data["return_tx_id"]),
+            forward_amount=float(data["forward_amount"]),
+            return_amount=float(data["return_amount"]),
+            cycle_hours=float(data["cycle_hours"]),
+            detected_at=detected_at,
+        )
+
+
+class CircularFlowDetector:
+    """Detects round-trip / circular laundering flows between users and counterparties."""
+
+    def __init__(
+        self,
+        window_seconds: float = 172800.0,
+        min_amount: float = 1000.0,
+        amount_tolerance: float = 0.20,
+    ) -> None:
+        self.window_seconds = window_seconds
+        self.min_amount = min_amount
+        self.amount_tolerance = amount_tolerance
+        self._lock = threading.RLock()
+        self._transfers: dict[tuple[str, str], deque[tuple[str, float, datetime]]] = defaultdict(
+            deque
+        )
+
+    def record_and_evaluate(
+        self,
+        event: AmlTransactionEvent,
+    ) -> CircularFlowAlert | None:
+        """Record transfer and evaluate whether reverse flow creates a circular loop."""
+        if not event.counterparty_id or event.amount < self.min_amount:
+            return None
+
+        with self._lock:
+            if event.direction == TransactionDirection.OUTFLOW:
+                sender = event.user_id
+                receiver = event.counterparty_id
+            else:
+                sender = event.counterparty_id
+                receiver = event.user_id
+
+            cutoff = event.timestamp - timedelta(seconds=self.window_seconds)
+
+            reverse_pair = (receiver, sender)
+            reverse_queue = self._transfers[reverse_pair]
+            while reverse_queue and reverse_queue[0][2] < cutoff:
+                reverse_queue.popleft()
+
+            alert: CircularFlowAlert | None = None
+            for prior_tx_id, prior_amt, prior_ts in reversed(reverse_queue):
+                if prior_ts > event.timestamp:
+                    continue
+                diff = abs(event.amount - prior_amt) / max(prior_amt, 1.0)
+                if diff <= self.amount_tolerance:
+                    cycle_hrs = (event.timestamp - prior_ts).total_seconds() / 3600.0
+                    alert = CircularFlowAlert(
+                        origin_user_id=sender,
+                        counterparty_id=receiver,
+                        forward_tx_id=prior_tx_id,
+                        return_tx_id=event.transaction_id,
+                        forward_amount=prior_amt,
+                        return_amount=event.amount,
+                        cycle_hours=cycle_hrs,
+                        detected_at=event.timestamp,
+                    )
+                    break
+
+            pair = (sender, receiver)
+            self._transfers[pair].append((event.transaction_id, event.amount, event.timestamp))
+            return alert
+
+    def clear(self) -> None:
+        """Clear all transfer tracking queues."""
+        with self._lock:
+            self._transfers.clear()
