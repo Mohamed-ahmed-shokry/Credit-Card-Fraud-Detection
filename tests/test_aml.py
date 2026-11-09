@@ -17,6 +17,7 @@ from fraud_detection.aml import (
     TransactionDirection,
     WatchlistEntry,
     WatchlistType,
+    soundex,
 )
 
 
@@ -199,3 +200,14 @@ def test_sar_dossier_serialization() -> None:
     assert restored.status == SarStatus.PENDING_REVIEW
     assert restored.narrative.startswith("Customer conducted")
     assert restored.summary_financials["total_suspicious_amount"] == 28500.0
+
+
+def test_soundex() -> None:
+    """Verify American Soundex phonetic encoding."""
+    assert soundex("Robert") == "R163"
+    assert soundex("Rupert") == "R163"
+    assert soundex("Rubin") == "R150"
+    assert soundex("Ashcraft") == "A261"
+    assert soundex("Ashcroft") == "A261"
+    assert soundex("") == ""
+    assert soundex("12345") == ""

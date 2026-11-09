@@ -7,6 +7,7 @@ composite AML risk decisioning, and regulatory Suspicious Activity Report (SAR) 
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -376,3 +377,58 @@ class SarDossier:
             updated_at=updated_at,
             audit_trail=tuple(dict(entry) for entry in data.get("audit_trail", ())),
         )
+
+
+def soundex(text: str) -> str:
+    """Compute the American Soundex code for an entity name.
+
+    Returns a 4-character phonetic code (e.g., 'Robert' -> 'R163', 'Rupert' -> 'R163').
+    """
+    cleaned = re.sub(r"[^A-Za-z]", "", text).upper()
+    if not cleaned:
+        return ""
+
+    first_char = cleaned[0]
+    mapping = {
+        "B": "1",
+        "F": "1",
+        "P": "1",
+        "V": "1",
+        "C": "2",
+        "G": "2",
+        "J": "2",
+        "K": "2",
+        "Q": "2",
+        "S": "2",
+        "X": "2",
+        "Z": "2",
+        "D": "3",
+        "T": "3",
+        "L": "4",
+        "M": "5",
+        "N": "5",
+        "R": "6",
+        "A": "0",
+        "E": "0",
+        "I": "0",
+        "O": "0",
+        "U": "0",
+        "Y": "0",
+        "H": "0",
+        "W": "0",
+    }
+
+    codes: list[str] = [first_char]
+    prev_code = mapping.get(first_char, "0")
+
+    for char in cleaned[1:]:
+        code = mapping.get(char, "0")
+        if char in ("H", "W"):
+            continue
+        if code != "0" and code != prev_code:
+            codes.append(code)
+        prev_code = code
+
+    # Remove 0s and pad to 4 characters
+    soundex_digits = [c for c in codes[1:] if c != "0"]
+    return (first_char + "".join(soundex_digits) + "000")[:4]
