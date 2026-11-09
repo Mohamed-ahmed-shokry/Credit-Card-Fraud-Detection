@@ -205,3 +205,174 @@ class AmlTransactionEvent:
             tenant_id=str(data.get("tenant_id", "default")),
             metadata=dict(data.get("metadata", {})),
         )
+
+
+@dataclass(frozen=True)
+class StructuringAlert:
+    """Alert triggered by rapid sub-threshold cash/card structuring."""
+
+    user_id: str
+    transaction_ids: tuple[str, ...]
+    total_amount: float
+    transaction_count: int
+    window_seconds: float
+    average_amount: float
+    threshold_proximity: float
+    alert_id: str = field(default_factory=lambda: str(uuid4()))
+    detected_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize structuring alert to dictionary."""
+        return {
+            "alert_id": self.alert_id,
+            "user_id": self.user_id,
+            "transaction_ids": list(self.transaction_ids),
+            "total_amount": round(self.total_amount, 2),
+            "transaction_count": self.transaction_count,
+            "window_seconds": self.window_seconds,
+            "average_amount": round(self.average_amount, 2),
+            "threshold_proximity": round(self.threshold_proximity, 4),
+            "detected_at": self.detected_at.isoformat(),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> StructuringAlert:
+        """Deserialize structuring alert from dictionary."""
+        detected_at_raw = data.get("detected_at")
+        detected_at = (
+            datetime.fromisoformat(detected_at_raw)
+            if isinstance(detected_at_raw, str)
+            else datetime.now(UTC)
+        )
+        return cls(
+            alert_id=str(data.get("alert_id", uuid4())),
+            user_id=str(data["user_id"]),
+            transaction_ids=tuple(str(t) for t in data.get("transaction_ids", ())),
+            total_amount=float(data["total_amount"]),
+            transaction_count=int(data["transaction_count"]),
+            window_seconds=float(data["window_seconds"]),
+            average_amount=float(data["average_amount"]),
+            threshold_proximity=float(data["threshold_proximity"]),
+            detected_at=detected_at,
+        )
+
+
+@dataclass(frozen=True)
+class AmlAlert:
+    """Comprehensive alert record for suspected money laundering."""
+
+    user_id: str
+    typology: AmlTypology
+    risk_level: AmlRiskLevel
+    recommended_action: AmlAction
+    risk_score: float
+    trigger_details: dict[str, Any] = field(default_factory=dict)
+    transaction_ids: tuple[str, ...] = field(default_factory=tuple)
+    alert_id: str = field(default_factory=lambda: str(uuid4()))
+    tenant_id: str = "default"
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize AML alert to dictionary."""
+        return {
+            "alert_id": self.alert_id,
+            "user_id": self.user_id,
+            "typology": self.typology.value,
+            "risk_level": self.risk_level.value,
+            "recommended_action": self.recommended_action.value,
+            "risk_score": round(self.risk_score, 4),
+            "trigger_details": dict(self.trigger_details),
+            "transaction_ids": list(self.transaction_ids),
+            "tenant_id": self.tenant_id,
+            "created_at": self.created_at.isoformat(),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> AmlAlert:
+        """Deserialize AML alert from dictionary."""
+        created_at_raw = data.get("created_at")
+        created_at = (
+            datetime.fromisoformat(created_at_raw)
+            if isinstance(created_at_raw, str)
+            else datetime.now(UTC)
+        )
+        return cls(
+            alert_id=str(data.get("alert_id", uuid4())),
+            user_id=str(data["user_id"]),
+            typology=AmlTypology(data["typology"]),
+            risk_level=AmlRiskLevel(data["risk_level"]),
+            recommended_action=AmlAction(data["recommended_action"]),
+            risk_score=float(data["risk_score"]),
+            trigger_details=dict(data.get("trigger_details", {})),
+            transaction_ids=tuple(str(t) for t in data.get("transaction_ids", ())),
+            tenant_id=str(data.get("tenant_id", "default")),
+            created_at=created_at,
+        )
+
+
+@dataclass(frozen=True)
+class SarDossier:
+    """Suspicious Activity Report (SAR) regulatory filing package."""
+
+    user_id: str
+    narrative: str
+    alert_ids: tuple[str, ...] = field(default_factory=tuple)
+    status: SarStatus = SarStatus.DRAFT
+    suspect_details: dict[str, Any] = field(default_factory=dict)
+    summary_financials: dict[str, Any] = field(default_factory=dict)
+    jurisdictions: tuple[str, ...] = field(default_factory=tuple)
+    sar_id: str = field(default_factory=lambda: str(uuid4()))
+    filing_date: str = ""
+    tenant_id: str = "default"
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    updated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    audit_trail: tuple[dict[str, Any], ...] = field(default_factory=tuple)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize SAR dossier to dictionary."""
+        return {
+            "sar_id": self.sar_id,
+            "user_id": self.user_id,
+            "alert_ids": list(self.alert_ids),
+            "status": self.status.value,
+            "narrative": self.narrative,
+            "suspect_details": dict(self.suspect_details),
+            "summary_financials": dict(self.summary_financials),
+            "jurisdictions": list(self.jurisdictions),
+            "filing_date": self.filing_date,
+            "tenant_id": self.tenant_id,
+            "created_at": self.created_at.isoformat(),
+            "updated_at": self.updated_at.isoformat(),
+            "audit_trail": [dict(entry) for entry in self.audit_trail],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> SarDossier:
+        """Deserialize SAR dossier from dictionary."""
+        created_at_raw = data.get("created_at")
+        created_at = (
+            datetime.fromisoformat(created_at_raw)
+            if isinstance(created_at_raw, str)
+            else datetime.now(UTC)
+        )
+        updated_at_raw = data.get("updated_at")
+        updated_at = (
+            datetime.fromisoformat(updated_at_raw)
+            if isinstance(updated_at_raw, str)
+            else datetime.now(UTC)
+        )
+        return cls(
+            sar_id=str(data.get("sar_id", uuid4())),
+            user_id=str(data["user_id"]),
+            narrative=str(data.get("narrative", "")),
+            alert_ids=tuple(str(a) for a in data.get("alert_ids", ())),
+            status=SarStatus(data.get("status", SarStatus.DRAFT.value)),
+            suspect_details=dict(data.get("suspect_details", {})),
+            summary_financials=dict(data.get("summary_financials", {})),
+            jurisdictions=tuple(str(j) for j in data.get("jurisdictions", ())),
+            filing_date=str(data.get("filing_date", "")),
+            tenant_id=str(data.get("tenant_id", "default")),
+            created_at=created_at,
+            updated_at=updated_at,
+            audit_trail=tuple(dict(entry) for entry in data.get("audit_trail", ())),
+        )
