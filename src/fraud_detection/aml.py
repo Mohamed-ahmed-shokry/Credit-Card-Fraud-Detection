@@ -747,3 +747,116 @@ class StructuringDetector:
         """Clear all sliding window transaction histories."""
         with self._lock:
             self._user_events.clear()
+
+
+@dataclass(frozen=True)
+class LayeringAlert:
+    """Alert triggered by rapid fund pass-through with minimal account dwell time."""
+
+    user_id: str
+    inflow_tx_id: str
+    outflow_tx_id: str
+    inflow_amount: float
+    outflow_amount: float
+    turnover_ratio: float
+    dwell_minutes: float
+    alert_id: str = field(default_factory=lambda: str(uuid4()))
+    detected_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize layering alert to dictionary."""
+        return {
+            "alert_id": self.alert_id,
+            "user_id": self.user_id,
+            "inflow_tx_id": self.inflow_tx_id,
+            "outflow_tx_id": self.outflow_tx_id,
+            "inflow_amount": round(self.inflow_amount, 2),
+            "outflow_amount": round(self.outflow_amount, 2),
+            "turnover_ratio": round(self.turnover_ratio, 4),
+            "dwell_minutes": round(self.dwell_minutes, 2),
+            "detected_at": self.detected_at.isoformat(),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> LayeringAlert:
+        """Deserialize layering alert from dictionary."""
+        detected_at_raw = data.get("detected_at")
+        detected_at = (
+            datetime.fromisoformat(detected_at_raw)
+            if isinstance(detected_at_raw, str)
+            else datetime.now(UTC)
+        )
+        return cls(
+            alert_id=str(data.get("alert_id", uuid4())),
+            user_id=str(data["user_id"]),
+            inflow_tx_id=str(data["inflow_tx_id"]),
+            outflow_tx_id=str(data["outflow_tx_id"]),
+            inflow_amount=float(data["inflow_amount"]),
+            outflow_amount=float(data["outflow_amount"]),
+            turnover_ratio=float(data["turnover_ratio"]),
+            dwell_minutes=float(data["dwell_minutes"]),
+            detected_at=detected_at,
+        )
+
+
+class LayeringDetector:
+    """Detects rapid pass-through / layering flow of funds with near-zero dwell time."""
+
+    def __init__(
+        self,
+        max_dwell_hours: float = 4.0,
+        min_flow_amount: float = 3000.0,
+        min_turnover_ratio: float = 0.85,
+        window_seconds: float = 86400.0,
+    ) -> None:
+        self.max_dwell_hours = max_dwell_hours
+        self.min_flow_amount = min_flow_amount
+        self.min_turnover_ratio = min_turnover_ratio
+        self.window_seconds = window_seconds
+        self._lock = threading.RLock()
+        self._inflows: dict[str, deque[AmlTransactionEvent]] = defaultdict(deque)
+
+    def record_and_evaluate(
+        self,
+        event: AmlTransactionEvent,
+    ) -> LayeringAlert | None:
+        """Record an inflow or outflow and evaluate if funds are rapidly stripped."""
+        with self._lock:
+            inflows_queue = self._inflows[event.user_id]
+            cutoff = event.timestamp - timedelta(seconds=self.window_seconds)
+            while inflows_queue and inflows_queue[0].timestamp < cutoff:
+                inflows_queue.popleft()
+
+            if event.direction == TransactionDirection.INFLOW:
+                inflows_queue.append(event)
+                return None
+
+            if event.amount < self.min_flow_amount:
+                return None
+
+            for inflow in reversed(inflows_queue):
+                if inflow.timestamp > event.timestamp:
+                    continue
+                dwell = (event.timestamp - inflow.timestamp).total_seconds() / 60.0
+                if dwell > (self.max_dwell_hours * 60.0):
+                    break
+                if inflow.amount <= 0:
+                    continue
+                ratio = event.amount / inflow.amount
+                if ratio >= self.min_turnover_ratio:
+                    return LayeringAlert(
+                        user_id=event.user_id,
+                        inflow_tx_id=inflow.transaction_id,
+                        outflow_tx_id=event.transaction_id,
+                        inflow_amount=inflow.amount,
+                        outflow_amount=event.amount,
+                        turnover_ratio=ratio,
+                        dwell_minutes=dwell,
+                        detected_at=event.timestamp,
+                    )
+            return None
+
+    def clear(self) -> None:
+        """Clear all inflow queues."""
+        with self._lock:
+            self._inflows.clear()
