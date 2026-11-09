@@ -17,6 +17,8 @@ from fraud_detection.aml import (
     TransactionDirection,
     WatchlistEntry,
     WatchlistType,
+    levenshtein_distance,
+    levenshtein_similarity,
     soundex,
 )
 
@@ -211,3 +213,15 @@ def test_soundex() -> None:
     assert soundex("Ashcroft") == "A261"
     assert soundex("") == ""
     assert soundex("12345") == ""
+
+
+def test_levenshtein() -> None:
+    """Verify Levenshtein distance and similarity computation."""
+    assert levenshtein_distance("kitten", "sitting") == 3
+    assert levenshtein_distance("", "test") == 4
+    assert levenshtein_distance("same", "same") == 0
+
+    assert levenshtein_similarity("same", "same") == 1.0
+    assert levenshtein_similarity("", "") == 1.0
+    assert levenshtein_similarity("kitten", "sitting") == 1.0 - (3 / 7)
+    assert levenshtein_similarity("abc", "xyz") == 0.0
