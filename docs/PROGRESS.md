@@ -8,7 +8,7 @@
 
 ## Task Status
 - [x] Task 1: Create `src/fraud_detection/aml.py` with domain data models, enums, serialization, and unit tests in `tests/test_aml.py`.
-- [ ] Task 2: Implement `WatchlistScreeningEngine` with phonetic (Soundex) and fuzzy distance algorithms (Jaro-Winkler, Levenshtein) in `src/fraud_detection/aml.py` with unit tests.
+- [x] Task 2: Implement `WatchlistScreeningEngine` with phonetic (Soundex) and fuzzy distance algorithms (Jaro-Winkler, Levenshtein) in `src/fraud_detection/aml.py` with unit tests.
 - [ ] Task 3: Implement AML typology detectors (`StructuringDetector`, `LayeringDetector`, `CircularFlowDetector`, `HighRiskJurisdictionDetector`) in `src/fraud_detection/aml.py` with unit tests.
 - [ ] Task 4: Implement `AmlEngine` (scoring, policy routing, case escalation) and thread-safe `AmlStore` in `src/fraud_detection/aml.py` with unit tests.
 - [ ] Task 5: Implement `SarManager` (narrative generator, FinCEN/FATF SAR dossier compiler, lifecycle state machine) in `src/fraud_detection/aml.py` with unit tests.
@@ -21,7 +21,7 @@
 | Criterion | Status | Evidence |
 |-----------|--------|----------|
 | AC-1 (Domain Models & Taxonomies) | PASSED | Models, enums, serialization in `src/fraud_detection/aml.py` verified in `tests/test_aml.py` |
-| AC-2 (Watchlist & Sanction Fuzzy Screening) | PENDING | Jaro-Winkler, Levenshtein, Soundex matching against OFAC/PEP in `src/fraud_detection/aml.py` |
+| AC-2 (Watchlist & Sanction Fuzzy Screening) | PASSED | Jaro-Winkler, Levenshtein, Soundex matching against OFAC/PEP in `src/fraud_detection/aml.py` verified in `tests/test_aml.py` |
 | AC-3 (Typology Detectors) | PENDING | Structuring, Layering, Circular Flow, High Risk Corridors in `src/fraud_detection/aml.py` |
 | AC-4 (AML Scoring Engine & Case Escalation) | PENDING | Composite risk scoring, policy actions, and `cases.py` integration in `src/fraud_detection/aml.py` |
 | AC-5 (Regulatory SAR Packaging & Lifecycle) | PENDING | FinCEN/FATF SAR narratives, dossiers, status lifecycle in `src/fraud_detection/aml.py` |
