@@ -17,6 +17,8 @@ from fraud_detection.aml import (
     TransactionDirection,
     WatchlistEntry,
     WatchlistType,
+    jaro_similarity,
+    jaro_winkler_similarity,
     levenshtein_distance,
     levenshtein_similarity,
     soundex,
@@ -225,3 +227,25 @@ def test_levenshtein() -> None:
     assert levenshtein_similarity("", "") == 1.0
     assert levenshtein_similarity("kitten", "sitting") == 1.0 - (3 / 7)
     assert levenshtein_similarity("abc", "xyz") == 0.0
+
+
+def test_jaro_winkler() -> None:
+    """Verify Jaro and Jaro-Winkler string similarity calculations."""
+    assert jaro_similarity("same", "same") == 1.0
+    assert jaro_similarity("", "test") == 0.0
+    assert jaro_similarity("test", "") == 0.0
+    assert jaro_similarity("abc", "xyz") == 0.0
+
+    # Standard benchmark: MARTHA vs MARHTA
+    martha_jaro = jaro_similarity("MARTHA", "MARHTA")
+    assert 0.94 < martha_jaro < 0.95
+
+    # Jaro-Winkler gives higher score when prefix matches
+    jw = jaro_winkler_similarity("MARTHA", "MARHTA")
+    assert jw >= martha_jaro
+    assert 0.96 < jw < 0.97
+
+    # Exact match edge case
+    assert jaro_winkler_similarity("ALICE", "ALICE") == 1.0
+    assert jaro_winkler_similarity("", "") == 1.0
+    assert jaro_winkler_similarity("A", "Z") == 0.0
