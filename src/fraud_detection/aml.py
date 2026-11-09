@@ -114,6 +114,36 @@ class WatchlistEntry:
         )
 
 
+DEFAULT_WATCHLIST_ENTRIES: tuple[WatchlistEntry, ...] = (
+    WatchlistEntry(
+        name="Viktor Bout",
+        watchlist_type=WatchlistType.OFAC_SDN,
+        country="RU",
+        entity_id="sdn-001",
+        aliases=("Boris", "Merchant of Death"),
+    ),
+    WatchlistEntry(
+        name="Sergei Ivanov",
+        watchlist_type=WatchlistType.OFAC_SDN,
+        country="RU",
+        entity_id="sdn-002",
+        aliases=("Sergey Ivanov",),
+    ),
+    WatchlistEntry(
+        name="Vladimir Putin",
+        watchlist_type=WatchlistType.OFAC_SDN,
+        country="RU",
+        entity_id="sdn-003",
+    ),
+    WatchlistEntry(
+        name="Alexander Lukashenko",
+        watchlist_type=WatchlistType.PEP,
+        country="BY",
+        entity_id="pep-001",
+    ),
+)
+
+
 @dataclass(frozen=True)
 class ScreeningMatch:
     """Detailed report of a watchlist screening hit."""
@@ -1681,6 +1711,7 @@ class SarManager:
         transactions: list[AmlTransactionEvent] | None = None,
         tenant_id: str = "default",
         creator: str = "compliance_system",
+        narrative_summary: str = "",
     ) -> SarDossier:
         """Compile a SAR regulatory dossier from recorded alerts and transactional evidence."""
         with self._lock:
@@ -1711,6 +1742,8 @@ class SarManager:
                 suspect_name=suspect_name,
                 summary_financials=financials,
             )
+            if narrative_summary:
+                narrative = f"{narrative_summary}\n\n{narrative}"
 
             now = datetime.now(UTC)
             initial_audit = {
@@ -1795,6 +1828,15 @@ class SarManager:
                 )
 
             return updated
+
+    def list_sars(
+        self,
+        status: SarStatus | None = None,
+        user_id: str | None = None,
+        limit: int = 100,
+    ) -> list[SarDossier]:
+        """List SAR dossiers matching optional status and user filters."""
+        return self.store.list_sars(status=status, user_id=user_id, limit=limit)
 
     def export_fincen_xml(self, sar_id: str) -> str:
         """Export the SAR dossier into standard FinCEN BSA XML compliant representation."""
