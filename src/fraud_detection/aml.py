@@ -8,6 +8,7 @@ composite AML risk decisioning, and regulatory Suspicious Activity Report (SAR) 
 from __future__ import annotations
 
 import re
+import threading
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -533,3 +534,140 @@ def jaro_winkler_similarity(
             break
 
     return min(1.0, jaro_sim + prefix_len * prefix_weight * (1.0 - jaro_sim))
+
+
+class WatchlistScreeningEngine:
+    """Thread-safe sanctions, PEP, and law enforcement fuzzy screening engine."""
+
+    def __init__(self, default_threshold: float = 0.85) -> None:
+        self.default_threshold = default_threshold
+        self._lock = threading.RLock()
+        self._entries: dict[str, WatchlistEntry] = {}
+
+    def add_entry(self, entry: WatchlistEntry) -> None:
+        """Add or update an entry in the watchlist."""
+        with self._lock:
+            self._entries[entry.entity_id] = entry
+
+    def remove_entry(self, entity_id: str) -> bool:
+        """Remove an entry from the watchlist. Returns True if removed."""
+        with self._lock:
+            return self._entries.pop(entity_id, None) is not None
+
+    def get_entry(self, entity_id: str) -> WatchlistEntry | None:
+        """Retrieve a watchlist entry by entity ID."""
+        with self._lock:
+            return self._entries.get(entity_id)
+
+    def list_entries(
+        self,
+        watchlist_type: WatchlistType | None = None,
+    ) -> list[WatchlistEntry]:
+        """List all registered watchlist entries, optionally filtered by type."""
+        with self._lock:
+            if watchlist_type is None:
+                return list(self._entries.values())
+            return [e for e in self._entries.values() if e.watchlist_type == watchlist_type]
+
+    def count(self) -> int:
+        """Return total number of entries in watchlist."""
+        with self._lock:
+            return len(self._entries)
+
+    def screen_entity(
+        self,
+        name: str,
+        threshold: float | None = None,
+        country: str | None = None,
+    ) -> list[ScreeningMatch]:
+        """Screen an individual or organization name against registered watchlist entries."""
+        cutoff = self.default_threshold if threshold is None else threshold
+        normalized_query = " ".join(re.sub(r"[^\w\s]", "", name).strip().upper().split())
+        if not normalized_query:
+            return []
+
+        query_soundex = soundex(normalized_query)
+        query_tokens = sorted(normalized_query.split())
+        query_sorted_str = " ".join(query_tokens)
+
+        matches: list[ScreeningMatch] = []
+
+        with self._lock:
+            candidates = list(self._entries.values())
+
+        for entry in candidates:
+            # If country filter specified and does not match entry country, skip
+            if country and entry.country and entry.country.upper() != country.upper():
+                continue
+
+            target_names = [entry.name, *entry.aliases]
+            best_score = 0.0
+            best_algo = "none"
+
+            for target in target_names:
+                norm_target = " ".join(re.sub(r"[^\w\s]", "", target).strip().upper().split())
+                if not norm_target:
+                    continue
+
+                # 1. Exact match
+                if normalized_query == norm_target:
+                    best_score = 1.0
+                    best_algo = "exact"
+                    break
+
+                # 2. Token-sorted match (e.g. "Bout Viktor" vs "Viktor Bout")
+                target_tokens = sorted(norm_target.split())
+                target_sorted_str = " ".join(target_tokens)
+                if query_sorted_str == target_sorted_str:
+                    best_score = max(best_score, 0.98)
+                    best_algo = "token_sort_exact"
+
+                # 3. Jaro-Winkler similarity
+                jw_score = jaro_winkler_similarity(normalized_query, norm_target)
+                jw_sorted_score = jaro_winkler_similarity(query_sorted_str, target_sorted_str)
+                top_jw = max(jw_score, jw_sorted_score)
+                if top_jw > best_score:
+                    best_score = top_jw
+                    best_algo = "jaro_winkler"
+
+                # 4. Levenshtein normalized similarity
+                lev_score = levenshtein_similarity(normalized_query, norm_target)
+                if lev_score > best_score:
+                    best_score = lev_score
+                    best_algo = "levenshtein"
+
+                # 5. Phonetic Soundex match boost
+                target_soundex = soundex(norm_target)
+                if (
+                    query_soundex
+                    and target_soundex
+                    and query_soundex == target_soundex
+                    and lev_score >= 0.70
+                ):
+                    soundex_boosted = min(1.0, max(best_score, 0.88))
+                    if soundex_boosted > best_score:
+                        best_score = soundex_boosted
+                        best_algo = "soundex_phonetic"
+
+            if best_score >= cutoff:
+                if best_score >= 0.95:
+                    risk_level = AmlRiskLevel.CRITICAL
+                elif best_score >= 0.88:
+                    risk_level = AmlRiskLevel.HIGH
+                elif best_score >= 0.80:
+                    risk_level = AmlRiskLevel.MEDIUM
+                else:
+                    risk_level = AmlRiskLevel.LOW
+
+                matches.append(
+                    ScreeningMatch(
+                        entity_name=name,
+                        matched_entry=entry,
+                        similarity_score=best_score,
+                        match_algorithm=best_algo,
+                        risk_level=risk_level,
+                    )
+                )
+
+        matches.sort(key=lambda m: m.similarity_score, reverse=True)
+        return matches
