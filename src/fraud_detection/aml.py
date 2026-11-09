@@ -1545,3 +1545,108 @@ class AmlEngine:
                     tenant_id=event.tenant_id,
                 )
             )
+
+
+def generate_sar_narrative(
+    user_id: str,
+    alerts: list[AmlAlert],
+    suspect_name: str = "",
+    summary_financials: dict[str, Any] | None = None,
+) -> str:
+    """Generate an investigative Suspicious Activity Report (SAR) narrative."""
+    name_str = f" ({suspect_name})" if suspect_name else ""
+    lines: list[str] = [
+        "SUSPICIOUS ACTIVITY REPORT INVESTIGATIVE NARRATIVE",
+        "==================================================",
+        f"Subject Account ID: {user_id}{name_str}",
+        f"Report Generated: {datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC')}",
+        "",
+        "1. EXECUTIVE SUMMARY:",
+    ]
+    if summary_financials:
+        tot = float(summary_financials.get("total_suspicious_amount", 0.0))
+        curr = str(summary_financials.get("currency", "USD"))
+        count = int(summary_financials.get("transaction_count", len(alerts)))
+        lines.append(
+            f"During surveillance, subject conducted {count} suspicious transaction(s) "
+            f"totaling {tot:,.2f} {curr} triggering automated AML monitoring controls."
+        )
+    else:
+        lines.append(
+            f"Surveillance detected {len(alerts)} suspicious activity alert(s) "
+            f"associated with subject account {user_id}."
+        )
+
+    lines.extend(
+        [
+            "",
+            "2. SUSPICIOUS ACTIVITY TYPOLOGIES & PATTERN ANALYSIS:",
+        ]
+    )
+
+    seen_typologies: set[str] = set()
+    for alert in alerts:
+        t_val = alert.typology.value
+        if t_val in seen_typologies:
+            continue
+        seen_typologies.add(t_val)
+
+        if alert.typology == AmlTypology.STRUCTURING_SMURFING:
+            details = alert.trigger_details.get("structuring", {})
+            amt = float(details.get("total_amount", 0.0))
+            cnt = int(details.get("transaction_count", len(alert.transaction_ids)))
+            avg = float(details.get("average_amount", 0.0))
+            lines.append(
+                f"- STRUCTURING / SMURFING: Subject conducted {cnt} sequential transactions "
+                f"averaging {avg:,.2f} USD (total {amt:,.2f} USD) structured beneath "
+                "the mandatory currency transaction reporting (CTR) threshold."
+            )
+        elif alert.typology == AmlTypology.RAPID_MOVEMENT_LAYERING:
+            details = alert.trigger_details.get("layering", {})
+            ratio = float(details.get("turnover_ratio", 0.0)) * 100.0
+            dwell = float(details.get("dwell_minutes", 0.0))
+            lines.append(
+                f"- RAPID MOVEMENT / LAYERING: Funds deposited were exfiltrated within "
+                f"{dwell:.1f} min at {ratio:.1f}% turnover, exhibiting layering behavior "
+                "with negligible economic dwell time."
+            )
+        elif alert.typology == AmlTypology.ROUND_TRIP_CIRCULAR:
+            details = alert.trigger_details.get("circular_flow", {})
+            c_party = str(details.get("counterparty_id", "unknown"))
+            hrs = float(details.get("cycle_hours", 0.0))
+            lines.append(
+                f"- CIRCULAR FUND MOVEMENT: Bilateral transfers with counterparty {c_party} "
+                f"completed a circular round trip within {hrs:.1f} hours without business purpose."
+            )
+        elif alert.typology == AmlTypology.SANCTION_PEP_MATCH:
+            details = alert.trigger_details.get("top_match", {})
+            matched = str(details.get("matched_entry", {}).get("name", "Watchlist Entity"))
+            score = float(details.get("similarity_score", alert.risk_score)) * 100.0
+            lines.append(
+                f"- SANCTIONS / PEP WATCHLIST HIT: Entity matches designated target '{matched}' "
+                f"with {score:.1f}% confidence under fuzzy screening protocols."
+            )
+        elif alert.typology == AmlTypology.HIGH_RISK_JURISDICTION:
+            details = alert.trigger_details.get("jurisdiction", {})
+            tier = str(details.get("fatf_tier", "high_risk"))
+            cc = str(details.get("country", "XX"))
+            lines.append(
+                f"- HIGH-RISK JURISDICTION: Transactions routed through FATF {tier.upper()} "
+                f"corridor ({cc})."
+            )
+        else:
+            typ_name = alert.typology.value.upper()
+            lines.append(f"- {typ_name}: Triggered alert with score {alert.risk_score:.2f}.")
+
+    top_score = max((a.risk_score for a in alerts), default=0.0)
+    lines.extend(
+        [
+            "",
+            "3. LAW ENFORCEMENT & COMPLIANCE ACTIONS TAKEN:",
+            f"- Risk score assessed at {top_score:.2f}.",
+            "- Mandatory case file established for AML compliance officer adjudication.",
+            "- Complete transactional audit evidence preserved for regulatory subpoena compliance.",
+        ]
+    )
+
+    return "\n".join(lines)
