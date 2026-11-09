@@ -21,6 +21,7 @@ from fraud_detection.aml import (
     LayeringAlert,
     LayeringDetector,
     SarDossier,
+    SarManager,
     SarStatus,
     ScreeningMatch,
     StructuringAlert,
@@ -29,6 +30,7 @@ from fraud_detection.aml import (
     WatchlistEntry,
     WatchlistScreeningEngine,
     WatchlistType,
+    generate_sar_narrative,
     jaro_similarity,
     jaro_winkler_similarity,
     levenshtein_distance,
@@ -702,3 +704,125 @@ def test_aml_engine_evaluation_policies() -> None:
     restored = AmlAssessment.from_dict(assessment_dict)
     assert restored.transaction_id == "tx-sanction"
     assert restored.recommended_action == AmlAction.FILE_SAR_BLOCK
+
+
+def test_sar_manager_workflow_and_xml() -> None:
+    """Verify SarManager compiling, state transitions, validation, and FinCEN XML export."""
+    from fraud_detection.events import EventBus
+
+    bus = EventBus()
+    events: list[dict[str, Any]] = []
+    bus.subscribe(lambda e: events.append(e.to_dict()))
+
+    store = AmlStore()
+    manager = SarManager(store=store, event_bus=bus)
+
+    # 1. Create alerts in store
+    alert1 = AmlAlert(
+        user_id="usr-fincen",
+        typology=AmlTypology.STRUCTURING_SMURFING,
+        risk_level=AmlRiskLevel.HIGH,
+        recommended_action=AmlAction.ENHANCED_DUE_DILIGENCE,
+        risk_score=0.82,
+        trigger_details={
+            "structuring": {
+                "total_amount": 28500.0,
+                "transaction_count": 3,
+                "average_amount": 9500.0,
+            }
+        },
+        transaction_ids=("tx-1", "tx-2", "tx-3"),
+        alert_id="alt-str",
+    )
+    alert2 = AmlAlert(
+        user_id="usr-fincen",
+        typology=AmlTypology.HIGH_RISK_JURISDICTION,
+        risk_level=AmlRiskLevel.MEDIUM,
+        recommended_action=AmlAction.MONITOR,
+        risk_score=0.60,
+        trigger_details={"jurisdiction": {"country": "SY", "fatf_tier": "gray_list"}},
+        alert_id="alt-jur",
+    )
+    store.record_alert(alert1)
+    store.record_alert(alert2)
+
+    now = datetime.now(UTC)
+    txs = [
+        AmlTransactionEvent("tx-1", "usr-fincen", 9500.0, country="US", timestamp=now),
+        AmlTransactionEvent("tx-2", "usr-fincen", 9500.0, country="SY", timestamp=now),
+        AmlTransactionEvent("tx-3", "usr-fincen", 9500.0, country="US", timestamp=now),
+    ]
+
+    # Generate SAR
+    sar = manager.generate_sar(
+        user_id="usr-fincen",
+        alert_ids=["alt-str", "alt-jur"],
+        suspect_name="Carlos Danger",
+        transactions=txs,
+    )
+
+    assert sar.status == SarStatus.DRAFT
+    assert sar.summary_financials["total_suspicious_amount"] == 28500.0
+    assert sar.summary_financials["transaction_count"] == 3
+    assert "Carlos Danger" in sar.narrative
+    assert "STRUCTURING / SMURFING" in sar.narrative
+    assert "HIGH-RISK JURISDICTION" in sar.narrative
+    assert "SY" in sar.jurisdictions
+
+    # Verify event was published
+    sar_events = [e for e in events if e["event_type"] == "fraud.aml.sar_created"]
+    assert len(sar_events) == 1
+
+    # Status transitions: DRAFT -> PENDING_REVIEW -> APPROVED -> FILED
+    p_sar = manager.transition_status(
+        sar.sar_id, SarStatus.PENDING_REVIEW, notes="Reviewing evidence"
+    )
+    assert p_sar.status == SarStatus.PENDING_REVIEW
+
+    a_sar = manager.transition_status(
+        sar.sar_id, SarStatus.APPROVED, notes="Approved by BSA Officer"
+    )
+    assert a_sar.status == SarStatus.APPROVED
+
+    f_sar = manager.transition_status(sar.sar_id, SarStatus.FILED, notes="Submitted BSA e-filing")
+    assert f_sar.status == SarStatus.FILED
+    assert f_sar.filing_date != ""
+
+    # Invalid transition from FILED raises ValueError
+    import pytest
+
+    with pytest.raises(ValueError, match="Invalid SAR status transition"):
+        manager.transition_status(sar.sar_id, SarStatus.DRAFT)
+
+    # Transition on non-existent SAR raises KeyError
+    with pytest.raises(KeyError, match="not found"):
+        manager.transition_status("unknown-sar", SarStatus.PENDING_REVIEW)
+
+    # Export FinCEN XML
+    xml_output = manager.export_fincen_xml(sar.sar_id)
+    assert '<?xml version="1.0" encoding="UTF-8"?>' in xml_output
+    assert "<FinCEN_BSA_SAR" in xml_output
+    assert f"<SAR_ID>{sar.sar_id}</SAR_ID>" in xml_output
+    assert "<FilingStatus>FILED</FilingStatus>" in xml_output
+    assert "<CountryCode>SY</CountryCode>" in xml_output
+    assert '<TotalAmount currency="USD">28500.00</TotalAmount>' in xml_output
+    assert "<Name>Carlos Danger</Name>" in xml_output
+
+    with pytest.raises(KeyError, match="not found"):
+        manager.export_fincen_xml("unknown-sar")
+
+
+def test_generate_sar_narrative_standalone() -> None:
+    """Verify standalone narrative generation with and without summary financials."""
+    alert = AmlAlert(
+        user_id="usr-simple",
+        typology=AmlTypology.RAPID_MOVEMENT_LAYERING,
+        risk_level=AmlRiskLevel.HIGH,
+        recommended_action=AmlAction.ENHANCED_DUE_DILIGENCE,
+        risk_score=0.75,
+        trigger_details={"layering": {"turnover_ratio": 0.90, "dwell_minutes": 15.0}},
+    )
+    narrative = generate_sar_narrative("usr-simple", [alert])
+    assert "usr-simple" in narrative
+    assert "RAPID MOVEMENT / LAYERING" in narrative
+    assert "Surveillance detected 1 suspicious activity alert(s)" in narrative
