@@ -730,6 +730,68 @@ flowchart TD
 - **API, CLI & Observability**: Exposes FastAPI endpoints (`/v1/ato/login`, `/v1/ato/evaluate`, `/v1/ato/accounts/{user_id}`, `/v1/ato/accounts/{user_id}/mutations`, `/v1/ato/accounts/{user_id}/quarantine`, `/v1/ato/accounts/{user_id}/release`, `/v1/ato/assessments`), Typer CLI subcommands (`ato-login`, `ato-eval`, `ato-inspect`, `ato-quarantine`, `ato-release`, `ato-mutation`), and Prometheus metrics (`fraud_ato_login_attempts_total`, `fraud_ato_risk_assessments_total`, `fraud_ato_quarantines_total`).
 
 
+## Phase 48 — Anti-Money Laundering (AML) Transaction Monitoring, Structuring/Smurfing Detection & Regulatory SAR Engine
+
+Phase 48 introduces an in-process, zero-external-dependency Anti-Money Laundering (AML) Transaction Monitoring, Structuring/Smurfing Detection, Sanction/PEP Screening, and Regulatory Suspicious Activity Report (SAR) Filing Engine (`aml.py`). It enforces Bank Secrecy Act (BSA), FinCEN, and FATF regulatory compliance across payments, card transactions, and account transfers.
+
+```mermaid
+flowchart TD
+    subgraph Ingestion & Screening
+        TxIn["Financial Transaction Event\nPOST /v1/aml/monitor / CLI"] --> AML["AmlEngine"]
+        ScreenReq["Entity Name / PEP Query\nPOST /v1/aml/watchlist/screen"] --> ScreenEngine["WatchlistScreeningEngine\n(Levenshtein, Jaro-Winkler, Soundex)"]
+        ScreenEngine --> AML
+    end
+
+    subgraph AML Typology Detectors
+        AML --> Struct["StructuringDetector\n(Sub-CTR Smurfing Window\n$8,000-$9,999 Cumulative >= $10,000)"]
+        AML --> Layer["LayeringDetector\n(Rapid Flow-Through Inflow/Outflow\nTurnover Ratio > 80% within 4h)"]
+        AML --> Circ["CircularFlowDetector\n(Round-Trip Counterparty Loops\nA -> B -> A within 48h)"]
+        AML --> Juris["HighRiskJurisdictionDetector\n(FATF Blacklist / Graylist Corridors)"]
+        Struct --> Scoring["Calibrated Risk Scorer & Policy Matrix\n[0.0, 1.0]"]
+        Layer --> Scoring
+        Circ --> Scoring
+        Juris --> Scoring
+        ScreenEngine --> Scoring
+    end
+
+    subgraph Policy Routing & Case Escalation
+        Scoring --> Policy{"AML Policy Decision"}
+        Policy -->|< 0.30| Pass["PASS"]
+        Policy -->|0.30 - 0.69| Mon["MONITOR\nLog Alert"]
+        Policy -->|0.70 - 0.84| EDD["ENHANCED_DUE_DILIGENCE\nEscalate Case"]
+        Policy -->|>= 0.85 or Sanction Match| Block["FILE_SAR_BLOCK\nEscalate Priority P1 Case & Draft SAR"]
+        Block --> CaseEscalation["CaseManager\n(Auto-Escalate Cases)"]
+        EDD --> CaseEscalation
+    end
+
+    subgraph Store & Regulatory SAR Packaging
+        AML --> Store[("AmlStore\n(Thread-Safe Multi-Index)")]
+        Store --> SAR["SarManager\n(FinCEN BSA Narrative Generator\nAudit Trail & Status State Machine)"]
+        SAR --> XML["FinCEN XML Export\nGET /v1/aml/sar/{id}/xml"]
+        SAR --> SARAPI["SAR Lifecycle REST & CLI\n(draft -> pending_review -> approved -> filed)"]
+    end
+
+    subgraph Streaming & Observability
+        AML -->|Publish AML Domain Events| Bus["EventBus"]
+        Store --> API["FastAPI /v1/aml/*\n5x Prometheus AML Metrics"]
+        Store --> CLI["Typer CLI: aml-monitor, aml-screen,\naml-alerts, aml-sar-*"]
+    end
+```
+
+### Key Components
+
+- **AML Typologies & Taxonomy (`aml.py`)**: `AmlTypology` models regulatory financial crime patterns (`STRUCTURING_SMURFING`, `RAPID_MOVEMENT_LAYERING`, `ROUND_TRIP_CIRCULAR`, `HIGH_RISK_JURISDICTION`, `SANCTION_PEP_MATCH`). `AmlAction` provides deterministic compliance actions (`PASS`, `MONITOR`, `ENHANCED_DUE_DILIGENCE`, `FILE_SAR_BLOCK`).
+- **Phonetic & Fuzzy Watchlist Screening (`WatchlistScreeningEngine`)**: Zero-dependency string matching using Soundex phonetic encoding, Levenshtein edit distance, Jaro, and Jaro-Winkler prefix-weighted similarity against OFAC SDN, PEP, and FATF watchlists.
+- **Typology Detectors**:
+  - `StructuringDetector`: Detects intentional sub-threshold structuring (e.g. transactions between \$8,000 and \$9,999 aggregating over the \$10,000 Currency Transaction Report threshold in sliding time windows).
+  - `LayeringDetector`: Detects rapid movement of funds where inbound deposits are promptly disbursed to third parties with high turnover ratios (>80%) within short dwell windows (<4h).
+  - `CircularFlowDetector`: Identifies circular round-trip money movement loops between matching counterparties ($A \to B \to A$) within a 48-hour window.
+  - `HighRiskJurisdictionDetector`: Flags transaction corridors involving FATF High-Risk Jurisdictions subject to a Call for Action (Blacklist) and Increased Monitoring (Graylist).
+- **AML Engine & Autonomous Case Escalation (`AmlEngine`)**: Evaluates transactions against all active typologies, aggregates weighted scores into a calibrated composite risk metric, routes policy actions, and auto-escalates high-risk alerts into `CaseManager` investigations.
+- **Regulatory SAR Packaging & Lifecycle (`SarManager`)**: Formulates comprehensive FinCEN/FATF Suspicious Activity Report narratives, maintains strict audit-trailed state transitions (`DRAFT` $\to$ `PENDING_REVIEW` $\to$ `APPROVED` $\to$ `FILED` / `REJECTED`), and exports compliant FinCEN BSA XML representations.
+- **REST API, CLI & Observability**: Exposes FastAPI endpoints (`/v1/aml/monitor`, `/v1/aml/watchlist/screen`, `/v1/aml/alerts`, `/v1/aml/sar`, `/v1/aml/sar/{id}/xml`, `/v1/aml/sar/{id}/status`), Typer CLI subcommands (`aml-monitor`, `aml-screen`, `aml-alerts`, `aml-sar-generate`, `aml-sar-list`, `aml-sar-status`), and Prometheus metrics (`fraud_aml_transactions_monitored_total`, `fraud_aml_alerts_total`, `fraud_aml_sanction_hits_total`, `fraud_aml_sars_created_total`, `fraud_aml_sars_filed_total`).
+
+
 ## Extension guidance
 
 
