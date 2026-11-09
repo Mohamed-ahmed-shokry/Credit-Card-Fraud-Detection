@@ -11,7 +11,7 @@ import re
 import secrets
 import time
 from collections.abc import AsyncIterator, Callable, Collection
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from threading import RLock
@@ -38,6 +38,19 @@ from starlette.middleware.base import RequestResponseEndpoint
 from starlette.responses import Response
 
 from fraud_detection import __version__
+from fraud_detection.aml import (
+    AmlAssessment,
+    AmlEngine,
+    AmlRiskLevel,
+    AmlTransactionEvent,
+    AmlTypology,
+    SarDossier,
+    SarManager,
+    SarStatus,
+    TransactionDirection,
+    WatchlistEntry,
+    WatchlistType,
+)
 from fraud_detection.ato import (
     AccountMutationRecord,
     AccountMutationType,
@@ -316,6 +329,10 @@ OPERATIONAL_PATHS = frozenset(
         "/v1/ato/login",
         "/v1/ato/evaluate",
         "/v1/ato/assessments",
+        "/v1/aml/transactions/monitor",
+        "/v1/aml/watchlist/screen",
+        "/v1/aml/alerts",
+        "/v1/aml/sar",
     }
 )
 UNMATCHED_ROUTE_LABEL = "unmatched"
@@ -2008,6 +2025,161 @@ def _profile_to_response(profile: AccountProfile) -> AtoProfileResponse:
     return AtoProfileResponse(**data)
 
 
+class AmlMonitorRequest(BaseModel):
+    """Payload to evaluate a financial transaction for AML typologies."""
+
+    transaction_id: str = Field(default_factory=lambda: f"tx_{uuid4().hex[:12]}")
+    user_id: str
+    amount: float = Field(gt=0.0)
+    currency: str = "USD"
+    direction: str = "outflow"
+    counterparty_id: str = ""
+    country: str = "US"
+    payment_method: str = "card"
+    entity_name: str | None = None
+    tenant_id: str = "default"
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class AmlAssessmentResponse(BaseModel):
+    """Evaluation response from the AML scoring and policy decisioning engine."""
+
+    transaction_id: str
+    user_id: str
+    risk_score: float
+    risk_level: str
+    recommended_action: str
+    triggered_typologies: list[str]
+    score_breakdown: dict[str, float]
+    screening_matches: list[dict[str, Any]]
+    alert_id: str | None = None
+    case_id: str | None = None
+    tenant_id: str = "default"
+    evaluated_at: str
+
+
+class AmlWatchlistScreenRequest(BaseModel):
+    """Request to screen an entity name against sanctions and PEP watchlists."""
+
+    name: str
+    threshold: float | None = None
+    country: str | None = None
+
+
+class AmlWatchlistEntryRequest(BaseModel):
+    """Request to add or update an entry in the watchlist."""
+
+    name: str
+    watchlist_type: str
+    country: str = ""
+    aliases: list[str] = Field(default_factory=list)
+    notes: str = ""
+
+
+class AmlWatchlistMatchResponse(BaseModel):
+    """Screening match record."""
+
+    match_id: str
+    entity_name: str
+    matched_entry: dict[str, Any]
+    similarity_score: float
+    match_algorithm: str
+    risk_level: str
+    screened_at: str
+
+
+class AmlAlertResponse(BaseModel):
+    """Serialized AML alert."""
+
+    alert_id: str
+    user_id: str
+    typology: str
+    risk_level: str
+    recommended_action: str
+    risk_score: float
+    trigger_details: dict[str, Any]
+    transaction_ids: list[str]
+    tenant_id: str
+    created_at: str
+
+
+class AmlAlertListResponse(BaseModel):
+    """List of AML alerts."""
+
+    total_count: int
+    alerts: list[AmlAlertResponse]
+
+
+class AmlSarGenerateRequest(BaseModel):
+    """Request to compile a regulatory SAR filing dossier."""
+
+    user_id: str
+    alert_ids: list[str]
+    suspect_name: str = ""
+    suspect_details: dict[str, Any] = Field(default_factory=dict)
+    transactions: list[dict[str, Any]] = Field(default_factory=list)
+    tenant_id: str = "default"
+
+
+class AmlSarStatusUpdateRequest(BaseModel):
+    """Request to transition the status of a SAR filing dossier."""
+
+    new_status: str
+    notes: str = ""
+    actor: str = "compliance_officer"
+
+
+class AmlSarResponse(BaseModel):
+    """Serialized SAR regulatory filing dossier."""
+
+    sar_id: str
+    user_id: str
+    alert_ids: list[str]
+    status: str
+    narrative: str
+    suspect_details: dict[str, Any]
+    summary_financials: dict[str, Any]
+    jurisdictions: list[str]
+    filing_date: str
+    tenant_id: str
+    created_at: str
+    updated_at: str
+    audit_trail: list[dict[str, Any]]
+
+
+class AmlSarListResponse(BaseModel):
+    """List of SAR dossiers."""
+
+    total_count: int
+    sars: list[AmlSarResponse]
+
+
+def _aml_assessment_to_response(assessment: AmlAssessment) -> AmlAssessmentResponse:
+    """Helper to convert AmlAssessment dataclass to AmlAssessmentResponse."""
+    d = assessment.to_dict()
+    alert_id = d["alert"]["alert_id"] if d.get("alert") else None
+    return AmlAssessmentResponse(
+        transaction_id=d["transaction_id"],
+        user_id=d["user_id"],
+        risk_score=d["risk_score"],
+        risk_level=d["risk_level"],
+        recommended_action=d["recommended_action"],
+        triggered_typologies=d["triggered_typologies"],
+        score_breakdown=d["score_breakdown"],
+        screening_matches=d["screening_matches"],
+        alert_id=alert_id,
+        case_id=d.get("case_id"),
+        tenant_id=d.get("tenant_id", "default"),
+        evaluated_at=d["evaluated_at"],
+    )
+
+
+def _aml_sar_to_response(sar: SarDossier) -> AmlSarResponse:
+    """Helper to convert SarDossier dataclass to AmlSarResponse."""
+    d = sar.to_dict()
+    return AmlSarResponse(**d)
+
+
 def create_app(
     *,
     model: FraudModel | None = None,
@@ -2092,6 +2264,8 @@ def create_app(
     case_manager: CaseManager | None = None,
     chargeback_manager: ChargebackManager | None = None,
     ato_engine: AtoEngine | None = None,
+    aml_engine: AmlEngine | None = None,
+    sar_manager: SarManager | None = None,
 ) -> FastAPI:
     """Create an application using an injected model or a trusted artifact path.
 
@@ -2546,6 +2720,36 @@ def create_app(
     ato_quarantines_counter = Counter(
         "fraud_ato_quarantines_total",
         "Total user accounts quarantined for ATO security breach.",
+        ["tenant_id"],
+        registry=metrics_registry,
+    )
+    aml_transactions_counter = Counter(
+        "fraud_aml_transactions_monitored_total",
+        "Total transactions evaluated by AML engine.",
+        ["tenant_id", "action", "risk_level"],
+        registry=metrics_registry,
+    )
+    aml_alerts_counter = Counter(
+        "fraud_aml_alerts_total",
+        "Total AML alerts triggered.",
+        ["tenant_id", "typology", "risk_level"],
+        registry=metrics_registry,
+    )
+    aml_sanction_hits_counter = Counter(
+        "fraud_aml_sanction_hits_total",
+        "Total sanctions and PEP watchlist matches detected.",
+        ["tenant_id"],
+        registry=metrics_registry,
+    )
+    aml_sars_created_counter = Counter(
+        "fraud_aml_sars_created_total",
+        "Total SAR dossiers compiled.",
+        ["tenant_id"],
+        registry=metrics_registry,
+    )
+    aml_sars_filed_counter = Counter(
+        "fraud_aml_sars_filed_total",
+        "Total SAR dossiers transitioned to FILED status.",
         ["tenant_id"],
         registry=metrics_registry,
     )
@@ -3106,6 +3310,21 @@ def create_app(
         application.state.ato_login_attempts_counter = ato_login_attempts_counter
         application.state.ato_evaluations_counter = ato_evaluations_counter
         application.state.ato_quarantines_counter = ato_quarantines_counter
+        resolved_aml_engine = aml_engine or AmlEngine(
+            case_manager=application.state.case_manager,
+            event_bus=resolved_event_bus,
+        )
+        resolved_sar_manager = sar_manager or SarManager(
+            store=resolved_aml_engine.store,
+            event_bus=resolved_event_bus,
+        )
+        application.state.aml_engine = resolved_aml_engine
+        application.state.sar_manager = resolved_sar_manager
+        application.state.aml_transactions_counter = aml_transactions_counter
+        application.state.aml_alerts_counter = aml_alerts_counter
+        application.state.aml_sanction_hits_counter = aml_sanction_hits_counter
+        application.state.aml_sars_created_counter = aml_sars_created_counter
+        application.state.aml_sars_filed_counter = aml_sars_filed_counter
         application.state.audit_sink = resolved_audit_sink
         application.state.explanation_provider = explanation_provider
         application.state.fallback_mode = resolved_fallback_mode
@@ -6921,6 +7140,388 @@ def create_app(
                 content={"detail": f"ATO assessment '{assessment_id}' not found"},
             )
         return _assessment_to_response(assessment)
+
+    # -------------------------------------------------------------------------
+    # Phase 48: Anti-Money Laundering (AML) & Regulatory SAR Endpoints
+    # -------------------------------------------------------------------------
+
+    @application.post(
+        "/v1/aml/transactions/monitor",
+        response_model=AmlAssessmentResponse,
+        responses={
+            400: {"description": "Invalid transaction direction or parameters."},
+            500: {"description": "AmlEngine not initialized."},
+        },
+        tags=["aml"],
+    )
+    async def aml_monitor_transaction_endpoint(
+        payload: AmlMonitorRequest,
+        request: Request,
+    ) -> AmlAssessmentResponse | JSONResponse:
+        """Monitor financial transaction for AML typologies, structuring, and sanctions hits."""
+        engine: AmlEngine | None = getattr(request.app.state, "aml_engine", None)
+        if engine is None:
+            return JSONResponse(status_code=500, content={"detail": "AmlEngine not initialized"})
+
+        try:
+            direction_enum = TransactionDirection(payload.direction.lower())
+        except ValueError:
+            return JSONResponse(
+                status_code=400,
+                content={"detail": f"Invalid direction '{payload.direction}'"},
+            )
+
+        event = AmlTransactionEvent(
+            transaction_id=payload.transaction_id,
+            user_id=payload.user_id,
+            amount=payload.amount,
+            currency=payload.currency,
+            direction=direction_enum,
+            counterparty_id=payload.counterparty_id,
+            country=payload.country,
+            payment_method=payload.payment_method,
+            tenant_id=payload.tenant_id,
+            metadata=payload.metadata,
+        )
+
+        assessment = engine.evaluate_transaction(event, entity_name=payload.entity_name)
+
+        tx_counter = getattr(request.app.state, "aml_transactions_counter", None)
+        if tx_counter is not None:
+            tx_counter.labels(
+                tenant_id=assessment.tenant_id,
+                action=assessment.recommended_action.value,
+                risk_level=assessment.risk_level.value,
+            ).inc()
+
+        if assessment.alert is not None:
+            alt_counter = getattr(request.app.state, "aml_alerts_counter", None)
+            if alt_counter is not None:
+                alt_counter.labels(
+                    tenant_id=assessment.tenant_id,
+                    typology=assessment.alert.typology.value,
+                    risk_level=assessment.risk_level.value,
+                ).inc()
+
+        if AmlTypology.SANCTION_PEP_MATCH in assessment.triggered_typologies:
+            s_counter = getattr(request.app.state, "aml_sanction_hits_counter", None)
+            if s_counter is not None:
+                s_counter.labels(tenant_id=assessment.tenant_id).inc()
+
+        return _aml_assessment_to_response(assessment)
+
+    @application.post(
+        "/v1/aml/watchlist/screen",
+        response_model=list[AmlWatchlistMatchResponse],
+        responses={
+            500: {"description": "AmlEngine not initialized."},
+        },
+        tags=["aml"],
+    )
+    async def aml_watchlist_screen_endpoint(
+        payload: AmlWatchlistScreenRequest,
+        request: Request,
+    ) -> list[AmlWatchlistMatchResponse] | JSONResponse:
+        """Screen entity name against registered OFAC, PEP, and law enforcement watchlists."""
+        engine: AmlEngine | None = getattr(request.app.state, "aml_engine", None)
+        if engine is None:
+            return JSONResponse(status_code=500, content={"detail": "AmlEngine not initialized"})
+
+        matches = engine.screening_engine.screen_entity(
+            name=payload.name,
+            threshold=payload.threshold,
+            country=payload.country,
+        )
+        return [
+            AmlWatchlistMatchResponse(
+                match_id=m.match_id,
+                entity_name=m.entity_name,
+                matched_entry=m.matched_entry.to_dict(),
+                similarity_score=m.similarity_score,
+                match_algorithm=m.match_algorithm,
+                risk_level=m.risk_level.value,
+                screened_at=m.screened_at.isoformat(),
+            )
+            for m in matches
+        ]
+
+    @application.post(
+        "/v1/aml/watchlist/entries",
+        responses={
+            400: {"description": "Invalid watchlist type."},
+            500: {"description": "AmlEngine not initialized."},
+        },
+        tags=["aml"],
+    )
+    async def aml_add_watchlist_entry_endpoint(
+        payload: AmlWatchlistEntryRequest,
+        request: Request,
+    ) -> JSONResponse:
+        """Register a new sanctions or PEP entity in the fuzzy screening watchlist."""
+        engine: AmlEngine | None = getattr(request.app.state, "aml_engine", None)
+        if engine is None:
+            return JSONResponse(status_code=500, content={"detail": "AmlEngine not initialized"})
+
+        try:
+            wl_type = WatchlistType(payload.watchlist_type.lower())
+        except ValueError:
+            return JSONResponse(
+                status_code=400,
+                content={"detail": f"Invalid watchlist type '{payload.watchlist_type}'"},
+            )
+
+        entry = WatchlistEntry(
+            name=payload.name,
+            watchlist_type=wl_type,
+            country=payload.country,
+            aliases=tuple(payload.aliases),
+            notes=payload.notes,
+        )
+        engine.screening_engine.add_entry(entry)
+        return JSONResponse(
+            status_code=201,
+            content={"status": "created", "entry": entry.to_dict()},
+        )
+
+    @application.get(
+        "/v1/aml/alerts",
+        response_model=AmlAlertListResponse,
+        responses={
+            500: {"description": "AmlEngine not initialized."},
+        },
+        tags=["aml"],
+    )
+    async def aml_list_alerts_endpoint(
+        request: Request,
+        user_id: str | None = None,
+        typology: str | None = None,
+        risk_level: str | None = None,
+        tenant_id: str | None = None,
+        limit: int = 100,
+    ) -> AmlAlertListResponse | JSONResponse:
+        """Query recorded AML surveillance alerts."""
+        engine: AmlEngine | None = getattr(request.app.state, "aml_engine", None)
+        if engine is None:
+            return JSONResponse(status_code=500, content={"detail": "AmlEngine not initialized"})
+
+        typ_enum = None
+        if typology:
+            with suppress(ValueError):
+                typ_enum = AmlTypology(typology.lower())
+
+        risk_enum = None
+        if risk_level:
+            with suppress(ValueError):
+                risk_enum = AmlRiskLevel(risk_level.lower())
+
+        alerts = engine.store.list_alerts(
+            user_id=user_id,
+            typology=typ_enum,
+            risk_level=risk_enum,
+            tenant_id=tenant_id,
+            limit=limit,
+        )
+        return AmlAlertListResponse(
+            total_count=len(alerts),
+            alerts=[AmlAlertResponse(**a.to_dict()) for a in alerts],
+        )
+
+    @application.get(
+        "/v1/aml/alerts/{alert_id}",
+        response_model=AmlAlertResponse,
+        responses={
+            404: {"description": "AML alert not found."},
+            500: {"description": "AmlEngine not initialized."},
+        },
+        tags=["aml"],
+    )
+    async def aml_get_alert_endpoint(
+        alert_id: str,
+        request: Request,
+    ) -> AmlAlertResponse | JSONResponse:
+        """Retrieve details of a single AML alert by ID."""
+        engine: AmlEngine | None = getattr(request.app.state, "aml_engine", None)
+        if engine is None:
+            return JSONResponse(status_code=500, content={"detail": "AmlEngine not initialized"})
+
+        alert = engine.store.get_alert(alert_id)
+        if alert is None:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": f"AML alert '{alert_id}' not found"},
+            )
+        return AmlAlertResponse(**alert.to_dict())
+
+    @application.post(
+        "/v1/aml/sar/generate",
+        response_model=AmlSarResponse,
+        responses={
+            500: {"description": "SarManager not initialized."},
+        },
+        tags=["aml"],
+    )
+    async def aml_generate_sar_endpoint(
+        payload: AmlSarGenerateRequest,
+        request: Request,
+    ) -> AmlSarResponse | JSONResponse:
+        """Compile a Suspicious Activity Report (SAR) regulatory dossier."""
+        sar_mgr: SarManager | None = getattr(request.app.state, "sar_manager", None)
+        if sar_mgr is None:
+            return JSONResponse(status_code=500, content={"detail": "SarManager not initialized"})
+
+        txs = [AmlTransactionEvent.from_dict(t) for t in payload.transactions]
+        dossier = sar_mgr.generate_sar(
+            user_id=payload.user_id,
+            alert_ids=payload.alert_ids,
+            suspect_name=payload.suspect_name,
+            suspect_details=payload.suspect_details,
+            transactions=txs,
+            tenant_id=payload.tenant_id,
+        )
+
+        counter = getattr(request.app.state, "aml_sars_created_counter", None)
+        if counter is not None:
+            counter.labels(tenant_id=dossier.tenant_id).inc()
+
+        return _aml_sar_to_response(dossier)
+
+    @application.get(
+        "/v1/aml/sar",
+        response_model=AmlSarListResponse,
+        responses={
+            500: {"description": "SarManager not initialized."},
+        },
+        tags=["aml"],
+    )
+    async def aml_list_sars_endpoint(
+        request: Request,
+        user_id: str | None = None,
+        status: str | None = None,
+        tenant_id: str | None = None,
+        limit: int = 100,
+    ) -> AmlSarListResponse | JSONResponse:
+        """Query SAR dossiers by user, filing status, or tenant."""
+        sar_mgr: SarManager | None = getattr(request.app.state, "sar_manager", None)
+        if sar_mgr is None:
+            return JSONResponse(status_code=500, content={"detail": "SarManager not initialized"})
+
+        status_enum = None
+        if status:
+            with suppress(ValueError):
+                status_enum = SarStatus(status.lower())
+
+        sars = sar_mgr.store.list_sars(
+            user_id=user_id,
+            status=status_enum,
+            tenant_id=tenant_id,
+            limit=limit,
+        )
+        return AmlSarListResponse(
+            total_count=len(sars),
+            sars=[_aml_sar_to_response(s) for s in sars],
+        )
+
+    @application.get(
+        "/v1/aml/sar/{sar_id}",
+        response_model=AmlSarResponse,
+        responses={
+            404: {"description": "SAR dossier not found."},
+            500: {"description": "SarManager not initialized."},
+        },
+        tags=["aml"],
+    )
+    async def aml_get_sar_endpoint(
+        sar_id: str,
+        request: Request,
+    ) -> AmlSarResponse | JSONResponse:
+        """Retrieve a specific SAR regulatory filing dossier."""
+        sar_mgr: SarManager | None = getattr(request.app.state, "sar_manager", None)
+        if sar_mgr is None:
+            return JSONResponse(status_code=500, content={"detail": "SarManager not initialized"})
+
+        dossier = sar_mgr.store.get_sar(sar_id)
+        if dossier is None:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": f"SAR dossier '{sar_id}' not found"},
+            )
+        return _aml_sar_to_response(dossier)
+
+    @application.get(
+        "/v1/aml/sar/{sar_id}/xml",
+        responses={
+            404: {"description": "SAR dossier not found."},
+            500: {"description": "SarManager not initialized."},
+        },
+        tags=["aml"],
+    )
+    async def aml_get_sar_xml_endpoint(
+        sar_id: str,
+        request: Request,
+    ) -> Response | JSONResponse:
+        """Export SAR regulatory filing dossier in standard FinCEN BSA XML schema."""
+        sar_mgr: SarManager | None = getattr(request.app.state, "sar_manager", None)
+        if sar_mgr is None:
+            return JSONResponse(status_code=500, content={"detail": "SarManager not initialized"})
+
+        try:
+            xml_content = sar_mgr.export_fincen_xml(sar_id)
+        except KeyError:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": f"SAR dossier '{sar_id}' not found"},
+            )
+        return Response(content=xml_content, media_type="application/xml")
+
+    @application.post(
+        "/v1/aml/sar/{sar_id}/status",
+        response_model=AmlSarResponse,
+        responses={
+            400: {"description": "Invalid status transition."},
+            404: {"description": "SAR dossier not found."},
+            500: {"description": "SarManager not initialized."},
+        },
+        tags=["aml"],
+    )
+    async def aml_update_sar_status_endpoint(
+        sar_id: str,
+        payload: AmlSarStatusUpdateRequest,
+        request: Request,
+    ) -> AmlSarResponse | JSONResponse:
+        """Transition the review or regulatory filing status of a SAR dossier."""
+        sar_mgr: SarManager | None = getattr(request.app.state, "sar_manager", None)
+        if sar_mgr is None:
+            return JSONResponse(status_code=500, content={"detail": "SarManager not initialized"})
+
+        try:
+            target_status = SarStatus(payload.new_status.lower())
+        except ValueError:
+            return JSONResponse(
+                status_code=400,
+                content={"detail": f"Invalid SAR status '{payload.new_status}'"},
+            )
+
+        try:
+            updated = sar_mgr.transition_status(
+                sar_id,
+                target_status,
+                notes=payload.notes,
+                actor=payload.actor,
+            )
+        except KeyError:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": f"SAR dossier '{sar_id}' not found"},
+            )
+        except ValueError as exc:
+            return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+        if target_status == SarStatus.FILED:
+            counter = getattr(request.app.state, "aml_sars_filed_counter", None)
+            if counter is not None:
+                counter.labels(tenant_id=updated.tenant_id).inc()
+
+        return _aml_sar_to_response(updated)
 
     @application.get(
         "/v1/routing/status",
