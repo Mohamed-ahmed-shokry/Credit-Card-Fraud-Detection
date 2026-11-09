@@ -1,0 +1,201 @@
+"""Tests for AML transaction monitoring, typology detection, and SAR filing."""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime
+
+from fraud_detection.aml import (
+    AmlAction,
+    AmlAlert,
+    AmlRiskLevel,
+    AmlTransactionEvent,
+    AmlTypology,
+    SarDossier,
+    SarStatus,
+    ScreeningMatch,
+    StructuringAlert,
+    TransactionDirection,
+    WatchlistEntry,
+    WatchlistType,
+)
+
+
+def test_aml_enums() -> None:
+    """Verify string enum mappings and values."""
+    assert AmlTypology.STRUCTURING_SMURFING == "structuring_smurfing"
+    assert AmlTypology.RAPID_MOVEMENT_LAYERING == "rapid_movement_layering"
+    assert AmlTypology.ROUND_TRIP_CIRCULAR == "round_trip_circular"
+    assert AmlTypology.SANCTION_PEP_MATCH == "sanction_pep_match"
+    assert AmlTypology.HIGH_RISK_JURISDICTION == "high_risk_jurisdiction"
+    assert AmlTypology.HIGH_VELOCITY_BURST == "high_velocity_burst"
+
+    assert AmlRiskLevel.LOW == "low"
+    assert AmlRiskLevel.CRITICAL == "critical"
+
+    assert AmlAction.PASS == "pass"  # noqa: S105
+    assert AmlAction.FILE_SAR_BLOCK == "file_sar_block"
+
+    assert SarStatus.DRAFT == "draft"
+    assert SarStatus.FILED == "filed"
+
+    assert WatchlistType.OFAC_SDN == "ofac_sdn"
+    assert TransactionDirection.INFLOW == "inflow"
+    assert TransactionDirection.OUTFLOW == "outflow"
+
+
+def test_watchlist_entry_serialization() -> None:
+    """Verify WatchlistEntry serialization and deserialization."""
+    entry = WatchlistEntry(
+        entity_id="w-101",
+        name="Viktor Bout",
+        watchlist_type=WatchlistType.OFAC_SDN,
+        country="RU",
+        aliases=("Merchant of Death", "Boris"),
+        listed_date="2008-03-06",
+        notes="High risk arms dealer",
+    )
+    d = entry.to_dict()
+    assert d["entity_id"] == "w-101"
+    assert d["name"] == "Viktor Bout"
+    assert d["watchlist_type"] == "ofac_sdn"
+    assert "Boris" in d["aliases"]
+
+    restored = WatchlistEntry.from_dict(d)
+    assert restored.entity_id == entry.entity_id
+    assert restored.name == entry.name
+    assert restored.watchlist_type == WatchlistType.OFAC_SDN
+    assert restored.aliases == ("Merchant of Death", "Boris")
+
+
+def test_screening_match_serialization() -> None:
+    """Verify ScreeningMatch serialization and deserialization."""
+    entry = WatchlistEntry(
+        entity_id="w-102",
+        name="John Doe",
+        watchlist_type=WatchlistType.PEP,
+        country="US",
+    )
+    now = datetime.now(UTC)
+    match = ScreeningMatch(
+        match_id="m-501",
+        entity_name="Jon Doe",
+        matched_entry=entry,
+        similarity_score=0.92,
+        match_algorithm="jaro_winkler",
+        risk_level=AmlRiskLevel.HIGH,
+        screened_at=now,
+    )
+    d = match.to_dict()
+    assert d["match_id"] == "m-501"
+    assert d["similarity_score"] == 0.92
+    assert d["matched_entry"]["name"] == "John Doe"
+
+    restored = ScreeningMatch.from_dict(d)
+    assert restored.match_id == "m-501"
+    assert restored.entity_name == "Jon Doe"
+    assert restored.matched_entry.name == "John Doe"
+    assert restored.similarity_score == 0.92
+    assert restored.risk_level == AmlRiskLevel.HIGH
+
+
+def test_aml_transaction_event_serialization() -> None:
+    """Verify AmlTransactionEvent serialization and deserialization."""
+    now = datetime.now(UTC)
+    tx = AmlTransactionEvent(
+        transaction_id="tx-999",
+        user_id="usr-123",
+        amount=9500.0,
+        currency="USD",
+        direction=TransactionDirection.INFLOW,
+        counterparty_id="usr-456",
+        country="US",
+        payment_method="ach",
+        timestamp=now,
+        tenant_id="tenant-alpha",
+        metadata={"channel": "web"},
+    )
+    d = tx.to_dict()
+    assert d["transaction_id"] == "tx-999"
+    assert d["amount"] == 9500.0
+    assert d["direction"] == "inflow"
+    assert d["metadata"]["channel"] == "web"
+
+    restored = AmlTransactionEvent.from_dict(d)
+    assert restored.transaction_id == "tx-999"
+    assert restored.amount == 9500.0
+    assert restored.direction == TransactionDirection.INFLOW
+    assert restored.metadata["channel"] == "web"
+
+
+def test_structuring_alert_serialization() -> None:
+    """Verify StructuringAlert serialization and deserialization."""
+    alert = StructuringAlert(
+        alert_id="str-1",
+        user_id="usr-abc",
+        transaction_ids=("tx-1", "tx-2", "tx-3"),
+        total_amount=28500.0,
+        transaction_count=3,
+        window_seconds=86400.0,
+        average_amount=9500.0,
+        threshold_proximity=0.95,
+    )
+    d = alert.to_dict()
+    assert d["total_amount"] == 28500.0
+    assert d["transaction_count"] == 3
+    assert len(d["transaction_ids"]) == 3
+
+    restored = StructuringAlert.from_dict(d)
+    assert restored.alert_id == "str-1"
+    assert restored.transaction_count == 3
+    assert restored.total_amount == 28500.0
+
+
+def test_aml_alert_serialization() -> None:
+    """Verify AmlAlert serialization and deserialization."""
+    alert = AmlAlert(
+        alert_id="alt-1",
+        user_id="usr-xyz",
+        typology=AmlTypology.STRUCTURING_SMURFING,
+        risk_level=AmlRiskLevel.HIGH,
+        recommended_action=AmlAction.ENHANCED_DUE_DILIGENCE,
+        risk_score=0.82,
+        trigger_details={"smurfing_streak": 3},
+        transaction_ids=("tx-1", "tx-2"),
+        tenant_id="tenant-beta",
+    )
+    d = alert.to_dict()
+    assert d["alert_id"] == "alt-1"
+    assert d["typology"] == "structuring_smurfing"
+    assert d["risk_score"] == 0.82
+
+    restored = AmlAlert.from_dict(d)
+    assert restored.alert_id == "alt-1"
+    assert restored.typology == AmlTypology.STRUCTURING_SMURFING
+    assert restored.recommended_action == AmlAction.ENHANCED_DUE_DILIGENCE
+
+
+def test_sar_dossier_serialization() -> None:
+    """Verify SarDossier serialization and deserialization."""
+    sar = SarDossier(
+        sar_id="sar-001",
+        user_id="usr-xyz",
+        narrative="Customer conducted sequential ATM cash loads under $10,000 threshold.",
+        alert_ids=("alt-1",),
+        status=SarStatus.PENDING_REVIEW,
+        suspect_details={"full_name": "Suspicious Individual", "ssn_hash": "abc..."},
+        summary_financials={"total_suspicious_amount": 28500.0, "currency": "USD"},
+        jurisdictions=("US",),
+        filing_date="",
+        tenant_id="tenant-beta",
+        audit_trail=({"action": "created", "by": "system"},),
+    )
+    d = sar.to_dict()
+    assert d["sar_id"] == "sar-001"
+    assert d["status"] == "pending_review"
+    assert len(d["audit_trail"]) == 1
+
+    restored = SarDossier.from_dict(d)
+    assert restored.sar_id == "sar-001"
+    assert restored.status == SarStatus.PENDING_REVIEW
+    assert restored.narrative.startswith("Customer conducted")
+    assert restored.summary_financials["total_suspicious_amount"] == 28500.0
