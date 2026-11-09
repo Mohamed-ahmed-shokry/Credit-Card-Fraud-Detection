@@ -6558,3 +6558,277 @@ def test_ato_api_error_branches_and_edge_cases(api_context: tuple[Path, Any, Pat
         assert client.post("/v1/ato/accounts/u/release", json={"reason": "r"}).status_code == 500
         assert client.get("/v1/ato/assessments").status_code == 500
         assert client.get("/v1/ato/assessments/ato_123").status_code == 500
+
+
+def test_aml_api_endpoints_and_lifecycle(api_context: tuple[Path, Any, Path]) -> None:
+    """Validate /v1/aml/* REST endpoints for monitoring, screening, alerts, and SARs."""
+    from fraud_detection.aml import AmlEngine, SarManager
+
+    _, model, _ = api_context
+    aml_engine = AmlEngine()
+    sar_manager = SarManager(store=aml_engine.store)
+    app = create_app(model=model, aml_engine=aml_engine, sar_manager=sar_manager)
+
+    with TestClient(app) as client:
+        # 1. Add entry to watchlist
+        res_wl = client.post(
+            "/v1/aml/watchlist/entries",
+            json={
+                "name": "Viktor Bout",
+                "watchlist_type": "ofac_sdn",
+                "country": "RU",
+                "aliases": ["The Merchant", "Boris"],
+                "notes": "Arms trafficking designation",
+            },
+        )
+        assert res_wl.status_code == 201
+        assert res_wl.json()["status"] == "created"
+        assert res_wl.json()["entry"]["name"] == "Viktor Bout"
+
+        # 2. Screen entity name against watchlist
+        res_screen = client.post(
+            "/v1/aml/watchlist/screen",
+            json={"name": "Victor Bout", "threshold": 0.85},
+        )
+        assert res_screen.status_code == 200
+        matches = res_screen.json()
+        assert len(matches) == 1
+        assert matches[0]["matched_entry"]["name"] == "Viktor Bout"
+        assert matches[0]["similarity_score"] >= 0.88
+
+        # 3. Monitor normal transaction -> PASS
+        res_norm = client.post(
+            "/v1/aml/transactions/monitor",
+            json={
+                "transaction_id": "tx-normal-1",
+                "user_id": "usr-aml-1",
+                "amount": 150.0,
+                "direction": "outflow",
+                "country": "US",
+            },
+        )
+        assert res_norm.status_code == 200
+        norm_data = res_norm.json()
+        assert norm_data["recommended_action"] == "pass"
+        assert norm_data["risk_level"] == "low"
+        assert norm_data["alert_id"] is None
+
+        # 4. Monitor structuring transactions (two sub-threshold bursts)
+        res_str1 = client.post(
+            "/v1/aml/transactions/monitor",
+            json={
+                "transaction_id": "tx-str-1",
+                "user_id": "usr-aml-smurf",
+                "amount": 9500.0,
+                "direction": "outflow",
+                "country": "US",
+            },
+        )
+        assert res_str1.status_code == 200
+
+        res_str2 = client.post(
+            "/v1/aml/transactions/monitor",
+            json={
+                "transaction_id": "tx-str-2",
+                "user_id": "usr-aml-smurf",
+                "amount": 9200.0,
+                "direction": "outflow",
+                "country": "US",
+            },
+        )
+        assert res_str2.status_code == 200
+        str2_data = res_str2.json()
+        assert "structuring_smurfing" in str2_data["triggered_typologies"]
+        assert str2_data["alert_id"] is not None
+        saved_alert_id = str2_data["alert_id"]
+
+        # 5. Monitor sanctions hit -> FILE_SAR_BLOCK
+        res_sanc = client.post(
+            "/v1/aml/transactions/monitor",
+            json={
+                "transaction_id": "tx-sanc-1",
+                "user_id": "usr-bad-actor",
+                "amount": 50000.0,
+                "counterparty_id": "Viktor Bout",
+                "direction": "outflow",
+                "country": "US",
+            },
+        )
+        assert res_sanc.status_code == 200
+        sanc_data = res_sanc.json()
+        assert sanc_data["recommended_action"] == "file_sar_block"
+        assert sanc_data["risk_level"] == "critical"
+        sanc_alert_id = sanc_data["alert_id"]
+        assert sanc_alert_id is not None
+
+        # 6. Query alerts
+        res_alerts = client.get("/v1/aml/alerts", params={"user_id": "usr-aml-smurf"})
+        assert res_alerts.status_code == 200
+        alerts_list = res_alerts.json()
+        assert alerts_list["total_count"] >= 1
+        assert alerts_list["alerts"][0]["alert_id"] == saved_alert_id
+
+        # Filter by typology
+        res_typ_alerts = client.get("/v1/aml/alerts", params={"typology": "structuring_smurfing"})
+        assert res_typ_alerts.status_code == 200
+        assert res_typ_alerts.json()["total_count"] >= 1
+
+        # Retrieve single alert
+        res_single_alert = client.get(f"/v1/aml/alerts/{saved_alert_id}")
+        assert res_single_alert.status_code == 200
+        assert res_single_alert.json()["alert_id"] == saved_alert_id
+
+        # 7. Generate SAR dossier
+        res_sar_gen = client.post(
+            "/v1/aml/sar/generate",
+            json={
+                "user_id": "usr-aml-smurf",
+                "alert_ids": [saved_alert_id],
+                "suspect_name": "Smurf Master",
+                "suspect_details": {"occupation": "Currency Courier"},
+                "transactions": [
+                    {"transaction_id": "tx-str-1", "user_id": "usr-aml-smurf", "amount": 9500.0},
+                    {"transaction_id": "tx-str-2", "user_id": "usr-aml-smurf", "amount": 9200.0},
+                ],
+            },
+        )
+        assert res_sar_gen.status_code == 200
+        sar_data = res_sar_gen.json()
+        sar_id = sar_data["sar_id"]
+        assert sar_data["status"] == "draft"
+        assert "Smurf Master" in sar_data["narrative"]
+        assert sar_data["summary_financials"]["total_suspicious_amount"] == 18700.0
+
+        # 8. Query SAR dossiers
+        res_sar_list = client.get("/v1/aml/sar", params={"user_id": "usr-aml-smurf"})
+        assert res_sar_list.status_code == 200
+        assert res_sar_list.json()["total_count"] == 1
+
+        res_single_sar = client.get(f"/v1/aml/sar/{sar_id}")
+        assert res_single_sar.status_code == 200
+        assert res_single_sar.json()["sar_id"] == sar_id
+
+        # 9. Export FinCEN XML
+        res_xml = client.get(f"/v1/aml/sar/{sar_id}/xml")
+        assert res_xml.status_code == 200
+        assert res_xml.headers["content-type"].startswith("application/xml")
+        assert "<FinCEN_BSA_SAR" in res_xml.text
+        assert f"<SAR_ID>{sar_id}</SAR_ID>" in res_xml.text
+
+        # 10. SAR status transition: DRAFT -> PENDING_REVIEW -> APPROVED -> FILED
+        res_review = client.post(
+            f"/v1/aml/sar/{sar_id}/status",
+            json={"new_status": "pending_review", "notes": "Audited by BSA analyst"},
+        )
+        assert res_review.status_code == 200
+        assert res_review.json()["status"] == "pending_review"
+
+        res_appr = client.post(
+            f"/v1/aml/sar/{sar_id}/status",
+            json={"new_status": "approved", "notes": "Signed off by MLRO"},
+        )
+        assert res_appr.status_code == 200
+        assert res_appr.json()["status"] == "approved"
+
+        res_filed = client.post(
+            f"/v1/aml/sar/{sar_id}/status",
+            json={"new_status": "filed", "notes": "FinCEN e-file ack #99231"},
+        )
+        assert res_filed.status_code == 200
+        assert res_filed.json()["status"] == "filed"
+        assert res_filed.json()["filing_date"] != ""
+
+
+def test_aml_api_error_branches_and_edge_cases(api_context: tuple[Path, Any, Path]) -> None:
+    """Validate 400, 404, 500 error branches and edge cases on /v1/aml/* endpoints."""
+    from fraud_detection.aml import AmlEngine, SarManager
+
+    _, model, _ = api_context
+    aml_engine = AmlEngine()
+    sar_manager = SarManager(store=aml_engine.store)
+    app = create_app(model=model, aml_engine=aml_engine, sar_manager=sar_manager)
+
+    with TestClient(app) as client:
+        # 1. Invalid transaction direction -> 400
+        res_bad_dir = client.post(
+            "/v1/aml/transactions/monitor",
+            json={
+                "user_id": "u1",
+                "amount": 100.0,
+                "direction": "diagonal",
+            },
+        )
+        assert res_bad_dir.status_code == 400
+        assert "Invalid direction" in res_bad_dir.json()["detail"]
+
+        # 2. Invalid watchlist type -> 400
+        res_bad_wl = client.post(
+            "/v1/aml/watchlist/entries",
+            json={
+                "name": "Test Entry",
+                "watchlist_type": "invalid_type",
+            },
+        )
+        assert res_bad_wl.status_code == 400
+        assert "Invalid watchlist type" in res_bad_wl.json()["detail"]
+
+        # 3. Alert not found -> 404
+        assert client.get("/v1/aml/alerts/nonexistent-alert").status_code == 404
+
+        # 4. SAR not found -> 404
+        assert client.get("/v1/aml/sar/nonexistent-sar").status_code == 404
+        assert client.get("/v1/aml/sar/nonexistent-sar/xml").status_code == 404
+
+        # 5. Invalid SAR status string -> 400
+        res_bad_stat = client.post(
+            "/v1/aml/sar/some-sar/status",
+            json={"new_status": "in_outer_space"},
+        )
+        assert res_bad_stat.status_code == 400
+        assert "Invalid SAR status" in res_bad_stat.json()["detail"]
+
+        # 6. Status update on non-existent SAR -> 404
+        res_stat_404 = client.post(
+            "/v1/aml/sar/missing-sar/status",
+            json={"new_status": "draft"},
+        )
+        assert res_stat_404.status_code == 404
+
+        # 7. Invalid transition rule on real SAR (e.g. DRAFT -> FILED directly) -> 400
+        sar = sar_manager.generate_sar(user_id="u_err", alert_ids=[])
+        res_invalid_trans = client.post(
+            f"/v1/aml/sar/{sar.sar_id}/status",
+            json={"new_status": "filed"},
+        )
+        assert res_invalid_trans.status_code == 400
+        assert "Invalid SAR status transition" in res_invalid_trans.json()["detail"]
+
+        # 8. Uninitialized engine / manager -> 500
+        cast(Any, client.app).state.aml_engine = None
+        cast(Any, client.app).state.sar_manager = None
+
+        assert (
+            client.post(
+                "/v1/aml/transactions/monitor", json={"user_id": "u", "amount": 10.0}
+            ).status_code
+            == 500
+        )
+        assert client.post("/v1/aml/watchlist/screen", json={"name": "n"}).status_code == 500
+        assert (
+            client.post(
+                "/v1/aml/watchlist/entries", json={"name": "n", "watchlist_type": "pep"}
+            ).status_code
+            == 500
+        )
+        assert client.get("/v1/aml/alerts").status_code == 500
+        assert client.get("/v1/aml/alerts/alt_1").status_code == 500
+        assert (
+            client.post("/v1/aml/sar/generate", json={"user_id": "u", "alert_ids": []}).status_code
+            == 500
+        )
+        assert client.get("/v1/aml/sar").status_code == 500
+        assert client.get("/v1/aml/sar/s_1").status_code == 500
+        assert client.get("/v1/aml/sar/s_1/xml").status_code == 500
+        assert (
+            client.post("/v1/aml/sar/s_1/status", json={"new_status": "draft"}).status_code == 500
+        )
