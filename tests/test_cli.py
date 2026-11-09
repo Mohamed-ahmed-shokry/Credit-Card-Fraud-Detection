@@ -10056,3 +10056,372 @@ def test_cli_ato_workflow_and_edge_cases(tmp_path: Path) -> None:
     non_dict_file = tmp_path / "non_dict_ato.json"
     non_dict_file.write_text(json.dumps(["just", "a", "list"]), encoding="utf-8")
     assert runner.invoke(app, ["ato-inspect", "-u", "u1", "-s", str(non_dict_file)]).exit_code == 2
+
+
+def test_aml_cli_workflows(tmp_path: Path) -> None:
+    """Validate aml-* CLI commands: screen, monitor, alerts, sar-generate, sar-list, sar-status."""
+    runner = CliRunner()
+    store_file = tmp_path / "aml_store.json"
+
+    # 1. aml-screen against default watchlists (table & json)
+    res_scr_tbl = runner.invoke(
+        app,
+        ["aml-screen", "-n", "Sergei Ivanov", "-t", "0.80", "-f", "table"],
+    )
+    assert res_scr_tbl.exit_code == 0
+    assert "Screening Query: Sergei Ivanov" in res_scr_tbl.stdout
+    assert "Matches Found:" in res_scr_tbl.stdout
+
+    res_scr_json = runner.invoke(
+        app,
+        ["aml-screen", "-n", "Vladimir Putin", "-t", "0.85", "-f", "json"],
+    )
+    assert res_scr_json.exit_code == 0
+    matches_data = json.loads(res_scr_json.stdout)
+    assert isinstance(matches_data, list)
+    assert len(matches_data) > 0
+    assert matches_data[0]["matched_entry"]["watchlist_type"] == "ofac_sdn"
+
+    # aml-screen with custom watchlist file
+    custom_wl_file = tmp_path / "custom_wl.json"
+    custom_wl_file.write_text(
+        json.dumps(
+            [
+                {
+                    "entity_id": "wl_custom_001",
+                    "name": "Tony Montana",
+                    "aliases": ["Scarface"],
+                    "watchlist_type": "pep",
+                    "country": "CU",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    res_custom_scr = runner.invoke(
+        app,
+        ["aml-screen", "-n", "Tony Montana", "-w", str(custom_wl_file), "-f", "table"],
+    )
+    assert res_custom_scr.exit_code == 0
+    assert "Matches Found:   1" in res_custom_scr.stdout
+
+    # 2. aml-monitor: low-risk transaction with table output (default aml_store.json fallback)
+    res_mon_low = runner.invoke(
+        app,
+        [
+            "aml-monitor",
+            "-u",
+            "usr_aml_1",
+            "-a",
+            "150.0",
+            "-c",
+            "merch_groceries",
+            "--country",
+            "US",
+            "-d",
+            "outbound",
+            "-s",
+            str(store_file),
+            "-f",
+            "table",
+        ],
+    )
+    assert res_mon_low.exit_code == 0
+    assert "User ID:        usr_aml_1" in res_mon_low.stdout
+    assert "Policy Action:  pass" in res_mon_low.stdout
+
+    # 3. aml-monitor: high-risk sanction entity with json output and persistence
+    res_mon_sanction = runner.invoke(
+        app,
+        [
+            "aml-monitor",
+            "-u",
+            "usr_aml_bad",
+            "-a",
+            "75000.0",
+            "-c",
+            "entity_suspicious",
+            "-n",
+            "Sergei Ivanov",
+            "--country",
+            "RU",
+            "-d",
+            "outbound",
+            "-s",
+            str(store_file),
+            "-f",
+            "json",
+        ],
+    )
+    assert res_mon_sanction.exit_code == 0
+    assess_data = json.loads(res_mon_sanction.stdout)
+    assert assess_data["risk_level"] in ("high", "critical")
+    assert assess_data["recommended_action"] == "file_sar_block"
+    assert "sanction_pep_match" in assess_data["score_breakdown"]
+    assert assess_data["alert"] is not None
+    sanction_alert_id = assess_data["alert"]["alert_id"]
+
+    # 4. aml-monitor: structuring pattern (3 sub-threshold transactions)
+    for _ in range(3):
+        runner.invoke(
+            app,
+            [
+                "aml-monitor",
+                "-u",
+                "usr_aml_structurer",
+                "-a",
+                "9500.0",
+                "-s",
+                str(store_file),
+            ],
+        )
+
+    # 5. aml-alerts (table and json output with filtering)
+    res_alerts_tbl = runner.invoke(
+        app,
+        ["aml-alerts", "-s", str(store_file), "-f", "table"],
+    )
+    assert res_alerts_tbl.exit_code == 0
+    assert "Alerts (" in res_alerts_tbl.stdout
+
+    res_alerts_json = runner.invoke(
+        app,
+        [
+            "aml-alerts",
+            "-u",
+            "usr_aml_bad",
+            "-t",
+            "sanction_pep_match",
+            "-s",
+            str(store_file),
+            "-f",
+            "json",
+        ],
+    )
+    assert res_alerts_json.exit_code == 0
+    filtered_alerts = json.loads(res_alerts_json.stdout)
+    assert len(filtered_alerts) > 0
+    assert filtered_alerts[0]["alert_id"] == sanction_alert_id
+
+    # 6. aml-sar-generate: compile SAR dossier from sanction alert
+    res_sar_gen = runner.invoke(
+        app,
+        [
+            "aml-sar-generate",
+            "-u",
+            "usr_aml_bad",
+            "-a",
+            sanction_alert_id,
+            "-n",
+            "Sergei Ivanov",
+            "--narrative",
+            "High confidence OFAC sanctions match on international wire transfer.",
+            "-s",
+            str(store_file),
+            "-f",
+            "table",
+        ],
+    )
+    assert res_sar_gen.exit_code == 0
+    assert "SAR ID:" in res_sar_gen.stdout
+    assert "Filing Status: draft" in res_sar_gen.stdout
+
+    # aml-sar-generate with json output
+    res_sar_gen_json = runner.invoke(
+        app,
+        [
+            "aml-sar-generate",
+            "-u",
+            "usr_aml_bad",
+            "-a",
+            sanction_alert_id,
+            "-s",
+            str(store_file),
+            "-f",
+            "json",
+        ],
+    )
+    assert res_sar_gen_json.exit_code == 0
+    sar_data = json.loads(res_sar_gen_json.stdout)
+    sar_id = sar_data["sar_id"]
+    assert sar_data["status"] == "draft"
+
+    # 7. aml-sar-list (table & json)
+    res_sar_list_tbl = runner.invoke(
+        app,
+        ["aml-sar-list", "-s", str(store_file), "-f", "table"],
+    )
+    assert res_sar_list_tbl.exit_code == 0
+    assert "SAR Dossiers (" in res_sar_list_tbl.stdout
+
+    res_sar_list_json = runner.invoke(
+        app,
+        ["aml-sar-list", "--status", "draft", "-s", str(store_file), "-f", "json"],
+    )
+    assert res_sar_list_json.exit_code == 0
+    sars_list = json.loads(res_sar_list_json.stdout)
+    assert len(sars_list) >= 2
+
+    # 8. aml-sar-status: transition draft -> pending_review -> approved -> filed
+    res_st1 = runner.invoke(
+        app,
+        [
+            "aml-sar-status",
+            "--sar-id",
+            sar_id,
+            "--status",
+            "pending_review",
+            "-r",
+            "officer_alice",
+            "-c",
+            "Escalated for senior compliance officer review.",
+            "-s",
+            str(store_file),
+            "-f",
+            "table",
+        ],
+    )
+    assert res_st1.exit_code == 0
+    assert "New Status:    pending_review" in res_st1.stdout
+
+    res_st2 = runner.invoke(
+        app,
+        [
+            "aml-sar-status",
+            "--sar-id",
+            sar_id,
+            "--status",
+            "approved",
+            "-r",
+            "officer_bob",
+            "-c",
+            "Approved for regulatory submission to FinCEN.",
+            "-s",
+            str(store_file),
+        ],
+    )
+    assert res_st2.exit_code == 0
+    assert "New Status:    approved" in res_st2.stdout
+
+    res_st3 = runner.invoke(
+        app,
+        [
+            "aml-sar-status",
+            "--sar-id",
+            sar_id,
+            "--status",
+            "filed",
+            "-r",
+            "officer_bob",
+            "-c",
+            "Submitted via FinCEN BSA Direct.",
+            "-s",
+            str(store_file),
+            "-f",
+            "json",
+        ],
+    )
+    assert res_st3.exit_code == 0
+    filed_data = json.loads(res_st3.stdout)
+    assert filed_data["status"] == "filed"
+    assert filed_data["filing_date"] != ""
+
+
+def test_aml_cli_error_branches(tmp_path: Path) -> None:
+    """Validate error branches and exit code 2 handling in aml-* CLI commands."""
+    runner = CliRunner()
+    store_file = tmp_path / "aml_store.json"
+
+    # Invalid direction
+    res_dir = runner.invoke(
+        app,
+        ["aml-monitor", "-u", "u1", "-a", "100.0", "-d", "invalid_dir"],
+    )
+    assert res_dir.exit_code == 2
+    assert "Invalid transaction direction" in res_dir.stderr
+
+    # Non-existent watchlist file
+    res_missing_wl = runner.invoke(
+        app,
+        ["aml-screen", "-n", "Target", "-w", str(tmp_path / "missing.json")],
+    )
+    assert res_missing_wl.exit_code == 2
+    assert "Watchlist file not found" in res_missing_wl.stderr
+
+    # Corrupt watchlist file
+    corrupt_wl = tmp_path / "corrupt_wl.json"
+    corrupt_wl.write_text("{invalid json", encoding="utf-8")
+    res_corrupt_wl = runner.invoke(
+        app,
+        ["aml-screen", "-n", "Target", "-w", str(corrupt_wl)],
+    )
+    assert res_corrupt_wl.exit_code == 2
+
+    # Invalid typology in aml-alerts
+    res_bad_typ = runner.invoke(
+        app,
+        ["aml-alerts", "-t", "unknown_typology", "-s", str(store_file)],
+    )
+    assert res_bad_typ.exit_code == 2
+
+    # Invalid risk level in aml-alerts
+    res_bad_rl = runner.invoke(
+        app,
+        ["aml-alerts", "-r", "ultra_extreme", "-s", str(store_file)],
+    )
+    assert res_bad_rl.exit_code == 2
+
+    # Corrupt store file
+    corrupt_store = tmp_path / "corrupt_store.json"
+    corrupt_store.write_text("{bad json", encoding="utf-8")
+    assert runner.invoke(app, ["aml-alerts", "-s", str(corrupt_store)]).exit_code == 2
+
+    # Non-dict store file
+    non_dict = tmp_path / "non_dict.json"
+    non_dict.write_text("[1, 2, 3]", encoding="utf-8")
+    assert runner.invoke(app, ["aml-alerts", "-s", str(non_dict)]).exit_code == 2
+
+    # aml-sar-generate with empty alert IDs
+    res_empty_alerts = runner.invoke(
+        app,
+        ["aml-sar-generate", "-u", "u1", "-a", " , ", "-s", str(store_file)],
+    )
+    assert res_empty_alerts.exit_code == 2
+
+    # aml-sar-status with non-existent SAR ID
+    res_no_sar = runner.invoke(
+        app,
+        [
+            "aml-sar-status",
+            "--sar-id",
+            "non_existent_sar",
+            "--status",
+            "pending_review",
+            "-s",
+            str(store_file),
+        ],
+    )
+    assert res_no_sar.exit_code == 2
+    assert "not found" in res_no_sar.stderr
+
+    # aml-sar-status with invalid status string
+    res_bad_st = runner.invoke(
+        app,
+        [
+            "aml-sar-status",
+            "--sar-id",
+            "sar_123",
+            "--status",
+            "invalid_status",
+            "-s",
+            str(store_file),
+        ],
+    )
+    assert res_bad_st.exit_code == 2
+
+    # aml-sar-list with invalid status string
+    res_bad_list_st = runner.invoke(
+        app,
+        ["aml-sar-list", "--status", "invalid_status", "-s", str(store_file)],
+    )
+    assert res_bad_list_st.exit_code == 2
