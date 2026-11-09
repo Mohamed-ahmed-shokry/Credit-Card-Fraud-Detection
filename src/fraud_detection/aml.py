@@ -13,8 +13,12 @@ from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
+
+if TYPE_CHECKING:
+    from fraud_detection.cases import CaseManager
+    from fraud_detection.events import EventBus
 
 
 class AmlTypology(StrEnum):
@@ -1248,3 +1252,296 @@ class AmlStore:
             self._user_alerts.clear()
             self._sars.clear()
             self._user_sars.clear()
+
+
+@dataclass(frozen=True)
+class AmlAssessment:
+    """Consolidated assessment of AML risk, policy routing, and triggered typologies."""
+
+    transaction_id: str
+    user_id: str
+    risk_score: float
+    risk_level: AmlRiskLevel
+    recommended_action: AmlAction
+    triggered_typologies: tuple[AmlTypology, ...]
+    score_breakdown: dict[str, float]
+    screening_matches: tuple[ScreeningMatch, ...] = field(default_factory=tuple)
+    alert: AmlAlert | None = None
+    case_id: str | None = None
+    tenant_id: str = "default"
+    evaluated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize AML assessment to dictionary."""
+        return {
+            "transaction_id": self.transaction_id,
+            "user_id": self.user_id,
+            "risk_score": round(self.risk_score, 4),
+            "risk_level": self.risk_level.value,
+            "recommended_action": self.recommended_action.value,
+            "triggered_typologies": [t.value for t in self.triggered_typologies],
+            "score_breakdown": {k: round(v, 4) for k, v in self.score_breakdown.items()},
+            "screening_matches": [m.to_dict() for m in self.screening_matches],
+            "alert": self.alert.to_dict() if self.alert else None,
+            "case_id": self.case_id,
+            "tenant_id": self.tenant_id,
+            "evaluated_at": self.evaluated_at.isoformat(),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> AmlAssessment:
+        """Deserialize AML assessment from dictionary."""
+        eval_at_raw = data.get("evaluated_at")
+        eval_at = (
+            datetime.fromisoformat(eval_at_raw)
+            if isinstance(eval_at_raw, str)
+            else datetime.now(UTC)
+        )
+        alert_data = data.get("alert")
+        alert = AmlAlert.from_dict(alert_data) if alert_data else None
+
+        return cls(
+            transaction_id=str(data["transaction_id"]),
+            user_id=str(data["user_id"]),
+            risk_score=float(data["risk_score"]),
+            risk_level=AmlRiskLevel(data["risk_level"]),
+            recommended_action=AmlAction(data["recommended_action"]),
+            triggered_typologies=tuple(
+                AmlTypology(t) for t in data.get("triggered_typologies", ())
+            ),
+            score_breakdown={k: float(v) for k, v in data.get("score_breakdown", {}).items()},
+            screening_matches=tuple(
+                ScreeningMatch.from_dict(m) for m in data.get("screening_matches", ())
+            ),
+            alert=alert,
+            case_id=data.get("case_id"),
+            tenant_id=str(data.get("tenant_id", "default")),
+            evaluated_at=eval_at,
+        )
+
+
+class AmlEngine:
+    """Multi-typology AML evaluation, calibrated risk scoring, and policy enforcement engine."""
+
+    def __init__(
+        self,
+        screening_engine: WatchlistScreeningEngine | None = None,
+        structuring_detector: StructuringDetector | None = None,
+        layering_detector: LayeringDetector | None = None,
+        circular_detector: CircularFlowDetector | None = None,
+        jurisdiction_detector: HighRiskJurisdictionDetector | None = None,
+        store: AmlStore | None = None,
+        case_manager: CaseManager | None = None,
+        event_bus: EventBus | None = None,
+        pass_threshold: float = 0.35,
+        monitor_threshold: float = 0.70,
+        edd_threshold: float = 0.85,
+    ) -> None:
+        self.screening_engine = screening_engine or WatchlistScreeningEngine()
+        self.structuring_detector = structuring_detector or StructuringDetector()
+        self.layering_detector = layering_detector or LayeringDetector()
+        self.circular_detector = circular_detector or CircularFlowDetector()
+        self.jurisdiction_detector = jurisdiction_detector or HighRiskJurisdictionDetector()
+        self.store = store or AmlStore()
+        self.case_manager = case_manager
+        self.event_bus = event_bus
+        self.pass_threshold = pass_threshold
+        self.monitor_threshold = monitor_threshold
+        self.edd_threshold = edd_threshold
+        self._lock = threading.RLock()
+
+    def evaluate_transaction(
+        self,
+        event: AmlTransactionEvent,
+        entity_name: str | None = None,
+    ) -> AmlAssessment:
+        """Evaluate financial transaction against all AML typologies, sanctions, and corridors."""
+        triggered_typologies: list[AmlTypology] = []
+        score_breakdown: dict[str, float] = {}
+        trigger_details: dict[str, Any] = {}
+        tx_ids: list[str] = [event.transaction_id]
+
+        # 1. Sanctions / PEP Screening
+        matches: list[ScreeningMatch] = []
+        target_name = entity_name or event.counterparty_id
+        if target_name:
+            matches = self.screening_engine.screen_entity(target_name)
+            if matches:
+                top_match = matches[0]
+                if top_match.similarity_score >= 0.85:
+                    triggered_typologies.append(AmlTypology.SANCTION_PEP_MATCH)
+                    match_weight = 1.0 if top_match.similarity_score >= 0.95 else 0.85
+                    score_breakdown["sanction_pep_match"] = match_weight
+                    trigger_details["top_match"] = top_match.to_dict()
+
+        # 2. Structuring / Smurfing
+        structuring_alert = self.structuring_detector.record_and_evaluate(event)
+        if structuring_alert:
+            triggered_typologies.append(AmlTypology.STRUCTURING_SMURFING)
+            score_breakdown["structuring_smurfing"] = 0.45
+            trigger_details["structuring"] = structuring_alert.to_dict()
+            tx_ids.extend(list(structuring_alert.transaction_ids))
+
+        # 3. Layering / Rapid Flow-Through
+        layering_alert = self.layering_detector.record_and_evaluate(event)
+        if layering_alert:
+            triggered_typologies.append(AmlTypology.RAPID_MOVEMENT_LAYERING)
+            score_breakdown["rapid_movement_layering"] = 0.40
+            trigger_details["layering"] = layering_alert.to_dict()
+            tx_ids.append(layering_alert.inflow_tx_id)
+
+        # 4. Circular / Round-Trip Flow
+        circular_alert = self.circular_detector.record_and_evaluate(event)
+        if circular_alert:
+            triggered_typologies.append(AmlTypology.ROUND_TRIP_CIRCULAR)
+            score_breakdown["round_trip_circular"] = 0.35
+            trigger_details["circular_flow"] = circular_alert.to_dict()
+            tx_ids.append(circular_alert.forward_tx_id)
+
+        # 5. High-Risk Jurisdiction Corridor
+        jur_assessment = self.jurisdiction_detector.evaluate(event.country)
+        if jur_assessment.is_high_risk:
+            triggered_typologies.append(AmlTypology.HIGH_RISK_JURISDICTION)
+            jur_weight = 0.50 if jur_assessment.fatf_tier == "black_list" else 0.30
+            score_breakdown["high_risk_jurisdiction"] = jur_weight
+            trigger_details["jurisdiction"] = jur_assessment.to_dict()
+
+        # Calculate composite calibrated risk score [0.0, 1.0]
+        if (
+            "sanction_pep_match" in score_breakdown
+            and score_breakdown["sanction_pep_match"] >= 0.95
+        ):
+            composite_score = 1.0
+        else:
+            composite_score = min(1.0, sum(score_breakdown.values()))
+
+        # Policy Action Routing
+        if composite_score >= self.edd_threshold or (
+            matches and matches[0].similarity_score >= 0.95
+        ):
+            recommended_action = AmlAction.FILE_SAR_BLOCK
+            risk_level = AmlRiskLevel.CRITICAL
+        elif composite_score >= self.monitor_threshold:
+            recommended_action = AmlAction.ENHANCED_DUE_DILIGENCE
+            risk_level = AmlRiskLevel.HIGH
+        elif composite_score >= self.pass_threshold:
+            recommended_action = AmlAction.MONITOR
+            risk_level = AmlRiskLevel.MEDIUM
+        else:
+            recommended_action = AmlAction.PASS
+            risk_level = AmlRiskLevel.LOW
+
+        alert: AmlAlert | None = None
+        unique_tx_ids = tuple(sorted(set(tx_ids)))
+        if recommended_action != AmlAction.PASS or triggered_typologies:
+            primary_typology = (
+                triggered_typologies[0] if triggered_typologies else AmlTypology.HIGH_VELOCITY_BURST
+            )
+            alert = AmlAlert(
+                user_id=event.user_id,
+                typology=primary_typology,
+                risk_level=risk_level,
+                recommended_action=recommended_action,
+                risk_score=composite_score,
+                trigger_details=trigger_details,
+                transaction_ids=unique_tx_ids,
+                tenant_id=event.tenant_id,
+                created_at=event.timestamp,
+            )
+            self.store.record_alert(alert)
+
+        # Case Escalation
+        case_id: str | None = None
+        if self.case_manager is not None and recommended_action in (
+            AmlAction.ENHANCED_DUE_DILIGENCE,
+            AmlAction.FILE_SAR_BLOCK,
+        ):
+            from fraud_detection.cases import CasePriority
+
+            priority = (
+                CasePriority.CRITICAL
+                if recommended_action == AmlAction.FILE_SAR_BLOCK
+                else CasePriority.HIGH
+            )
+            case_record = self.case_manager.create_case(
+                transaction_id=event.transaction_id,
+                fraud_score=composite_score,
+                amount=event.amount,
+                currency=event.currency,
+                tenant_id=event.tenant_id,
+                priority=priority,
+                metadata={
+                    "source": "aml_engine",
+                    "action": recommended_action.value,
+                    "typologies": [t.value for t in triggered_typologies],
+                    "alert_id": alert.alert_id if alert else None,
+                },
+            )
+            case_id = case_record.case_id
+
+        # Streaming EventBus Notification
+        if self.event_bus is not None:
+            self._publish_events(
+                event, composite_score, recommended_action, triggered_typologies, alert
+            )
+
+        return AmlAssessment(
+            transaction_id=event.transaction_id,
+            user_id=event.user_id,
+            risk_score=composite_score,
+            risk_level=risk_level,
+            recommended_action=recommended_action,
+            triggered_typologies=tuple(triggered_typologies),
+            score_breakdown=score_breakdown,
+            screening_matches=tuple(matches),
+            alert=alert,
+            case_id=case_id,
+            tenant_id=event.tenant_id,
+            evaluated_at=event.timestamp,
+        )
+
+    def _publish_events(
+        self,
+        event: AmlTransactionEvent,
+        score: float,
+        action: AmlAction,
+        typologies: list[AmlTypology],
+        alert: AmlAlert | None,
+    ) -> None:
+        if self.event_bus is None:
+            return
+        from fraud_detection.events import EventType, FraudDomainEvent
+
+        payload = {
+            "transaction_id": event.transaction_id,
+            "user_id": event.user_id,
+            "amount": event.amount,
+            "score": round(score, 4),
+            "action": action.value,
+            "typologies": [t.value for t in typologies],
+            "alert_id": alert.alert_id if alert else None,
+            "tenant_id": event.tenant_id,
+        }
+        self.event_bus.publish(
+            FraudDomainEvent(
+                event_type=EventType.AML_TRANSACTION_MONITORED,
+                payload=payload,
+                tenant_id=event.tenant_id,
+            )
+        )
+        if alert is not None:
+            self.event_bus.publish(
+                FraudDomainEvent(
+                    event_type=EventType.AML_ALERT_TRIGGERED,
+                    payload=alert.to_dict(),
+                    tenant_id=event.tenant_id,
+                )
+            )
+        if AmlTypology.SANCTION_PEP_MATCH in typologies:
+            self.event_bus.publish(
+                FraudDomainEvent(
+                    event_type=EventType.AML_SANCTION_MATCH_DETECTED,
+                    payload=payload,
+                    tenant_id=event.tenant_id,
+                )
+            )
