@@ -20,6 +20,7 @@ import uvicorn
 
 from fraud_detection import __version__
 from fraud_detection.aml import (
+    DEFAULT_WATCHLIST_ENTRIES,
     AmlAlert,
     AmlEngine,
     AmlRiskLevel,
@@ -10013,6 +10014,8 @@ def _load_aml_state(
     """Load persistent AML transactions, alerts, and SAR dossiers from store file."""
     store = AmlStore()
     engine = AmlEngine(store=store)
+    for wl_entry in DEFAULT_WATCHLIST_ENTRIES:
+        engine.screening_engine.add_entry(wl_entry)
     sar_manager = SarManager(store=store)
     transactions: list[AmlTransactionEvent] = []
     if store_file is None or not store_file.exists():
@@ -10402,13 +10405,17 @@ def aml_monitor(
     ] = "table",
 ) -> None:
     """Monitor financial transaction for AML typologies, sanctions hits, and corridor risk."""
-    try:
-        tx_dir = TransactionDirection(direction.lower())
-    except ValueError:
-        _abort(f"Invalid transaction direction '{direction}'. Expected 'inbound' or 'outbound'.")
+    direction_normalized = direction.lower()
+    if direction_normalized in ("inflow", "inbound", "in"):
+        tx_dir = TransactionDirection.INFLOW
+    elif direction_normalized in ("outflow", "outbound", "out"):
+        tx_dir = TransactionDirection.OUTFLOW
+    else:
+        _abort(f"Invalid transaction direction '{direction}'. Expected 'inflow' or 'outflow'.")
 
     engine, _, transactions = _load_aml_state(store_file)
     event = AmlTransactionEvent(
+        transaction_id=str(uuid4()),
         user_id=user_id,
         amount=amount,
         counterparty_id=counterparty_id,
@@ -10421,14 +10428,15 @@ def aml_monitor(
     _save_aml_state(store_file, engine.store, transactions)
 
     if output_format.lower() == "table":
-        typer.echo(f"Assessment ID: {assessment.assessment_id}")
-        typer.echo(f"User ID:       {assessment.user_id}")
-        typer.echo(f"Risk Score:    {assessment.risk_score:.4f}")
-        typer.echo(f"Risk Level:    {assessment.risk_level.value}")
-        typer.echo(f"Policy Action: {assessment.recommended_action.value}")
+        typer.echo(f"Transaction ID: {assessment.transaction_id}")
+        typer.echo(f"User ID:        {assessment.user_id}")
+        typer.echo(f"Risk Score:     {assessment.risk_score:.4f}")
+        typer.echo(f"Risk Level:     {assessment.risk_level.value}")
+        typer.echo(f"Policy Action:  {assessment.recommended_action.value}")
         typs = ", ".join(t.value for t in assessment.triggered_typologies) or "none"
-        typer.echo(f"Typologies:    {typs}")
-        typer.echo(f"Alerts Count:  {len(assessment.alerts)}")
+        typer.echo(f"Typologies:     {typs}")
+        if assessment.alert:
+            typer.echo(f"Alert ID:       {assessment.alert.alert_id}")
     else:
         typer.echo(json.dumps(assessment.to_dict(), indent=2))
 
@@ -10468,6 +10476,9 @@ def aml_screen(
                         screening_engine.add_entry(WatchlistEntry.from_dict(ed))
         except (OSError, json.JSONDecodeError) as exc:
             _abort(f"Could not load watchlist file: {exc}")
+    else:
+        for wl_entry in DEFAULT_WATCHLIST_ENTRIES:
+            screening_engine.add_entry(wl_entry)
 
     matches = screening_engine.screen_entity(name, threshold=threshold)
 
@@ -10478,10 +10489,9 @@ def aml_screen(
         if matches:
             typer.echo("-" * 60)
             for m in matches:
-                types_str = ", ".join(m.match_types)
                 typer.echo(
-                    f"[{m.entry.watchlist_type.value.upper()}] {m.matched_name} "
-                    f"| Score: {m.similarity_score:.4f} | Methods: {types_str}"
+                    f"[{m.matched_entry.watchlist_type.value.upper()}] {m.matched_entry.name} "
+                    f"| Score: {m.similarity_score:.4f} | Method: {m.match_algorithm}"
                 )
     else:
         typer.echo(json.dumps([m.to_dict() for m in matches], indent=2))
@@ -10544,7 +10554,8 @@ def aml_alerts(
         for a in alerts:
             typer.echo(
                 f"- ID: {a.alert_id} | User: {a.user_id} | Level: {a.risk_level.value.upper()} "
-                f"| Typology: {a.typology.value} | {a.description}"
+                f"| Typology: {a.typology.value} | Action: {a.recommended_action.value} "
+                f"| Score: {a.risk_score:.2f}"
             )
     else:
         typer.echo(json.dumps([a.to_dict() for a in alerts], indent=2))
@@ -10592,11 +10603,12 @@ def aml_sar_generate(
     _save_aml_state(store_file, engine.store, transactions)
 
     if output_format.lower() == "table":
-        typer.echo(f"SAR ID:       {dossier.sar_id}")
-        typer.echo(f"Filing Status:{dossier.status.value}")
-        typer.echo(f"Subject:      {dossier.suspect_name or dossier.user_id}")
-        typer.echo(f"Alerts Count: {len(dossier.alert_ids)}")
-        typer.echo(f"Narrative:    {dossier.narrative[:120]}...")
+        typer.echo(f"SAR ID:        {dossier.sar_id}")
+        typer.echo(f"Filing Status: {dossier.status.value}")
+        subj = dossier.suspect_details.get("full_name") or dossier.user_id
+        typer.echo(f"Subject:       {subj}")
+        typer.echo(f"Alerts Count:  {len(dossier.alert_ids)}")
+        typer.echo(f"Narrative:     {dossier.narrative[:120]}...")
     else:
         typer.echo(json.dumps(dossier.to_dict(), indent=2))
 
@@ -10641,9 +10653,10 @@ def aml_sar_list(
     if output_format.lower() == "table":
         typer.echo(f"SAR Dossiers ({len(sars)}):")
         for s in sars:
+            subj = s.suspect_details.get("full_name") or s.user_id
             typer.echo(
                 f"- ID: {s.sar_id} | Status: {s.status.value.upper()} "
-                f"| Subject: {s.suspect_name or s.user_id} | Alerts: {len(s.alert_ids)}"
+                f"| Subject: {subj} | Alerts: {len(s.alert_ids)}"
             )
     else:
         typer.echo(json.dumps([s.to_dict() for s in sars], indent=2))
@@ -10687,11 +10700,11 @@ def aml_sar_status(
 
     engine, sar_manager, transactions = _load_aml_state(store_file)
     try:
-        updated = sar_manager.update_status(
+        updated = sar_manager.transition_status(
             sar_id=sar_id,
-            status=new_status,
-            reviewer=reviewer,
-            comment=comment,
+            new_status=new_status,
+            actor=reviewer,
+            notes=comment,
         )
     except KeyError:
         _abort(f"SAR dossier '{sar_id}' not found.")
@@ -10704,8 +10717,8 @@ def aml_sar_status(
         typer.echo(f"SAR ID:        {updated.sar_id}")
         typer.echo(f"New Status:    {updated.status.value}")
         typer.echo(f"Reviewer:      {reviewer}")
-        if updated.filing_reference:
-            typer.echo(f"Filing Ref:    {updated.filing_reference}")
+        if updated.filing_date:
+            typer.echo(f"Filing Date:   {updated.filing_date}")
     else:
         typer.echo(json.dumps(updated.to_dict(), indent=2))
 
