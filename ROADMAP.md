@@ -2522,6 +2522,135 @@ Does not implement biometric keystroke dynamics machine learning models; provide
 - [x] Task 8: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate with 100% Green CI.
 
 
+## Phase 48 — Anti-Money Laundering (AML) Transaction Monitoring, Structuring/Smurfing Detection & Regulatory SAR Engine (Done)
+
+Phase 48 implements an in-process, zero-external-dependency Anti-Money Laundering (AML) transaction monitoring and regulatory compliance engine (`aml.py`). It detects money laundering typologies—including structuring/smurfing (amounts just below reporting thresholds), rapid flow-through layering, circular fund movement, and high-risk FATF corridors—screens entities against OFAC/PEP watchlists using phonetic and fuzzy distance algorithms, computes composite AML risk scores, orchestrates compliance case escalation, and automates FinCEN/FATF Suspicious Activity Report (SAR) packaging with audit trails.
+
+### Objective
+
+Provide deterministic, high-throughput AML transaction monitoring, typology detection, sanctions/PEP screening, and automated SAR dossier generation with zero external services.
+
+### Scope
+
+1. **AML Domain Models & Typology Taxonomies (`aml.py`)**:
+   - `AmlTypology`: `STRUCTURING_SMURFING`, `RAPID_MOVEMENT_LAYERING`, `ROUND_TRIP_CIRCULAR`, `SANCTION_PEP_MATCH`, `HIGH_RISK_JURISDICTION`, `HIGH_VELOCITY_BURST`.
+   - `AmlRiskLevel`: `LOW`, `MEDIUM`, `HIGH`, `CRITICAL`.
+   - `AmlAction`: `PASS`, `MONITOR`, `ENHANCED_DUE_DILIGENCE`, `FILE_SAR_BLOCK`.
+   - `SarStatus`: `DRAFT`, `PENDING_REVIEW`, `APPROVED`, `FILED`, `REJECTED`.
+   - `WatchlistType`: `OFAC_SDN`, `PEP`, `FATF_HIGH_RISK`, `LAW_ENFORCEMENT`.
+   - `WatchlistEntry`: In-memory entity with name, aliases, country, and risk tier.
+   - `ScreeningMatch`: Match report with Jaro-Winkler/Levenshtein/Soundex phonetic scores.
+   - `AmlTransactionEvent`: Financial transaction model with direction, counterparty, and currency.
+   - `StructuringAlert`: Sub-threshold aggregation report with sliding window metrics.
+   - `AmlAlert`: Comprehensive detection record with triggered typologies, calibrated risk score, and recommended action.
+   - `SarDossier`: Structured regulatory filing dossier with narrative, suspects, and financial summaries.
+2. **Watchlist & Sanction Screening Engine (`WatchlistScreeningEngine` in `aml.py`)**:
+   - In-memory fuzzy and phonetic matching (Jaro-Winkler, Levenshtein, Soundex) with configurable thresholds.
+   - Support for dynamic addition, removal, and querying of watchlist entities.
+3. **Typology Detection Suite (`StructuringDetector`, `LayeringDetector`, `CircularFlowDetector`, `HighRiskJurisdictionDetector` in `aml.py`)**:
+   - Structuring/Smurfing detector: Sliding window detection of sub-CTR transactions ($8,000–$9,999).
+   - Rapid fund flow / Layering detector: Turnover ratio and dwell-time calculation.
+   - Circular fund flow detector: Direct and intermediary fund loops.
+   - High-risk jurisdiction corridor detector: FATF gray/black list matching.
+4. **AML Scoring Engine & Policy Decisioning (`AmlEngine` in `aml.py`)**:
+   - Calibrated multi-typology composite scoring in $[0.0, 1.0]$.
+   - Deterministic policy routing: `PASS`, `MONITOR`, `ENHANCED_DUE_DILIGENCE`, `FILE_SAR_BLOCK`.
+   - Automatic case escalation with `CaseManager` (`cases.py`).
+5. **SAR Packaging & Compliance Workflow (`SarManager` in `aml.py`)**:
+   - Automated narrative drafting and structured regulatory dossier export.
+   - Compliance review lifecycle state machine (`DRAFT` -> `PENDING_REVIEW` -> `APPROVED` -> `FILED` / `REJECTED`).
+6. **Thread-Safe Store & EventBus Streaming (`AmlStore` in `aml.py`)**:
+   - Concurrently indexed storage with thread locks and bounded capacity eviction.
+   - EventBus domain events: `AML_TRANSACTION_MONITORED`, `AML_ALERT_TRIGGERED`, `AML_SANCTION_MATCH_DETECTED`, `AML_SAR_CREATED`, `AML_SAR_STATUS_UPDATED`.
+7. **FastAPI Endpoints & Prometheus Observability (`api.py`)**:
+   - `/v1/aml/transactions/monitor`, `/v1/aml/watchlist/screen`, `/v1/aml/watchlist/entries`, `/v1/aml/alerts`, `/v1/aml/alerts/{alert_id}`, `/v1/aml/sar/generate`, `/v1/aml/sar`, `/v1/aml/sar/{sar_id}`, `/v1/aml/sar/{sar_id}/status`.
+   - Prometheus metrics: `fraud_aml_transactions_monitored_total`, `fraud_aml_alerts_total`, `fraud_aml_sanction_hits_total`, `fraud_aml_sars_created_total`, `fraud_aml_sars_filed_total`.
+8. **Typer CLI Workflows (`cli.py`)**:
+   - `fraud-detect aml-monitor`, `fraud-detect aml-screen`, `fraud-detect aml-alerts`, `fraud-detect aml-sar-generate`, `fraud-detect aml-sar-list`, `fraud-detect aml-sar-status`.
+
+### Acceptance Criteria
+
+1. **AC-1 (Domain Models & Taxonomies)**: `AmlTypology`, `AmlRiskLevel`, `AmlAction`, `SarStatus`, `WatchlistType`, `WatchlistEntry`, `ScreeningMatch`, `AmlTransactionEvent`, `AmlAlert`, and `SarDossier` serialize and validate cleanly.
+2. **AC-2 (Watchlist & Sanction Fuzzy Screening)**: `WatchlistScreeningEngine` accurately identifies exact, typo, and phonetic matches against OFAC/PEP lists with configurable confidence thresholds.
+3. **AC-3 (Typology Detectors)**: `StructuringDetector`, `LayeringDetector`, `CircularFlowDetector`, and `HighRiskJurisdictionDetector` flag structured sub-threshold bursts, rapid pass-throughs, and looping funds.
+4. **AC-4 (AML Scoring Engine & Case Escalation)**: `AmlEngine` computes calibrated risk scores, enforces action policies, and automatically escalates high-risk alerts to `CaseManager`.
+5. **AC-5 (Regulatory SAR Packaging & Lifecycle)**: `SarManager` compiles narrative dossiers and manages review/filing status transitions with immutable audit history.
+6. **AC-6 (Thread-Safe Store & EventBus Streaming)**: `AmlStore` provides multi-index thread-safe queries, and domain events stream over `EventBus`.
+7. **AC-7 (REST API & Observability)**: FastAPI exposes `/v1/aml/*` endpoints with Prometheus metrics and rate limits.
+8. **AC-8 (CLI Workflows)**: Typer CLI exposes `aml-*` commands supporting table and JSON formats with standard exit codes.
+9. **AC-9 (Quality Standards & 100% Green CI)**: All local CI-parity checks and remote CI workflow runs pass 100%, branch coverage >= 97.0%, strict mypy 0 issues, Ruff clean, and build/twine valid.
+
+### Validation & CI Plan
+
+- Local CI-parity commands:
+  - `python -m ruff format --check src tests`
+  - `python -m ruff check src tests`
+  - `python -m mypy src`
+  - `python -m pytest --cov=fraud_detection --cov-report=term-missing`
+  - `python -m build` & `python -m twine check dist/*`
+- Remote CI workflow runs monitored via `gh run list` and `gh pr checks`.
+
+### Exclusions
+
+Does not connect to external live FinCEN BSA E-Filing REST APIs or real-time paid Swift networks; provides zero-external-dependency self-contained matching algorithms, sliding-window monitoring, and standardized exportable SAR packages.
+
+### Micro-Task Breakdown
+
+- [x] Task 1: Create `src/fraud_detection/aml.py` with domain data models, enums, serialization, and unit tests in `tests/test_aml.py`.
+- [x] Task 2: Implement `WatchlistScreeningEngine` with phonetic (Soundex) and fuzzy distance algorithms (Jaro-Winkler, Levenshtein) in `src/fraud_detection/aml.py` with unit tests.
+- [x] Task 3: Implement AML typology detectors (`StructuringDetector`, `LayeringDetector`, `CircularFlowDetector`, `HighRiskJurisdictionDetector`) in `src/fraud_detection/aml.py` with unit tests.
+- [x] Task 4: Implement `AmlEngine` (scoring, policy routing, case escalation) and thread-safe `AmlStore` in `src/fraud_detection/aml.py` with unit tests.
+- [x] Task 5: Implement `SarManager` (narrative generator, FinCEN/FATF SAR dossier compiler, lifecycle state machine) in `src/fraud_detection/aml.py` with unit tests.
+- [x] Task 6: Integrate AML Engine with `events.py` (domain events) with unit and integration tests.
+- [x] Task 7: Implement `/v1/aml/*` REST endpoints and Prometheus metrics in `src/fraud_detection/api.py` with integration tests in `tests/test_api.py`.
+- [x] Task 8: Implement CLI commands `aml-monitor`, `aml-screen`, `aml-alerts`, `aml-sar-generate`, `aml-sar-list`, and `aml-sar-status` in `src/fraud_detection/cli.py` with tests in `tests/test_cli.py`.
+- [x] Task 9: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate with 100% Green CI.
+
+### Delivery Record
+
+- `6416b3d`: docs(roadmap): define Phase 48 AML transaction monitoring and SAR engine scope
+- `c8bd1c6`: docs(progress): initialize Phase 48 living progress record and decision log
+- `49852b0`: feat(aml): add core AML domain enums and taxonomy models in aml.py
+- `209e9cd`: feat(aml): add domain models and serialization for transactions, alerts, and SAR dossiers
+- `a5fcae2`: test(aml): add unit tests for aml domain models serialization and roundtrips
+- `652735c`: feat(aml): add deserialization methods from_dict for all AML domain models
+- `b277040`: test(aml): add comprehensive roundtrip tests for domain models deserialization
+- `3cf2a56`: feat(aml): implement Soundex phonetic algorithm in aml.py
+- `ab03c08`: feat(aml): implement Levenshtein distance and similarity ratio in aml.py
+- `5646abf`: feat(aml): implement Jaro and Jaro-Winkler string similarity algorithms in aml.py
+- `341146b`: feat(aml): implement thread-safe WatchlistScreeningEngine in aml.py
+- `b912f09`: test(aml): add comprehensive tests for Soundex, Levenshtein, and Jaro-Winkler
+- `9b2d9cf`: test(aml): add unit tests for WatchlistScreeningEngine matching algorithms
+- `44ede43`: feat(aml): implement StructuringDetector for sub-CTR smurfing detection
+- `41d3d31`: feat(aml): implement LayeringDetector for rapid flow-through turnover detection
+- `5065e30`: feat(aml): implement CircularFlowDetector for round-trip counterparty loops
+- `bc83b72`: feat(aml): implement HighRiskJurisdictionDetector for FATF corridors
+- `54d6a16`: test(aml): add unit tests for StructuringDetector, LayeringDetector, CircularFlowDetector, and HighRiskJurisdictionDetector
+- `b820c25`: test(aml): add unit tests for typology alert models serialization and deserialization
+- `d0706cd`: feat(aml): implement thread-safe AmlStore with secondary indexing and capacity eviction
+- `94ab4c9`: feat(events): register AML domain event types in events.py
+- `1f10d8c`: feat(aml): implement AmlEngine composite risk scoring and policy actions
+- `eaad2da`: feat(aml): add automated CaseManager escalation for high-risk AML alerts
+- `477303e`: test(aml): add unit tests for AmlStore, AmlEngine scoring, and case escalation
+- `05391c8`: feat(aml): implement FinCEN/FATF SAR narrative generator in aml.py
+- `62e2863`: feat(aml): implement SarManager lifecycle state machine and FinCEN XML export
+- `f79fc5d`: test(aml): add unit tests for SarManager lifecycle, XML export, and audit trails
+- `bd06625`: test(aml): add unit tests for standalone generate_sar_narrative and transition errors
+- `c8081c1`: test(events): add EventBus integration test for AML domain events
+- `5591793`: docs(progress): mark Task 6 and AC-6 complete in PROGRESS.md
+- `3a5db4c`: feat(api): implement /v1/aml/* REST endpoints and Prometheus metrics
+- `4c7a1e4`: fix(api): specify response_model=None on aml XML endpoint
+- `2af273e`: test(api): add comprehensive integration tests for /v1/aml/* endpoints
+- `73c3267`: docs(progress): mark Task 7 and AC-7 complete in PROGRESS.md
+- `cc0dba9`: feat(cli): add aml-monitor, aml-screen, aml-alerts, aml-sar-* commands
+- `8ecdde3`: feat(aml): add DEFAULT_WATCHLIST_ENTRIES and narrative_summary support in SarManager
+- `1ac7365`: fix(cli): align aml CLI commands with aml domain model attributes and enum values
+- `9b1519c`: test(cli): add comprehensive CLI tests for all aml-* commands and error branches
+- `32149c3`: docs(progress): mark Task 8 and AC-8 complete in PROGRESS.md
+- `39ec6ba`: docs(architecture): document Phase 48 AML engine, typology detectors, and SAR management
+- `cd1ada8`: docs(readme): add Phase 48 AML CLI commands and REST API documentation
+
+
 ## Contributing to the roadmap
 
 Open an issue or a pull request that references the relevant phase item.

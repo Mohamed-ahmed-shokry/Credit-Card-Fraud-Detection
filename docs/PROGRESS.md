@@ -1,36 +1,38 @@
-# Phase 47 Progress Record
+# Phase 48 Progress Record
 
 ### Overview
-- **Phase**: Phase 47 — Account Takeover (ATO) Detection, Credential Stuffing Defense & Identity Session Anomaly Engine
-- **Branch**: `phase/account-takeover-defense`
+- **Phase**: Phase 48 — Anti-Money Laundering (AML) Transaction Monitoring, Structuring/Smurfing Detection & Regulatory SAR Engine
+- **Branch**: `phase/aml-transaction-monitoring`
 - **Status**: Completed
-- **Pull Request**: [#30](https://github.com/Mohamed-ahmed-shokry/Credit-Card-Fraud-Detection/pull/30)
+- **Pull Request**: [#31](https://github.com/Mohamed-ahmed-shokry/Credit-Card-Fraud-Detection/pull/31)
 
 ## Task Status
-- [x] Task 1: Create `src/fraud_detection/ato.py` with domain data models, enums, mutation records, and unit tests in `tests/test_ato.py`.
-- [x] Task 2: Implement `CredentialStuffingDetector` (sliding-window IP spraying and distributed brute-force detection) in `src/fraud_detection/ato.py` with unit tests.
-- [x] Task 3: Implement `AccountProfileTracker` (baselines, known devices/locations, mutation decay, quarantine) in `src/fraud_detection/ato.py` with unit tests.
-- [x] Task 4: Implement `AtoEngine` (multi-factor risk scoring, policy evaluation, challenge & case integration) and thread-safe `AtoStore` in `src/fraud_detection/ato.py` with unit tests.
-- [x] Task 5: Integrate ATO Engine with `events.py` (domain events) with unit/integration tests.
-- [x] Task 6: Implement `/v1/ato/*` REST endpoints and Prometheus metrics in `src/fraud_detection/api.py` with integration tests in `tests/test_api.py`.
-- [x] Task 7: Implement CLI commands `ato-login`, `ato-eval`, `ato-inspect`, `ato-quarantine`, `ato-release`, and `ato-mutation` in `src/fraud_detection/cli.py` with tests in `tests/test_cli.py`.
-- [x] Task 8: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate with 100% Green CI.
+- [x] Task 1: Create `src/fraud_detection/aml.py` with domain data models, enums, serialization, and unit tests in `tests/test_aml.py`.
+- [x] Task 2: Implement `WatchlistScreeningEngine` with phonetic (Soundex) and fuzzy distance algorithms (Jaro-Winkler, Levenshtein) in `src/fraud_detection/aml.py` with unit tests.
+- [x] Task 3: Implement AML typology detectors (`StructuringDetector`, `LayeringDetector`, `CircularFlowDetector`, `HighRiskJurisdictionDetector`) in `src/fraud_detection/aml.py` with unit tests.
+- [x] Task 4: Implement `AmlEngine` (scoring, policy routing, case escalation) and thread-safe `AmlStore` in `src/fraud_detection/aml.py` with unit tests.
+- [x] Task 5: Implement `SarManager` (narrative generator, FinCEN/FATF SAR dossier compiler, lifecycle state machine) in `src/fraud_detection/aml.py` with unit tests.
+- [x] Task 6: Integrate AML Engine with `events.py` (domain events) with unit and integration tests.
+- [x] Task 7: Implement `/v1/aml/*` REST endpoints and Prometheus metrics in `src/fraud_detection/api.py` with integration tests in `tests/test_api.py`.
+- [x] Task 8: Implement CLI commands `aml-monitor`, `aml-screen`, `aml-alerts`, `aml-sar-generate`, `aml-sar-list`, and `aml-sar-status` in `src/fraud_detection/cli.py` with tests in `tests/test_cli.py`.
+- [x] Task 9: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate with 100% Green CI.
 
 ## Acceptance Criteria Status
 | Criterion | Status | Evidence |
 |-----------|--------|----------|
-| AC-1 (Domain Models & Risk Factor Taxonomy) | PASSED | Domain models, enums, serialization in `src/fraud_detection/ato.py` verified in `tests/test_ato.py` |
-| AC-2 (Credential Stuffing & Spraying Detection) | PASSED | Sliding-window detector in `src/fraud_detection/ato.py` verified in `tests/test_ato.py` |
-| AC-3 (Account Baseline & Mutation Tracking) | PASSED | Baseline devices/locations and mutation decay penalties in `src/fraud_detection/ato.py` verified in `tests/test_ato.py` |
-| AC-4 (ATO Engine & Policy Decisioning) | PASSED | Multi-factor risk scoring, impossible travel, and quarantine enforcement verified in `tests/test_ato.py` |
-| AC-5 (Thread-Safe Store & EventBus Streaming) | PASSED | Thread-safe `AtoStore` and `EventBus` domain event dispatch verified in `tests/test_ato.py` |
-| AC-6 (REST API & Observability) | PASSED | `/v1/ato/*` endpoints, lifecycle actions, and Prometheus metrics verified in `tests/test_api.py` |
-| AC-7 (CLI Workflows) | PASSED | `ato-*` commands for login, eval, inspection, quarantine, release, and mutations verified in `tests/test_cli.py` |
-| AC-8 (Quality Standards & 100% Green CI) | PASSED | Coverage 98.34% on `ato.py`, 97.01% across 1,153 passing tests, zero strict mypy issues, ruff clean, pip-audit clean, build clean |
+| AC-1 (Domain Models & Taxonomies) | PASSED | Models, enums, serialization in `src/fraud_detection/aml.py` verified in `tests/test_aml.py` |
+| AC-2 (Watchlist & Sanction Fuzzy Screening) | PASSED | Jaro-Winkler, Levenshtein, Soundex matching against OFAC/PEP in `src/fraud_detection/aml.py` verified in `tests/test_aml.py` |
+| AC-3 (Typology Detectors) | PASSED | Structuring, Layering, Circular Flow, High Risk Corridors in `src/fraud_detection/aml.py` verified in `tests/test_aml.py` |
+| AC-4 (AML Scoring Engine & Case Escalation) | PASSED | Composite risk scoring, policy actions, and `cases.py` integration in `src/fraud_detection/aml.py` verified in `tests/test_aml.py` |
+| AC-5 (Regulatory SAR Packaging & Lifecycle) | PASSED | FinCEN/FATF SAR narratives, dossiers, status lifecycle in `src/fraud_detection/aml.py` verified in `tests/test_aml.py` |
+| AC-6 (Thread-Safe Store & EventBus Streaming) | PASSED | `AmlStore` concurrency, indexes, and `events.py` domain events verified in `tests/test_aml.py` and `tests/test_events.py` |
+| AC-7 (REST API & Observability) | PASSED | `/v1/aml/*` endpoints and Prometheus metrics in `src/fraud_detection/api.py` verified in `tests/test_api.py` |
+| AC-8 (CLI Workflows) | PASSED | `aml-*` commands in `src/fraud_detection/cli.py` verified in `tests/test_cli.py` |
+| AC-9 (Quality Standards & 100% Green CI) | PASSED | 100% local checks, branch coverage >= 97%, zero strict mypy issues, remote CI green |
 
 ## Decision Log
 | Date | Decision | Alternatives Considered | Rationale |
 |---|---|---|---|
-| 2026-11-08 | Select Phase 47: Account Takeover (ATO) Detection, Credential Stuffing Defense & Identity Session Anomaly Engine | Synthetic Identity Fraud (SIF); Anti-Money Laundering (AML) Transaction Monitoring | ATO directly links authentication attacks to payment fraud, closing the loop between `device.py`, `geolocation.py`, `challenge.py`, and `cases.py` with zero external dependencies. |
-| 2026-11-08 | Create dedicated phase branch `phase/account-takeover-defense` | Reusing previous phase branch; committing directly to main | Conforms to strict branching protocol and isolated remote CI tracking. |
-| 2026-11-08 | Complete Phase 47 end-to-end with 100% Green CI parity | Partial implementation; asking user for review | Follows Autonomy Contract §9 full lifecycle completion. |
+| 2026-11-09 | Select Phase 48: Anti-Money Laundering (AML) Transaction Monitoring, Structuring/Smurfing Detection & Regulatory SAR Engine | Synthetic Identity Fraud (SIF); Mule Account & Exfiltration Graph Engine | AML is a critical regulatory pillar in payment card operations. Providing structuring/smurfing, layering, circular flows, OFAC/PEP fuzzy screening, and FinCEN SAR reporting completes the compliance lifecycle without external dependencies. |
+| 2026-11-09 | Create dedicated phase branch `phase/aml-transaction-monitoring` | Working on main directly | Conforms to strict branching protocol and remote CI tracking. |
+| 2026-11-09 | Seed default reference watchlists in `aml.py` while keeping base engine empty by default | Mandatory hardcoded list in `WatchlistScreeningEngine.__init__` | Preserves existing unit test contracts (`assert engine.count() == 0`) while giving CLI users immediate out-of-the-box screening against high-profile sanctions entities. |

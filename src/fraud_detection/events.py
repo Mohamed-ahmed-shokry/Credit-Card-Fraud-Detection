@@ -104,6 +104,11 @@ class EventType(StrEnum):
     ATO_ACCOUNT_QUARANTINED = "fraud.ato.account_quarantined"
     ATO_ACCOUNT_RELEASED = "fraud.ato.account_released"
     ATO_CREDENTIAL_STUFFING_BURST = "fraud.ato.credential_stuffing_burst"
+    AML_TRANSACTION_MONITORED = "fraud.aml.transaction_monitored"
+    AML_ALERT_TRIGGERED = "fraud.aml.alert_triggered"
+    AML_SANCTION_MATCH_DETECTED = "fraud.aml.sanction_match_detected"
+    AML_SAR_CREATED = "fraud.aml.sar_created"
+    AML_SAR_STATUS_UPDATED = "fraud.aml.sar_status_updated"
 
 
 class EventDeliveryStatus(StrEnum):

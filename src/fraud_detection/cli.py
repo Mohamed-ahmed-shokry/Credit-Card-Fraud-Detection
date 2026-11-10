@@ -19,6 +19,21 @@ import typer
 import uvicorn
 
 from fraud_detection import __version__
+from fraud_detection.aml import (
+    DEFAULT_WATCHLIST_ENTRIES,
+    AmlAlert,
+    AmlEngine,
+    AmlRiskLevel,
+    AmlStore,
+    AmlTransactionEvent,
+    AmlTypology,
+    SarDossier,
+    SarManager,
+    SarStatus,
+    TransactionDirection,
+    WatchlistEntry,
+    WatchlistScreeningEngine,
+)
 from fraud_detection.ato import (
     AccountMutationRecord,
     AccountMutationType,
@@ -9993,6 +10008,62 @@ def _save_ato_state(
     _atomic_write_text(json.dumps(data, indent=2), store_file)
 
 
+def _load_aml_state(
+    store_file: Path | None,
+) -> tuple[AmlEngine, SarManager, list[AmlTransactionEvent]]:
+    """Load persistent AML transactions, alerts, and SAR dossiers from store file."""
+    store = AmlStore()
+    engine = AmlEngine(store=store)
+    for wl_entry in DEFAULT_WATCHLIST_ENTRIES:
+        engine.screening_engine.add_entry(wl_entry)
+    sar_manager = SarManager(store=store)
+    transactions: list[AmlTransactionEvent] = []
+    if store_file is None or not store_file.exists():
+        return engine, sar_manager, transactions
+
+    try:
+        raw = store_file.read_text(encoding="utf-8")
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            _abort("Invalid AML store file format: expected JSON object.")
+    except (OSError, json.JSONDecodeError) as exc:
+        _abort(f"Could not read AML store file: {exc}")
+
+    for tx_data in data.get("transactions", []):
+        if isinstance(tx_data, dict):
+            tx = AmlTransactionEvent.from_dict(tx_data)
+            transactions.append(tx)
+            engine.structuring_detector.record_and_evaluate(tx)
+            engine.layering_detector.record_and_evaluate(tx)
+            engine.circular_detector.record_and_evaluate(tx)
+
+    for alert_data in data.get("alerts", []):
+        if isinstance(alert_data, dict):
+            store.record_alert(AmlAlert.from_dict(alert_data))
+
+    for sar_data in data.get("sars", []):
+        if isinstance(sar_data, dict):
+            store.record_sar(SarDossier.from_dict(sar_data))
+
+    return engine, sar_manager, transactions
+
+
+def _save_aml_state(
+    store_file: Path | None,
+    store: AmlStore,
+    transactions: list[AmlTransactionEvent],
+) -> None:
+    """Save persistent AML transactions, alerts, and SAR dossiers to store file."""
+    if store_file is None:
+        return
+    data = {
+        "transactions": [tx.to_dict() for tx in transactions[-5000:]],
+        "alerts": [alert.to_dict() for alert in store.list_alerts(limit=5000)],
+        "sars": [sar.to_dict() for sar in store.list_sars(limit=5000)],
+    }
+    _atomic_write_text(json.dumps(data, indent=2), store_file)
+
+
 @app.command("ato-login")
 def ato_login(
     user_id: Annotated[
@@ -10290,6 +10361,366 @@ def ato_mutation(
         typer.echo(f"Channel:     {rec.channel}")
     else:
         typer.echo(json.dumps(rec.to_dict(), indent=2))
+
+
+@app.command("aml-monitor")
+def aml_monitor(
+    user_id: Annotated[
+        str,
+        typer.Option("--user-id", "-u", help="User or account identifier."),
+    ],
+    amount: Annotated[
+        float,
+        typer.Option("--amount", "-a", help="Transaction amount in currency units."),
+    ],
+    counterparty_id: Annotated[
+        str,
+        typer.Option("--counterparty-id", "-c", help="Counterparty account or entity ID."),
+    ] = "",
+    entity_name: Annotated[
+        str,
+        typer.Option(
+            "--entity-name", "-n", help="Legal name of counterparty/entity for screening."
+        ),
+    ] = "",
+    country: Annotated[
+        str,
+        typer.Option("--country", help="ISO country code (e.g. US, IR, KP, MM)."),
+    ] = "US",
+    direction: Annotated[
+        str,
+        typer.Option("--direction", "-d", help="Transaction direction (inbound or outbound)."),
+    ] = "outbound",
+    currency: Annotated[
+        str,
+        typer.Option("--currency", help="ISO currency code (e.g. USD, EUR)."),
+    ] = "USD",
+    store_file: Annotated[
+        Path,
+        typer.Option("--store-file", "-s", help="Path to AML state JSON file."),
+    ] = Path("aml_store.json"),
+    output_format: Annotated[
+        str,
+        typer.Option("--format", "-f", help="Output format (table or json)."),
+    ] = "table",
+) -> None:
+    """Monitor financial transaction for AML typologies, sanctions hits, and corridor risk."""
+    direction_normalized = direction.lower()
+    if direction_normalized in ("inflow", "inbound", "in"):
+        tx_dir = TransactionDirection.INFLOW
+    elif direction_normalized in ("outflow", "outbound", "out"):
+        tx_dir = TransactionDirection.OUTFLOW
+    else:
+        _abort(f"Invalid transaction direction '{direction}'. Expected 'inflow' or 'outflow'.")
+
+    engine, _, transactions = _load_aml_state(store_file)
+    event = AmlTransactionEvent(
+        transaction_id=str(uuid4()),
+        user_id=user_id,
+        amount=amount,
+        counterparty_id=counterparty_id,
+        country=country.upper(),
+        direction=tx_dir,
+        currency=currency.upper(),
+    )
+    assessment = engine.evaluate_transaction(event, entity_name=entity_name or None)
+    transactions.append(event)
+    _save_aml_state(store_file, engine.store, transactions)
+
+    if output_format.lower() == "table":
+        typer.echo(f"Transaction ID: {assessment.transaction_id}")
+        typer.echo(f"User ID:        {assessment.user_id}")
+        typer.echo(f"Risk Score:     {assessment.risk_score:.4f}")
+        typer.echo(f"Risk Level:     {assessment.risk_level.value}")
+        typer.echo(f"Policy Action:  {assessment.recommended_action.value}")
+        typs = ", ".join(t.value for t in assessment.triggered_typologies) or "none"
+        typer.echo(f"Typologies:     {typs}")
+        if assessment.alert:
+            typer.echo(f"Alert ID:       {assessment.alert.alert_id}")
+    else:
+        typer.echo(json.dumps(assessment.to_dict(), indent=2))
+
+
+@app.command("aml-screen")
+def aml_screen(
+    name: Annotated[
+        str,
+        typer.Option("--name", "-n", help="Entity or individual name to screen."),
+    ],
+    threshold: Annotated[
+        float,
+        typer.Option("--threshold", "-t", help="Fuzzy match similarity threshold [0.0 - 1.0]."),
+    ] = 0.85,
+    watchlist_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--watchlist-file", "-w", help="Optional JSON file with custom watchlist entries."
+        ),
+    ] = None,
+    output_format: Annotated[
+        str,
+        typer.Option("--format", "-f", help="Output format (table or json)."),
+    ] = "table",
+) -> None:
+    """Screen entity name against OFAC/PEP watchlists with fuzzy and phonetic matching."""
+    screening_engine = WatchlistScreeningEngine()
+    if watchlist_file is not None:
+        if not watchlist_file.exists():
+            _abort(f"Watchlist file not found: {watchlist_file}")
+        try:
+            raw = watchlist_file.read_text(encoding="utf-8")
+            entries_data = json.loads(raw)
+            if isinstance(entries_data, list):
+                for ed in entries_data:
+                    if isinstance(ed, dict):
+                        screening_engine.add_entry(WatchlistEntry.from_dict(ed))
+        except (OSError, json.JSONDecodeError) as exc:
+            _abort(f"Could not load watchlist file: {exc}")
+    else:
+        for wl_entry in DEFAULT_WATCHLIST_ENTRIES:
+            screening_engine.add_entry(wl_entry)
+
+    matches = screening_engine.screen_entity(name, threshold=threshold)
+
+    if output_format.lower() == "table":
+        typer.echo(f"Screening Query: {name}")
+        typer.echo(f"Threshold:       {threshold}")
+        typer.echo(f"Matches Found:   {len(matches)}")
+        if matches:
+            typer.echo("-" * 60)
+            for m in matches:
+                typer.echo(
+                    f"[{m.matched_entry.watchlist_type.value.upper()}] {m.matched_entry.name} "
+                    f"| Score: {m.similarity_score:.4f} | Method: {m.match_algorithm}"
+                )
+    else:
+        typer.echo(json.dumps([m.to_dict() for m in matches], indent=2))
+
+
+@app.command("aml-alerts")
+def aml_alerts(
+    user_id: Annotated[
+        str | None,
+        typer.Option("--user-id", "-u", help="Filter by user identifier."),
+    ] = None,
+    typology: Annotated[
+        str | None,
+        typer.Option("--typology", "-t", help="Filter by AML typology."),
+    ] = None,
+    risk_level: Annotated[
+        str | None,
+        typer.Option(
+            "--risk-level", "-r", help="Filter by risk level (low, medium, high, critical)."
+        ),
+    ] = None,
+    limit: Annotated[
+        int,
+        typer.Option("--limit", "-l", help="Maximum alerts to return."),
+    ] = 100,
+    store_file: Annotated[
+        Path,
+        typer.Option("--store-file", "-s", help="Path to AML state JSON file."),
+    ] = Path("aml_store.json"),
+    output_format: Annotated[
+        str,
+        typer.Option("--format", "-f", help="Output format (table or json)."),
+    ] = "table",
+) -> None:
+    """Inspect and filter AML detection alerts from store file."""
+    typology_enum: AmlTypology | None = None
+    if typology:
+        try:
+            typology_enum = AmlTypology(typology.lower())
+        except ValueError:
+            _abort(f"Invalid typology '{typology}'.")
+
+    risk_level_enum: AmlRiskLevel | None = None
+    if risk_level:
+        try:
+            risk_level_enum = AmlRiskLevel(risk_level.lower())
+        except ValueError:
+            _abort(f"Invalid risk level '{risk_level}'.")
+
+    engine, _, _ = _load_aml_state(store_file)
+    alerts = engine.store.list_alerts(
+        user_id=user_id,
+        typology=typology_enum,
+        risk_level=risk_level_enum,
+        limit=limit,
+    )
+
+    if output_format.lower() == "table":
+        typer.echo(f"Alerts ({len(alerts)}):")
+        for a in alerts:
+            typer.echo(
+                f"- ID: {a.alert_id} | User: {a.user_id} | Level: {a.risk_level.value.upper()} "
+                f"| Typology: {a.typology.value} | Action: {a.recommended_action.value} "
+                f"| Score: {a.risk_score:.2f}"
+            )
+    else:
+        typer.echo(json.dumps([a.to_dict() for a in alerts], indent=2))
+
+
+@app.command("aml-sar-generate")
+def aml_sar_generate(
+    user_id: Annotated[
+        str,
+        typer.Option("--user-id", "-u", help="Subject user identifier."),
+    ],
+    alert_ids: Annotated[
+        str,
+        typer.Option("--alert-ids", "-a", help="Comma-separated AML alert IDs."),
+    ],
+    suspect_name: Annotated[
+        str,
+        typer.Option("--suspect-name", "-n", help="Subject suspect legal name."),
+    ] = "",
+    narrative: Annotated[
+        str,
+        typer.Option("--narrative", help="Optional narrative summary or context."),
+    ] = "",
+    store_file: Annotated[
+        Path,
+        typer.Option("--store-file", "-s", help="Path to AML state JSON file."),
+    ] = Path("aml_store.json"),
+    output_format: Annotated[
+        str,
+        typer.Option("--format", "-f", help="Output format (table or json)."),
+    ] = "table",
+) -> None:
+    """Compile and package a regulatory SAR filing dossier from suspicious alerts."""
+    a_ids = [aid.strip() for aid in alert_ids.split(",") if aid.strip()]
+    if not a_ids:
+        _abort("At least one alert ID must be specified.")
+
+    engine, sar_manager, transactions = _load_aml_state(store_file)
+    dossier = sar_manager.generate_sar(
+        user_id=user_id,
+        alert_ids=a_ids,
+        suspect_name=suspect_name,
+        narrative_summary=narrative,
+    )
+    _save_aml_state(store_file, engine.store, transactions)
+
+    if output_format.lower() == "table":
+        typer.echo(f"SAR ID:        {dossier.sar_id}")
+        typer.echo(f"Filing Status: {dossier.status.value}")
+        subj = dossier.suspect_details.get("full_name") or dossier.user_id
+        typer.echo(f"Subject:       {subj}")
+        typer.echo(f"Alerts Count:  {len(dossier.alert_ids)}")
+        typer.echo(f"Narrative:     {dossier.narrative[:120]}...")
+    else:
+        typer.echo(json.dumps(dossier.to_dict(), indent=2))
+
+
+@app.command("aml-sar-list")
+def aml_sar_list(
+    status: Annotated[
+        str | None,
+        typer.Option(
+            "--status",
+            help="Filter by SAR filing status (draft, pending_review, approved, filed, rejected).",
+        ),
+    ] = None,
+    user_id: Annotated[
+        str | None,
+        typer.Option("--user-id", "-u", help="Filter by subject user identifier."),
+    ] = None,
+    limit: Annotated[
+        int,
+        typer.Option("--limit", "-l", help="Maximum SAR dossiers to return."),
+    ] = 100,
+    store_file: Annotated[
+        Path,
+        typer.Option("--store-file", "-s", help="Path to AML state JSON file."),
+    ] = Path("aml_store.json"),
+    output_format: Annotated[
+        str,
+        typer.Option("--format", "-f", help="Output format (table or json)."),
+    ] = "table",
+) -> None:
+    """List regulatory SAR dossiers filtered by filing status or subject user."""
+    status_enum: SarStatus | None = None
+    if status:
+        try:
+            status_enum = SarStatus(status.lower())
+        except ValueError:
+            _abort(f"Invalid SAR status '{status}'.")
+
+    _, sar_manager, _ = _load_aml_state(store_file)
+    sars = sar_manager.list_sars(status=status_enum, user_id=user_id, limit=limit)
+
+    if output_format.lower() == "table":
+        typer.echo(f"SAR Dossiers ({len(sars)}):")
+        for s in sars:
+            subj = s.suspect_details.get("full_name") or s.user_id
+            typer.echo(
+                f"- ID: {s.sar_id} | Status: {s.status.value.upper()} "
+                f"| Subject: {subj} | Alerts: {len(s.alert_ids)}"
+            )
+    else:
+        typer.echo(json.dumps([s.to_dict() for s in sars], indent=2))
+
+
+@app.command("aml-sar-status")
+def aml_sar_status(
+    sar_id: Annotated[
+        str,
+        typer.Option("--sar-id", help="SAR filing dossier ID."),
+    ],
+    status: Annotated[
+        str,
+        typer.Option(
+            "--status",
+            help="New target status (pending_review, approved, filed, rejected).",
+        ),
+    ],
+    reviewer: Annotated[
+        str,
+        typer.Option("--reviewer", "-r", help="Compliance officer / reviewer identifier."),
+    ] = "compliance_officer",
+    comment: Annotated[
+        str,
+        typer.Option("--comment", "-c", help="Status transition review comment."),
+    ] = "",
+    store_file: Annotated[
+        Path,
+        typer.Option("--store-file", "-s", help="Path to AML state JSON file."),
+    ] = Path("aml_store.json"),
+    output_format: Annotated[
+        str,
+        typer.Option("--format", "-f", help="Output format (table or json)."),
+    ] = "table",
+) -> None:
+    """Update regulatory SAR filing status according to strict compliance lifecycle."""
+    try:
+        new_status = SarStatus(status.lower())
+    except ValueError:
+        _abort(f"Invalid SAR status '{status}'.")
+
+    engine, sar_manager, transactions = _load_aml_state(store_file)
+    try:
+        updated = sar_manager.transition_status(
+            sar_id=sar_id,
+            new_status=new_status,
+            actor=reviewer,
+            notes=comment,
+        )
+    except KeyError:
+        _abort(f"SAR dossier '{sar_id}' not found.")
+    except (ValueError, RuntimeError) as exc:
+        _abort(str(exc))
+
+    _save_aml_state(store_file, engine.store, transactions)
+
+    if output_format.lower() == "table":
+        typer.echo(f"SAR ID:        {updated.sar_id}")
+        typer.echo(f"New Status:    {updated.status.value}")
+        typer.echo(f"Reviewer:      {reviewer}")
+        if updated.filing_date:
+            typer.echo(f"Filing Date:   {updated.filing_date}")
+    else:
+        typer.echo(json.dumps(updated.to_dict(), indent=2))
 
 
 def _abort(message: str) -> NoReturn:
