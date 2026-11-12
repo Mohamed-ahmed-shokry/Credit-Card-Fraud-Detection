@@ -361,3 +361,143 @@ def test_mule_engine_event_bus_publishing() -> None:
     assert EventType.MULE_ACCOUNT_FLAGGED in types_2
     assert EventType.MULE_NETWORK_DETECTED in types_2
     bus.close()
+
+
+def test_mule_edge_cases_and_policy_tiers() -> None:
+    from fraud_detection.mule_detection import _parse_dt
+
+    # _parse_dt naive and fallback
+    naive = datetime(2026, 11, 12, 10, 0, 0)
+    assert _parse_dt(naive).tzinfo == UTC
+    assert _parse_dt("2026-11-12T10:00:00").tzinfo == UTC
+    assert _parse_dt(None, default=naive.replace(tzinfo=UTC)).year == 2026
+
+    # DormancyBurstDetector negative branches (low count, low volume, active prior history)
+    det = DormancyBurstDetector(dormancy_days=30, burst_min_transfers=3, burst_min_volume=2000.0)
+    t_now = datetime(2026, 11, 12, 12, 0, 0, tzinfo=UTC)
+    low_cnt = MuleAccountProfile(
+        account_id="d_low",
+        account_opened_at=t_now - timedelta(days=60),
+        transfers=[
+            MuleTransferRecord(
+                transfer_id="1",
+                account_id="d_low",
+                counterparty_id="c1",
+                direction=TransferDirection.INBOUND,
+                amount=3000.0,
+                timestamp=t_now,
+            )
+        ],
+    )
+    assert det.evaluate(low_cnt, now=t_now) == (False, 0.0, "")
+
+    low_vol = MuleAccountProfile(
+        account_id="d_vol",
+        account_opened_at=t_now - timedelta(days=60),
+        transfers=[
+            MuleTransferRecord(
+                transfer_id=f"v{i}",
+                account_id="d_vol",
+                counterparty_id="c1",
+                direction=TransferDirection.INBOUND,
+                amount=100.0,
+                timestamp=t_now,
+            )
+            for i in range(3)
+        ],
+    )
+    assert det.evaluate(low_vol, now=t_now) == (False, 0.0, "")
+
+    active_prior = MuleAccountProfile(
+        account_id="d_act",
+        account_opened_at=t_now - timedelta(days=60),
+        transfers=[
+            MuleTransferRecord(
+                transfer_id="old",
+                account_id="d_act",
+                counterparty_id="c0",
+                direction=TransferDirection.INBOUND,
+                amount=500.0,
+                timestamp=t_now - timedelta(days=5),
+            ),
+            *[
+                MuleTransferRecord(
+                    transfer_id=f"n{i}",
+                    account_id="d_act",
+                    counterparty_id=f"c{i}",
+                    direction=TransferDirection.INBOUND,
+                    amount=1000.0,
+                    timestamp=t_now,
+                )
+                for i in range(3)
+            ],
+        ],
+    )
+    assert det.evaluate(active_prior, now=t_now) == (False, 0.0, "")
+
+    # Store list_profiles(None), assessment eviction, list_assessments
+    store = MuleAccountStore(max_records=1)
+    engine = MuleDetectionEngine(store=store)
+    a1 = engine.evaluate_account("s1", now=t_now)
+    a2 = engine.evaluate_account("s2", now=t_now)
+    assert store.assessment_count == 1
+    assert store.get_assessment(a1.assessment_id) is None
+    assert store.get_assessment(a2.assessment_id) is not None
+    assert len(store.list_profiles()) == 1
+    assert len(store.list_assessments()) == 1
+    assert len(store.list_assessments(tenant_id="default")) == 1
+
+    # Engine STEP_UP_VERIFICATION and FREEZE_ACCOUNT tiers
+    tier_engine = MuleDetectionEngine(
+        step_up_threshold=0.20,
+        hold_funds_threshold=0.60,
+        freeze_threshold=0.70,
+        escalate_sar_threshold=0.95,
+    )
+    # STEP_UP (~0.2025 from pass-through 0.45 * 0.45)
+    tier_engine.ingest_and_evaluate(
+        MuleTransferRecord(
+            transfer_id="su_in",
+            account_id="acct_su",
+            counterparty_id="c1",
+            direction=TransferDirection.INBOUND,
+            amount=1000.0,
+            timestamp=t_now - timedelta(hours=20),
+        )
+    )
+    su_ass = tier_engine.ingest_and_evaluate(
+        MuleTransferRecord(
+            transfer_id="su_out",
+            account_id="acct_su",
+            counterparty_id="c2",
+            direction=TransferDirection.OUTBOUND,
+            amount=900.0,
+            channel=ExfiltrationChannel.ACH,
+            timestamp=t_now,
+        )
+    )
+    assert su_ass.action == MuleAction.STEP_UP_VERIFICATION
+
+    # FREEZE_ACCOUNT (>= 0.70, < 0.95)
+    tier_engine.ingest_and_evaluate(
+        MuleTransferRecord(
+            transfer_id="fr_in",
+            account_id="acct_fr",
+            counterparty_id="c1",
+            direction=TransferDirection.INBOUND,
+            amount=1000.0,
+            timestamp=t_now - timedelta(minutes=10),
+        )
+    )
+    fr_ass = tier_engine.ingest_and_evaluate(
+        MuleTransferRecord(
+            transfer_id="fr_out",
+            account_id="acct_fr",
+            counterparty_id="c2",
+            direction=TransferDirection.OUTBOUND,
+            amount=950.0,
+            channel=ExfiltrationChannel.ACH,
+            timestamp=t_now,
+        )
+    )
+    assert fr_ass.action == MuleAction.FREEZE_ACCOUNT
