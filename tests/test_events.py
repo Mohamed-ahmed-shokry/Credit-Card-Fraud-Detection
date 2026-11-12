@@ -696,3 +696,36 @@ def test_aml_domain_events_dispatch_and_routing() -> None:
     bus.publish(other_evt, synchronous=True)
     assert len(received) == 1
     bus.close()
+
+
+def test_sif_domain_events_dispatch_and_routing() -> None:
+    """Validate SIF domain event types registration, serialization, and EventBus routing."""
+    assert EventType.SIF_APPLICATION_EVALUATED == "fraud.sif.application_evaluated"
+    assert EventType.SIF_ANOMALY_DETECTED == "fraud.sif.anomaly_detected"
+    assert EventType.SIF_IDENTITY_CONFIRMED == "fraud.sif.identity_confirmed"
+    assert EventType.SIF_APPLICATION_DECLINED == "fraud.sif.application_declined"
+
+    bus = EventBus()
+    received: list[FraudDomainEvent] = []
+    bus.subscribe(
+        lambda ev: received.append(ev),
+        event_type=EventType.SIF_ANOMALY_DETECTED,
+    )
+
+    evt = FraudDomainEvent(
+        event_type=EventType.SIF_ANOMALY_DETECTED,
+        payload={"assessment_id": "sif_123", "anomalies": ["ssn_dob_mismatch"]},
+        tenant_id="tenant_sif",
+    )
+    bus.publish(evt, synchronous=True)
+    assert len(received) == 1
+    assert received[0].payload["assessment_id"] == "sif_123"
+
+    other = FraudDomainEvent(
+        event_type=EventType.SIF_APPLICATION_DECLINED,
+        payload={"assessment_id": "sif_999"},
+        tenant_id="tenant_sif",
+    )
+    bus.publish(other, synchronous=True)
+    assert len(received) == 1
+    bus.close()

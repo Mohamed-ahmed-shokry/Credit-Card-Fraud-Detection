@@ -543,3 +543,53 @@ def test_synthetic_identity_engine_decisions_and_escalations() -> None:
     assert ass_burner.action == SifAction.STEP_UP_IDENTITY_PROOFING
     assert ass_burner.risk_level == SifRiskLevel.MEDIUM
     assert mock_challenge_mgr.create_challenge.called
+
+
+def test_synthetic_identity_engine_with_event_bus() -> None:
+    from fraud_detection.events import EventBus, EventType, FraudDomainEvent
+    from fraud_detection.synthetic_identity import (
+        IdentityProfile,
+        SyntheticIdentityEngine,
+    )
+
+    bus = EventBus()
+    received: list[FraudDomainEvent] = []
+    bus.subscribe(lambda ev: received.append(ev))
+
+    engine = SyntheticIdentityEngine(event_bus=bus)
+
+    # Legitimate applicant -> SIF_APPLICATION_EVALUATED and SIF_IDENTITY_CONFIRMED
+    legit = IdentityProfile(
+        applicant_id="app_event_1",
+        ssn="050-12-3456",
+        first_name="Diana",
+        last_name="Prince",
+        dob="1984-01-01",
+        address="700 Themyscira Blvd, New York, NY",
+        phone="+12125554321",
+        email="diana@example.com",
+    )
+    engine.evaluate(legit)
+
+    event_types = [e.event_type for e in received]
+    assert EventType.SIF_APPLICATION_EVALUATED in event_types
+    assert EventType.SIF_IDENTITY_CONFIRMED in event_types
+
+    # Deceased applicant -> SIF_APPLICATION_EVALUATED, SIF_ANOMALY_DETECTED,
+    # and SIF_APPLICATION_DECLINED
+    dec = IdentityProfile(
+        applicant_id="app_event_2",
+        ssn="042-12-9999",
+        first_name="Arthur",
+        last_name="Pendelton",
+        dob="1950-01-01",
+        address="10 Ghost St, Hartford, CT",
+        phone="+12035559999",
+        email="ghost@example.com",
+    )
+    engine.evaluate(dec)
+
+    event_types_2 = [e.event_type for e in received]
+    assert EventType.SIF_ANOMALY_DETECTED in event_types_2
+    assert EventType.SIF_APPLICATION_DECLINED in event_types_2
+    bus.close()

@@ -1198,4 +1198,66 @@ class SyntheticIdentityEngine:
         self.store.add_profile(profile)
         self.store.add_assessment(assessment)
 
+        # Publish domain events
+        if self.event_bus:
+            with contextlib.suppress(Exception):
+                from fraud_detection.events import EventType, FraudDomainEvent
+
+                self.event_bus.publish(
+                    FraudDomainEvent(
+                        event_type=EventType.SIF_APPLICATION_EVALUATED,
+                        payload={
+                            "assessment_id": assessment.assessment_id,
+                            "applicant_id": profile.applicant_id,
+                            "risk_score": assessment.risk_score,
+                            "risk_level": assessment.risk_level.value,
+                            "action": assessment.action.value,
+                        },
+                        tenant_id=profile.tenant_id,
+                    ),
+                    synchronous=True,
+                )
+
+                if anomalies:
+                    self.event_bus.publish(
+                        FraudDomainEvent(
+                            event_type=EventType.SIF_ANOMALY_DETECTED,
+                            payload={
+                                "assessment_id": assessment.assessment_id,
+                                "applicant_id": profile.applicant_id,
+                                "anomalies": [a.value for a in anomalies],
+                                "risk_score": assessment.risk_score,
+                            },
+                            tenant_id=profile.tenant_id,
+                        ),
+                        synchronous=True,
+                    )
+
+                if action == SifAction.DECLINE_BLOCK:
+                    self.event_bus.publish(
+                        FraudDomainEvent(
+                            event_type=EventType.SIF_APPLICATION_DECLINED,
+                            payload={
+                                "assessment_id": assessment.assessment_id,
+                                "applicant_id": profile.applicant_id,
+                                "risk_score": assessment.risk_score,
+                            },
+                            tenant_id=profile.tenant_id,
+                        ),
+                        synchronous=True,
+                    )
+                elif action == SifAction.APPROVE:
+                    self.event_bus.publish(
+                        FraudDomainEvent(
+                            event_type=EventType.SIF_IDENTITY_CONFIRMED,
+                            payload={
+                                "assessment_id": assessment.assessment_id,
+                                "applicant_id": profile.applicant_id,
+                                "risk_score": assessment.risk_score,
+                            },
+                            tenant_id=profile.tenant_id,
+                        ),
+                        synchronous=True,
+                    )
+
         return assessment
