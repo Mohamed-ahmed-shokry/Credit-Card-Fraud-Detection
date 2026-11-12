@@ -593,3 +593,284 @@ def test_synthetic_identity_engine_with_event_bus() -> None:
     assert EventType.SIF_ANOMALY_DETECTED in event_types_2
     assert EventType.SIF_APPLICATION_DECLINED in event_types_2
     bus.close()
+
+
+def test_synthetic_identity_uncovered_branches_and_edge_cases() -> None:
+    from datetime import UTC, datetime
+
+    from fraud_detection.synthetic_identity import (
+        AuthorizedUserRecord,
+        IdentityProfile,
+        PiiInconsistencyEngine,
+        SifAction,
+        SifAnomalyType,
+        SifAssessment,
+        SifRiskLevel,
+        SsnValidationStatus,
+        SsnValidator,
+        SyntheticIdentityEngine,
+        SyntheticIdentityStore,
+        SyntheticIdentityTracker,
+    )
+
+    # 1. IdentityProfile short SSN masking
+    short_prof = IdentityProfile(
+        applicant_id="app_short",
+        ssn="123",
+        first_name="Short",
+        last_name="SSN",
+        dob="1990-01-01",
+        address="123 St",
+        phone="+12125550000",
+        email="short@example.com",
+    )
+    assert short_prof.ssn_masked() == "XXX-XX-XXXX"
+
+    # 2. SsnValidator add_deceased_record invalid length & lookup_area unmapped
+    val = SsnValidator(unissued_areas=set())
+    val.add_deceased_record(ssn="123", name="Invalid", dod="2020-01-01")
+    assert not val.is_deceased("123")[0]
+
+    # Validate with no dob, malformed dob, and unmapped area
+    res_no_dob = val.validate("050-12-3456", dob=None)
+    assert res_no_dob.is_valid
+    res_bad_dob = val.validate("050-12-3456", dob="not-a-date")
+    assert res_bad_dob.is_valid
+    res_unmapped = val.validate("750-12-3456")
+    assert res_unmapped.status == SsnValidationStatus.VALID
+    assert "Unmapped" in res_unmapped.state_issued
+
+    # Post-2011 randomized area with birth year >= 2011
+    val_default = SsnValidator()
+    res_post_2011 = val_default.validate("750-12-3456", dob="2015-05-01")
+    assert res_post_2011.status == SsnValidationStatus.ISSUED_POST_RANDOMIZATION
+
+    # 3. PiiInconsistencyEngine self-skip & same name/DOB with different SSN
+    pii = PiiInconsistencyEngine()
+    target_p = IdentityProfile(
+        applicant_id="target_1",
+        ssn="050-12-3456",
+        first_name="Alice",
+        last_name="Smith",
+        dob="1990-01-01",
+        phone="+12125551111",
+        email="alice@example.com",
+        address="100 Maple St, Boston, MA",
+    )
+    same_id_p = IdentityProfile(
+        applicant_id="target_1",
+        ssn="050-12-3456",
+        first_name="Alice",
+        last_name="Smith",
+        dob="1990-01-01",
+        phone="+12125551111",
+        email="alice@example.com",
+        address="100 Maple St, Boston, MA",
+    )
+    clone_diff_ssn = IdentityProfile(
+        applicant_id="target_clone",
+        ssn="060-12-3456",
+        first_name="Alice",
+        last_name="Smith",
+        dob="1990-01-01",
+        phone="+12125559999",
+        email="alice.clone@example.com",
+        address="200 Oak St, Boston, MA",
+    )
+    score, _matches, anomalies = pii.evaluate_inconsistency(target_p, [same_id_p, clone_diff_ssn])
+    assert score > 0.0
+    assert SifAnomalyType.PII_ELEMENT_FRAGMENTATION in anomalies
+
+    # 4. SyntheticIdentityTracker phone velocity & address velocity spikes
+    tracker = SyntheticIdentityTracker(
+        max_applications_per_phone=1,
+        max_applications_per_address=1,
+    )
+    now = datetime(2026, 6, 1, 12, 0, 0, tzinfo=UTC)
+    p_phone1 = IdentityProfile(
+        applicant_id="p1",
+        ssn="050-11-1111",
+        first_name="One",
+        last_name="Test",
+        dob="1990-01-01",
+        phone="+12125558888",
+        address="300 Pine St, Boston, MA",
+        email="one@example.com",
+    )
+    p_phone2 = IdentityProfile(
+        applicant_id="p2",
+        ssn="050-22-2222",
+        first_name="Two",
+        last_name="Test",
+        dob="1990-01-01",
+        phone="+12125558888",
+        address="300 Pine St, Boston, MA",
+        email="two@example.com",
+    )
+    tracker.check_and_record(p_phone1, now=now)
+    # Second evaluation triggers velocity burst on phone and address
+    _, tracker_anomalies, _ = tracker.check_and_record(p_phone2, now=now)
+    assert SifAnomalyType.SYNTHETIC_VELOCITY_BURST in tracker_anomalies
+    assert SifAnomalyType.HIGH_RISK_ADDRESS_DROP in tracker_anomalies
+
+    # 5. SyntheticIdentityStore eviction, removal, counts, and listing
+    store = SyntheticIdentityStore(max_records=2)
+    p_a = IdentityProfile(
+        applicant_id="p_a",
+        ssn="050-11-0001",
+        first_name="A",
+        last_name="X",
+        dob="1990-01-01",
+        address="Addr A",
+        phone="+12125550001",
+        email="a@example.com",
+    )
+    p_b = IdentityProfile(
+        applicant_id="p_b",
+        ssn="050-11-0002",
+        first_name="B",
+        last_name="Y",
+        dob="1990-01-01",
+        address="Addr B",
+        phone="",
+        email="",
+    )
+    p_c = IdentityProfile(
+        applicant_id="p_c",
+        ssn="050-11-0003",
+        first_name="C",
+        last_name="Z",
+        dob="1990-01-01",
+        address="Addr C",
+        phone="+12125550003",
+        email="c@example.com",
+    )
+
+    store.add_profile(p_a)
+    store.add_profile(p_a)  # Duplicate add tests branch when app_id already in index
+    store.add_profile(p_b)
+    assert store.profile_count == 2
+    store.add_profile(p_c)  # Triggers eviction of p_a
+    assert store.profile_count == 2
+    assert store.get_profile("p_a") is None
+    assert store.get_profile("p_c") is not None
+
+    store.remove_profile("nonexistent_id")  # Tests remove_profile when prof is None
+    store.remove_profile("p_b")  # Tests remove_profile when phone and email are empty
+    assert store.get_profile("p_b") is None
+    all_profiles = store.list_profiles()
+    assert len(all_profiles) == 1
+
+    # Assessments eviction and listing
+    ass_1 = SifAssessment(
+        assessment_id="ass_1",
+        applicant_id="p_a",
+        risk_score=0.1,
+        risk_level=SifRiskLevel.LOW,
+        action=SifAction.APPROVE,
+        triggered_anomalies=[],
+        ssn_validation=res_no_dob,
+    )
+    ass_2 = SifAssessment(
+        assessment_id="ass_2",
+        applicant_id="p_b",
+        risk_score=0.2,
+        risk_level=SifRiskLevel.LOW,
+        action=SifAction.APPROVE,
+        triggered_anomalies=[],
+        ssn_validation=res_no_dob,
+    )
+    ass_3 = SifAssessment(
+        assessment_id="ass_3",
+        applicant_id="p_c",
+        risk_score=0.3,
+        risk_level=SifRiskLevel.LOW,
+        action=SifAction.APPROVE,
+        triggered_anomalies=[],
+        ssn_validation=res_no_dob,
+    )
+    store.add_assessment(ass_1)
+    store.add_assessment(ass_2)
+    assert store.assessment_count == 2
+    store.add_assessment(ass_3)  # Triggers eviction of ass_1
+    assert store.assessment_count == 2
+    assert store.get_assessment("ass_1") is None
+    assert len(store.list_assessments()) == 2
+    assert len(store.list_assessments(tenant_id="default")) == 2
+
+    # 6. SyntheticIdentityEngine status mappings and floor checks
+    engine = SyntheticIdentityEngine(store=store)
+
+    # Invalid SSN structure status mapping
+    invalid_ssn_prof = IdentityProfile(
+        applicant_id="p_inv_ssn",
+        ssn="123",
+        first_name="Invalid",
+        last_name="SSN",
+        dob="1990-01-01",
+        address="10 Bad St",
+        phone="+12125550010",
+        email="inv@example.com",
+    )
+    eval_inv = engine.evaluate(invalid_ssn_prof)
+    assert SifAnomalyType.INVALID_SSN_STRUCTURE in eval_inv.triggered_anomalies
+
+    # DOB inconsistent status mapping (RRB SSN born after 1963)
+    dob_inconsistent_prof = IdentityProfile(
+        applicant_id="p_rrb",
+        ssn="700-12-3456",
+        first_name="RRB",
+        last_name="Applicant",
+        dob="1990-01-01",
+        address="20 RRB Way",
+        phone="+12125550020",
+        email="rrb@example.com",
+    )
+    eval_rrb = engine.evaluate(dob_inconsistent_prof)
+    assert SifAnomalyType.SSN_DOB_MISMATCH in eval_rrb.triggered_anomalies
+
+    # Unissued area pre-2011 status mapping
+    unissued_prof = IdentityProfile(
+        applicant_id="p_unissued",
+        ssn="750-12-3456",
+        first_name="Unissued",
+        last_name="Applicant",
+        dob="1990-01-01",
+        address="30 Unissued St",
+        phone="+12125550030",
+        email="unissued@example.com",
+    )
+    eval_unissued = engine.evaluate(unissued_prof)
+    assert SifAnomalyType.UNISSUED_SSN_AREA in eval_unissued.triggered_anomalies
+
+    # Authorized user abuse standalone floor check
+    user_rel_1 = AuthorizedUserRecord(user_id="u1", name="Rel 1", relationship="other")
+    user_rel_2 = AuthorizedUserRecord(user_id="u2", name="Rel 2", relationship="broker")
+    piggyback_prof = IdentityProfile(
+        applicant_id="p_piggy",
+        ssn="050-12-3456",
+        first_name="Piggy",
+        last_name="Backer",
+        dob="1990-01-01",
+        address="40 Normal St",
+        phone="+12125550040",
+        email="piggy@example.com",
+        authorized_users=[user_rel_1, user_rel_2],
+    )
+    eval_piggy = engine.evaluate(piggyback_prof)
+    assert SifAnomalyType.AUTHORIZED_USER_ABUSE in eval_piggy.triggered_anomalies
+    assert eval_piggy.risk_score >= 0.55
+
+    # Drop address trigger in tracker
+    drop_prof = IdentityProfile(
+        applicant_id="p_drop",
+        ssn="050-12-3456",
+        first_name="Drop",
+        last_name="User",
+        dob="1990-01-01",
+        address="100 Commercial Mail Drop Suite PMB 99",
+        phone="+12125550050",
+        email="drop@example.com",
+    )
+    _, drop_anomalies, _ = tracker.check_and_record(drop_prof, now=now)
+    assert SifAnomalyType.HIGH_RISK_ADDRESS_DROP in drop_anomalies
