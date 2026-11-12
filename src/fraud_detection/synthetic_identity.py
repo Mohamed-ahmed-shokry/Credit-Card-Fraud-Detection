@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import hashlib
 import re
+import threading
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Any
 from uuid import uuid4
@@ -661,6 +663,164 @@ class PiiInconsistencyEngine:
 
         fragmentation_score = min(1.0, total_penalty)
         return (fragmentation_score, matches, list(anomalies))
+
+
+DROP_ADDRESS_PATTERNS: list[str] = [
+    r"\bp\.?o\.?\s*box\b",
+    r"\bpost\s*office\s*box\b",
+    r"\bpmb\s*#?\d+\b",
+    r"\bsuite\s*pmb\b",
+    r"\bmailbox\s*etc\b",
+    r"\bparcel\s*pickup\b",
+    r"\bc/o\s*drop\b",
+    r"\bvmf\s*box\b",
+    r"\bcommercial\s*mail\b",
+]
+
+BURNER_PHONE_PATTERNS: list[str] = [
+    r"^(?:1)?(?:800|888|877|866|855|844|833)\d{7}$",
+    r"^(?:1)?[2-9]\d{2}55501\d{2}$",
+    r"^(?:1)?(\d)\1{6,}$",
+]
+
+
+class SyntheticIdentityTracker:
+    """Sliding-window velocity and anomaly tracker for synthetic identity patterns."""
+
+    def __init__(
+        self,
+        velocity_window_hours: float = 24.0,
+        max_applications_per_ssn: int = 2,
+        max_applications_per_phone: int = 3,
+        max_applications_per_address: int = 4,
+    ) -> None:
+        self.velocity_window = timedelta(hours=velocity_window_hours)
+        self.max_applications_per_ssn = max_applications_per_ssn
+        self.max_applications_per_phone = max_applications_per_phone
+        self.max_applications_per_address = max_applications_per_address
+        self._lock = threading.RLock()
+
+        self._ssn_history: dict[str, deque[datetime]] = defaultdict(deque)
+        self._phone_history: dict[str, deque[datetime]] = defaultdict(deque)
+        self._address_history: dict[str, deque[datetime]] = defaultdict(deque)
+
+        self._compiled_drop_patterns = [re.compile(p, re.IGNORECASE) for p in DROP_ADDRESS_PATTERNS]
+        self._compiled_phone_patterns = [re.compile(p) for p in BURNER_PHONE_PATTERNS]
+
+    def is_drop_address(self, address: str) -> bool:
+        """Check if address matches known mail drops, freight forwarders, or PO Boxes."""
+        normalized = address.strip()
+        return any(p.search(normalized) for p in self._compiled_drop_patterns)
+
+    def is_burner_phone(self, phone: str) -> bool:
+        """Check if phone number matches toll-free, fake, or repeated burner patterns."""
+        clean = re.sub(r"\D", "", phone)
+        return any(p.match(clean) for p in self._compiled_phone_patterns)
+
+    def is_authorized_user_abuse(self, profile: IdentityProfile) -> tuple[bool, str]:
+        """Detect credit piggybacking / authorized user manipulation."""
+        users = profile.authorized_users
+        if not users:
+            return (False, "")
+
+        count = len(users)
+        # More than 2 authorized users on an initial application is high risk
+        unrelated_count = sum(
+            1
+            for u in users
+            if u.relationship.lower() in {"other", "broker", "investor", "unknown", "none"}
+            or not u.relationship
+        )
+
+        if count >= 3 or (count >= 2 and unrelated_count >= 1):
+            msg = (
+                f"Elevated authorized user count ({count}) "
+                f"with {unrelated_count} non-household relations"
+            )
+            return (True, msg)
+        return (False, "")
+
+    def check_and_record(
+        self,
+        profile: IdentityProfile,
+        now: datetime | None = None,
+    ) -> tuple[float, list[SifAnomalyType], dict[str, Any]]:
+        """Evaluate synthetic velocity, drop address, burner phone, and piggybacking."""
+        current_time = now if now is not None else profile.created_at
+        anomalies: list[SifAnomalyType] = []
+        breakdown: dict[str, float] = {}
+        risk_score = 0.0
+
+        # 1. Drop address check
+        if self.is_drop_address(profile.address):
+            anomalies.append(SifAnomalyType.HIGH_RISK_ADDRESS_DROP)
+            breakdown["high_risk_address_drop"] = 0.35
+            risk_score += 0.35
+
+        # 2. Burner phone check
+        if self.is_burner_phone(profile.phone):
+            anomalies.append(SifAnomalyType.BURNER_PHONE_DETECTED)
+            breakdown["burner_phone_detected"] = 0.40
+            risk_score += 0.40
+
+        # 3. Authorized user abuse check
+        is_abuse, abuse_reason = self.is_authorized_user_abuse(profile)
+        if is_abuse:
+            anomalies.append(SifAnomalyType.AUTHORIZED_USER_ABUSE)
+            breakdown["authorized_user_abuse"] = 0.50
+            risk_score += 0.50
+
+        # 4. Sliding-window velocity check
+        ssn_key = profile.ssn_hash()
+        phone_key = re.sub(r"\D", "", profile.phone)
+        addr_key = profile.address.strip().lower()
+
+        cutoff = current_time - self.velocity_window
+
+        with self._lock:
+            # Clean and check SSN velocity
+            ssn_q = self._ssn_history[ssn_key]
+            while ssn_q and ssn_q[0] < cutoff:
+                ssn_q.popleft()
+            if len(ssn_q) >= self.max_applications_per_ssn:
+                anomalies.append(SifAnomalyType.SYNTHETIC_VELOCITY_BURST)
+                breakdown["ssn_velocity_burst"] = 0.60
+                risk_score += 0.60
+            ssn_q.append(current_time)
+
+            # Clean and check Phone velocity
+            if phone_key:
+                phone_q = self._phone_history[phone_key]
+                while phone_q and phone_q[0] < cutoff:
+                    phone_q.popleft()
+                if (
+                    len(phone_q) >= self.max_applications_per_phone
+                    and SifAnomalyType.SYNTHETIC_VELOCITY_BURST not in anomalies
+                ):
+                    anomalies.append(SifAnomalyType.SYNTHETIC_VELOCITY_BURST)
+                    breakdown["phone_velocity_burst"] = 0.45
+                    risk_score += 0.45
+                phone_q.append(current_time)
+
+            # Clean and check Address velocity
+            if addr_key:
+                addr_q = self._address_history[addr_key]
+                while addr_q and addr_q[0] < cutoff:
+                    addr_q.popleft()
+                if len(addr_q) >= self.max_applications_per_address:
+                    if SifAnomalyType.HIGH_RISK_ADDRESS_DROP not in anomalies:
+                        anomalies.append(SifAnomalyType.HIGH_RISK_ADDRESS_DROP)
+                    breakdown["address_velocity_spike"] = 0.40
+                    risk_score += 0.40
+                addr_q.append(current_time)
+
+        details = {
+            "breakdown": breakdown,
+            "abuse_reason": abuse_reason,
+            "drop_address": SifAnomalyType.HIGH_RISK_ADDRESS_DROP in anomalies,
+            "burner_phone": SifAnomalyType.BURNER_PHONE_DETECTED in anomalies,
+        }
+        return (min(1.0, risk_score), anomalies, details)
 
 
 @dataclass

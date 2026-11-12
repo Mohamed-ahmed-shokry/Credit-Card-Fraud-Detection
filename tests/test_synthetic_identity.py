@@ -288,3 +288,97 @@ def test_pii_inconsistency_shared_contact_and_address() -> None:
     assert "phone" in fields
     assert "email" in fields
     assert "address" in fields
+
+
+def test_synthetic_identity_tracker_drop_and_burner() -> None:
+    from fraud_detection.synthetic_identity import SyntheticIdentityTracker
+
+    tracker = SyntheticIdentityTracker()
+
+    # Drop address PO Box
+    assert tracker.is_drop_address("P.O. Box 742, Springfield, IL") is True
+    assert tracker.is_drop_address("Suite PMB 450, 100 Main St") is True
+    assert tracker.is_drop_address("123 Maple Street, Chicago, IL") is False
+
+    # Burner phone
+    assert tracker.is_burner_phone("18005551234") is True
+    assert tracker.is_burner_phone("+12125550199") is True
+    assert tracker.is_burner_phone("1111111111") is True
+    assert tracker.is_burner_phone("+12175558901") is False
+
+
+def test_synthetic_identity_tracker_piggybacking_and_velocity() -> None:
+    from datetime import timedelta
+
+    from fraud_detection.synthetic_identity import (
+        AuthorizedUserRecord,
+        IdentityProfile,
+        SyntheticIdentityTracker,
+    )
+
+    tracker = SyntheticIdentityTracker(velocity_window_hours=1.0, max_applications_per_ssn=2)
+
+    # Authorized user piggybacking
+    u1 = AuthorizedUserRecord(user_id="u1", name="Tradeline Buyer 1", relationship="other")
+    u2 = AuthorizedUserRecord(user_id="u2", name="Tradeline Buyer 2", relationship="broker")
+    profile = IdentityProfile(
+        applicant_id="app_abuse",
+        ssn="050-12-3456",
+        first_name="David",
+        last_name="Copperfield",
+        dob="1990-01-01",
+        address="100 Grand Ave, New York, NY",
+        phone="+12125558888",
+        email="david@example.com",
+        authorized_users=[u1, u2],
+    )
+
+    score, anomalies, details = tracker.check_and_record(profile)
+    assert SifAnomalyType.AUTHORIZED_USER_ABUSE in anomalies
+    assert details["abuse_reason"] != ""
+    assert score >= 0.5
+
+    # Velocity: second application (below limit 2)
+    p2 = IdentityProfile(
+        applicant_id="app_abuse_2",
+        ssn="050-12-3456",
+        first_name="David",
+        last_name="Copperfield",
+        dob="1990-01-01",
+        address="100 Grand Ave, New York, NY",
+        phone="+12125558888",
+        email="david@example.com",
+    )
+    _score2, anomalies2, _ = tracker.check_and_record(p2)
+    assert SifAnomalyType.SYNTHETIC_VELOCITY_BURST not in anomalies2
+
+    # Third application: exceeds max_applications_per_ssn (2)
+    p3 = IdentityProfile(
+        applicant_id="app_abuse_3",
+        ssn="050-12-3456",
+        first_name="David",
+        last_name="Copperfield",
+        dob="1990-01-01",
+        address="100 Grand Ave, New York, NY",
+        phone="+12125558888",
+        email="david@example.com",
+    )
+    _score3, anomalies3, _ = tracker.check_and_record(p3)
+    assert SifAnomalyType.SYNTHETIC_VELOCITY_BURST in anomalies3
+
+    # Fast forward time beyond window
+    future_time = profile.created_at + timedelta(hours=2.5)
+    p4 = IdentityProfile(
+        applicant_id="app_abuse_4",
+        ssn="050-12-3456",
+        first_name="David",
+        last_name="Copperfield",
+        dob="1990-01-01",
+        address="100 Grand Ave, New York, NY",
+        phone="+12125558888",
+        email="david@example.com",
+        created_at=future_time,
+    )
+    _, anomalies4, _ = tracker.check_and_record(p4, now=future_time)
+    # The old applications should have slid out of the window!
+    assert SifAnomalyType.SYNTHETIC_VELOCITY_BURST not in anomalies4
