@@ -6,11 +6,13 @@ from datetime import UTC, datetime, timedelta
 
 from fraud_detection.mule_detection import (
     HIGH_RISK_OFF_RAMP_CHANNELS,
+    DormancyBurstDetector,
     ExfiltrationChannel,
     MuleAccountProfile,
     MuleAction,
     MuleAnomalyType,
     MuleAssessment,
+    MuleNetworkAnalyzer,
     MuleRiskLevel,
     MuleTransferRecord,
     PassThroughAnalyzer,
@@ -125,3 +127,72 @@ def test_pass_through_analyzer_rapid_cash_out_and_empty() -> None:
     assert MuleAnomalyType.RAPID_DWELL_COMPRESSION in metrics.anomalies
     assert MuleAnomalyType.HIGH_RISK_OFF_RAMP in metrics.anomalies
     assert metrics.risk_score == 1.0
+
+
+def test_mule_network_analyzer_fan_in_fan_out_and_new_counterparties() -> None:
+    net = MuleNetworkAnalyzer(fan_in_threshold=3, fan_out_threshold=3, new_counterparty_threshold=4)
+    empty = net.analyze([])
+    assert empty.unique_inbound_counterparties == 0
+    assert empty.anomalies == []
+
+    t0 = datetime(2026, 11, 12, 10, 0, 0, tzinfo=UTC)
+    transfers = [
+        MuleTransferRecord(
+            transfer_id=f"in_{i}",
+            account_id="acct_hub",
+            counterparty_id=f"src_{i}",
+            direction=TransferDirection.INBOUND,
+            amount=1000.0,
+            timestamp=t0 + timedelta(minutes=i * 10),
+        )
+        for i in range(3)
+    ] + [
+        MuleTransferRecord(
+            transfer_id=f"out_{i}",
+            account_id="acct_hub",
+            counterparty_id=f"dst_{i}",
+            direction=TransferDirection.OUTBOUND,
+            amount=950.0,
+            timestamp=t0 + timedelta(hours=1, minutes=i * 10),
+        )
+        for i in range(3)
+    ]
+    res = net.analyze(transfers, now=t0 + timedelta(hours=2))
+    assert res.unique_inbound_counterparties == 3
+    assert res.unique_outbound_counterparties == 3
+    assert res.new_counterparties_24h == 6
+    assert MuleAnomalyType.FAN_IN_COLLECTION in res.anomalies
+    assert MuleAnomalyType.FAN_OUT_DISPERSION in res.anomalies
+    assert MuleAnomalyType.NEW_COUNTERPARTY_FLOOD in res.anomalies
+    assert res.risk_score == 1.0
+
+
+def test_dormancy_burst_detector() -> None:
+    detector = DormancyBurstDetector(
+        dormancy_days=30, burst_min_transfers=3, burst_min_volume=2000.0
+    )
+    opened = datetime(2026, 1, 1, 0, 0, 0, tzinfo=UTC)
+    empty_prof = MuleAccountProfile(account_id="acct_dormant", account_opened_at=opened)
+    assert detector.evaluate(empty_prof) == (False, 0.0, "")
+
+    burst_time = datetime(2026, 11, 12, 12, 0, 0, tzinfo=UTC)
+    burst_transfers = [
+        MuleTransferRecord(
+            transfer_id=f"b_{i}",
+            account_id="acct_dormant",
+            counterparty_id=f"cp_{i}",
+            direction=TransferDirection.INBOUND if i < 2 else TransferDirection.OUTBOUND,
+            amount=1200.0,
+            timestamp=burst_time + timedelta(minutes=i * 15),
+        )
+        for i in range(3)
+    ]
+    prof = MuleAccountProfile(
+        account_id="acct_dormant",
+        account_opened_at=opened,
+        transfers=burst_transfers,
+    )
+    is_burst, score, reason = detector.evaluate(prof, now=burst_time + timedelta(hours=1))
+    assert is_burst is True
+    assert score == 0.45
+    assert "dormant" in reason.lower()
