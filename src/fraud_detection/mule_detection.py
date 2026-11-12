@@ -13,8 +13,11 @@ from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from statistics import median
 from threading import RLock
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
+
+if TYPE_CHECKING:
+    from fraud_detection.cases import CaseManager
 
 
 class MuleRiskLevel(StrEnum):
@@ -640,3 +643,155 @@ class MuleAccountStore:
         for a in data.get("assessments", []):
             store.add_assessment(MuleAssessment.from_dict(a))
         return store
+
+
+class MuleDetectionEngine:
+    """Composite scoring and policy routing engine for money mule detection."""
+
+    def __init__(
+        self,
+        store: MuleAccountStore | None = None,
+        pass_through_analyzer: PassThroughAnalyzer | None = None,
+        network_analyzer: MuleNetworkAnalyzer | None = None,
+        dormancy_detector: DormancyBurstDetector | None = None,
+        case_manager: CaseManager | None = None,
+        step_up_threshold: float = 0.35,
+        hold_funds_threshold: float = 0.60,
+        freeze_threshold: float = 0.80,
+        escalate_sar_threshold: float = 0.90,
+    ) -> None:
+        self.store = store or MuleAccountStore()
+        self.pass_through_analyzer = pass_through_analyzer or PassThroughAnalyzer()
+        self.network_analyzer = network_analyzer or MuleNetworkAnalyzer()
+        self.dormancy_detector = dormancy_detector or DormancyBurstDetector()
+        self.case_manager = case_manager
+        self.step_up_threshold = step_up_threshold
+        self.hold_funds_threshold = hold_funds_threshold
+        self.freeze_threshold = freeze_threshold
+        self.escalate_sar_threshold = escalate_sar_threshold
+
+    def ingest_and_evaluate(
+        self,
+        transfer: MuleTransferRecord,
+        now: datetime | None = None,
+    ) -> MuleAssessment:
+        """Record a transfer and immediately evaluate the account's mule risk."""
+        profile = self.store.record_transfer(transfer)
+        eval_time = now if now is not None else transfer.timestamp
+        return self.evaluate_account(profile.account_id, now=eval_time)
+
+    def evaluate_account(
+        self,
+        account_id: str,
+        now: datetime | None = None,
+    ) -> MuleAssessment:
+        """Evaluate an existing monitored account for mule activity and route policy."""
+        profile = self.store.get_profile(account_id)
+        if profile is None:
+            profile = MuleAccountProfile(account_id=account_id)
+            self.store.upsert_profile(profile)
+        return self.evaluate_profile(profile, now=now)
+
+    def evaluate_profile(
+        self,
+        profile: MuleAccountProfile,
+        now: datetime | None = None,
+    ) -> MuleAssessment:
+        """Compute composite mule risk score, route policy action, and persist."""
+        eval_time = now if now is not None else datetime.now(UTC)
+        pt = self.pass_through_analyzer.analyze(profile.transfers, now=eval_time)
+        net = self.network_analyzer.analyze(profile.transfers, now=eval_time)
+        is_burst, burst_score, burst_reason = self.dormancy_detector.evaluate(
+            profile, now=eval_time
+        )
+
+        anomalies: list[MuleAnomalyType] = list(pt.anomalies)
+        for a in net.anomalies:
+            if a not in anomalies:
+                anomalies.append(a)
+        if is_burst and MuleAnomalyType.DORMANCY_BURST not in anomalies:
+            anomalies.append(MuleAnomalyType.DORMANCY_BURST)
+
+        breakdown: dict[str, float] = {}
+        if pt.risk_score > 0.0:
+            breakdown["pass_through_velocity"] = round(pt.risk_score, 4)
+        if net.risk_score > 0.0:
+            breakdown["network_topology"] = round(net.risk_score, 4)
+        if burst_score > 0.0:
+            breakdown["dormancy_burst"] = round(burst_score, 4)
+
+        risk_score = min(
+            1.0,
+            max(0.0, pt.risk_score * 0.45 + net.risk_score * 0.35 + burst_score * 0.30),
+        )
+        if (
+            MuleAnomalyType.HIGH_PASS_THROUGH_RATIO in anomalies
+            and MuleAnomalyType.RAPID_DWELL_COMPRESSION in anomalies
+        ):
+            risk_score = max(risk_score, 0.70)
+        if (
+            MuleAnomalyType.HIGH_PASS_THROUGH_RATIO in anomalies
+            and MuleAnomalyType.HIGH_RISK_OFF_RAMP in anomalies
+            and (
+                MuleAnomalyType.FAN_IN_COLLECTION in anomalies
+                or MuleAnomalyType.DORMANCY_BURST in anomalies
+            )
+        ):
+            risk_score = max(risk_score, 0.90)
+
+        if risk_score >= self.escalate_sar_threshold:
+            action = MuleAction.ESCALATE_AML_SAR
+            risk_level = MuleRiskLevel.CRITICAL
+        elif risk_score >= self.freeze_threshold:
+            action = MuleAction.FREEZE_ACCOUNT
+            risk_level = MuleRiskLevel.CRITICAL
+        elif risk_score >= self.hold_funds_threshold:
+            action = MuleAction.HOLD_FUNDS
+            risk_level = MuleRiskLevel.HIGH
+        elif risk_score >= self.step_up_threshold:
+            action = MuleAction.STEP_UP_VERIFICATION
+            risk_level = MuleRiskLevel.MEDIUM
+        else:
+            action = MuleAction.ALLOW
+            risk_level = MuleRiskLevel.LOW
+
+        assessment = MuleAssessment(
+            account_id=profile.account_id,
+            tenant_id=profile.tenant_id,
+            risk_score=round(risk_score, 4),
+            risk_level=risk_level,
+            action=action,
+            triggered_anomalies=anomalies,
+            anomaly_breakdown=breakdown,
+            pass_through_ratio=round(pt.pass_through_ratio, 4),
+            median_dwell_hours=pt.median_dwell_hours,
+            unique_inbound_counterparties=net.unique_inbound_counterparties,
+            unique_outbound_counterparties=net.unique_outbound_counterparties,
+            inbound_volume=round(pt.inbound_volume, 2),
+            outbound_volume=round(pt.outbound_volume, 2),
+            evaluated_at=eval_time,
+            metadata={"dormancy_reason": burst_reason} if burst_reason else {},
+        )
+
+        profile.last_assessed_at = eval_time
+        self.store.upsert_profile(profile)
+        self.store.add_assessment(assessment)
+
+        if self.case_manager is not None and action in (
+            MuleAction.FREEZE_ACCOUNT,
+            MuleAction.ESCALATE_AML_SAR,
+        ):
+            self.case_manager.create_case(
+                transaction_id=assessment.assessment_id,
+                fraud_score=assessment.risk_score,
+                amount=assessment.outbound_volume or assessment.inbound_volume,
+                tenant_id=profile.tenant_id,
+                metadata={
+                    "source": "mule_detection",
+                    "account_id": profile.account_id,
+                    "action": action.value,
+                    "anomalies": [a.value for a in anomalies],
+                },
+            )
+
+        return assessment
