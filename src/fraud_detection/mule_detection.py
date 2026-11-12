@@ -18,6 +18,7 @@ from uuid import uuid4
 
 if TYPE_CHECKING:
     from fraud_detection.cases import CaseManager
+    from fraud_detection.events import EventBus
 
 
 class MuleRiskLevel(StrEnum):
@@ -655,6 +656,7 @@ class MuleDetectionEngine:
         network_analyzer: MuleNetworkAnalyzer | None = None,
         dormancy_detector: DormancyBurstDetector | None = None,
         case_manager: CaseManager | None = None,
+        event_bus: EventBus | None = None,
         step_up_threshold: float = 0.35,
         hold_funds_threshold: float = 0.60,
         freeze_threshold: float = 0.80,
@@ -665,6 +667,7 @@ class MuleDetectionEngine:
         self.network_analyzer = network_analyzer or MuleNetworkAnalyzer()
         self.dormancy_detector = dormancy_detector or DormancyBurstDetector()
         self.case_manager = case_manager
+        self.event_bus = event_bus
         self.step_up_threshold = step_up_threshold
         self.hold_funds_threshold = hold_funds_threshold
         self.freeze_threshold = freeze_threshold
@@ -793,5 +796,66 @@ class MuleDetectionEngine:
                     "anomalies": [a.value for a in anomalies],
                 },
             )
+
+        if self.event_bus is not None:
+            from fraud_detection.events import EventType, FraudDomainEvent
+
+            self.event_bus.publish(
+                FraudDomainEvent(
+                    event_type=EventType.MULE_ACTIVITY_EVALUATED,
+                    payload={
+                        "assessment_id": assessment.assessment_id,
+                        "account_id": profile.account_id,
+                        "risk_score": assessment.risk_score,
+                        "action": action.value,
+                    },
+                    tenant_id=profile.tenant_id,
+                ),
+                synchronous=True,
+            )
+            if action == MuleAction.HOLD_FUNDS:
+                self.event_bus.publish(
+                    FraudDomainEvent(
+                        event_type=EventType.MULE_FUNDS_HELD,
+                        payload={
+                            "assessment_id": assessment.assessment_id,
+                            "account_id": profile.account_id,
+                            "risk_score": assessment.risk_score,
+                        },
+                        tenant_id=profile.tenant_id,
+                    ),
+                    synchronous=True,
+                )
+            elif action in (MuleAction.FREEZE_ACCOUNT, MuleAction.ESCALATE_AML_SAR):
+                self.event_bus.publish(
+                    FraudDomainEvent(
+                        event_type=EventType.MULE_ACCOUNT_FLAGGED,
+                        payload={
+                            "assessment_id": assessment.assessment_id,
+                            "account_id": profile.account_id,
+                            "risk_score": assessment.risk_score,
+                            "action": action.value,
+                        },
+                        tenant_id=profile.tenant_id,
+                    ),
+                    synchronous=True,
+                )
+            if (
+                MuleAnomalyType.FAN_IN_COLLECTION in anomalies
+                or MuleAnomalyType.FAN_OUT_DISPERSION in anomalies
+            ):
+                self.event_bus.publish(
+                    FraudDomainEvent(
+                        event_type=EventType.MULE_NETWORK_DETECTED,
+                        payload={
+                            "assessment_id": assessment.assessment_id,
+                            "account_id": profile.account_id,
+                            "inbound_counterparties": net.unique_inbound_counterparties,
+                            "outbound_counterparties": net.unique_outbound_counterparties,
+                        },
+                        tenant_id=profile.tenant_id,
+                    ),
+                    synchronous=True,
+                )
 
         return assessment
