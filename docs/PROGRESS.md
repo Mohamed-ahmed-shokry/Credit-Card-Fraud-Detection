@@ -7,7 +7,7 @@
 - **Pull Request**: TBD
 
 ## Task Status
-- [ ] Task 1: Create `src/fraud_detection/synthetic_identity.py` with domain data models, enums, serialization, and unit tests in `tests/test_synthetic_identity.py`.
+- [x] Task 1: Create `src/fraud_detection/synthetic_identity.py` with domain data models, enums, serialization, and unit tests in `tests/test_synthetic_identity.py`.
 - [ ] Task 2: Implement `SsnValidator` (SSA issuance table, DOB mismatch, Death Master File checking) in `src/fraud_detection/synthetic_identity.py` with unit tests.
 - [ ] Task 3: Implement `PiiInconsistencyEngine` (PII element fragmentation, cross-element similarity) in `src/fraud_detection/synthetic_identity.py` with unit tests.
 - [ ] Task 4: Implement `SyntheticIdentityTracker` (sliding-window velocity, burner phone/drop address detection, authorized user piggybacking) in `src/fraud_detection/synthetic_identity.py` with unit tests.
@@ -20,7 +20,7 @@
 ## Acceptance Criteria Status
 | Criterion | Status | Evidence |
 |-----------|--------|----------|
-| AC-1 (Domain Models & Taxonomies) | PENDING | Pending Task 1 |
+| AC-1 (Domain Models & Taxonomies) | PASSED | `SifRiskLevel`, `SifAction`, `IdentityProfile`, `SsnValidationResult`, and `SifAssessment` implemented with serialization in `synthetic_identity.py` and verified in `tests/test_synthetic_identity.py` |
 | AC-2 (SSN Validation & DMF Screening) | PENDING | Pending Task 2 |
 | AC-3 (PII Inconsistency & Fragmentation) | PENDING | Pending Task 3 |
 | AC-4 (Synthetic Velocity & Abuse Tracking) | PENDING | Pending Task 4 |
