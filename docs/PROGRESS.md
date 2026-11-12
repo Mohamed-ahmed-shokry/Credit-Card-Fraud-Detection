@@ -11,7 +11,7 @@
 - [x] Task 2: Create `src/fraud_detection/mule_detection.py` domain enums and data models + unit tests in `tests/test_mule_detection.py`.
 - [x] Task 3: Implement `PassThroughAnalyzer` + unit tests.
 - [x] Task 4: Implement `MuleNetworkAnalyzer` & `DormancyBurstDetector` + unit tests.
-- [ ] Task 5: Implement `MuleAccountStore` & `MuleDetectionEngine` + unit tests.
+- [x] Task 5: Implement `MuleAccountStore` & `MuleDetectionEngine` + unit tests.
 - [ ] Task 6: Register `MULE_*` events in `src/fraud_detection/events.py` and wire `EventBus` into `MuleDetectionEngine` + tests.
 - [ ] Task 7: Add `/v1/mule/*` REST endpoints and Prometheus metrics in `src/fraud_detection/api.py` + tests in `tests/test_api.py`.
 - [ ] Task 8: Add `mule-ingest`, `mule-eval`, `mule-inspect`, and `mule-summary` CLI commands in `src/fraud_detection/cli.py` + tests in `tests/test_cli.py`.
@@ -23,7 +23,7 @@
 | AC-1 (Domain Models & Taxonomies) | PASSED | `MuleRiskLevel`, `MuleAction`, `MuleAnomalyType`, `TransferDirection`, `ExfiltrationChannel`, `MuleTransferRecord`, `MuleAccountProfile`, `MuleAssessment` verified in `tests/test_mule_detection.py` |
 | AC-2 (Pass-Through & Dwell Compression) | PASSED | `PassThroughAnalyzer` verified on rapid cash-out sequences, dwell compression, and off-ramps in `tests/test_mule_detection.py` |
 | AC-3 (Network Topology & Dormancy Burst) | PASSED | `MuleNetworkAnalyzer` and `DormancyBurstDetector` verified on fan-in/fan-out concentration and dormancy spikes in `tests/test_mule_detection.py` |
-| AC-4 (Mule Engine, Store & Escalation) | PENDING | Pending Task 5 |
+| AC-4 (Mule Engine, Store & Escalation) | PASSED | `MuleDetectionEngine` and `MuleAccountStore` verified on scoring, policy routing, capacity eviction, and `CaseManager` escalation in `tests/test_mule_detection.py` |
 | AC-5 (EventBus Streaming) | PENDING | Pending Task 6 |
 | AC-6 (REST API & Metrics) | PENDING | Pending Task 7 |
 | AC-7 (CLI Workflows) | PENDING | Pending Task 8 |
