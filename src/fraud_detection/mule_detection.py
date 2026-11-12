@@ -7,10 +7,12 @@ and high-risk off-ramp cash-out channels with zero external dependencies.
 
 from __future__ import annotations
 
+from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from statistics import median
+from threading import RLock
 from typing import Any
 from uuid import uuid4
 
@@ -496,3 +498,145 @@ class DormancyBurstDetector:
             return (True, 0.45, reason)
 
         return (False, 0.0, "")
+
+
+class MuleAccountStore:
+    """Thread-safe in-memory store for monitored mule accounts and assessments."""
+
+    def __init__(self, max_records: int = 10_000) -> None:
+        self.max_records = max_records
+        self._lock = RLock()
+        self._profiles: dict[str, MuleAccountProfile] = {}
+        self._profiles_by_tenant: dict[str, list[str]] = defaultdict(list)
+        self._profiles_by_counterparty: dict[str, list[str]] = defaultdict(list)
+        self._assessments: dict[str, MuleAssessment] = {}
+        self._assessments_by_account: dict[str, list[str]] = defaultdict(list)
+        self._assessments_by_tenant: dict[str, list[str]] = defaultdict(list)
+
+    def upsert_profile(self, profile: MuleAccountProfile) -> None:
+        """Store or update an account profile and maintain secondary indexes."""
+        with self._lock:
+            acct_id = profile.account_id
+            if len(self._profiles) >= self.max_records and acct_id not in self._profiles:
+                oldest = next(iter(self._profiles))
+                self.remove_profile(oldest)
+
+            self._profiles[acct_id] = profile
+            if acct_id not in self._profiles_by_tenant[profile.tenant_id]:
+                self._profiles_by_tenant[profile.tenant_id].append(acct_id)
+            for xfer in profile.transfers:
+                if (
+                    xfer.counterparty_id
+                    and acct_id not in self._profiles_by_counterparty[xfer.counterparty_id]
+                ):
+                    self._profiles_by_counterparty[xfer.counterparty_id].append(acct_id)
+
+    def remove_profile(self, account_id: str) -> None:
+        """Remove an account profile and clean up secondary index entries."""
+        with self._lock:
+            prof = self._profiles.pop(account_id, None)
+            if prof is None:
+                return
+            if account_id in self._profiles_by_tenant[prof.tenant_id]:
+                self._profiles_by_tenant[prof.tenant_id].remove(account_id)
+            for xfer in prof.transfers:
+                if (
+                    xfer.counterparty_id
+                    and account_id in self._profiles_by_counterparty[xfer.counterparty_id]
+                ):
+                    self._profiles_by_counterparty[xfer.counterparty_id].remove(account_id)
+
+    def record_transfer(self, transfer: MuleTransferRecord) -> MuleAccountProfile:
+        """Append a transfer to an existing or newly initialized account profile."""
+        with self._lock:
+            prof = self._profiles.get(transfer.account_id)
+            if prof is None:
+                prof = MuleAccountProfile(
+                    account_id=transfer.account_id,
+                    tenant_id=transfer.tenant_id,
+                    account_opened_at=transfer.timestamp,
+                )
+            prof.transfers.append(transfer)
+            self.upsert_profile(prof)
+            return prof
+
+    def get_profile(self, account_id: str) -> MuleAccountProfile | None:
+        with self._lock:
+            return self._profiles.get(account_id)
+
+    def list_profiles(
+        self, tenant_id: str | None = None, limit: int = 100
+    ) -> list[MuleAccountProfile]:
+        with self._lock:
+            if tenant_id:
+                ids = self._profiles_by_tenant.get(tenant_id, [])
+                return [self._profiles[aid] for aid in reversed(ids) if aid in self._profiles][
+                    :limit
+                ]
+            return list(reversed(list(self._profiles.values())))[:limit]
+
+    def find_accounts_by_counterparty(self, counterparty_id: str) -> list[MuleAccountProfile]:
+        with self._lock:
+            ids = self._profiles_by_counterparty.get(counterparty_id, [])
+            return [self._profiles[aid] for aid in ids if aid in self._profiles]
+
+    def add_assessment(self, assessment: MuleAssessment) -> None:
+        with self._lock:
+            aid = assessment.assessment_id
+            if len(self._assessments) >= self.max_records and aid not in self._assessments:
+                oldest = next(iter(self._assessments))
+                self._assessments.pop(oldest, None)
+            self._assessments[aid] = assessment
+            self._assessments_by_account[assessment.account_id].append(aid)
+            self._assessments_by_tenant[assessment.tenant_id].append(aid)
+
+    def get_assessment(self, assessment_id: str) -> MuleAssessment | None:
+        with self._lock:
+            return self._assessments.get(assessment_id)
+
+    def list_assessments(
+        self, tenant_id: str | None = None, limit: int = 100
+    ) -> list[MuleAssessment]:
+        with self._lock:
+            if tenant_id:
+                aids = self._assessments_by_tenant.get(tenant_id, [])
+                return [
+                    self._assessments[aid] for aid in reversed(aids) if aid in self._assessments
+                ][:limit]
+            return list(reversed(list(self._assessments.values())))[:limit]
+
+    @property
+    def profile_count(self) -> int:
+        with self._lock:
+            return len(self._profiles)
+
+    @property
+    def assessment_count(self) -> int:
+        with self._lock:
+            return len(self._assessments)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._profiles.clear()
+            self._profiles_by_tenant.clear()
+            self._profiles_by_counterparty.clear()
+            self._assessments.clear()
+            self._assessments_by_account.clear()
+            self._assessments_by_tenant.clear()
+
+    def to_dict(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "max_records": self.max_records,
+                "profiles": [p.to_dict() for p in self._profiles.values()],
+                "assessments": [a.to_dict() for a in self._assessments.values()],
+            }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> MuleAccountStore:
+        store = cls(max_records=int(data.get("max_records", 10_000)))
+        for p in data.get("profiles", []):
+            store.upsert_profile(MuleAccountProfile.from_dict(p))
+        for a in data.get("assessments", []):
+            store.add_assessment(MuleAssessment.from_dict(a))
+        return store
