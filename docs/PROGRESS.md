@@ -10,7 +10,7 @@
 - [x] Task 1: Create `src/fraud_detection/synthetic_identity.py` with domain data models, enums, serialization, and unit tests in `tests/test_synthetic_identity.py`.
 - [x] Task 2: Implement `SsnValidator` (SSA issuance table, DOB mismatch, Death Master File checking) in `src/fraud_detection/synthetic_identity.py` with unit tests.
 - [x] Task 3: Implement `PiiInconsistencyEngine` (PII element fragmentation, cross-element similarity) in `src/fraud_detection/synthetic_identity.py` with unit tests.
-- [ ] Task 4: Implement `SyntheticIdentityTracker` (sliding-window velocity, burner phone/drop address detection, authorized user piggybacking) in `src/fraud_detection/synthetic_identity.py` with unit tests.
+- [x] Task 4: Implement `SyntheticIdentityTracker` (sliding-window velocity, burner phone/drop address detection, authorized user piggybacking) in `src/fraud_detection/synthetic_identity.py` with unit tests.
 - [ ] Task 5: Implement `SyntheticIdentityEngine` (composite scoring, policy routing, case/challenge escalation) and thread-safe `SyntheticIdentityStore` in `src/fraud_detection/synthetic_identity.py` with unit tests.
 - [ ] Task 6: Integrate SIF Engine with `events.py` (domain events) with unit and integration tests.
 - [ ] Task 7: Implement `/v1/sif/*` REST endpoints and Prometheus metrics in `src/fraud_detection/api.py` with integration tests in `tests/test_api.py`.
@@ -23,7 +23,7 @@
 | AC-1 (Domain Models & Taxonomies) | PASSED | `SifRiskLevel`, `SifAction`, `IdentityProfile`, `SsnValidationResult`, and `SifAssessment` implemented with serialization in `synthetic_identity.py` and verified in `tests/test_synthetic_identity.py` |
 | AC-2 (SSN Validation & DMF Screening) | PASSED | `SsnValidator` implements SSA area/group tables, June 2011 randomization boundary, Railroad Retirement DOB mismatch, and simulated DMF registry verified in `tests/test_synthetic_identity.py` |
 | AC-3 (PII Inconsistency & Fragmentation) | PASSED | `PiiInconsistencyEngine` detects PII fragmentation, stolen SSN spliced with conflicting names/DOBs, and shared contact channels verified in `tests/test_synthetic_identity.py` |
-| AC-4 (Synthetic Velocity & Abuse Tracking) | PENDING | Pending Task 4 |
+| AC-4 (Synthetic Velocity & Abuse Tracking) | PASSED | `SyntheticIdentityTracker` detects drop addresses/CMRA, burner/VOIP patterns, authorized user piggybacking, and sliding-window multi-application velocity bursts verified in `tests/test_synthetic_identity.py` |
 | AC-5 (SIF Scoring Engine & Policy Routing) | PENDING | Pending Task 5 |
 | AC-6 (Thread-Safe Store & EventBus Streaming) | PENDING | Pending Task 6 |
 | AC-7 (REST API & Observability) | PENDING | Pending Task 7 |
