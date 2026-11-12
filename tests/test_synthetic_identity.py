@@ -214,3 +214,77 @@ def test_group_order_helper() -> None:
     # Invalid
     assert get_group_order(0) == 0
     assert get_group_order(100) == 0
+
+
+def test_pii_inconsistency_engine_fragmentation() -> None:
+    from fraud_detection.synthetic_identity import (
+        PiiInconsistencyEngine,
+    )
+
+    engine = PiiInconsistencyEngine()
+
+    target = IdentityProfile(
+        applicant_id="app_new",
+        ssn="050-12-3456",
+        first_name="Alice",
+        last_name="Johnson",
+        dob="1992-06-15",
+        address="742 Evergreen Terrace, Springfield, IL",
+        phone="+12175550001",
+        email="alice.j@example.com",
+    )
+
+    # 1. Stolen SSN with different name
+    hist1 = IdentityProfile(
+        applicant_id="app_old_1",
+        ssn="050-12-3456",
+        first_name="Robert",
+        last_name="Smith",
+        dob="1985-01-20",
+        address="100 Oak St, Chicago, IL",
+        phone="+13125559999",
+        email="rsmith@example.com",
+    )
+
+    score, matches, anomalies = engine.evaluate_inconsistency(target, [hist1])
+    assert score > 0.8
+    assert SifAnomalyType.PII_ELEMENT_FRAGMENTATION in anomalies
+    assert SifAnomalyType.SSN_DOB_MISMATCH in anomalies
+    assert len(matches) == 2
+    match_dict = matches[0].to_dict()
+    assert match_dict["overlap_field"] == "ssn"
+    assert "Robert Smith" in match_dict["description"]
+
+
+def test_pii_inconsistency_shared_contact_and_address() -> None:
+    from fraud_detection.synthetic_identity import PiiInconsistencyEngine
+
+    engine = PiiInconsistencyEngine()
+    target = IdentityProfile(
+        applicant_id="target_app",
+        ssn="123-45-6789",
+        first_name="Charlie",
+        last_name="Brown",
+        dob="1995-10-10",
+        address="456 Elm Ave Apt 2, Boston, MA",
+        phone="+16175551212",
+        email="charlie.b@testmail.com",
+    )
+    # Different person with same phone, email, and address
+    hist = IdentityProfile(
+        applicant_id="hist_app",
+        ssn="987-65-4321",
+        first_name="Danielle",
+        last_name="Vance",
+        dob="1991-03-05",
+        address="456 Elm Ave Apt 2, Boston, MA",
+        phone="+16175551212",
+        email="charlie.b@testmail.com",
+    )
+
+    score, matches, _ = engine.evaluate_inconsistency(target, [hist])
+    assert score > 0.5
+    fields = {m.overlap_field for m in matches}
+    assert "phone" in fields
+    assert "email" in fields
+    assert "address" in fields

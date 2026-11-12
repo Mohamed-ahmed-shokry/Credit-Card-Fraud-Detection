@@ -15,6 +15,8 @@ from enum import StrEnum
 from typing import Any
 from uuid import uuid4
 
+from fraud_detection.aml import jaro_winkler_similarity, levenshtein_similarity
+
 # SSA Area to State mapping (pre-2011 historical allocation)
 SSA_AREA_ALLOCATION: list[tuple[int, int, str, int, int]] = [
     (1, 3, "New Hampshire", 1936, 2011),
@@ -479,6 +481,186 @@ class SsnValidator:
             estimated_issuance_year_range=(from_yr, to_yr),
             details=f"Valid pre-randomization SSN issued in {state}",
         )
+
+
+@dataclass(frozen=True)
+class PiiFragmentationMatch:
+    """Individual conflict or overlap indicating PII splicing across applicant profiles."""
+
+    matched_applicant_id: str
+    overlap_field: str
+    conflicting_field: str
+    similarity: float
+    risk_penalty: float
+    description: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "matched_applicant_id": self.matched_applicant_id,
+            "overlap_field": self.overlap_field,
+            "conflicting_field": self.conflicting_field,
+            "similarity": round(self.similarity, 4),
+            "risk_penalty": round(self.risk_penalty, 4),
+            "description": self.description,
+        }
+
+
+class PiiInconsistencyEngine:
+    """Evaluates cross-application PII element fragmentation and pairwise similarity anomalies."""
+
+    def __init__(
+        self,
+        name_similarity_threshold: float = 0.70,
+        address_similarity_threshold: float = 0.85,
+    ) -> None:
+        self.name_similarity_threshold = name_similarity_threshold
+        self.address_similarity_threshold = address_similarity_threshold
+
+    def evaluate_inconsistency(
+        self,
+        target: IdentityProfile,
+        historical_profiles: list[IdentityProfile],
+    ) -> tuple[float, list[PiiFragmentationMatch], list[SifAnomalyType]]:
+        """Compute PII fragmentation penalty and detect conflicting historical identities."""
+        matches: list[PiiFragmentationMatch] = []
+        anomalies: set[SifAnomalyType] = set()
+        total_penalty = 0.0
+
+        target_name = f"{target.first_name} {target.last_name}".strip().lower()
+        target_ssn_hash = target.ssn_hash()
+        target_phone = re.sub(r"\D", "", target.phone)
+        target_email = target.email.strip().lower()
+        target_address = target.address.strip().lower()
+
+        for h in historical_profiles:
+            if h.applicant_id == target.applicant_id:
+                continue
+
+            h_name = f"{h.first_name} {h.last_name}".strip().lower()
+            h_ssn_hash = h.ssn_hash()
+            h_phone = re.sub(r"\D", "", h.phone)
+            h_email = h.email.strip().lower()
+            h_address = h.address.strip().lower()
+
+            name_sim = jaro_winkler_similarity(target_name, h_name)
+
+            # 1. Same SSN, different Name
+            if target_ssn_hash == h_ssn_hash:
+                if name_sim < self.name_similarity_threshold:
+                    penalty = 0.85
+                    total_penalty += penalty
+                    anomalies.add(SifAnomalyType.PII_ELEMENT_FRAGMENTATION)
+                    matches.append(
+                        PiiFragmentationMatch(
+                            matched_applicant_id=h.applicant_id,
+                            overlap_field="ssn",
+                            conflicting_field="name",
+                            similarity=name_sim,
+                            risk_penalty=penalty,
+                            description=(
+                                f"Same SSN used by distinct name '{h.first_name} {h.last_name}' "
+                                f"(similarity: {name_sim:.2f})"
+                            ),
+                        )
+                    )
+                # Check DOB with same SSN
+                if target.dob and h.dob and target.dob != h.dob:
+                    penalty = 0.60
+                    total_penalty += penalty
+                    anomalies.add(SifAnomalyType.SSN_DOB_MISMATCH)
+                    matches.append(
+                        PiiFragmentationMatch(
+                            matched_applicant_id=h.applicant_id,
+                            overlap_field="ssn",
+                            conflicting_field="dob",
+                            similarity=0.0,
+                            risk_penalty=penalty,
+                            description=f"Same SSN registered with conflicting DOB '{h.dob}'",
+                        )
+                    )
+
+            # 2. Similar/Same Name & DOB, but different SSN
+            elif name_sim >= 0.90 and target.dob and h.dob and target.dob == h.dob:
+                penalty = 0.75
+                total_penalty += penalty
+                anomalies.add(SifAnomalyType.PII_ELEMENT_FRAGMENTATION)
+                matches.append(
+                    PiiFragmentationMatch(
+                        matched_applicant_id=h.applicant_id,
+                        overlap_field="name_and_dob",
+                        conflicting_field="ssn",
+                        similarity=name_sim,
+                        risk_penalty=penalty,
+                        description="Identical Name and DOB associated with a different SSN",
+                    )
+                )
+
+            # 3. Same Phone, different SSN and Name
+            if (
+                target_phone
+                and h_phone
+                and target_phone == h_phone
+                and target_ssn_hash != h_ssn_hash
+                and name_sim < self.name_similarity_threshold
+            ):
+                penalty = 0.35
+                total_penalty += penalty
+                matches.append(
+                    PiiFragmentationMatch(
+                        matched_applicant_id=h.applicant_id,
+                        overlap_field="phone",
+                        conflicting_field="identity",
+                        similarity=name_sim,
+                        risk_penalty=penalty,
+                        description=f"Shared phone number across distinct identity '{h_name}'",
+                    )
+                )
+
+            # 4. Same Email, different SSN and Name
+            if (
+                target_email
+                and h_email
+                and target_email == h_email
+                and target_ssn_hash != h_ssn_hash
+                and name_sim < self.name_similarity_threshold
+            ):
+                penalty = 0.35
+                total_penalty += penalty
+                matches.append(
+                    PiiFragmentationMatch(
+                        matched_applicant_id=h.applicant_id,
+                        overlap_field="email",
+                        conflicting_field="identity",
+                        similarity=name_sim,
+                        risk_penalty=penalty,
+                        description=f"Shared email address across distinct identity '{h_name}'",
+                    )
+                )
+
+            # 5. Same Address, different last name and different SSN
+            if target_address and h_address:
+                addr_sim = levenshtein_similarity(target_address, h_address)
+                if (
+                    addr_sim >= self.address_similarity_threshold
+                    and target.last_name.lower() != h.last_name.lower()
+                    and target_ssn_hash != h_ssn_hash
+                ):
+                    penalty = 0.25
+                    total_penalty += penalty
+                    desc = f"Shared address '{h.address}' with unrelated last name '{h.last_name}'"
+                    matches.append(
+                        PiiFragmentationMatch(
+                            matched_applicant_id=h.applicant_id,
+                            overlap_field="address",
+                            conflicting_field="last_name",
+                            similarity=addr_sim,
+                            risk_penalty=penalty,
+                            description=desc,
+                        )
+                    )
+
+        fragmentation_score = min(1.0, total_penalty)
+        return (fragmentation_score, matches, list(anomalies))
 
 
 @dataclass
