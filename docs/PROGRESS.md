@@ -8,7 +8,7 @@
 
 ## Task Status
 - [x] Task 1: Define Phase 50 roadmap & initialize `docs/PROGRESS.md`.
-- [ ] Task 2: Create `src/fraud_detection/mule_detection.py` domain enums and data models + unit tests in `tests/test_mule_detection.py`.
+- [x] Task 2: Create `src/fraud_detection/mule_detection.py` domain enums and data models + unit tests in `tests/test_mule_detection.py`.
 - [ ] Task 3: Implement `PassThroughAnalyzer` + unit tests.
 - [ ] Task 4: Implement `MuleNetworkAnalyzer` & `DormancyBurstDetector` + unit tests.
 - [ ] Task 5: Implement `MuleAccountStore` & `MuleDetectionEngine` + unit tests.
@@ -20,7 +20,7 @@
 ## Acceptance Criteria Status
 | Criterion | Status | Evidence |
 |-----------|--------|----------|
-| AC-1 (Domain Models & Taxonomies) | PENDING | Pending Task 2 |
+| AC-1 (Domain Models & Taxonomies) | PASSED | `MuleRiskLevel`, `MuleAction`, `MuleAnomalyType`, `TransferDirection`, `ExfiltrationChannel`, `MuleTransferRecord`, `MuleAccountProfile`, `MuleAssessment` verified in `tests/test_mule_detection.py` |
 | AC-2 (Pass-Through & Dwell Compression) | PENDING | Pending Task 3 |
 | AC-3 (Network Topology & Dormancy Burst) | PENDING | Pending Task 4 |
 | AC-4 (Mule Engine, Store & Escalation) | PENDING | Pending Task 5 |
