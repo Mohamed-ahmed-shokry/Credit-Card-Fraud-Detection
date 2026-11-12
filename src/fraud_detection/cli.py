@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import statistics
 import subprocess
 import time
 import urllib.error
 import urllib.request
+from collections import defaultdict
 from pathlib import Path
 from typing import Annotated, Any, NoReturn, cast
 from uuid import uuid4
@@ -18,12 +20,64 @@ import typer
 import uvicorn
 
 from fraud_detection import __version__
+from fraud_detection.aml import (
+    DEFAULT_WATCHLIST_ENTRIES,
+    AmlAlert,
+    AmlEngine,
+    AmlRiskLevel,
+    AmlStore,
+    AmlTransactionEvent,
+    AmlTypology,
+    SarDossier,
+    SarManager,
+    SarStatus,
+    TransactionDirection,
+    WatchlistEntry,
+    WatchlistScreeningEngine,
+)
+from fraud_detection.ato import (
+    AccountMutationRecord,
+    AccountMutationType,
+    AccountProfile,
+    AccountProfileTracker,
+    AtoEngine,
+    AtoRiskAssessment,
+    AtoStore,
+    LoginEvent,
+    LoginOutcome,
+)
 from fraud_detection.audit import (
     JsonlAuditSink,
     backtest_audit_policy,
+    build_pipeline_chaos_audit_event,
+    build_pipeline_replay_audit_event,
     build_promotion_audit_event,
     build_scoring_audit_event,
     replay_audit_log,
+)
+from fraud_detection.cases import (
+    CaseDisposition,
+    CaseError,
+    CaseManager,
+    CasePriority,
+    CaseStore,
+    FraudCase,
+)
+from fraud_detection.challenge import (
+    ChallengeError,
+    ChallengeManager,
+    ChallengeMethod,
+    ChallengePolicy,
+    ChallengeSession,
+    ChallengeStore,
+)
+from fraud_detection.chargeback import (
+    CardScheme,
+    ChargebackDispute,
+    ChargebackError,
+    ChargebackManager,
+    ChargebackStage,
+    ChargebackStore,
 )
 from fraud_detection.data import (
     DEFAULT_TARGET,
@@ -32,6 +86,15 @@ from fraud_detection.data import (
     generate_synthetic_data,
     inject_drift,
     load_csv,
+)
+from fraud_detection.device import (
+    DeviceFeatureExtractor,
+    DeviceFingerprint,
+    DeviceFingerprintError,
+    DeviceHasher,
+    DeviceTracker,
+    DeviceTrackerConfig,
+    ScreenGeometry,
 )
 from fraud_detection.drift import (
     DriftError,
@@ -57,6 +120,17 @@ from fraud_detection.evaluation import (
     expected_classification_cost,
     summarize_thresholds,
 )
+from fraud_detection.events import (
+    DeadLetterRecord,
+    DispatchConfig,
+    EventDeliveryStatus,
+    EventError,
+    EventType,
+    FraudDomainEvent,
+    SubscriptionRegistry,
+    WebhookDispatcher,
+    WebhookSubscription,
+)
 from fraud_detection.explanations import ExplanationProvider
 from fraud_detection.features import (
     FeatureSkewAnalyzer,
@@ -64,6 +138,43 @@ from fraud_detection.features import (
     FileFeatureStore,
     SkewStatus,
     point_in_time_join,
+)
+from fraud_detection.feedback import (
+    FeedbackError,
+    FeedbackSurveillanceAnalyzer,
+    LabelIngestionStore,
+    LabelMaturationCurve,
+    RetrainingTriggerPolicy,
+    match_labels_with_audit_log,
+    partition_into_cohorts,
+)
+from fraud_detection.geolocation import (
+    DEFAULT_MAX_SPEED_KMH,
+    GeoCoordinates,
+    GeoFeatureConfig,
+    GeoFeatureExtractor,
+    GeoLocationError,
+    GeoLocationEvent,
+    GeoLocationTracker,
+    IPGeoResolver,
+)
+from fraud_detection.graph import (
+    EntityGraph,
+    EntityType,
+    FraudRingDetector,
+    FraudRingDetectorConfig,
+    GraphConfig,
+    GraphFeatureConfig,
+    GraphFeatureExtractor,
+    RingSeverity,
+)
+from fraud_detection.merchant import (
+    MerchantFeatureExtractor,
+    MerchantRiskError,
+    MerchantTracker,
+    MerchantTrackerConfig,
+    MerchantTransactionEvent,
+    resolve_mcc_profile,
 )
 from fraud_detection.model import (
     MANIFEST_FILENAME,
@@ -84,7 +195,12 @@ from fraud_detection.model import (
 )
 from fraud_detection.pipeline import (
     DecisionGraphExecutor,
+    StageFaultSpec,
+    StageFaultType,
     create_default_fraud_pipeline,
+    optimize_counterfactual_pipeline,
+    replay_audit_log_through_pipeline,
+    simulate_pipeline_chaos,
 )
 from fraud_detection.recalibration import (
     CalibrationDiagnostics,
@@ -94,6 +210,16 @@ from fraud_detection.recalibration import (
     compute_calibration_drift,
 )
 from fraud_detection.reporting import ComplianceReportError, render_compliance_report
+from fraud_detection.retraining import (
+    ChallengerSafetyVerifier,
+    ChallengerTrainer,
+    RetrainingConfig,
+    RetrainingDatasetBuilder,
+    RetrainingError,
+    SafetyGatingThresholds,
+    VerificationStatus,
+    export_certified_candidate,
+)
 from fraud_detection.routing import (
     CanaryConfig,
     TrafficSplitStrategy,
@@ -106,6 +232,22 @@ from fraud_detection.signing import (
     load_public_key,
     verify_attestation_signature,
     write_keypair,
+)
+from fraud_detection.synthetic_identity import (
+    IdentityProfile,
+    SifAssessment,
+    SsnValidator,
+    SyntheticIdentityEngine,
+    SyntheticIdentityStore,
+)
+from fraud_detection.tenant import (
+    RuleInheritanceMode,
+    TenantContext,
+    TenantError,
+    TenantRegistry,
+    TenantRiskProfile,
+    TenantStatus,
+    TenantTier,
 )
 from fraud_detection.trust import (
     TrustBundle,
@@ -4890,6 +5032,59 @@ def pipeline_eval(
             help="Exit with code 1 if any transaction executed in degraded mode.",
         ),
     ] = False,
+    enable_cache: Annotated[
+        bool,
+        typer.Option(
+            "--enable-cache/--no-enable-cache",
+            help="Enable deterministic in-memory node caching across pipeline stages.",
+        ),
+    ] = False,
+    cache_size: Annotated[
+        int,
+        typer.Option(
+            "--cache-size",
+            help="Maximum LRU cache entries per pipeline stage.",
+            min=1,
+        ),
+    ] = 1000,
+    cache_ttl: Annotated[
+        float,
+        typer.Option(
+            "--cache-ttl",
+            help="TTL in seconds for cached stage outputs.",
+            min=0.001,
+        ),
+    ] = 60.0,
+    speculative: Annotated[
+        bool,
+        typer.Option(
+            "--speculative/--no-speculative",
+            help="Enable speculative asynchronous model inference execution.",
+        ),
+    ] = False,
+    enable_circuit_breaker: Annotated[
+        bool,
+        typer.Option(
+            "--enable-circuit-breaker/--no-circuit-breaker",
+            help="Enable stage-level circuit breakers for fast-fail isolation.",
+        ),
+    ] = False,
+    cb_failure_threshold: Annotated[
+        int,
+        typer.Option(
+            "--cb-failure-threshold",
+            help="Consecutive failure threshold before tripping stage circuit breaker.",
+            min=1,
+        ),
+    ] = 5,
+    cb_recovery_timeout: Annotated[
+        float,
+        typer.Option(
+            "--cb-recovery-timeout",
+            help="Recovery timeout in seconds before stage circuit attempts half-open probe.",
+            min=0.001,
+        ),
+    ] = 30.0,
     output: Annotated[
         Path | None,
         typer.Option(
@@ -4956,18 +5151,34 @@ def pipeline_eval(
         velocity_buffer=loaded_vb,
         velocity_config=loaded_vc,
         recalibrator=getattr(loaded_model, "recalibrator", None),
+        enable_cache=enable_cache,
+        cache_ttl_seconds=cache_ttl,
+        cache_max_size=cache_size,
+        speculative_inference=speculative,
+        enable_circuit_breaker=enable_circuit_breaker,
+        circuit_failure_threshold=cb_failure_threshold,
+        circuit_recovery_timeout_seconds=cb_recovery_timeout,
     )
-    executor = DecisionGraphExecutor(pipeline_graph)
+    executor = DecisionGraphExecutor(
+        pipeline_graph,
+        enable_cache=enable_cache,
+        enable_speculative=speculative,
+        enable_circuit_breaker=enable_circuit_breaker,
+    )
 
     total = len(df)
     decisions_count: dict[str, int] = {"ALLOW": 0, "REVIEW": 0, "DENY": 0}
     fraud_count = 0
     degraded_count = 0
     degraded_node_counts: dict[str, int] = {}
+    circuit_short_circuits_count = 0
+    circuit_short_circuit_node_counts: dict[str, int] = {}
     latencies: list[float] = []
-    stage_latencies: dict[str, list[float]] = {
-        node_name: [] for node_name in pipeline_graph.nodes
-    }
+    stage_latencies: dict[str, list[float]] = {node_name: [] for node_name in pipeline_graph.nodes}
+    total_cache_hits = 0
+    total_cache_misses = 0
+    speculative_executed_count = 0
+    speculative_hit_count = 0
 
     records = cast(list[dict[str, Any]], df.to_dict(orient="records"))
     for rec in records:
@@ -4980,17 +5191,30 @@ def pipeline_eval(
         if res.degraded:
             degraded_count += 1
             for node_name in res.degraded_nodes:
-                degraded_node_counts[node_name] = (
-                    degraded_node_counts.get(node_name, 0) + 1
+                degraded_node_counts[node_name] = degraded_node_counts.get(node_name, 0) + 1
+        if res.circuit_short_circuits:
+            circuit_short_circuits_count += len(res.circuit_short_circuits)
+            for sc_node in res.circuit_short_circuits:
+                circuit_short_circuit_node_counts[sc_node] = (
+                    circuit_short_circuit_node_counts.get(sc_node, 0) + 1
                 )
         for stage_name, s_res in res.stage_results.items():
             if stage_name in stage_latencies:
                 stage_latencies[stage_name].append(s_res.latency_ms)
+        total_cache_hits += res.cache_hits
+        total_cache_misses += res.cache_misses
+        if res.speculative_executed:
+            speculative_executed_count += 1
+        if res.speculative_hit:
+            speculative_hit_count += 1
 
     mean_lat = statistics.fmean(latencies) if latencies else 0.0
     p50_lat = float(np.percentile(latencies, 50)) if latencies else 0.0
     p95_lat = float(np.percentile(latencies, 95)) if latencies else 0.0
     p99_lat = float(np.percentile(latencies, 99)) if latencies else 0.0
+
+    cache_lookups = total_cache_hits + total_cache_misses
+    cache_hit_ratio = round(total_cache_hits / cache_lookups, 4) if cache_lookups > 0 else 0.0
 
     stage_stats: dict[str, dict[str, float]] = {}
     for stage_name, slist in stage_latencies.items():
@@ -5009,6 +5233,25 @@ def pipeline_eval(
         "degraded_count": degraded_count,
         "degraded_rate": round(degraded_count / total, 4) if total > 0 else 0.0,
         "degraded_nodes": degraded_node_counts,
+        "circuit_breaker": {
+            "enabled": enable_circuit_breaker,
+            "short_circuits_count": circuit_short_circuits_count,
+            "short_circuit_nodes": circuit_short_circuit_node_counts,
+            "summary": executor.circuits.summary() if enable_circuit_breaker else {},
+        },
+        "cache": {
+            "enabled": enable_cache,
+            "hits": total_cache_hits,
+            "misses": total_cache_misses,
+            "hit_ratio": cache_hit_ratio,
+            "size": executor.cache.stats_dict()["total_size"] if enable_cache else 0,
+            "max_size": cache_size if enable_cache else 0,
+        },
+        "speculative": {
+            "enabled": speculative,
+            "executed": speculative_executed_count,
+            "hits": speculative_hit_count,
+        },
         "latency_ms": {
             "mean": round(mean_lat, 3),
             "p50": round(p50_lat, 3),
@@ -5034,6 +5277,22 @@ def pipeline_eval(
         typer.echo(f"  Fraud Count: {fraud_count} ({fraud_pct:.2f}%)")
         deg_pct = (degraded_count / total * 100.0) if total > 0 else 0.0
         typer.echo(f"  Degraded Executions: {degraded_count} ({deg_pct:.2f}%)")
+        if enable_circuit_breaker:
+            typer.echo(
+                f"  Circuit Breaker: Short Circuits={circuit_short_circuits_count}, "
+                f"Trips={executor.circuits.summary().get('total_trips', 0)}"
+            )
+        if enable_cache:
+            cache_pct = cache_hit_ratio * 100.0
+            typer.echo(
+                f"  Cache: Hits={total_cache_hits}, Misses={total_cache_misses}, "
+                f"Hit Ratio={cache_pct:.1f}%"
+            )
+        if speculative:
+            typer.echo(
+                f"  Speculative Inference: Executed={speculative_executed_count}, "
+                f"Hits={speculative_hit_count}"
+            )
         typer.echo(
             f"  Latency (ms): Mean={mean_lat:.2f}ms, P50={p50_lat:.2f}ms, "
             f"P95={p95_lat:.2f}ms, P99={p99_lat:.2f}ms"
@@ -5048,7 +5307,5654 @@ def pipeline_eval(
         raise typer.Exit(code=1)
 
 
+@app.command("pipeline-replay")
+def pipeline_replay_command(
+    audit_log: Annotated[
+        Path,
+        typer.Argument(
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="JSONL audit log file containing historical scoring events.",
+        ),
+    ],
+    model: Annotated[
+        Path,
+        typer.Option(
+            "--model",
+            "-m",
+            exists=True,
+            readable=True,
+            help="Model artifact directory or file to evaluate in the decision graph.",
+        ),
+    ],
+    rules: Annotated[
+        Path | None,
+        typer.Option(
+            "--rules",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="Optional declarative JSON rules file for graph rules stage.",
+        ),
+    ] = None,
+    rule_precedence: Annotated[
+        str,
+        typer.Option(
+            "--rule-precedence",
+            help="Precedence: 'rules_override_model' or 'model_overrides_rules'.",
+        ),
+    ] = "rules_override_model",
+    data: Annotated[
+        Path | None,
+        typer.Option(
+            "--data",
+            "-d",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="Optional CSV of transactions if features are not logged inline in the audit log.",
+        ),
+    ] = None,
+    threshold: Annotated[
+        float | None,
+        typer.Option(
+            "--threshold",
+            "-t",
+            min=0.0,
+            max=1.0,
+            help="Operational threshold override for binary decision.",
+        ),
+    ] = None,
+    review_threshold: Annotated[
+        float | None,
+        typer.Option(
+            "--review-threshold",
+            min=0.0,
+            max=1.0,
+            help="Review boundary for tiered decision policy.",
+        ),
+    ] = None,
+    deny_threshold: Annotated[
+        float | None,
+        typer.Option(
+            "--deny-threshold",
+            min=0.0,
+            max=1.0,
+            help="Deny boundary for tiered decision policy.",
+        ),
+    ] = None,
+    tolerance: Annotated[
+        float,
+        typer.Option(
+            "--tolerance",
+            min=0.0,
+            help="Maximum acceptable difference between logged and replayed probability.",
+        ),
+    ] = 1e-4,
+    enable_cache: Annotated[
+        bool,
+        typer.Option(
+            "--enable-cache/--no-cache",
+            help="Enable stage execution memoization during replay.",
+        ),
+    ] = False,
+    speculative: Annotated[
+        bool,
+        typer.Option(
+            "--speculative/--no-speculative",
+            help="Enable speculative asynchronous inference during replay.",
+        ),
+    ] = False,
+    fail_on_divergence: Annotated[
+        bool,
+        typer.Option(
+            "--fail-on-divergence",
+            help="Exit with code 1 if status reaches DIVERGENT.",
+        ),
+    ] = False,
+    output: Annotated[
+        Path | None,
+        typer.Option(
+            "--output",
+            "-o",
+            help="Optional path to write JSON replay report.",
+        ),
+    ] = None,
+    audit_output: Annotated[
+        Path | None,
+        typer.Option(
+            "--audit-log",
+            "-a",
+            help="Optional destination JSONL file to record pipeline replay audit event.",
+        ),
+    ] = None,
+    as_json: Annotated[
+        bool,
+        typer.Option(
+            "--json",
+            help="Print report in JSON format.",
+        ),
+    ] = False,
+    overwrite: Annotated[
+        bool,
+        typer.Option(
+            "--overwrite/--no-overwrite",
+            help="Allow overwriting output file.",
+        ),
+    ] = False,
+) -> None:
+    """Replay historical audit events through a candidate decision graph pipeline."""
+    _guard_output(output, overwrite)
+
+    try:
+        from fraud_detection.rules import RulePrecedence, RuleSet
+
+        resolved_prec = RulePrecedence(rule_precedence.strip().lower())
+    except ValueError:
+        _abort(
+            f"Invalid --rule-precedence '{rule_precedence}'. "
+            "Must be 'rules_override_model' or 'model_overrides_rules'."
+        )
+
+    try:
+        loaded_model = load_model(model)
+    except (ModelArtifactError, OSError, ValueError) as exc:
+        _abort(f"Failed to load model from '{model}': {exc}")
+
+    loaded_rules: RuleSet | None = None
+    if rules is not None:
+        try:
+            loaded_rules = RuleSet.load_file(rules)
+        except (OSError, ValueError, TypeError, KeyError, RuntimeError) as exc:
+            _abort(f"Failed to load rules from '{rules}': {exc}")
+
+    graph = create_default_fraud_pipeline(
+        model=loaded_model,
+        rules=loaded_rules,
+        rule_precedence=resolved_prec,
+        threshold=threshold,
+        review_threshold=review_threshold,
+        deny_threshold=deny_threshold,
+        enable_cache=enable_cache,
+        speculative_inference=speculative,
+    )
+    executor = DecisionGraphExecutor(
+        graph,
+        enable_cache=enable_cache,
+        enable_speculative=speculative,
+    )
+
+    try:
+        report = replay_audit_log_through_pipeline(
+            audit_log_path=audit_log,
+            pipeline=executor,
+            data_path=data,
+            tolerance=tolerance,
+        )
+    except (OSError, ValueError, TypeError, FileNotFoundError) as exc:
+        _abort(str(exc))
+
+    if audit_output is not None:
+        sink = JsonlAuditSink(audit_output)
+        try:
+            audit_ev = build_pipeline_replay_audit_event(
+                pipeline_name=graph.name,
+                audit_source=str(audit_log),
+                replayed_events=report.replayed_events,
+                total_transactions=report.total_transactions,
+                score_discrepancies=report.score_discrepancies,
+                decision_flips=report.decision_flips,
+                flip_rate=report.flip_rate,
+                status=report.status,
+                transition_matrix=report.transition_matrix.to_dict(),
+                mean_latency_ms=report.mean_latency_ms,
+                p95_latency_ms=report.p95_latency_ms,
+                metadata={"tolerance": tolerance},
+            )
+            sink.emit(audit_ev)
+        finally:
+            sink.close()
+
+    report_dict = report.to_dict()
+    report_json = json.dumps(report_dict, indent=2)
+
+    if output is not None:
+        _atomic_write_text(report_json + "\n", output)
+
+    if as_json:
+        typer.echo(report_json)
+    else:
+        matrix = report.transition_matrix
+        typer.echo("Decision Graph Pipeline Replay Report:")
+        typer.echo(f"  Status: {report.status}")
+        typer.echo(f"  Scoring Events: {report.replayed_events}/{report.scoring_events}")
+        typer.echo(f"  Transactions Replayed: {report.total_transactions}")
+        typer.echo(
+            f"  Score Discrepancies: {report.score_discrepancies} (tolerance={report.tolerance})"
+        )
+        typer.echo(f"  Decision Flips: {report.decision_flips} ({report.flip_rate:.2%})")
+        typer.echo(
+            f"  Probability Diff: Max={report.max_absolute_difference:.6f}, "
+            f"Mean={report.mean_absolute_difference:.6f}"
+        )
+        typer.echo(
+            f"  Latency: Mean={report.mean_latency_ms:.2f}ms, P95={report.p95_latency_ms:.2f}ms"
+        )
+        typer.echo(f"  Degraded Executions: {report.degraded_executions}")
+        typer.echo("  Transition Matrix (Logged -> Replayed):")
+        typer.echo(
+            f"    ALLOW     -> ALLOW: {matrix.allow_to_allow:<5} "
+            f"CHALLENGE: {matrix.allow_to_challenge:<5} DENY: {matrix.allow_to_deny:<5}"
+        )
+        typer.echo(
+            f"    CHALLENGE -> ALLOW: {matrix.challenge_to_allow:<5} "
+            f"CHALLENGE: {matrix.challenge_to_challenge:<5} DENY: {matrix.challenge_to_deny:<5}"
+        )
+        typer.echo(
+            f"    DENY      -> ALLOW: {matrix.deny_to_allow:<5} "
+            f"CHALLENGE: {matrix.deny_to_challenge:<5} DENY: {matrix.deny_to_deny:<5}"
+        )
+        if output is not None:
+            typer.echo(f"Report written to: {output}")
+
+    if fail_on_divergence and report.status == "DIVERGENT":
+        raise typer.Exit(code=1)
+
+
+@app.command("pipeline-counterfactual")
+def pipeline_counterfactual_command(
+    audit_log: Annotated[
+        Path,
+        typer.Argument(
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="JSONL audit log file containing historical scored probabilities.",
+        ),
+    ],
+    candidate_review: Annotated[
+        float,
+        typer.Option(
+            "--candidate-review",
+            "-r",
+            min=0.0,
+            max=1.0,
+            help="Candidate review threshold for CHALLENGE decision.",
+        ),
+    ],
+    candidate_deny: Annotated[
+        float,
+        typer.Option(
+            "--candidate-deny",
+            "-d",
+            min=0.0,
+            max=1.0,
+            help="Candidate deny threshold for DENY decision.",
+        ),
+    ],
+    baseline_review: Annotated[
+        float | None,
+        typer.Option(
+            "--baseline-review",
+            min=0.0,
+            max=1.0,
+            help="Optional baseline review threshold override.",
+        ),
+    ] = None,
+    baseline_deny: Annotated[
+        float | None,
+        typer.Option(
+            "--baseline-deny",
+            min=0.0,
+            max=1.0,
+            help="Optional baseline deny threshold override.",
+        ),
+    ] = None,
+    manual_review_cost: Annotated[
+        float,
+        typer.Option(
+            "--manual-review-cost",
+            min=0.0,
+            help="Operational friction cost per challenged transaction.",
+        ),
+    ] = 5.0,
+    false_deny_cost: Annotated[
+        float,
+        typer.Option(
+            "--false-deny-cost",
+            min=0.0,
+            help="Friction/support loss cost per legitimate transaction denied.",
+        ),
+    ] = 50.0,
+    missed_fraud_cost: Annotated[
+        float,
+        typer.Option(
+            "--missed-fraud-cost",
+            min=0.0,
+            help="Loss cost per undetected fraud transaction allowed.",
+        ),
+    ] = 200.0,
+    output: Annotated[
+        Path | None,
+        typer.Option(
+            "--output",
+            "-o",
+            help="Optional JSON report output destination.",
+        ),
+    ] = None,
+    as_json: Annotated[
+        bool,
+        typer.Option(
+            "--json",
+            help="Print report in JSON format.",
+        ),
+    ] = False,
+    overwrite: Annotated[
+        bool,
+        typer.Option(
+            "--overwrite/--no-overwrite",
+            help="Allow overwriting output file.",
+        ),
+    ] = False,
+) -> None:
+    """Evaluate counterfactual policy shifts, decision turnover, and workload/cost impact."""
+    _guard_output(output, overwrite)
+
+    if candidate_review > candidate_deny:
+        _abort("--candidate-review cannot exceed --candidate-deny.")
+    if (baseline_review is None) ^ (baseline_deny is None):
+        _abort("Both --baseline-review and --baseline-deny must be provided or omitted.")
+    if (
+        baseline_review is not None
+        and baseline_deny is not None
+        and baseline_review > baseline_deny
+    ):
+        _abort("--baseline-review cannot exceed --baseline-deny.")
+
+    probs_list: list[float] = []
+    logged_decisions: list[str] = []
+    inferred_baseline_review: float | None = None
+    inferred_baseline_deny: float | None = None
+
+    try:
+        with audit_log.open("r", encoding="utf-8") as f:
+            for line in f:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    event = json.loads(stripped)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(event, dict) or event.get("event_type") != "scoring":
+                    continue
+                payload = event.get("payload")
+                if not isinstance(payload, dict):
+                    continue
+
+                if inferred_baseline_review is None and baseline_review is None:
+                    r_th = payload.get("review_threshold")
+                    d_th = payload.get("deny_threshold")
+                    if r_th is not None and d_th is not None:
+                        try:
+                            rf = float(r_th)
+                            df = float(d_th)
+                            if 0.0 <= rf <= df <= 1.0:
+                                inferred_baseline_review = rf
+                                inferred_baseline_deny = df
+                        except (TypeError, ValueError):
+                            pass
+
+                predictions = payload.get("predictions")
+                if not isinstance(predictions, list):
+                    continue
+                for pred in predictions:
+                    if not isinstance(pred, dict):
+                        continue
+                    raw_prob = pred.get("fraud_probability")
+                    if raw_prob is None or isinstance(raw_prob, bool):
+                        continue
+                    try:
+                        p_val = float(raw_prob)
+                        if 0.0 <= p_val <= 1.0:
+                            probs_list.append(p_val)
+                            dec = pred.get("decision")
+                            if dec is not None:
+                                logged_decisions.append(str(dec))
+                            else:
+                                is_f = bool(pred.get("is_fraud", False))
+                                logged_decisions.append("DENY" if is_f else "ALLOW")
+                    except (TypeError, ValueError):
+                        continue
+    except OSError as exc:
+        _abort(f"Failed to read audit log '{audit_log}': {exc}")
+
+    if not probs_list:
+        _abort(f"No valid scoring transactions found in audit log '{audit_log}'.")
+
+    candidate_th = TieredThresholds(candidate_review, candidate_deny)
+    baseline_th: TieredThresholds | None = None
+    if baseline_review is not None and baseline_deny is not None:
+        baseline_th = TieredThresholds(baseline_review, baseline_deny)
+    elif inferred_baseline_review is not None and inferred_baseline_deny is not None:
+        baseline_th = TieredThresholds(inferred_baseline_review, inferred_baseline_deny)
+
+    try:
+        base_decs = logged_decisions if len(logged_decisions) == len(probs_list) else None
+        cf_eval = optimize_counterfactual_pipeline(
+            probabilities=probs_list,
+            candidate_thresholds=candidate_th,
+            baseline_thresholds=baseline_th,
+            baseline_decisions=base_decs,
+            manual_review_cost=manual_review_cost,
+            false_deny_cost=false_deny_cost,
+            missed_fraud_cost=missed_fraud_cost,
+        )
+    except (ValueError, TypeError) as exc:
+        _abort(str(exc))
+
+    report_dict = cf_eval.to_dict()
+    report_json = json.dumps(report_dict, indent=2)
+
+    if output is not None:
+        _atomic_write_text(report_json + "\n", output)
+
+    if as_json:
+        typer.echo(report_json)
+    else:
+        matrix = cf_eval.transition_matrix
+        typer.echo(f"Pipeline Counterfactual Evaluation: {cf_eval.rows} records evaluated")
+        typer.echo(
+            f"Baseline: review={cf_eval.baseline_thresholds.review_threshold:.4f}, "
+            f"deny={cf_eval.baseline_thresholds.deny_threshold:.4f}"
+        )
+        typer.echo(
+            f"Candidate: review={cf_eval.candidate_thresholds.review_threshold:.4f}, "
+            f"deny={cf_eval.candidate_thresholds.deny_threshold:.4f}"
+        )
+        typer.echo(
+            f"Turnover: {matrix.turnover_count} / {matrix.total_records} "
+            f"({matrix.turnover_rate:.1%})"
+        )
+        typer.echo(
+            f"Review Workload Delta: {cf_eval.review_count_delta:+d} "
+            f"({cf_eval.review_rate_delta:+.1%})"
+        )
+        typer.echo(
+            f"Deny Volume Delta: {cf_eval.deny_count_delta:+d} ({cf_eval.deny_rate_delta:+.1%})"
+        )
+        typer.echo("Transition Matrix (Baseline -> Candidate):")
+        typer.echo(
+            f"  ALLOW     -> ALLOW: {matrix.allow_to_allow:<5} "
+            f"CHALLENGE: {matrix.allow_to_challenge:<5} DENY: {matrix.allow_to_deny:<5}"
+        )
+        typer.echo(
+            f"  CHALLENGE -> ALLOW: {matrix.challenge_to_allow:<5} "
+            f"CHALLENGE: {matrix.challenge_to_challenge:<5} DENY: {matrix.challenge_to_deny:<5}"
+        )
+        typer.echo(
+            f"  DENY      -> ALLOW: {matrix.deny_to_allow:<5} "
+            f"CHALLENGE: {matrix.deny_to_challenge:<5} DENY: {matrix.deny_to_deny:<5}"
+        )
+        if output is not None:
+            typer.echo(f"Report written to: {output}")
+
+
+@app.command("pipeline-chaos")
+def pipeline_chaos_command(
+    input_data: Annotated[
+        Path,
+        typer.Option(
+            "--input",
+            "-i",
+            help="Path to input transactions CSV dataset.",
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            readable=True,
+            resolve_path=True,
+        ),
+    ],
+    fault_spec_path: Annotated[
+        Path,
+        typer.Option(
+            "--faults",
+            "-f",
+            help="JSON file containing list of StageFaultSpec definitions.",
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            readable=True,
+            resolve_path=True,
+        ),
+    ],
+    model: Annotated[
+        Path | None,
+        typer.Option(
+            "--model",
+            "-m",
+            help="Optional path to FraudModel artifact. If omitted, default model is loaded.",
+        ),
+    ] = None,
+    rules: Annotated[
+        Path | None,
+        typer.Option(
+            "--rules",
+            "-r",
+            help="Optional declarative rules file (JSON or YAML).",
+        ),
+    ] = None,
+    sla_budget_ms: Annotated[
+        float,
+        typer.Option(
+            "--sla-budget-ms",
+            help="Latency SLA budget in milliseconds per transaction.",
+            min=0.001,
+        ),
+    ] = 100.0,
+    enable_circuit_breaker: Annotated[
+        bool,
+        typer.Option(
+            "--enable-circuit-breaker/--no-circuit-breaker",
+            help="Enable stage circuit breakers for fast-fail isolation during chaos.",
+        ),
+    ] = True,
+    cb_failure_threshold: Annotated[
+        int,
+        typer.Option(
+            "--cb-failure-threshold",
+            help="Consecutive failure threshold before tripping stage circuit breaker.",
+            min=1,
+        ),
+    ] = 5,
+    cb_recovery_timeout: Annotated[
+        float,
+        typer.Option(
+            "--cb-recovery-timeout",
+            help="Recovery timeout in seconds before stage circuit probes half-open.",
+            min=0.001,
+        ),
+    ] = 30.0,
+    max_records: Annotated[
+        int | None,
+        typer.Option(
+            "--max-records",
+            "-n",
+            help="Maximum transactions to evaluate.",
+            min=1,
+        ),
+    ] = None,
+    fail_on_sla_breach: Annotated[
+        bool,
+        typer.Option(
+            "--fail-on-sla-breach/--no-fail-on-sla-breach",
+            help="Exit with code 1 if any transaction breached the SLA budget.",
+        ),
+    ] = False,
+    fail_on_unrecovered: Annotated[
+        bool,
+        typer.Option(
+            "--fail-on-unrecovered/--no-fail-on-unrecovered",
+            help="Exit with code 1 if any circuit breaker remained unrecovered.",
+        ),
+    ] = False,
+    audit_log: Annotated[
+        Path | None,
+        typer.Option(
+            "--audit-log",
+            help="Optional path to append structured chaos audit event.",
+        ),
+    ] = None,
+    output: Annotated[
+        Path | None,
+        typer.Option(
+            "--output",
+            "-o",
+            help="Optional path to write JSON chaos report.",
+        ),
+    ] = None,
+    as_json: Annotated[
+        bool,
+        typer.Option(
+            "--json",
+            help="Print report in JSON format.",
+        ),
+    ] = False,
+    overwrite: Annotated[
+        bool,
+        typer.Option("--overwrite/--no-overwrite", help="Allow overwriting output file."),
+    ] = False,
+) -> None:
+    """Simulate stage-level chaos faults and evaluate circuit breaking resilience and SLAs."""
+    _guard_output(output, overwrite)
+
+    loaded_model: FraudModel
+    if model is not None:
+        try:
+            loaded_model = load_model(model)
+        except (ModelArtifactError, OSError, ValueError) as exc:
+            _abort(f"Failed to load model from '{model}': {exc}")
+    else:
+        from fraud_detection.data import generate_synthetic_data, validate_frame
+        from fraud_detection.model import train_model
+
+        syn_df = generate_synthetic_data(rows=500, fraud_rate=0.05)
+        syn_dataset = validate_frame(syn_df)
+        loaded_model = train_model(syn_dataset)
+
+    loaded_rules: RuleSet | None = None
+    if rules is not None:
+        try:
+            loaded_rules = RuleSet.load_file(rules)
+        except (OSError, ValueError, TypeError, KeyError, RuntimeError) as exc:
+            _abort(f"Failed to load rules from '{rules}': {exc}")
+
+    try:
+        raw_fault_specs = json.loads(fault_spec_path.read_text(encoding="utf-8"))
+        if not isinstance(raw_fault_specs, list):
+            _abort("Fault specifications file must contain a JSON list of objects.")
+        converted_specs: list[StageFaultSpec] = [
+            StageFaultSpec(
+                node_name=str(f["node_name"]),
+                fault_type=StageFaultType(f["fault_type"]),
+                start_index=int(f.get("start_index", 0)),
+                end_index=int(f["end_index"]) if f.get("end_index") is not None else None,
+                latency_ms=float(f.get("latency_ms", 0.0)),
+                error_message=str(f.get("error_message", "Injected stage chaos fault")),
+            )
+            for f in raw_fault_specs
+        ]
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        _abort(f"Failed to read/parse fault specifications from '{fault_spec_path}': {exc}")
+
+    try:
+        df = pd.read_csv(input_data)
+    except (OSError, ValueError, TypeError) as exc:
+        _abort(f"Failed to read input dataset '{input_data}': {exc}")
+
+    if max_records is not None:
+        df = df.iloc[:max_records]
+
+    pipeline_graph = create_default_fraud_pipeline(
+        model=loaded_model,
+        rules=loaded_rules,
+        recalibrator=getattr(loaded_model, "recalibrator", None),
+        enable_circuit_breaker=enable_circuit_breaker,
+        circuit_failure_threshold=cb_failure_threshold,
+        circuit_recovery_timeout_seconds=cb_recovery_timeout,
+    )
+
+    records = cast(list[dict[str, Any]], df.to_dict(orient="records"))
+
+    try:
+        report = simulate_pipeline_chaos(
+            records=records,
+            pipeline=pipeline_graph,
+            fault_specs=converted_specs,
+            sla_budget_ms=sla_budget_ms,
+            enable_circuit_breaker=enable_circuit_breaker,
+            circuit_failure_threshold=cb_failure_threshold,
+            circuit_recovery_timeout_seconds=cb_recovery_timeout,
+        )
+    except (ValueError, TypeError, RuntimeError) as exc:
+        _abort(f"Chaos simulation failed: {exc}")
+
+    if audit_log is not None:
+        sink = JsonlAuditSink(audit_log)
+        audit_ev = build_pipeline_chaos_audit_event(
+            chaos_report=report,
+            model_version=str(loaded_model.metadata.get("dataset_fingerprint", ""))[:12],
+            dataset_fingerprint=str(loaded_model.metadata.get("dataset_fingerprint", "")),
+        )
+        sink.emit(audit_ev)
+        sink.close()
+
+    report_dict = report.to_dict()
+    report_json = json.dumps(report_dict, indent=2)
+
+    if output is not None:
+        _atomic_write_text(report_json + "\n", output)
+
+    if as_json:
+        typer.echo(report_json)
+    else:
+        typer.echo("Pipeline Chaos Resilience Report:")
+        typer.echo(f"  Status: {report.status}")
+        typer.echo(f"  Transactions: {report.total_transactions}")
+        typer.echo(f"  Circuit Breaker Enabled: {report.circuit_breaker_enabled}")
+        typer.echo(f"  SLA Budget: {report.sla_budget_ms:.2f}ms (Breaches: {report.sla_breaches})")
+        typer.echo(
+            f"  Circuit Trips: {report.circuit_trips}, "
+            f"Short-Circuited: {report.short_circuited_calls}"
+        )
+        typer.echo(
+            f"  Degraded: {report.degraded_transactions}, "
+            f"Unhandled Errors: {report.unhandled_errors}"
+        )
+        typer.echo(
+            f"  Latency (ms): P50={report.latencies_p50_ms:.2f}ms, "
+            f"P95={report.latencies_p95_ms:.2f}ms, Max={report.latencies_max_ms:.2f}ms"
+        )
+        typer.echo(f"  Recovered: {report.recovered}")
+        typer.echo("  Stage Metrics:")
+        for node_name, sm in report.stage_metrics.items():
+            typer.echo(
+                f"    - {node_name} [{sm.fault_type}]: Injected={sm.injected_count}, "
+                f"Handled={sm.handled_count}, Tripped={sm.tripped_circuit}"
+            )
+        if output is not None:
+            typer.echo(f"Report written to: {output}")
+
+    if fail_on_sla_breach and report.sla_breaches > 0:
+        raise typer.Exit(code=1)
+
+    if fail_on_unrecovered and not report.recovered:
+        raise typer.Exit(code=1)
+
+
+@app.command("ingest-labels")
+def ingest_labels_cmd(
+    labels_path: Annotated[
+        Path,
+        typer.Option(
+            "--labels-path",
+            "-l",
+            help="Path to CSV or JSONL ground-truth labels file.",
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            readable=True,
+        ),
+    ],
+    output: Annotated[
+        Path | None,
+        typer.Option(
+            "--output",
+            "-o",
+            help="Optional path to write JSON ingestion report.",
+            dir_okay=False,
+        ),
+    ] = None,
+    as_json: Annotated[
+        bool,
+        typer.Option("--json", help="Emit report directly to stdout as formatted JSON."),
+    ] = False,
+    overwrite: Annotated[
+        bool,
+        typer.Option("--overwrite", help="Overwrite report file if destination already exists."),
+    ] = False,
+) -> None:
+    """Ingest delayed ground-truth feedback labels from CSV or JSONL into an operational store."""
+    _guard_output(output, overwrite)
+
+    store = LabelIngestionStore()
+    suffix = labels_path.suffix.lower()
+    try:
+        if suffix == ".csv":
+            count = store.ingest_from_csv(labels_path)
+        elif suffix in {".jsonl", ".json"}:
+            count = store.ingest_from_jsonl(labels_path)
+        else:
+            _abort(f"Unsupported labels file extension '{suffix}'. Expected .csv or .jsonl.")
+    except (FeedbackError, ValueError) as exc:
+        _abort(f"Label ingestion failed: {exc}")
+
+    report = {
+        "labels_path": str(labels_path),
+        "ingested_count": count,
+        "total_stored": len(store),
+        "status": "success",
+    }
+    report_json = json.dumps(report, indent=2)
+
+    if output is not None:
+        _atomic_write_text(report_json + "\n", output)
+
+    if as_json:
+        typer.echo(report_json)
+    else:
+        typer.echo(f"Successfully ingested {count} delayed label(s) from {labels_path}.")
+        typer.echo(f"Total unique records in store: {len(store)}")
+        if output is not None:
+            typer.echo(f"Report written to: {output}")
+
+
+@app.command("feedback-surveillance")
+def feedback_surveillance_cmd(
+    audit_log: Annotated[
+        Path,
+        typer.Option(
+            "--audit-log",
+            "-a",
+            help="Path to JSONL audit log containing historical scoring events.",
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            readable=True,
+        ),
+    ],
+    labels_path: Annotated[
+        Path,
+        typer.Option(
+            "--labels-path",
+            "-l",
+            help="Path to CSV or JSONL ground-truth labels file.",
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            readable=True,
+        ),
+    ],
+    min_precision: Annotated[
+        float | None,
+        typer.Option("--min-precision", help="Minimum required realized precision threshold."),
+    ] = None,
+    min_auprc: Annotated[
+        float | None,
+        typer.Option("--min-auprc", help="Minimum required realized AUPRC threshold."),
+    ] = None,
+    max_fpr: Annotated[
+        float | None,
+        typer.Option("--max-fpr", help="Maximum allowable false positive rate threshold."),
+    ] = None,
+    max_missed_rate: Annotated[
+        float | None,
+        typer.Option("--max-missed-rate", help="Maximum allowable missed fraud rate threshold."),
+    ] = None,
+    min_transactions: Annotated[
+        int,
+        typer.Option("--min-transactions", help="Minimum matured transactions to evaluate."),
+    ] = 10,
+    target_maturity_level: Annotated[
+        float,
+        typer.Option("--target-maturity-level", help="Cohort maturity threshold for evaluation."),
+    ] = 0.90,
+    output: Annotated[
+        Path | None,
+        typer.Option(
+            "--output",
+            "-o",
+            help="Optional path to write JSON surveillance report.",
+            dir_okay=False,
+        ),
+    ] = None,
+    gate: Annotated[
+        bool,
+        typer.Option(
+            "--gate", help="Exit with code 1 if any retraining policy threshold is breached."
+        ),
+    ] = False,
+    as_json: Annotated[
+        bool,
+        typer.Option("--json", help="Emit report directly to stdout as formatted JSON."),
+    ] = False,
+    overwrite: Annotated[
+        bool,
+        typer.Option("--overwrite", help="Overwrite report file if destination already exists."),
+    ] = False,
+) -> None:
+    """Surveil realized performance on mature cohorts and evaluate automated retraining triggers."""
+    _guard_output(output, overwrite)
+
+    store = LabelIngestionStore()
+    suffix = labels_path.suffix.lower()
+    try:
+        if suffix == ".csv":
+            store.ingest_from_csv(labels_path)
+        elif suffix in {".jsonl", ".json"}:
+            store.ingest_from_jsonl(labels_path)
+        else:
+            _abort(f"Unsupported labels file extension '{suffix}'. Expected .csv or .jsonl.")
+    except (FeedbackError, ValueError) as exc:
+        _abort(f"Label loading failed: {exc}")
+
+    try:
+        matched = match_labels_with_audit_log(audit_log, store)
+        cohorts = partition_into_cohorts(matched)
+        curve = LabelMaturationCurve.fit_from_records(matched)
+        now = time.time()
+        matured_cohorts = curve.filter_mature_cohorts(
+            cohorts, now, min_maturation_fraction=target_maturity_level
+        )
+        matured_records = [r for c in matured_cohorts for r in c.records]
+
+        policy = RetrainingTriggerPolicy(
+            min_precision=min_precision,
+            min_auprc=min_auprc,
+            max_fpr=max_fpr,
+            max_missed_fraud_rate=max_missed_rate,
+            min_matured_transactions=min_transactions,
+        )
+        analyzer = FeedbackSurveillanceAnalyzer(maturation_curve=curve, default_policy=policy)
+        report, trigger = analyzer.evaluate_cohort(matured_records, policy=policy)
+    except (FeedbackError, ValueError) as exc:
+        _abort(f"Feedback surveillance failed: {exc}")
+
+    out_data = {
+        "audit_log": str(audit_log),
+        "labels_path": str(labels_path),
+        "total_matched": len(matched),
+        "total_cohorts": len(cohorts),
+        "matured_cohort_count": len(matured_cohorts),
+        "total_matured_transactions": len(matured_records),
+        "realized_metrics": report.to_dict(),
+        "trigger_event": trigger.to_dict() if trigger is not None else None,
+        "policy_breached": trigger is not None,
+    }
+    report_json = json.dumps(out_data, indent=2)
+
+    if output is not None:
+        _atomic_write_text(report_json + "\n", output)
+
+    if as_json:
+        typer.echo(report_json)
+    else:
+        typer.echo(
+            f"Feedback surveillance evaluated on {len(matured_records)} mature transaction(s):"
+        )
+        typer.echo(f"  Realized Precision: {report.realized_precision:.4f}")
+        typer.echo(f"  Realized Recall:    {report.realized_recall:.4f}")
+        typer.echo(f"  Realized AUPRC:     {report.realized_auprc:.4f}")
+        typer.echo(f"  Realized FPR:       {report.realized_fpr:.4f}")
+        typer.echo(f"  Net Savings:        ${report.net_financial_savings:.2f}")
+        if trigger is not None:
+            typer.echo(f"  [RETRAINING TRIGGERED]: {trigger.reason}")
+        else:
+            typer.echo("  [POLICY OK]: All thresholds satisfied.")
+        if output is not None:
+            typer.echo(f"Report written to: {output}")
+
+    if gate and trigger is not None:
+        raise typer.Exit(code=1)
+
+
+@app.command("auto-retrain")
+def auto_retrain(
+    audit_log_path: Annotated[
+        Path,
+        typer.Option(
+            "--audit-log-path",
+            help="Path to JSONL scoring audit log file.",
+            dir_okay=False,
+            file_okay=True,
+            exists=True,
+            readable=True,
+        ),
+    ],
+    labels_path: Annotated[
+        Path,
+        typer.Option(
+            "--labels-path",
+            "--labels-file",
+            help="Path to ground truth labels file (.jsonl or .csv).",
+            dir_okay=False,
+            file_okay=True,
+            exists=True,
+            readable=True,
+        ),
+    ],
+    champion_model_path: Annotated[
+        Path,
+        typer.Option(
+            "--champion-model-path",
+            help="Directory path to active champion model artifact.",
+            dir_okay=True,
+            file_okay=False,
+            exists=True,
+        ),
+    ],
+    output_dir: Annotated[
+        Path,
+        typer.Option(
+            "--output-dir",
+            "-o",
+            help="Directory path where candidate artifact bundle will be exported.",
+            dir_okay=True,
+            file_okay=False,
+        ),
+    ],
+    estimator: Annotated[
+        str,
+        typer.Option(
+            "--estimator",
+            help="Estimator to train (logistic_regression, random_forest, lightgbm).",
+        ),
+    ] = "logistic_regression",
+    hyperparameters_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--hyperparameters-file",
+            help="Optional JSON file path containing model hyperparameters.",
+            dir_okay=False,
+            file_okay=True,
+            readable=True,
+        ),
+    ] = None,
+    hyperparameters_json: Annotated[
+        str | None,
+        typer.Option(
+            "--hyperparameters-json",
+            help="Optional JSON string containing model hyperparameters.",
+        ),
+    ] = None,
+    signing_key_path: Annotated[
+        Path | None,
+        typer.Option(
+            "--signing-key-path",
+            "--signing-key",
+            help="Optional path to Ed25519 private key PEM file for candidate signing.",
+            dir_okay=False,
+            file_okay=True,
+            readable=True,
+        ),
+    ] = None,
+    holdout_gap_seconds: Annotated[
+        float,
+        typer.Option(
+            "--holdout-gap-seconds",
+            help="Temporal purge gap in seconds between train and holdout splits.",
+        ),
+    ] = 0.0,
+    promote: Annotated[
+        str,
+        typer.Option("--promote", help="Promotion target: 'canary', 'full', or 'none'."),
+    ] = "none",
+    canary_percentage: Annotated[
+        float,
+        typer.Option(
+            "--canary-percentage", help="Traffic percentage for canary promotion (0.0 to 100.0)."
+        ),
+    ] = 10.0,
+    slice_column: Annotated[
+        str | None,
+        typer.Option(
+            "--slice-column", help="Optional feature column name for slice disparity evaluation."
+        ),
+    ] = None,
+    api_url: Annotated[
+        str | None,
+        typer.Option(
+            "--api-url", help="Optional base URL of running fraud detection service for promotion."
+        ),
+    ] = None,
+    min_pr_auc_delta: Annotated[
+        float,
+        typer.Option(
+            "--min-pr-auc-delta",
+            help="Minimum required PR-AUC difference (candidate - champion).",
+        ),
+    ] = -0.02,
+    min_recall_delta: Annotated[
+        float,
+        typer.Option(
+            "--min-recall-delta",
+            help="Minimum required Recall difference (candidate - champion).",
+        ),
+    ] = -0.03,
+    max_ece_increase: Annotated[
+        float,
+        typer.Option(
+            "--max-ece-increase", help="Maximum allowable increase in Expected Calibration Error."
+        ),
+    ] = 0.03,
+    max_slice_disparity: Annotated[
+        float,
+        typer.Option(
+            "--max-slice-disparity",
+            help="Maximum allowable slice disparity between candidate and champion.",
+        ),
+    ] = 0.25,
+    max_net_cost_increase_pct: Annotated[
+        float,
+        typer.Option(
+            "--max-net-cost-increase-pct",
+            help="Maximum allowable percentage increase in net expected cost.",
+        ),
+    ] = 0.05,
+    false_positive_cost: Annotated[
+        float,
+        typer.Option(
+            "--false-positive-cost", help="Cost of a false positive in financial evaluation."
+        ),
+    ] = 1.0,
+    false_negative_cost: Annotated[
+        float,
+        typer.Option(
+            "--false-negative-cost", help="Cost of a false negative in financial evaluation."
+        ),
+    ] = 10.0,
+    report_output: Annotated[
+        Path | None,
+        typer.Option(
+            "--report-output", help="Optional path to write JSON retraining report.", dir_okay=False
+        ),
+    ] = None,
+    as_json: Annotated[
+        bool,
+        typer.Option("--json", help="Emit report directly to stdout as formatted JSON."),
+    ] = False,
+    overwrite: Annotated[
+        bool,
+        typer.Option("--overwrite", help="Overwrite report file if destination already exists."),
+    ] = False,
+) -> None:
+    """Automate closed-loop candidate retraining, safety verification gating, and safe promotion."""
+    _guard_output(report_output, overwrite)
+
+    promote_norm = promote.strip().lower()
+    if promote_norm not in {"canary", "full", "none"}:
+        _abort(f"Invalid --promote option '{promote}'. Must be one of: 'canary', 'full', 'none'.")
+
+    if canary_percentage < 0.0 or canary_percentage > 100.0:
+        _abort(f"Invalid --canary-percentage '{canary_percentage}'. Must be between 0.0 and 100.0.")
+
+    # Parse hyperparameters
+    hparams: dict[str, Any] = {}
+    if hyperparameters_file is not None:
+        try:
+            hparams = json.loads(hyperparameters_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            _abort(f"Failed to read hyperparameters file: {exc}")
+    elif hyperparameters_json is not None:
+        try:
+            hparams = json.loads(hyperparameters_json)
+        except (ValueError, json.JSONDecodeError) as exc:
+            _abort(f"Failed to parse hyperparameters JSON: {exc}")
+
+    # Load labels
+    store = LabelIngestionStore()
+    suffix = labels_path.suffix.lower()
+    try:
+        if suffix == ".csv":
+            store.ingest_from_csv(labels_path)
+        elif suffix in {".jsonl", ".json"}:
+            store.ingest_from_jsonl(labels_path)
+        else:
+            _abort(f"Unsupported labels file extension '{suffix}'. Expected .csv or .jsonl.")
+    except (FeedbackError, ValueError, OSError) as exc:
+        _abort(f"Label loading failed: {exc}")
+
+    # Load champion model
+    try:
+        champion_model = load_model(champion_model_path)
+    except (ModelArtifactError, OSError, ValueError) as exc:
+        _abort(f"Failed to load champion model from {champion_model_path}: {exc}")
+
+    # Materialize dataset
+    cfg = RetrainingConfig(
+        estimator=estimator,
+        hyperparameters=hparams,
+        holdout_gap_seconds=holdout_gap_seconds,
+    )
+    try:
+        builder = RetrainingDatasetBuilder(cfg)
+        dataset = builder.build_from_audit_and_labels(audit_log_path, store)
+    except (RetrainingError, ValueError, OSError) as exc:
+        typer.echo(f"Retraining dataset materialization failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    # Train challenger candidate
+    try:
+        trainer = ChallengerTrainer(cfg)
+        cand_res = trainer.train(dataset)
+    except (RetrainingError, ValueError, RuntimeError) as exc:
+        typer.echo(f"Challenger model training failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    # Evaluate safety gating
+    thresholds = SafetyGatingThresholds(
+        min_pr_auc_delta=min_pr_auc_delta,
+        min_recall_delta=min_recall_delta,
+        max_ece_increase=max_ece_increase,
+        max_slice_disparity=max_slice_disparity,
+        max_net_cost_increase_pct=max_net_cost_increase_pct,
+        false_positive_cost=false_positive_cost,
+        false_negative_cost=false_negative_cost,
+    )
+    verifier = ChallengerSafetyVerifier(thresholds)
+    try:
+        verif_report = verifier.verify_candidate(
+            cand_res.model,
+            champion_model,
+            dataset,
+            slice_column=slice_column,
+        )
+    except (RetrainingError, ValueError, TypeError, KeyError) as exc:
+        typer.echo(f"Candidate verification error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    # Export candidate artifact bundle and attestation
+    output_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        attestation_path = export_certified_candidate(
+            cand_res,
+            output_dir,
+            verification_report=verif_report,
+            signing_key_path=signing_key_path,
+        )
+        attestation_data = json.loads(attestation_path.read_text(encoding="utf-8"))
+        attestation_digest = attestation_data.get("attestation_digest")
+    except (RetrainingError, OSError, ValueError, TypeError) as exc:
+        typer.echo(f"Failed to export candidate artifact: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    # Promotion handling
+    promoted = False
+    promotion_message: str | None = None
+    if verif_report.status == VerificationStatus.PASSED and promote_norm != "none":
+        if api_url:
+            base = api_url.rstrip("/")
+            if not base.startswith(("http://", "https://")):
+                _abort(f"Invalid api-url '{api_url}'. Must begin with http:// or https://")
+            endpoint = f"{base}/v1/models/promote"
+            promote_payload = {
+                "candidate_path": str(output_dir.resolve()),
+                "promotion_type": promote_norm,
+                "canary_percentage": canary_percentage if promote_norm == "canary" else 100.0,
+                "require_attestation": False,
+            }
+            try:
+                req = urllib.request.Request(  # noqa: S310
+                    endpoint,
+                    data=json.dumps(promote_payload).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=30.0) as resp:  # noqa: S310
+                    resp_data = json.loads(resp.read().decode("utf-8"))
+                    promoted = True
+                    promotion_message = resp_data.get("message", "Candidate successfully promoted.")
+            except (
+                urllib.error.URLError,
+                urllib.error.HTTPError,
+                OSError,
+                TimeoutError,
+                json.JSONDecodeError,
+            ) as exc:
+                typer.echo(f"API promotion call failed to {endpoint}: {exc}", err=True)
+                raise typer.Exit(code=1) from exc
+        else:
+            promoted = True
+            promotion_message = (
+                f"Candidate certified for {promote_norm} promotion (no API URL specified)."
+            )
+
+    report_dict: dict[str, Any] = {
+        "status": "completed",
+        "verification_status": verif_report.status.value,
+        "verification_report": verif_report.to_dict(),
+        "training_metrics": cand_res.test_metrics,
+        "model_version": cand_res.model_version,
+        "artifact_path": str(output_dir.resolve()),
+        "attestation_digest": attestation_digest,
+        "promoted": promoted,
+        "promotion_type": promote_norm,
+        "promotion_message": promotion_message,
+    }
+    report_json = json.dumps(report_dict, indent=2)
+
+    if report_output is not None:
+        _atomic_write_text(report_json + "\n", report_output)
+
+    if as_json:
+        typer.echo(report_json)
+    else:
+        typer.echo("Candidate Retraining Complete:")
+        typer.echo(f"  Status:                 {verif_report.status.value.upper()}")
+        typer.echo(f"  Artifact Export:        {output_dir.resolve()}")
+        typer.echo(f"  Attestation Digest:     {attestation_digest}")
+        typer.echo(f"  Summary:                {verif_report.summary}")
+        for comp in verif_report.comparisons:
+            tag = "[PASS]" if comp.passed else "[FAIL]"
+            typer.echo(
+                f"  {tag} {comp.metric_name}: Cand={comp.challenger_value:.4f} "
+                f"Champ={comp.champion_value:.4f} "
+                f"(delta={comp.delta:+.4f}, thresh={comp.threshold})"
+            )
+        if verif_report.slice_disparities:
+            for sname, sval in verif_report.slice_disparities.items():
+                typer.echo(f"  Slice disparity ({sname}): {sval:.4f}")
+        if promoted:
+            typer.echo(f"  Promotion:              {promotion_message}")
+
+    if verif_report.status == VerificationStatus.FAILED:
+        raise typer.Exit(code=3)
+
+
+@app.command("graph-rings")
+def graph_rings(
+    input_file: Annotated[
+        Path,
+        typer.Option(
+            "--input-file",
+            "-i",
+            help="Input CSV or JSON file containing transactions with entity identifiers.",
+        ),
+    ],
+    output: Annotated[
+        Path | None,
+        typer.Option(
+            "--output",
+            "-o",
+            help="Optional file path to persist the fraud rings JSON report.",
+        ),
+    ] = None,
+    overwrite: Annotated[
+        bool,
+        typer.Option(
+            "--overwrite",
+            help="Overwrite existing output file if it exists.",
+        ),
+    ] = False,
+    as_json: Annotated[
+        bool,
+        typer.Option(
+            "--json",
+            help="Print report as raw JSON to stdout.",
+        ),
+    ] = False,
+    window_seconds: Annotated[
+        float,
+        typer.Option(
+            "--window-seconds",
+            help="Sliding temporal lookback window for entity link analysis.",
+        ),
+    ] = 86400.0,
+    min_cards_per_device: Annotated[
+        int,
+        typer.Option(
+            "--min-cards-per-device",
+            help="Minimum cards sharing a device/IP to flag as dense biclique.",
+        ),
+    ] = 3,
+    min_devices_per_card: Annotated[
+        int,
+        typer.Option(
+            "--min-devices-per-card",
+            help="Minimum devices/IPs associated with a card to flag as dense biclique.",
+        ),
+    ] = 2,
+    card_testing_window_seconds: Annotated[
+        float,
+        typer.Option(
+            "--card-testing-window-seconds",
+            help="Rapid burst window threshold in seconds for card-testing botnet attacks.",
+        ),
+    ] = 300.0,
+    card_testing_min_cards: Annotated[
+        int,
+        typer.Option(
+            "--card-testing-min-cards",
+            help="Minimum cards tested within burst window to detect botnet attack.",
+        ),
+    ] = 4,
+    min_risk: Annotated[
+        float,
+        typer.Option(
+            "--min-risk",
+            help="Minimum risk score threshold to include in fraud ring clusters.",
+        ),
+    ] = 0.0,
+    fail_on_rings: Annotated[
+        bool,
+        typer.Option(
+            "--fail-on-rings",
+            help="Exit with code 3 if any critical or high severity rings are detected.",
+        ),
+    ] = False,
+) -> None:
+    """Detect organized fraud rings, botnets, and syndicate bicliques from transaction history."""
+    if not input_file.exists():
+        _abort(f"Input file not found: {input_file}")
+    _guard_output(output, overwrite)
+
+    if input_file.suffix.lower() in (".json", ".jsonl"):
+        content = input_file.read_text(encoding="utf-8")
+        if input_file.suffix.lower() == ".jsonl" or "\n" in content.strip():
+            raw_records = [json.loads(line) for line in content.splitlines() if line.strip()]
+        else:
+            raw_records = json.loads(content)
+        records = raw_records if isinstance(raw_records, list) else [raw_records]
+    else:
+        df = pd.read_csv(input_file)
+        records = df.to_dict(orient="records")
+
+    graph = EntityGraph(
+        GraphConfig(window_seconds=window_seconds, max_transactions=max(1000, len(records) * 2))
+    )
+    for idx, rec in enumerate(records):
+        entities: dict[EntityType, str] = {}
+        for et in EntityType:
+            val = (
+                rec.get(et.value) or rec.get(et.name.lower()) or rec.get(et.value.replace("_", ""))
+            )
+            if val is not None and str(val).strip() and str(val).strip().lower() != "nan":
+                entities[et] = str(val).strip()
+        if not entities:
+            continue
+        tx_id = str(rec.get("transaction_id") or rec.get("tx_id") or f"tx_{idx}")
+        ts = float(rec.get("timestamp") or rec.get("Time") or float(idx))
+        amt = float(rec.get("Amount") or rec.get("amount") or 0.0)
+        is_fraud = bool(rec.get("Class") or rec.get("is_fraud") or False)
+        risk = float(
+            rec.get("risk_score") or rec.get("fraud_probability") or (1.0 if is_fraud else 0.0)
+        )
+        graph.add_transaction(
+            transaction_id=tx_id,
+            timestamp=ts,
+            amount=amt,
+            entities=entities,
+            is_fraud=is_fraud,
+            risk_score=risk,
+        )
+
+    detector_config = FraudRingDetectorConfig(
+        min_cards_per_device=min_cards_per_device,
+        min_devices_per_card=min_devices_per_card,
+        card_testing_window_seconds=card_testing_window_seconds,
+        card_testing_min_cards=card_testing_min_cards,
+    )
+    detector = FraudRingDetector(graph, detector_config)
+    report = detector.detect_rings()
+
+    if min_risk > 0.0:
+        filtered_clusters = tuple(c for c in report.clusters if c.risk_score >= min_risk)
+        crit = sum(1 for c in filtered_clusters if c.severity == RingSeverity.CRITICAL)
+        high = sum(1 for c in filtered_clusters if c.severity == RingSeverity.HIGH)
+        med = sum(1 for c in filtered_clusters if c.severity == RingSeverity.MEDIUM)
+        low = sum(1 for c in filtered_clusters if c.severity == RingSeverity.LOW)
+        report_dict: dict[str, Any] = {
+            "generated_at": report.generated_at,
+            "total_clusters": len(filtered_clusters),
+            "critical_count": crit,
+            "high_count": high,
+            "medium_count": med,
+            "low_count": low,
+            "clusters": [c.to_dict() for c in filtered_clusters],
+            "summary": report.summary,
+        }
+    else:
+        report_dict = report.to_dict()
+
+    report_json = json.dumps(report_dict, indent=2)
+    if output is not None:
+        _atomic_write_text(report_json + "\n", output)
+
+    if as_json:
+        typer.echo(report_json)
+    else:
+        typer.echo("Fraud Ring Link Analysis Report:")
+        typer.echo(f"  Total Clusters:         {report_dict['total_clusters']}")
+        typer.echo(f"  Critical Severity:      {report_dict['critical_count']}")
+        typer.echo(f"  High Severity:          {report_dict['high_count']}")
+        typer.echo(f"  Medium Severity:        {report_dict['medium_count']}")
+        typer.echo(f"  Low Severity:           {report_dict['low_count']}")
+        for c in report_dict["clusters"]:
+            typer.echo(
+                f"  [{c['severity'].upper()}] Cluster '{c['cluster_id']}' "
+                f"({c['pattern_type']}): {c['transaction_count']} txs, "
+                f"${c['total_amount']:.2f}, risk={c['risk_score']:.2f} -> {c['recommended_action']}"
+            )
+            typer.echo(f"    Description: {c['description']}")
+
+    if fail_on_rings and (report_dict["critical_count"] > 0 or report_dict["high_count"] > 0):
+        typer.echo(
+            f"Error: Fraud rings detected ({report_dict['critical_count']} critical, "
+            f"{report_dict['high_count']} high). Failing per --fail-on-rings.",
+            err=True,
+        )
+        raise typer.Exit(code=3)
+
+
+@app.command("graph-enrich")
+def graph_enrich(
+    input_file: Annotated[
+        Path,
+        typer.Option(
+            "--input-file",
+            "-i",
+            help="Input CSV file containing transactions to enrich with graph features.",
+        ),
+    ],
+    output_file: Annotated[
+        Path,
+        typer.Option(
+            "--output-file",
+            "-o",
+            help="Output CSV file destination for enriched transaction dataset.",
+        ),
+    ],
+    overwrite: Annotated[
+        bool,
+        typer.Option(
+            "--overwrite",
+            help="Overwrite existing output file if it exists.",
+        ),
+    ] = False,
+    window_seconds: Annotated[
+        float,
+        typer.Option(
+            "--window-seconds",
+            help="Sliding temporal lookback window for entity graph aggregation.",
+        ),
+    ] = 86400.0,
+    diffusion_damping: Annotated[
+        float,
+        typer.Option(
+            "--diffusion-damping",
+            help="Damping factor alpha for Personalized PageRank risk diffusion.",
+        ),
+    ] = 0.85,
+    diffusion_iterations: Annotated[
+        int,
+        typer.Option(
+            "--diffusion-iterations",
+            help="Iteration count for power-iteration risk diffusion.",
+        ),
+    ] = 5,
+) -> None:
+    """Enrich transactions with streaming bipartite link analysis and graph features.
+
+    Features are extracted sequentially without lookahead bias.
+    """
+    if not input_file.exists():
+        _abort(f"Input file not found: {input_file}")
+    _guard_output(output_file, overwrite)
+
+    df = pd.read_csv(input_file)
+    if df.empty:
+        _abort(f"Input file contains no transactions: {input_file}")
+
+    graph = EntityGraph(
+        GraphConfig(window_seconds=window_seconds, max_transactions=max(1000, len(df) * 2))
+    )
+    feat_config = GraphFeatureConfig(
+        windows_seconds=(window_seconds,),
+        diffusion_damping=diffusion_damping,
+        diffusion_iterations=diffusion_iterations,
+    )
+    extractor = GraphFeatureExtractor(graph, feat_config)
+
+    records = df.to_dict(orient="records")
+    enriched_rows: list[dict[str, Any]] = []
+
+    for idx, row in enumerate(records):
+        entities: dict[EntityType, str] = {}
+        for et in EntityType:
+            val = (
+                row.get(et.value) or row.get(et.name.lower()) or row.get(et.value.replace("_", ""))
+            )
+            if val is not None and str(val).strip() and str(val).strip().lower() != "nan":
+                entities[et] = str(val).strip()
+
+        tx_id = str(row.get("transaction_id") or row.get("tx_id") or f"tx_{idx}")
+        ts = float(row.get("timestamp") or row.get("Time") or float(idx))
+        amt = float(row.get("Amount") or row.get("amount") or 0.0)
+        is_fraud = bool(row.get("Class") or row.get("is_fraud") or False)
+        risk = float(
+            row.get("risk_score") or row.get("fraud_probability") or (1.0 if is_fraud else 0.0)
+        )
+
+        graph_features = extractor.extract_features(
+            transaction_id=tx_id,
+            timestamp=ts,
+            entities=entities,
+        )
+
+        if entities:
+            graph.add_transaction(
+                transaction_id=tx_id,
+                timestamp=ts,
+                amount=amt,
+                entities=entities,
+                is_fraud=is_fraud,
+                risk_score=risk,
+            )
+
+        new_row: dict[str, Any] = {str(k): v for k, v in row.items()}
+        new_row.update(graph_features)
+        enriched_rows.append(new_row)
+
+    enriched_df = pd.DataFrame(enriched_rows)
+    _atomic_write_csv(enriched_df, output_file)
+    feature_count = len(enriched_df.columns) - len(df.columns)
+    typer.echo(
+        f"Successfully enriched {len(enriched_df)} transactions with {feature_count} "
+        f"graph features -> {output_file}"
+    )
+
+
+@app.command("geo-velocity")
+def geo_velocity(
+    input_file: Annotated[
+        Path,
+        typer.Option(
+            "--input-file",
+            "-i",
+            help="Path to input transactions CSV or JSON audit log file.",
+        ),
+    ],
+    output: Annotated[
+        Path | None,
+        typer.Option(
+            "--output",
+            "-o",
+            help="Optional file path to persist velocity evaluation report as JSON.",
+        ),
+    ] = None,
+    as_json: Annotated[
+        bool,
+        typer.Option(
+            "--as-json",
+            help="Print report in structured JSON format.",
+        ),
+    ] = False,
+    speed_threshold: Annotated[
+        float,
+        typer.Option(
+            "--speed-threshold",
+            help="Velocity threshold in km/h to classify impossible travel.",
+        ),
+    ] = DEFAULT_MAX_SPEED_KMH,
+    max_events_per_entity: Annotated[
+        int,
+        typer.Option(
+            "--max-events-per-entity",
+            help="Maximum historical geolocation events retained per entity in sliding window.",
+        ),
+    ] = 1000,
+    window_seconds: Annotated[
+        float,
+        typer.Option(
+            "--window-seconds",
+            help="Sliding temporal lookback window in seconds.",
+        ),
+    ] = 86400.0,
+    fail_on_impossible: Annotated[
+        bool,
+        typer.Option(
+            "--fail-on-impossible",
+            help="Exit with return code 3 if impossible travel velocity anomalies are detected.",
+        ),
+    ] = False,
+    overwrite: Annotated[
+        bool,
+        typer.Option(
+            "--overwrite",
+            help="Overwrite existing output report if it already exists.",
+        ),
+    ] = False,
+) -> None:
+    """Evaluate consecutive geolocation events and detect impossible travel velocity anomalies."""
+    if not input_file.exists():
+        _abort(f"Input file not found: {input_file}")
+    _guard_output(output, overwrite)
+
+    records: list[dict[str, Any]] = []
+    if input_file.suffix.lower() == ".csv":
+        try:
+            df = pd.read_csv(input_file)
+        except pd.errors.EmptyDataError:
+            _abort(f"Input file contains no transactions: {input_file}")
+        if df.empty:
+            _abort(f"Input file contains no transactions: {input_file}")
+        records = [{str(k): v for k, v in r.items()} for r in df.to_dict(orient="records")]
+    else:
+        content = input_file.read_text(encoding="utf-8").strip()
+        if not content:
+            _abort(f"Input file is empty: {input_file}")
+        if content.startswith("["):
+            try:
+                parsed = json.loads(content)
+                if isinstance(parsed, list):
+                    records = [dict(item) for item in parsed if isinstance(item, dict)]
+            except (json.JSONDecodeError, ValueError) as exc:
+                _abort(f"Failed to parse JSON file {input_file}: {exc}")
+        else:
+            for line_idx, line in enumerate(content.splitlines()):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    parsed_item = json.loads(line)
+                    if isinstance(parsed_item, dict):
+                        records.append(parsed_item)
+                except (json.JSONDecodeError, ValueError) as exc:
+                    _abort(f"Failed to parse JSONL line {line_idx + 1} in {input_file}: {exc}")
+
+    if not records:
+        _abort(f"Input file contains no valid transaction records: {input_file}")
+
+    tracker = GeoLocationTracker(
+        max_entities=max_events_per_entity * 10,
+        window_seconds=window_seconds,
+        max_speed_kmh=speed_threshold,
+    )
+    ip_resolver = IPGeoResolver()
+
+    evaluated_transitions: list[dict[str, Any]] = []
+    impossible_anomalies: list[dict[str, Any]] = []
+    max_speed_kmh = 0.0
+
+    for idx, row in enumerate(records):
+        raw_entity = (
+            row.get("card_id")
+            or row.get("entity_id")
+            or row.get("user_id")
+            or row.get("customer_id")
+            or row.get("client_id")
+        )
+        if raw_entity is None:
+            continue
+        entity_id = str(raw_entity).strip()
+        if not entity_id or entity_id == "nan":
+            continue
+
+        raw_ts = row.get("timestamp") or row.get("Time") or row.get("time") or row.get("epoch")
+        try:
+            ts = float(raw_ts) if raw_ts is not None else float(idx)
+        except (ValueError, TypeError):
+            ts = float(idx)
+
+        lat_val = row.get("latitude") if row.get("latitude") is not None else row.get("lat")
+        lon_val = (
+            row.get("longitude")
+            if row.get("longitude") is not None
+            else (row.get("lon") if row.get("lon") is not None else row.get("lng"))
+        )
+        raw_ip = row.get("ip_address") or row.get("ip") or row.get("client_ip")
+        ip_str = (
+            str(raw_ip).strip()
+            if raw_ip is not None and str(raw_ip).strip() and str(raw_ip).strip() != "nan"
+            else None
+        )
+
+        country = row.get("country_code") or row.get("country")
+        country_str = (
+            str(country).strip().upper() if country is not None and str(country).strip() else None
+        )
+        city = row.get("city")
+        city_str = str(city).strip() if city is not None and str(city).strip() else None
+
+        coords: GeoCoordinates | None = None
+        if lat_val is not None and lon_val is not None:
+            try:
+                coords = GeoCoordinates(
+                    latitude=float(lat_val),
+                    longitude=float(lon_val),
+                    country_code=country_str,
+                    city=city_str,
+                )
+            except (ValueError, TypeError, GeoLocationError):
+                coords = None
+
+        if coords is None and ip_str:
+            try:
+                resolved = ip_resolver.resolve(ip_str)
+                if not resolved.is_private and resolved.coordinates.country_code != "XX":
+                    coords = resolved.coordinates
+            except GeoLocationError:
+                pass
+
+        if coords is None:
+            continue
+
+        tx_id = str(row.get("transaction_id") or row.get("tx_id") or f"tx_{idx}")
+
+        event = GeoLocationEvent(
+            event_id=tx_id,
+            entity_id=entity_id,
+            timestamp=ts,
+            coordinates=coords,
+            ip_address=ip_str,
+        )
+
+        vel = tracker.record_event(event)
+        if vel is not None:
+            v_dict = vel.to_dict()
+            v_dict["entity_id"] = entity_id
+            v_dict["event_id"] = tx_id
+            evaluated_transitions.append(v_dict)
+            if vel.velocity_kmh > max_speed_kmh:
+                max_speed_kmh = vel.velocity_kmh
+            if vel.is_impossible_travel:
+                impossible_anomalies.append(v_dict)
+
+    stats = tracker.stats()
+    report_dict: dict[str, Any] = {
+        "input_file": str(input_file),
+        "total_entities": stats["total_entities"],
+        "total_events_processed": stats["total_events"],
+        "evaluated_transitions_count": len(evaluated_transitions),
+        "impossible_travel_count": len(impossible_anomalies),
+        "speed_threshold_kmh": speed_threshold,
+        "max_speed_kmh": round(max_speed_kmh, 2),
+        "impossible_anomalies": impossible_anomalies,
+    }
+
+    report_json = json.dumps(report_dict, indent=2)
+    if output is not None:
+        _atomic_write_text(report_json + "\n", output)
+
+    if as_json:
+        typer.echo(report_json)
+    else:
+        typer.echo("Geolocation Travel Velocity Analysis Report:")
+        typer.echo(f"  Input File:                 {report_dict['input_file']}")
+        typer.echo(f"  Total Entities Tracked:     {report_dict['total_entities']}")
+        typer.echo(f"  Total Events Processed:     {report_dict['total_events_processed']}")
+        typer.echo(f"  Transitions Evaluated:      {report_dict['evaluated_transitions_count']}")
+        typer.echo(f"  Speed Threshold:            {report_dict['speed_threshold_kmh']} km/h")
+        typer.echo(f"  Max Speed Observed:         {report_dict['max_speed_kmh']} km/h")
+        typer.echo(f"  Impossible Travel Anomalies:{report_dict['impossible_travel_count']}")
+        for anomaly in impossible_anomalies:
+            typer.echo(
+                f"  [IMPOSSIBLE TRAVEL] Entity '{anomaly['entity_id']}': "
+                f"{anomaly['distance_km']:.1f} km in {anomaly['time_elapsed_seconds']:.1f}s "
+                f"({anomaly['velocity_kmh']:.1f} km/h)"
+            )
+
+    if fail_on_impossible and len(impossible_anomalies) > 0:
+        typer.echo(
+            f"Error: Impossible travel detected ({len(impossible_anomalies)} events "
+            f"exceeding {speed_threshold} km/h). Failing per --fail-on-impossible.",
+            err=True,
+        )
+        raise typer.Exit(code=3)
+
+
+@app.command("geo-enrich")
+def geo_enrich(
+    input_file: Annotated[
+        Path,
+        typer.Option(
+            "--input-file",
+            "-i",
+            help="Input CSV file containing transactions to enrich with geolocation features.",
+        ),
+    ],
+    output_file: Annotated[
+        Path,
+        typer.Option(
+            "--output-file",
+            "-o",
+            help="Output destination file for enriched transaction dataset.",
+        ),
+    ],
+    overwrite: Annotated[
+        bool,
+        typer.Option(
+            "--overwrite",
+            help="Overwrite existing output file if it exists.",
+        ),
+    ] = False,
+    speed_threshold: Annotated[
+        float,
+        typer.Option(
+            "--speed-threshold",
+            help="Velocity threshold in km/h for impossible travel classification.",
+        ),
+    ] = DEFAULT_MAX_SPEED_KMH,
+    window_seconds: Annotated[
+        float,
+        typer.Option(
+            "--window-seconds",
+            help="Sliding temporal lookback window for trajectory tracking in seconds.",
+        ),
+    ] = 86400.0,
+    max_events_per_entity: Annotated[
+        int,
+        typer.Option(
+            "--max-events-per-entity",
+            help="Max historical geolocation events retained per entity.",
+        ),
+    ] = 1000,
+    billing_country_field: Annotated[
+        str,
+        typer.Option(
+            "--billing-country-field",
+            help="Field name in input dataset containing billing/reference country.",
+        ),
+    ] = "billing_country",
+    output_format: Annotated[
+        str,
+        typer.Option(
+            "--format",
+            help="Output format: 'csv' or 'json'.",
+        ),
+    ] = "csv",
+) -> None:
+    """Enrich transactions with streaming geolocation and travel velocity features.
+
+    Features are extracted sequentially without lookahead bias.
+    """
+    if not input_file.exists():
+        _abort(f"Input file not found: {input_file}")
+    _guard_output(output_file, overwrite)
+
+    try:
+        df = pd.read_csv(input_file)
+    except pd.errors.EmptyDataError:
+        _abort(f"Input file contains no transactions: {input_file}")
+    if df.empty:
+        _abort(f"Input file contains no transactions: {input_file}")
+
+    tracker = GeoLocationTracker(
+        max_entities=max_events_per_entity * 10,
+        window_seconds=window_seconds,
+        max_speed_kmh=speed_threshold,
+    )
+    feature_config = GeoFeatureConfig(
+        max_speed_kmh=speed_threshold,
+        billing_country_field=billing_country_field,
+    )
+    extractor = GeoFeatureExtractor(tracker=tracker, config=feature_config)
+
+    enriched_df = extractor.extract_batch(df, mutate_tracker=True)
+
+    fmt = output_format.lower().strip()
+    if fmt == "json" or output_file.suffix.lower() == ".json":
+        _atomic_write_text(enriched_df.to_json(orient="records", indent=2) + "\n", output_file)
+    else:
+        _atomic_write_csv(enriched_df, output_file)
+
+    feature_count = len(enriched_df.columns) - len(df.columns)
+    typer.echo(
+        f"Successfully enriched {len(enriched_df)} transactions with {feature_count} "
+        f"geolocation features -> {output_file}"
+    )
+
+
+@app.command("device-clusters")
+def device_clusters(
+    input_file: Annotated[
+        Path,
+        typer.Option(
+            "--input-file",
+            "-i",
+            help="Input CSV dataset with device identifiers and fingerprints.",
+        ),
+    ],
+    output: Annotated[
+        Path | None,
+        typer.Option(
+            "--output",
+            "-o",
+            help="Destination file path for anomaly detection and clustering report.",
+        ),
+    ] = None,
+    overwrite: Annotated[
+        bool,
+        typer.Option(
+            "--overwrite",
+            help="Overwrite existing output file if it exists.",
+        ),
+    ] = False,
+    window_seconds: Annotated[
+        float,
+        typer.Option(
+            "--window-seconds",
+            help="Sliding temporal lookback window for velocity and cycling tracking in seconds.",
+        ),
+    ] = 86400.0,
+    card_cycling_threshold: Annotated[
+        int,
+        typer.Option(
+            "--card-cycling-threshold",
+            help="Threshold for distinct credit cards seen on a single device.",
+        ),
+    ] = 3,
+    device_cycling_threshold: Annotated[
+        int,
+        typer.Option(
+            "--device-cycling-threshold",
+            help="Threshold for distinct devices seen on a single card.",
+        ),
+    ] = 3,
+    similarity_threshold: Annotated[
+        float,
+        typer.Option(
+            "--similarity-threshold",
+            help="Minimum similarity score below which device drift anomaly is flagged.",
+        ),
+    ] = 0.8,
+    fail_on_anomaly: Annotated[
+        bool,
+        typer.Option(
+            "--fail-on-anomaly",
+            help="Exit with code 3 if any HIGH or CRITICAL device anomalies are detected.",
+        ),
+    ] = False,
+    as_json: Annotated[
+        bool,
+        typer.Option(
+            "--json",
+            "-j",
+            help="Output report formatted as JSON.",
+        ),
+    ] = False,
+) -> None:
+    """Analyze transaction dataset for device card cycling, emulator bots, and fingerprint drift."""
+    if not input_file.exists():
+        _abort(f"Input file not found: {input_file}")
+    _guard_output(output, overwrite)
+
+    try:
+        df = pd.read_csv(input_file)
+    except pd.errors.EmptyDataError:
+        _abort(f"Input file contains no transactions: {input_file}")
+    if df.empty:
+        _abort(f"Input file contains no transactions: {input_file}")
+
+    tracker = DeviceTracker(
+        config=DeviceTrackerConfig(
+            window_seconds=window_seconds,
+            card_cycling_threshold=card_cycling_threshold,
+            device_cycling_threshold=device_cycling_threshold,
+            min_similarity_threshold=similarity_threshold,
+        )
+    )
+
+    card_cycling_anomalies: list[dict[str, Any]] = []
+    device_cycling_anomalies: list[dict[str, Any]] = []
+    emulator_anomalies: list[dict[str, Any]] = []
+    drift_anomalies: list[dict[str, Any]] = []
+    high_critical_anomalies: list[dict[str, Any]] = []
+    all_anomalies: list[dict[str, Any]] = []
+
+    records: list[dict[str, Any]] = [
+        {str(k): v for k, v in r.items()} for r in df.to_dict(orient="records")
+    ]
+
+    for idx, raw_row in enumerate(records):
+        raw_ts = (
+            raw_row.get("timestamp")
+            if raw_row.get("timestamp") is not None
+            else (
+                raw_row.get("trans_date_trans_time")
+                if raw_row.get("trans_date_trans_time") is not None
+                else (
+                    raw_row.get("unix_time")
+                    if raw_row.get("unix_time") is not None
+                    else raw_row.get("event_time")
+                )
+            )
+        )
+        try:
+            ts = float(raw_ts) if raw_ts is not None else float(idx)
+        except (ValueError, TypeError):
+            ts = float(idx)
+
+        screen_obj: ScreenGeometry | None = None
+        if "screen_width" in raw_row and "screen_height" in raw_row:
+            try:
+                w = int(raw_row["screen_width"])
+                h = int(raw_row["screen_height"])
+                if w > 0 and h > 0:
+                    screen_obj = ScreenGeometry(
+                        width=w,
+                        height=h,
+                        color_depth=int(raw_row.get("screen_color_depth", 24)),
+                        pixel_ratio=float(raw_row.get("screen_pixel_ratio", 1.0)),
+                    )
+            except (ValueError, TypeError, DeviceFingerprintError):
+                screen_obj = None
+
+        fp: DeviceFingerprint | None = None
+        raw_fp = raw_row.get("fingerprint", raw_row.get("device_fingerprint"))
+        if isinstance(raw_fp, DeviceFingerprint):
+            fp = raw_fp
+        elif isinstance(raw_fp, dict):
+            try:
+                fp = DeviceFingerprint.from_dict(raw_fp)
+            except (ValueError, TypeError, DeviceFingerprintError):
+                fp = None
+        elif any(
+            k in raw_row for k in ("user_agent", "os_platform", "browser_family", "screen_width")
+        ):
+            try:
+                raw_dev = raw_row.get("device_id")
+                dev_str = (
+                    str(raw_dev).strip()
+                    if raw_dev is not None
+                    and str(raw_dev).strip()
+                    and str(raw_dev).strip() != "nan"
+                    else None
+                )
+                fp = DeviceFingerprint(
+                    device_id=dev_str,
+                    user_agent=str(raw_row.get("user_agent", "")),
+                    os_platform=str(raw_row.get("os_platform", "")),
+                    browser_family=str(raw_row.get("browser_family", "")),
+                    screen=screen_obj,
+                    language=str(raw_row.get("language", "en")),
+                    timezone_offset_minutes=int(raw_row.get("timezone_offset_minutes", 0)),
+                    hardware_concurrency=int(raw_row.get("hardware_concurrency", 4)),
+                    device_memory_gb=float(raw_row.get("device_memory_gb", 8.0)),
+                    webgl_vendor=str(raw_row.get("webgl_vendor", "")),
+                    webgl_renderer=str(raw_row.get("webgl_renderer", "")),
+                    canvas_hash=str(raw_row.get("canvas_hash", "")),
+                    audio_hash=str(raw_row.get("audio_hash", "")),
+                    is_touch_capable=bool(raw_row.get("is_touch_capable", False)),
+                    has_webdriver=bool(raw_row.get("has_webdriver", False)),
+                    plugins_count=int(raw_row.get("plugins_count", 0)),
+                )
+            except (ValueError, TypeError, DeviceFingerprintError):
+                fp = None
+
+        raw_device = raw_row.get("device_id") or raw_row.get("device")
+        device_id = (
+            str(raw_device).strip()
+            if raw_device is not None
+            and str(raw_device).strip()
+            and str(raw_device).strip() != "nan"
+            else ""
+        )
+        if not device_id and fp is not None:
+            device_id = fp.device_id or DeviceHasher.canonical_hash(fp)
+        if not device_id:
+            device_id = f"device_{idx}"
+
+        card_id: str | None = None
+        for key in ("card_id", "cc_num", "account_id", "user_id"):
+            val = raw_row.get(key)
+            if val is not None and str(val).strip() and str(val).strip() != "nan":
+                card_id = str(val).strip()
+                break
+
+        report = tracker.record_event(
+            device_id=device_id,
+            card_id=card_id,
+            timestamp=ts,
+            fingerprint=fp,
+        )
+
+        if report.has_anomaly:
+            rep_dict = report.to_dict()
+            rep_dict["event_index"] = idx
+            rep_dict["card_id"] = card_id
+
+            all_anomalies.append(rep_dict)
+            if report.is_card_cycling:
+                card_cycling_anomalies.append(rep_dict)
+            if report.is_device_cycling:
+                device_cycling_anomalies.append(rep_dict)
+            if report.is_emulator:
+                emulator_anomalies.append(rep_dict)
+            if report.is_fingerprint_drift:
+                drift_anomalies.append(rep_dict)
+            if report.severity in ("HIGH", "CRITICAL"):
+                high_critical_anomalies.append(rep_dict)
+
+    stats = tracker.get_stats()
+    report_dict: dict[str, Any] = {
+        "input_file": str(input_file),
+        "total_events_processed": len(df),
+        "total_devices_tracked": stats["tracked_devices_count"],
+        "total_cards_tracked": stats["tracked_cards_count"],
+        "total_anomalies_detected": len(all_anomalies),
+        "card_cycling_anomalies_count": len(card_cycling_anomalies),
+        "device_cycling_anomalies_count": len(device_cycling_anomalies),
+        "emulator_anomalies_count": len(emulator_anomalies),
+        "drift_anomalies_count": len(drift_anomalies),
+        "high_critical_anomalies_count": len(high_critical_anomalies),
+        "anomalies": all_anomalies,
+    }
+
+    report_json = json.dumps(report_dict, indent=2)
+    if output is not None:
+        _atomic_write_text(report_json + "\n", output)
+
+    if as_json:
+        typer.echo(report_json)
+    else:
+        typer.echo("Device Fingerprinting & Anomaly Clustering Report:")
+        typer.echo(f"  Input File:                    {report_dict['input_file']}")
+        typer.echo(f"  Total Events Processed:        {report_dict['total_events_processed']}")
+        typer.echo(f"  Total Devices Tracked:         {report_dict['total_devices_tracked']}")
+        typer.echo(f"  Total Cards Tracked:           {report_dict['total_cards_tracked']}")
+        typer.echo(f"  Total Anomalies Detected:      {report_dict['total_anomalies_detected']}")
+        typer.echo(
+            f"  Card-Cycling Anomalies:        {report_dict['card_cycling_anomalies_count']}"
+        )
+        typer.echo(
+            f"  Device-Cycling Anomalies:      {report_dict['device_cycling_anomalies_count']}"
+        )
+        typer.echo(f"  Emulator Anomalies:            {report_dict['emulator_anomalies_count']}")
+        typer.echo(f"  Fingerprint Drift Anomalies:   {report_dict['drift_anomalies_count']}")
+        typer.echo(
+            f"  High/Critical Severity Count:  {report_dict['high_critical_anomalies_count']}"
+        )
+        for anomaly in high_critical_anomalies[:10]:
+            reasons_str = "; ".join(anomaly.get("reasons", []))
+            typer.echo(
+                f"  [{anomaly.get('severity')}] Device '{anomaly.get('device_id')}': {reasons_str}"
+            )
+
+    if fail_on_anomaly and len(high_critical_anomalies) > 0:
+        typer.echo(
+            f"Error: High/critical device anomalies detected "
+            f"({len(high_critical_anomalies)} events). Failing per --fail-on-anomaly.",
+            err=True,
+        )
+        raise typer.Exit(code=3)
+
+
+@app.command("device-enrich")
+def device_enrich(
+    input_file: Annotated[
+        Path,
+        typer.Option(
+            "--input-file",
+            "-i",
+            help="Input CSV file to enrich with device fingerprint features.",
+        ),
+    ],
+    output_file: Annotated[
+        Path,
+        typer.Option(
+            "--output-file",
+            "-o",
+            help="Output destination file for enriched transaction dataset.",
+        ),
+    ],
+    overwrite: Annotated[
+        bool,
+        typer.Option(
+            "--overwrite",
+            help="Overwrite existing output file if it exists.",
+        ),
+    ] = False,
+    window_seconds: Annotated[
+        float,
+        typer.Option(
+            "--window-seconds",
+            help="Sliding temporal lookback window for velocity and cycling tracking in seconds.",
+        ),
+    ] = 86400.0,
+    card_cycling_threshold: Annotated[
+        int,
+        typer.Option(
+            "--card-cycling-threshold",
+            help="Threshold for distinct credit cards seen on a single device.",
+        ),
+    ] = 3,
+    device_cycling_threshold: Annotated[
+        int,
+        typer.Option(
+            "--device-cycling-threshold",
+            help="Threshold for distinct devices seen on a single card.",
+        ),
+    ] = 3,
+    similarity_threshold: Annotated[
+        float,
+        typer.Option(
+            "--similarity-threshold",
+            help="Minimum similarity score below which device drift anomaly is flagged.",
+        ),
+    ] = 0.8,
+    output_format: Annotated[
+        str,
+        typer.Option(
+            "--format",
+            help="Output format: 'csv' or 'json'.",
+        ),
+    ] = "csv",
+) -> None:
+    """Enrich transactions with streaming device fingerprint and anomaly clustering features.
+
+    Features are extracted sequentially without lookahead bias.
+    """
+    if not input_file.exists():
+        _abort(f"Input file not found: {input_file}")
+    _guard_output(output_file, overwrite)
+
+    try:
+        df = pd.read_csv(input_file)
+    except pd.errors.EmptyDataError:
+        _abort(f"Input file contains no transactions: {input_file}")
+    if df.empty:
+        _abort(f"Input file contains no transactions: {input_file}")
+
+    tracker = DeviceTracker(
+        config=DeviceTrackerConfig(
+            window_seconds=window_seconds,
+            card_cycling_threshold=card_cycling_threshold,
+            device_cycling_threshold=device_cycling_threshold,
+            min_similarity_threshold=similarity_threshold,
+        )
+    )
+    extractor = DeviceFeatureExtractor(tracker=tracker)
+
+    records: list[dict[str, Any]] = [
+        {str(k): v for k, v in r.items()} for r in df.to_dict(orient="records")
+    ]
+    extracted_features = extractor.extract_batch(records, mutate_tracker=True)
+
+    features_df = pd.DataFrame(extracted_features)
+    enriched_df = pd.concat([df.reset_index(drop=True), features_df.reset_index(drop=True)], axis=1)
+
+    fmt = output_format.lower().strip()
+    if fmt == "json" or output_file.suffix.lower() == ".json":
+        _atomic_write_text(enriched_df.to_json(orient="records", indent=2) + "\n", output_file)
+    else:
+        _atomic_write_csv(enriched_df, output_file)
+
+    feature_count = len(extracted_features[0]) if extracted_features else 0
+    typer.echo(
+        f"Successfully enriched {len(enriched_df)} transactions with {feature_count} "
+        f"device features -> {output_file}"
+    )
+
+
+def _load_transaction_dataframe(input_file: Path) -> pd.DataFrame:
+    """Load CSV or JSON transaction records into a DataFrame or abort on error."""
+    if not input_file.exists():
+        _abort(f"Input file not found: {input_file}")
+    try:
+        if input_file.suffix.lower() == ".json":
+            raw_json = json.loads(input_file.read_text(encoding="utf-8"))
+            if not isinstance(raw_json, list):
+                _abort(f"Input JSON file must contain a list of records: {input_file}")
+            df = pd.DataFrame(raw_json)
+        else:
+            df = pd.read_csv(input_file)
+    except (pd.errors.EmptyDataError, json.JSONDecodeError, ValueError) as exc:
+        _abort(f"Input file contains no valid transactions ({exc}): {input_file}")
+    if df.empty:
+        _abort(f"Input file contains no transactions: {input_file}")
+    return df
+
+
+def _row_to_merchant_event(
+    record: dict[str, Any],
+    default_ts: float,
+) -> MerchantTransactionEvent:
+    """Convert a raw transaction dictionary into a validated MerchantTransactionEvent."""
+    merchant_id = "merchant_unknown"
+    for m_key in ("merchant_id", "merchant", "merch_id"):
+        raw_m = record.get(m_key)
+        if raw_m is not None and str(raw_m).strip() and str(raw_m).strip() != "nan":
+            merchant_id = str(raw_m).strip()
+            break
+
+    raw_mcc = "0000"
+    for mcc_key in ("mcc", "merchant_category_code", "category_code"):
+        val_mcc = record.get(mcc_key)
+        if val_mcc is not None and str(val_mcc).strip() and str(val_mcc).strip() != "nan":
+            raw_mcc = str(val_mcc).strip()
+            break
+
+    try:
+        mcc_profile = resolve_mcc_profile(raw_mcc)
+    except MerchantRiskError:
+        mcc_profile = resolve_mcc_profile("0000")
+
+    amount = 0.0
+    for a_key in ("amount", "amt", "Amount"):
+        if a_key in record and record[a_key] is not None:
+            try:
+                parsed_amt = float(record[a_key])
+                if np.isfinite(parsed_amt) and parsed_amt >= 0.0:
+                    amount = parsed_amt
+                    break
+            except (ValueError, TypeError):
+                pass
+
+    timestamp = default_ts
+    for t_key in ("timestamp", "unix_time", "Time", "event_time"):
+        if t_key in record and record[t_key] is not None:
+            try:
+                parsed_ts = float(record[t_key])
+                if np.isfinite(parsed_ts):
+                    timestamp = parsed_ts
+                    break
+            except (ValueError, TypeError):
+                pass
+
+    card_id: str | None = None
+    for c_key in ("card_id", "cc_num", "account_id", "user_id"):
+        raw_c = record.get(c_key)
+        if raw_c is not None and str(raw_c).strip() and str(raw_c).strip() != "nan":
+            card_id = str(raw_c).strip()
+            break
+
+    raw_fraud = record.get("is_fraud", record.get("Class", False))
+    is_fraud = bool(raw_fraud) and str(raw_fraud).strip().lower() not in ("0", "false", "", "nan")
+    raw_cb = record.get("is_chargeback", False)
+    is_chargeback = bool(raw_cb) and str(raw_cb).strip().lower() not in ("0", "false", "", "nan")
+
+    return MerchantTransactionEvent(
+        merchant_id=merchant_id,
+        timestamp=timestamp,
+        amount=amount,
+        mcc=mcc_profile.mcc,
+        card_id=card_id,
+        is_fraud=is_fraud,
+        is_chargeback=is_chargeback,
+    )
+
+
+@app.command("merchant-surveillance")
+def merchant_surveillance(
+    input_file: Annotated[
+        Path,
+        typer.Option(
+            "--input-file",
+            "-i",
+            help="Input CSV or JSON file containing transaction records with merchant telemetry.",
+        ),
+    ],
+    output: Annotated[
+        Path | None,
+        typer.Option(
+            "--output",
+            "-o",
+            help="Optional JSON report output file.",
+        ),
+    ] = None,
+    overwrite: Annotated[
+        bool,
+        typer.Option(
+            "--overwrite",
+            help="Overwrite existing output file if it exists.",
+        ),
+    ] = False,
+    window_seconds: Annotated[
+        float,
+        typer.Option(
+            "--window-seconds",
+            help="Sliding temporal lookback window for merchant velocity tracking in seconds.",
+        ),
+    ] = 86400.0,
+    chargeback_rate_threshold: Annotated[
+        float,
+        typer.Option(
+            "--chargeback-rate-threshold",
+            help="Maximum allowed chargeback ratio before high-chargeback anomaly triggers.",
+        ),
+    ] = 0.015,
+    min_chargeback_count: Annotated[
+        int,
+        typer.Option(
+            "--min-chargeback-count",
+            help="Minimum chargebacks in window required to trigger chargeback breach.",
+        ),
+    ] = 3,
+    bust_out_zscore_threshold: Annotated[
+        float,
+        typer.Option(
+            "--bust-out-zscore-threshold",
+            help="Ticket amount Z-score threshold for terminal bust-out surge detection.",
+        ),
+    ] = 3.0,
+    min_distinct_cards_for_testing: Annotated[
+        int,
+        typer.Option(
+            "--min-distinct-cards-for-testing",
+            help="Minimum distinct cards in window for micro-transaction card-testing detection.",
+        ),
+    ] = 5,
+    fail_on_anomaly: Annotated[
+        bool,
+        typer.Option(
+            "--fail-on-anomaly",
+            help="Exit with code 3 if any HIGH or CRITICAL merchant anomalies are detected.",
+        ),
+    ] = False,
+    as_json: Annotated[
+        bool,
+        typer.Option(
+            "--json",
+            "-j",
+            help="Output report formatted as JSON.",
+        ),
+    ] = False,
+) -> None:
+    """Analyze transaction dataset for merchant chargeback breaches, bust-outs, and card testing."""
+    _guard_output(output, overwrite)
+    df = _load_transaction_dataframe(input_file)
+
+    tracker = MerchantTracker(
+        config=MerchantTrackerConfig(
+            window_seconds=window_seconds,
+            chargeback_rate_threshold=chargeback_rate_threshold,
+            min_chargeback_count=min_chargeback_count,
+            bust_out_zscore_threshold=bust_out_zscore_threshold,
+            min_distinct_cards_for_testing=min_distinct_cards_for_testing,
+        )
+    )
+
+    chargeback_anomalies: list[dict[str, Any]] = []
+    bust_out_anomalies: list[dict[str, Any]] = []
+    card_testing_anomalies: list[dict[str, Any]] = []
+    ticket_outlier_anomalies: list[dict[str, Any]] = []
+    high_critical_anomalies: list[dict[str, Any]] = []
+    all_anomalies: list[dict[str, Any]] = []
+
+    records: list[dict[str, Any]] = [
+        {str(k): v for k, v in r.items()} for r in df.to_dict(orient="records")
+    ]
+
+    for idx, raw_row in enumerate(records):
+        event = _row_to_merchant_event(raw_row, default_ts=float(idx))
+        _, report = tracker.record_event(event)
+
+        if report.has_anomaly:
+            rep_dict = report.to_dict()
+            rep_dict["event_index"] = idx
+            rep_dict["card_id"] = event.card_id
+
+            all_anomalies.append(rep_dict)
+            if report.is_high_chargeback:
+                chargeback_anomalies.append(rep_dict)
+            if report.is_bust_out_surge:
+                bust_out_anomalies.append(rep_dict)
+            if report.is_card_testing:
+                card_testing_anomalies.append(rep_dict)
+            if report.is_ticket_outlier:
+                ticket_outlier_anomalies.append(rep_dict)
+            if report.severity in ("HIGH", "CRITICAL"):
+                high_critical_anomalies.append(rep_dict)
+
+    stats = tracker.get_stats()
+    report_dict: dict[str, Any] = {
+        "input_file": str(input_file),
+        "total_events_processed": len(df),
+        "total_merchants_tracked": stats["tracked_merchants"],
+        "total_anomalies_detected": len(all_anomalies),
+        "chargeback_anomalies_count": len(chargeback_anomalies),
+        "bust_out_anomalies_count": len(bust_out_anomalies),
+        "card_testing_anomalies_count": len(card_testing_anomalies),
+        "ticket_outlier_anomalies_count": len(ticket_outlier_anomalies),
+        "high_critical_anomalies_count": len(high_critical_anomalies),
+        "anomalies": all_anomalies,
+    }
+
+    report_json = json.dumps(report_dict, indent=2)
+    if output is not None:
+        _atomic_write_text(report_json + "\n", output)
+
+    if as_json:
+        typer.echo(report_json)
+    else:
+        typer.echo("Merchant Risk Profiling & Chargeback Surveillance Report:")
+        typer.echo(f"  Input File:                    {report_dict['input_file']}")
+        typer.echo(f"  Total Events Processed:        {report_dict['total_events_processed']}")
+        typer.echo(f"  Total Merchants Tracked:       {report_dict['total_merchants_tracked']}")
+        typer.echo(f"  Total Anomalies Detected:      {report_dict['total_anomalies_detected']}")
+        typer.echo(f"  Chargeback Breach Anomalies:   {report_dict['chargeback_anomalies_count']}")
+        typer.echo(f"  Bust-Out Surge Anomalies:      {report_dict['bust_out_anomalies_count']}")
+        typer.echo(
+            f"  Card-Testing Anomalies:        {report_dict['card_testing_anomalies_count']}"
+        )
+        typer.echo(
+            f"  Ticket Outlier Anomalies:      {report_dict['ticket_outlier_anomalies_count']}"
+        )
+        typer.echo(
+            f"  High/Critical Severity Count:  {report_dict['high_critical_anomalies_count']}"
+        )
+        for anomaly in high_critical_anomalies[:10]:
+            reasons_str = "; ".join(anomaly.get("reasons", []))
+            typer.echo(
+                f"  [{anomaly.get('severity')}] Merchant "
+                f"'{anomaly.get('merchant_id')}': {reasons_str}"
+            )
+
+    if fail_on_anomaly and len(high_critical_anomalies) > 0:
+        typer.echo(
+            f"Error: High/critical merchant anomalies detected "
+            f"({len(high_critical_anomalies)} events). Failing per --fail-on-anomaly.",
+            err=True,
+        )
+        raise typer.Exit(code=3)
+
+
+@app.command("merchant-enrich")
+def merchant_enrich(
+    input_file: Annotated[
+        Path,
+        typer.Option(
+            "--input-file",
+            "-i",
+            help="Input CSV or JSON file to enrich with merchant risk features.",
+        ),
+    ],
+    output_file: Annotated[
+        Path,
+        typer.Option(
+            "--output-file",
+            "-o",
+            help="Output destination file for enriched transaction dataset.",
+        ),
+    ],
+    overwrite: Annotated[
+        bool,
+        typer.Option(
+            "--overwrite",
+            help="Overwrite existing output file if it exists.",
+        ),
+    ] = False,
+    window_seconds: Annotated[
+        float,
+        typer.Option(
+            "--window-seconds",
+            help="Sliding temporal lookback window for merchant velocity tracking in seconds.",
+        ),
+    ] = 86400.0,
+    chargeback_rate_threshold: Annotated[
+        float,
+        typer.Option(
+            "--chargeback-rate-threshold",
+            help="Maximum allowed chargeback ratio before high-chargeback anomaly triggers.",
+        ),
+    ] = 0.015,
+    min_chargeback_count: Annotated[
+        int,
+        typer.Option(
+            "--min-chargeback-count",
+            help="Minimum chargebacks in window required to trigger chargeback breach.",
+        ),
+    ] = 3,
+    bust_out_zscore_threshold: Annotated[
+        float,
+        typer.Option(
+            "--bust-out-zscore-threshold",
+            help="Ticket amount Z-score threshold for terminal bust-out surge detection.",
+        ),
+    ] = 3.0,
+    min_distinct_cards_for_testing: Annotated[
+        int,
+        typer.Option(
+            "--min-distinct-cards-for-testing",
+            help="Minimum distinct cards in window for micro-transaction card-testing detection.",
+        ),
+    ] = 5,
+    output_format: Annotated[
+        str,
+        typer.Option(
+            "--format",
+            help="Output format: 'csv' or 'json'.",
+        ),
+    ] = "csv",
+) -> None:
+    """Enrich transactions with streaming merchant risk, MCC, and chargeback features.
+
+    Features are extracted sequentially without lookahead bias.
+    """
+    _guard_output(output_file, overwrite)
+    df = _load_transaction_dataframe(input_file)
+
+    tracker = MerchantTracker(
+        config=MerchantTrackerConfig(
+            window_seconds=window_seconds,
+            chargeback_rate_threshold=chargeback_rate_threshold,
+            min_chargeback_count=min_chargeback_count,
+            bust_out_zscore_threshold=bust_out_zscore_threshold,
+            min_distinct_cards_for_testing=min_distinct_cards_for_testing,
+        )
+    )
+    extractor = MerchantFeatureExtractor(tracker=tracker)
+
+    records: list[dict[str, Any]] = [
+        {str(k): v for k, v in r.items()} for r in df.to_dict(orient="records")
+    ]
+    extracted_features = extractor.extract_batch(records, mutate_tracker=True)
+
+    features_df = pd.DataFrame(extracted_features)
+    enriched_df = pd.concat([df.reset_index(drop=True), features_df.reset_index(drop=True)], axis=1)
+
+    fmt = output_format.lower().strip()
+    if fmt == "json" or output_file.suffix.lower() == ".json":
+        _atomic_write_text(enriched_df.to_json(orient="records", indent=2) + "\n", output_file)
+    else:
+        _atomic_write_csv(enriched_df, output_file)
+
+    feature_count = len(extracted_features[0]) if extracted_features else 0
+    typer.echo(
+        f"Successfully enriched {len(enriched_df)} transactions with {feature_count} "
+        f"merchant features -> {output_file}"
+    )
+
+
+@app.command("tenant-list")
+def tenant_list(
+    registry_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--registry-file",
+            "-r",
+            help="Optional path to serialized tenant registry JSON file.",
+        ),
+    ] = None,
+    tier: Annotated[
+        str | None,
+        typer.Option(
+            "--tier",
+            help="Filter tenants by tier: 'free', 'standard', 'premium', 'enterprise'.",
+        ),
+    ] = None,
+    status: Annotated[
+        str | None,
+        typer.Option(
+            "--status",
+            help="Filter tenants by status: 'active', 'suspended', 'deprecated'.",
+        ),
+    ] = None,
+    output_format: Annotated[
+        str,
+        typer.Option(
+            "--format",
+            "-f",
+            help="Output format: 'json' or 'table'.",
+        ),
+    ] = "json",
+) -> None:
+    """List registered tenant partitions and their operational configuration."""
+    registry = TenantRegistry()
+    if registry_file is not None:
+        if not registry_file.is_file():
+            _abort(f"Tenant registry file not found: {registry_file}")
+        try:
+            raw = registry_file.read_text(encoding="utf-8")
+            registry = TenantRegistry.import_manifest(json.loads(raw))
+        except (
+            OSError,
+            ValueError,
+            TypeError,
+            KeyError,
+            json.JSONDecodeError,
+            TenantError,
+        ) as exc:
+            _abort(f"Failed to load tenant registry from {registry_file}: {exc}")
+
+    tenants = registry.list_tenants()
+    if tier is not None:
+        tenants = [t for t in tenants if t.tier.value.lower() == tier.lower()]
+    if status is not None:
+        tenants = [t for t in tenants if t.status.value.lower() == status.lower()]
+
+    rows = [
+        {
+            "tenant_id": t.tenant_id,
+            "tier": t.tier.value,
+            "status": t.status.value,
+            "is_active": t.is_active,
+            "rate_limit_rpm": t.rate_limit_rpm,
+            "decline_threshold": t.risk_profile.decline_threshold,
+            "challenge_threshold": t.risk_profile.challenge_threshold,
+            "review_threshold": t.risk_profile.review_threshold,
+            "tags": list(t.tags),
+        }
+        for t in tenants
+    ]
+
+    payload = {
+        "total_count": len(rows),
+        "tenants": rows,
+    }
+
+    if output_format.lower() == "table":
+        headers = ["Tenant ID", "Tier", "Status", "Rate Limit", "Decline", "Review"]
+        col_w = [18, 12, 12, 12, 10, 10]
+        header_line = " | ".join(h.ljust(w) for h, w in zip(headers, col_w, strict=True))
+        divider = "-+-".join("-" * w for w in col_w)
+        typer.echo(header_line)
+        typer.echo(divider)
+        for r in rows:
+            line = " | ".join(
+                [
+                    str(r["tenant_id"])[:18].ljust(18),
+                    str(r["tier"])[:12].ljust(12),
+                    str(r["status"])[:12].ljust(12),
+                    str(r["rate_limit_rpm"]).ljust(12),
+                    f"{r['decline_threshold']:.2f}".ljust(10),
+                    f"{r['review_threshold']:.2f}".ljust(10),
+                ]
+            )
+            typer.echo(line)
+        typer.echo(f"\nTotal: {len(rows)} tenant(s)")
+    else:
+        typer.echo(json.dumps(payload, indent=2))
+
+
+@app.command("tenant-validate")
+def tenant_validate(
+    manifest_file: Annotated[
+        Path,
+        typer.Option(
+            "--manifest-file",
+            "-m",
+            help="Path to tenant JSON manifest file to validate.",
+        ),
+    ],
+    strict: Annotated[
+        bool,
+        typer.Option(
+            "--strict",
+            help="Enforce strict validation (require at least one tag and custom thresholds).",
+        ),
+    ] = False,
+) -> None:
+    """Validate tenant definition or registry manifest file for semantic correctness."""
+    if not manifest_file.is_file():
+        _abort(f"Manifest file not found: {manifest_file}")
+
+    try:
+        raw = manifest_file.read_text(encoding="utf-8")
+        data = json.loads(raw)
+    except (OSError, json.JSONDecodeError) as exc:
+        _abort(f"Failed to read JSON manifest {manifest_file}: {exc}")
+
+    tenant_items: list[dict[str, Any]] = []
+    if isinstance(data, list):
+        tenant_items = data
+    elif isinstance(data, dict):
+        if "tenants" in data and isinstance(data["tenants"], list):
+            tenant_items = data["tenants"]
+        else:
+            tenant_items = [data]
+    else:
+        _abort("Manifest root must be an object or a list of tenant objects.")
+
+    errors: list[str] = []
+    validated_count = 0
+
+    for idx, item in enumerate(tenant_items):
+        tid = item.get("tenant_id", f"<index {idx}>")
+        try:
+            rp_dict = item.get("risk_profile", {})
+            risk_profile = TenantRiskProfile(
+                decline_threshold=float(rp_dict.get("decline_threshold", 0.85)),
+                challenge_threshold=float(rp_dict.get("challenge_threshold", 0.60)),
+                review_threshold=float(rp_dict.get("review_threshold", 0.35)),
+                max_amount_per_tx=rp_dict.get("max_amount_per_tx"),
+                velocity_tx_limit_1h=rp_dict.get("velocity_tx_limit_1h"),
+                chargeback_rate_limit=float(rp_dict.get("chargeback_rate_limit", 0.015)),
+                rule_inheritance_mode=RuleInheritanceMode(
+                    rp_dict.get("rule_inheritance_mode", "inherit_and_override")
+                ),
+            )
+            ctx = TenantContext(
+                tenant_id=str(item.get("tenant_id", "")),
+                tier=TenantTier(item.get("tier", "standard")),
+                status=TenantStatus(item.get("status", "active")),
+                risk_profile=risk_profile,
+                rate_limit_rpm=int(item.get("rate_limit_rpm", 1000)),
+                tags=tuple(item.get("tags", ())),
+            )
+            if strict and not ctx.tags:
+                errors.append(f"Tenant '{tid}': Strict mode requires at least one tag.")
+            validated_count += 1
+        except (ValueError, TypeError, KeyError, TenantError) as exc:
+            errors.append(f"Tenant '{tid}': {exc}")
+
+    report = {
+        "file": str(manifest_file),
+        "total_evaluated": len(tenant_items),
+        "valid_count": validated_count - len(errors),
+        "status": "VALID" if not errors else "INVALID",
+        "errors": errors,
+    }
+    typer.echo(json.dumps(report, indent=2))
+    if errors:
+        raise typer.Exit(code=2)
+
+
+@app.command("tenant-eval")
+def tenant_eval(
+    input_file: Annotated[
+        Path,
+        typer.Option(
+            "--input-file",
+            "-i",
+            help="Input CSV or JSON file containing transactions to evaluate.",
+        ),
+    ],
+    tenant_id: Annotated[
+        str,
+        typer.Option(
+            "--tenant-id",
+            "-t",
+            help="Target tenant ID whose policy partition and thresholds apply.",
+        ),
+    ] = "default",
+    registry_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--registry-file",
+            "-r",
+            help="Optional path to serialized tenant registry JSON file.",
+        ),
+    ] = None,
+    model_path: Annotated[
+        Path | None,
+        typer.Option(
+            "--model-path",
+            "-m",
+            help="Optional directory containing trained FraudModel.",
+        ),
+    ] = None,
+    output_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--output-file",
+            "-o",
+            help="Optional output destination file to write scored batch with tenant decisions.",
+        ),
+    ] = None,
+    overwrite: Annotated[
+        bool,
+        typer.Option(
+            "--overwrite",
+            help="Overwrite output file if it exists.",
+        ),
+    ] = False,
+    output_format: Annotated[
+        str,
+        typer.Option(
+            "--format",
+            "-f",
+            help="Output format: 'json' or 'table'.",
+        ),
+    ] = "json",
+) -> None:
+    """Evaluate a batch of transactions under a specific tenant's policy partition."""
+    if output_file is not None:
+        _guard_output(output_file, overwrite)
+
+    registry = TenantRegistry()
+    if registry_file is not None:
+        if not registry_file.is_file():
+            _abort(f"Tenant registry file not found: {registry_file}")
+        try:
+            raw = registry_file.read_text(encoding="utf-8")
+            registry = TenantRegistry.import_manifest(json.loads(raw))
+        except (
+            OSError,
+            ValueError,
+            TypeError,
+            KeyError,
+            json.JSONDecodeError,
+            TenantError,
+        ) as exc:
+            _abort(f"Failed to load tenant registry from {registry_file}: {exc}")
+
+    try:
+        tenant_ctx = registry.get(tenant_id)
+        tenant_ctx.check_active()
+    except TenantError as exc:
+        _abort(f"Tenant resolution error: {exc}")
+
+    df = _load_transaction_dataframe(input_file)
+    model: FraudModel | None = None
+    if model_path is not None:
+        try:
+            model = load_model(model_path)
+        except (OSError, ValueError, RuntimeError, ModelArtifactError) as exc:
+            _abort(f"Failed to load model from {model_path}: {exc}")
+
+    features = df.copy()
+    feature_cols = [c for c in features.columns if c not in ("Class", "is_fraud", "target")]
+    features_subset = features[feature_cols]
+
+    if model is not None:
+        scores = model.predict_probabilities(features_subset)
+    else:
+        amount_col = (
+            features_subset["Amount"]
+            if "Amount" in features_subset.columns
+            else pd.Series(0.0, index=features_subset.index)
+        )
+        amounts = pd.to_numeric(amount_col, errors="coerce").fillna(0.0)
+        scores = np.clip(amounts.to_numpy(dtype=float) / 1000.0, 0.05, 0.95)
+
+    rp = tenant_ctx.risk_profile
+    decisions: list[str] = []
+    actions: dict[str, int] = {"ALLOW": 0, "CHALLENGE": 0, "REVIEW": 0, "DENY": 0}
+
+    for score in scores:
+        if score >= rp.decline_threshold:
+            decision = "DENY"
+        elif score >= rp.challenge_threshold:
+            decision = "CHALLENGE"
+        elif score >= rp.review_threshold:
+            decision = "REVIEW"
+        else:
+            decision = "ALLOW"
+        decisions.append(decision)
+        actions[decision] = actions.get(decision, 0) + 1
+
+    df_result = df.copy()
+    df_result["tenant_id"] = tenant_ctx.tenant_id
+    df_result["fraud_score"] = scores
+    df_result["decision"] = decisions
+
+    if output_file is not None:
+        fmt = output_file.suffix.lower()
+        if fmt == ".json":
+            _atomic_write_text(df_result.to_json(orient="records", indent=2) + "\n", output_file)
+        else:
+            _atomic_write_csv(df_result, output_file)
+
+    summary = {
+        "tenant_id": tenant_ctx.tenant_id,
+        "tenant_tier": tenant_ctx.tier.value,
+        "status": tenant_ctx.status.value,
+        "total_evaluated": len(df),
+        "thresholds": {
+            "decline": rp.decline_threshold,
+            "challenge": rp.challenge_threshold,
+            "review": rp.review_threshold,
+        },
+        "decisions": actions,
+        "fraud_rate_detected": float(np.mean([1 if d == "DENY" else 0 for d in decisions])),
+    }
+
+    if output_format.lower() == "table":
+        typer.echo(f"Tenant Policy Evaluation: {tenant_ctx.tenant_id} ({tenant_ctx.tier.value})")
+        typer.echo("=" * 45)
+        typer.echo(f"Total Transactions: {len(df)}")
+        typer.echo(f"ALLOW:              {actions['ALLOW']}")
+        typer.echo(f"REVIEW:             {actions['REVIEW']}")
+        typer.echo(f"CHALLENGE:          {actions['CHALLENGE']}")
+        typer.echo(f"DENY:               {actions['DENY']}")
+        typer.echo(f"Detected Fraud Rate:{summary['fraud_rate_detected']:.2%}")
+    else:
+        typer.echo(json.dumps(summary, indent=2))
+
+
+@app.command("webhook-list")
+def webhook_list(
+    manifest_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--manifest-file",
+            "-m",
+            help="Optional path to serialized webhook subscription registry manifest JSON.",
+        ),
+    ] = None,
+    tenant_id: Annotated[
+        str | None,
+        typer.Option(
+            "--tenant-id",
+            "-t",
+            help="Optional tenant filter for webhook subscriptions.",
+        ),
+    ] = None,
+    output_format: Annotated[
+        str,
+        typer.Option(
+            "--format",
+            "-f",
+            help="Output format: 'json' or 'table'.",
+        ),
+    ] = "json",
+) -> None:
+    """List registered webhook notification subscriptions and dispatch targets."""
+    registry = SubscriptionRegistry()
+    if manifest_file is not None:
+        if not manifest_file.is_file():
+            _abort(f"Webhook manifest file not found: {manifest_file}")
+        try:
+            raw = manifest_file.read_text(encoding="utf-8")
+            registry = SubscriptionRegistry.import_manifest(json.loads(raw))
+        except (
+            OSError,
+            ValueError,
+            TypeError,
+            KeyError,
+            json.JSONDecodeError,
+            EventError,
+        ) as exc:
+            _abort(f"Failed to load webhook registry from {manifest_file}: {exc}")
+
+    subs = registry.list_subscriptions(tenant_id=tenant_id)
+    rows = [
+        {
+            "subscription_id": s.subscription_id,
+            "tenant_id": s.tenant_id,
+            "target_url": s.target_url,
+            "is_active": s.is_active,
+            "max_retries": s.max_retries,
+            "timeout_seconds": s.timeout_seconds,
+            "subscribed_events": [e.value for e in s.subscribed_events],
+            "created_at": s.created_at,
+        }
+        for s in subs
+    ]
+
+    payload = {
+        "total_count": len(rows),
+        "subscriptions": rows,
+    }
+
+    if output_format.lower() == "table":
+        headers = ["Subscription ID", "Tenant ID", "Target URL", "Active", "Retries"]
+        col_w = [18, 12, 30, 8, 8]
+        header_line = " | ".join(h.ljust(w) for h, w in zip(headers, col_w, strict=True))
+        divider = "-+-".join("-" * w for w in col_w)
+        typer.echo(header_line)
+        typer.echo(divider)
+        for r in rows:
+            line = " | ".join(
+                [
+                    str(r["subscription_id"])[:18].ljust(18),
+                    str(r["tenant_id"])[:12].ljust(12),
+                    str(r["target_url"])[:30].ljust(30),
+                    str(r["is_active"]).ljust(8),
+                    str(r["max_retries"]).ljust(8),
+                ]
+            )
+            typer.echo(line)
+        typer.echo(f"\nTotal: {len(rows)} subscription(s)")
+    else:
+        typer.echo(json.dumps(payload, indent=2))
+
+
+@app.command("webhook-test")
+def webhook_test(
+    target_url: Annotated[
+        str,
+        typer.Option(
+            "--target-url",
+            "-u",
+            help="Target HTTP/HTTPS webhook receiver URL.",
+        ),
+    ],
+    secret: Annotated[
+        str | None,
+        typer.Option(
+            "--secret",
+            "-s",
+            help="Shared HMAC-SHA256 signature secret (minimum 16 characters).",
+        ),
+    ] = None,
+    tenant_id: Annotated[
+        str,
+        typer.Option(
+            "--tenant-id",
+            "-t",
+            help="Tenant identifier context for the simulated event.",
+        ),
+    ] = "default",
+    event_type: Annotated[
+        str,
+        typer.Option(
+            "--event-type",
+            "-e",
+            help="Domain event type to simulate (e.g. fraud.transaction.scored).",
+        ),
+    ] = EventType.TRANSACTION_SCORED.value,
+    timeout_seconds: Annotated[
+        float,
+        typer.Option(
+            "--timeout",
+            help="HTTP connection and read timeout in seconds.",
+        ),
+    ] = 5.0,
+) -> None:
+    """Send a signed test notification payload to a webhook destination."""
+    try:
+        ev_type = EventType(event_type)
+    except ValueError:
+        _abort(f"Unknown event type: '{event_type}'. Valid types: {[e.value for e in EventType]}")
+
+    token = secret or f"test_secret_{uuid4().hex}"
+    try:
+        sub = WebhookSubscription(
+            tenant_id=tenant_id,
+            target_url=target_url,
+            secret_token=token,
+            subscribed_events=(ev_type,),
+            timeout_seconds=timeout_seconds,
+            max_retries=1,
+        )
+    except EventError as exc:
+        _abort(f"Invalid webhook subscription configuration: {exc}")
+
+    event = FraudDomainEvent(
+        event_type=ev_type,
+        tenant_id=tenant_id,
+        payload={"ping": "test", "simulated": True, "timestamp": time.time()},
+    )
+
+    config = DispatchConfig(
+        max_retries=1,
+        initial_backoff_seconds=0.1,
+        http_timeout_seconds=timeout_seconds,
+    )
+    dispatcher = WebhookDispatcher(config=config)
+    result = dispatcher.dispatch(sub, event)
+
+    result_payload = {
+        "delivery_id": result.delivery_id,
+        "subscription_id": result.subscription_id,
+        "status": result.status.value,
+        "status_code": result.status_code,
+        "attempt_count": result.attempt_count,
+        "duration_seconds": round(result.duration_seconds, 4),
+        "error_message": result.error_message,
+    }
+    typer.echo(json.dumps(result_payload, indent=2))
+
+    if result.status != EventDeliveryStatus.DELIVERED:
+        raise typer.Exit(code=1)
+
+
+@app.command("webhook-replay-dlq")
+def webhook_replay_dlq(
+    dlq_file: Annotated[
+        Path,
+        typer.Option(
+            "--dlq-file",
+            "-d",
+            help="Path to serialized Dead Letter Queue JSON file.",
+        ),
+    ],
+    target_url: Annotated[
+        str | None,
+        typer.Option(
+            "--target-url",
+            "-u",
+            help="Optional override endpoint URL for replayed notifications.",
+        ),
+    ] = None,
+    tenant_id: Annotated[
+        str | None,
+        typer.Option(
+            "--tenant-id",
+            "-t",
+            help="Optional tenant filter for dead-letter records.",
+        ),
+    ] = None,
+    dry_run: Annotated[
+        bool,
+        typer.Option(
+            "--dry-run",
+            help="Inspect matching failed records without performing network delivery.",
+        ),
+    ] = False,
+) -> None:
+    """Replay undeliverable webhook events from a dead letter queue file."""
+    if not dlq_file.is_file():
+        _abort(f"DLQ file not found: {dlq_file}")
+
+    try:
+        raw_data = json.loads(dlq_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        _abort(f"Failed to read DLQ file {dlq_file}: {exc}")
+
+    if "records" not in raw_data or not isinstance(raw_data["records"], list):
+        _abort(f"Invalid DLQ file structure: expected top-level 'records' array in {dlq_file}")
+
+    records_data = raw_data["records"]
+
+    records: list[DeadLetterRecord] = []
+    for item in records_data:
+        try:
+            records.append(DeadLetterRecord.from_dict(item))
+        except EventError as exc:
+            _abort(f"Corrupted dead-letter record in {dlq_file}: {exc}")
+
+    if tenant_id is not None:
+        records = [r for r in records if r.event.tenant_id == tenant_id]
+
+    replayed = 0
+    succeeded = 0
+    failed = 0
+
+    if not dry_run:
+        dispatcher = WebhookDispatcher()
+        for rec in records:
+            dest_url = target_url or rec.target_url
+            sub = WebhookSubscription(
+                subscription_id=rec.subscription_id,
+                tenant_id=rec.event.tenant_id,
+                target_url=dest_url,
+                secret_token=uuid4().hex,
+                subscribed_events=(rec.event.event_type,),
+                max_retries=1,
+            )
+            replayed += 1
+            res = dispatcher.dispatch(sub, rec.event)
+            if res.status == EventDeliveryStatus.DELIVERED:
+                succeeded += 1
+            else:
+                failed += 1
+
+    summary = {
+        "dlq_file": str(dlq_file),
+        "total_matched": len(records),
+        "dry_run": dry_run,
+        "replayed_count": replayed,
+        "succeeded_count": succeeded,
+        "failed_count": failed,
+    }
+    typer.echo(json.dumps(summary, indent=2))
+
+
+@app.command("challenge-create")
+def challenge_create(
+    transaction_id: Annotated[
+        str,
+        typer.Option(
+            "--transaction-id",
+            "-x",
+            help="Unique transaction ID requiring step-up challenge.",
+        ),
+    ],
+    user_id: Annotated[
+        str,
+        typer.Option(
+            "--user-id",
+            "-u",
+            help="User identifier associated with the transaction.",
+        ),
+    ],
+    destination: Annotated[
+        str,
+        typer.Option(
+            "--destination",
+            "-d",
+            help="Destination phone number or email address for OTP delivery.",
+        ),
+    ],
+    tenant_id: Annotated[
+        str,
+        typer.Option(
+            "--tenant-id",
+            "-t",
+            help="Tenant identifier.",
+        ),
+    ] = "default",
+    method: Annotated[
+        str,
+        typer.Option(
+            "--method",
+            "-m",
+            help="Challenge method (sms_otp, email_otp, totp, biometric_push).",
+        ),
+    ] = "sms_otp",
+    ttl_seconds: Annotated[
+        int,
+        typer.Option(
+            "--ttl-seconds",
+            help="Challenge session lifetime in seconds.",
+        ),
+    ] = 300,
+    store_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--store-file",
+            "-s",
+            help="Optional path to persistent JSON file to append session record.",
+        ),
+    ] = None,
+    output_format: Annotated[
+        str,
+        typer.Option(
+            "--format",
+            "-f",
+            help="Output format: 'json' or 'table'.",
+        ),
+    ] = "json",
+) -> None:
+    """Issue a new step-up authentication challenge for a friction decision."""
+    try:
+        method_enum = ChallengeMethod(method)
+    except ValueError:
+        valid_opts = [m.value for m in ChallengeMethod]
+        _abort(f"Invalid challenge method '{method}'. Valid options: {valid_opts}")
+
+    policy = ChallengePolicy(default_ttl_seconds=ttl_seconds)
+    manager = ChallengeManager(policy=policy)
+
+    try:
+        session, raw_token = manager.create_challenge(
+            transaction_id=transaction_id,
+            user_id=user_id,
+            tenant_id=tenant_id,
+            destination=destination,
+            method=method_enum,
+        )
+    except (ChallengeError, ValueError) as exc:
+        _abort(f"Failed to create challenge: {exc}")
+
+    if store_file is not None:
+        try:
+            records: list[dict[str, Any]] = []
+            if store_file.is_file():
+                raw = store_file.read_text(encoding="utf-8")
+                records = json.loads(raw) if raw.strip() else []
+                if not isinstance(records, list):
+                    records = []
+            records.append(session.to_dict())
+            _atomic_write_text(json.dumps(records, indent=2), store_file)
+        except (OSError, json.JSONDecodeError) as exc:
+            _abort(f"Failed to persist challenge session to store file: {exc}")
+
+    output_data = {
+        "challenge_id": session.challenge_id,
+        "transaction_id": session.transaction_id,
+        "user_id": session.user_id,
+        "tenant_id": session.tenant_id,
+        "method": session.method.value,
+        "target_masked": session.target_masked,
+        "status": session.status.value,
+        "raw_token": raw_token,
+        "expires_at": session.expires_at,
+        "created_at": session.created_at,
+    }
+
+    if output_format.lower() == "table":
+        typer.echo(f"Challenge ID:    {output_data['challenge_id']}")
+        typer.echo(f"Transaction ID:  {output_data['transaction_id']}")
+        typer.echo(f"User ID:         {output_data['user_id']}")
+        typer.echo(f"Tenant ID:       {output_data['tenant_id']}")
+        typer.echo(f"Method:          {output_data['method']}")
+        typer.echo(f"Target Masked:   {output_data['target_masked']}")
+        typer.echo(f"Status:          {output_data['status']}")
+        typer.echo(f"Issued OTP:      {output_data['raw_token']}")
+        typer.echo(f"Expires At:      {output_data['expires_at']}")
+    else:
+        typer.echo(json.dumps(output_data, indent=2))
+
+
+@app.command("challenge-verify")
+def challenge_verify(
+    store_file: Annotated[
+        Path,
+        typer.Option(
+            "--store-file",
+            "-s",
+            help="Path to JSON file containing challenge session records.",
+        ),
+    ],
+    challenge_id: Annotated[
+        str,
+        typer.Option(
+            "--challenge-id",
+            "-c",
+            help="Challenge ID to verify.",
+        ),
+    ],
+    token: Annotated[
+        str,
+        typer.Option(
+            "--token",
+            help="Candidate token entered by the user.",
+        ),
+    ],
+    output_format: Annotated[
+        str,
+        typer.Option(
+            "--format",
+            "-f",
+            help="Output format: 'json' or 'table'.",
+        ),
+    ] = "json",
+) -> None:
+    """Verify an entered OTP token against a stored challenge session."""
+    if not store_file.is_file():
+        _abort(f"Store file not found: {store_file}")
+
+    try:
+        raw = store_file.read_text(encoding="utf-8")
+        records = json.loads(raw)
+        if not isinstance(records, list):
+            _abort("Invalid store file format: expected a JSON array of session objects.")
+    except (OSError, json.JSONDecodeError) as exc:
+        _abort(f"Could not read store file: {exc}")
+
+    matching_idx = None
+    target_session = None
+    for idx, item in enumerate(records):
+        if isinstance(item, dict) and item.get("challenge_id") == challenge_id:
+            matching_idx = idx
+            target_session = ChallengeSession.from_dict(item)
+            break
+
+    if target_session is None or matching_idx is None:
+        _abort(f"Challenge session '{challenge_id}' not found in store file.")
+
+    store = ChallengeStore()
+    store.put(target_session)
+    manager = ChallengeManager(store=store)
+
+    success = False
+    error_msg = None
+    try:
+        updated_session = manager.verify_challenge(challenge_id, token)
+        success = True
+        records[matching_idx] = updated_session.to_dict()
+        _atomic_write_text(json.dumps(records, indent=2), store_file)
+    except ChallengeError as exc:
+        records[matching_idx] = target_session.to_dict()
+        with contextlib.suppress(OSError):
+            _atomic_write_text(json.dumps(records, indent=2), store_file)
+        error_msg = str(exc)
+
+    summary = {
+        "challenge_id": challenge_id,
+        "verified": success,
+        "status": target_session.status.value,
+        "attempts_count": target_session.attempts_count,
+        "max_attempts": target_session.max_attempts,
+        "error": error_msg,
+    }
+
+    if output_format.lower() == "table":
+        typer.echo(f"Challenge ID:  {summary['challenge_id']}")
+        typer.echo(f"Verified:      {summary['verified']}")
+        typer.echo(f"Status:        {summary['status']}")
+        typer.echo(f"Attempts:      {summary['attempts_count']}/{summary['max_attempts']}")
+        if error_msg:
+            typer.echo(f"Error:         {error_msg}")
+    else:
+        typer.echo(json.dumps(summary, indent=2))
+
+    if not success:
+        raise typer.Exit(code=1)
+
+
+@app.command("challenge-inspect")
+def challenge_inspect(
+    store_file: Annotated[
+        Path,
+        typer.Option(
+            "--store-file",
+            "-s",
+            help="Path to JSON file containing challenge session records.",
+        ),
+    ],
+    challenge_id: Annotated[
+        str | None,
+        typer.Option(
+            "--challenge-id",
+            "-c",
+            help="Specific challenge ID to inspect.",
+        ),
+    ] = None,
+    tenant_id: Annotated[
+        str | None,
+        typer.Option(
+            "--tenant-id",
+            "-t",
+            help="Filter by tenant ID.",
+        ),
+    ] = None,
+    output_format: Annotated[
+        str,
+        typer.Option(
+            "--format",
+            "-f",
+            help="Output format: 'json' or 'table'.",
+        ),
+    ] = "json",
+) -> None:
+    """Inspect stored challenge sessions from a session store file."""
+    if not store_file.is_file():
+        _abort(f"Store file not found: {store_file}")
+
+    try:
+        raw = store_file.read_text(encoding="utf-8")
+        records = json.loads(raw)
+        if not isinstance(records, list):
+            _abort("Invalid store file format: expected a JSON array of session objects.")
+    except (OSError, json.JSONDecodeError) as exc:
+        _abort(f"Could not read store file: {exc}")
+
+    matched: list[dict[str, Any]] = []
+    for item in records:
+        if not isinstance(item, dict):
+            continue
+        if challenge_id and item.get("challenge_id") != challenge_id:
+            continue
+        if tenant_id and item.get("tenant_id") != tenant_id:
+            continue
+        matched.append(item)
+
+    if challenge_id and not matched:
+        _abort(f"Challenge session '{challenge_id}' not found.")
+
+    if output_format.lower() == "table":
+        if not matched:
+            typer.echo("No challenge sessions found.")
+            return
+        header = (
+            f"{'CHALLENGE ID':<36}  {'TENANT':<12}  {'USER':<12}  "
+            f"{'METHOD':<10}  {'STATUS':<10}  {'ATTEMPTS':<8}"
+        )
+        typer.echo(header)
+        typer.echo("-" * len(header))
+        for m in matched:
+            att = f"{m.get('attempts_count', 0)}/{m.get('max_attempts', 3)}"
+            typer.echo(
+                f"{m.get('challenge_id', ''):<36}  {m.get('tenant_id', ''):<12}  "
+                f"{m.get('user_id', ''):<12}  {m.get('method', ''):<10}  "
+                f"{m.get('status', ''):<10}  {att}"
+            )
+    else:
+        typer.echo(json.dumps({"total_count": len(matched), "challenges": matched}, indent=2))
+
+
+@app.command("case-create")
+def case_create(
+    transaction_id: Annotated[
+        str,
+        typer.Option(
+            "--transaction-id",
+            "-x",
+            help="Transaction identifier to investigate.",
+        ),
+    ],
+    amount: Annotated[
+        float,
+        typer.Option(
+            "--amount",
+            "-a",
+            help="Transaction amount.",
+        ),
+    ] = 0.0,
+    currency: Annotated[
+        str,
+        typer.Option(
+            "--currency",
+            "-c",
+            help="Transaction currency (e.g. USD, EUR).",
+        ),
+    ] = "USD",
+    fraud_score: Annotated[
+        float,
+        typer.Option(
+            "--fraud-score",
+            help="Model predicted fraud probability (0.0 to 1.0).",
+        ),
+    ] = 0.0,
+    tenant_id: Annotated[
+        str,
+        typer.Option(
+            "--tenant-id",
+            "-t",
+            help="Tenant identifier.",
+        ),
+    ] = "default",
+    priority: Annotated[
+        str | None,
+        typer.Option(
+            "--priority",
+            "-p",
+            help="Case priority (low, medium, high, critical).",
+        ),
+    ] = None,
+    sla_hours: Annotated[
+        float,
+        typer.Option(
+            "--sla-hours",
+            help="SLA deadline in hours.",
+        ),
+    ] = 24.0,
+    analyst: Annotated[
+        str | None,
+        typer.Option(
+            "--assign",
+            "-u",
+            help="Analyst identifier to assign.",
+        ),
+    ] = None,
+    store_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--store-file",
+            "-s",
+            help="Optional path to persistent JSON file to append case record.",
+        ),
+    ] = None,
+    output_format: Annotated[
+        str,
+        typer.Option(
+            "--format",
+            "-f",
+            help="Output format: 'json' or 'table'.",
+        ),
+    ] = "json",
+) -> None:
+    """Create a new fraud investigation case."""
+    prio_enum = None
+    if priority:
+        try:
+            prio_enum = CasePriority(priority)
+        except ValueError:
+            valid_opts = [p.value for p in CasePriority]
+            _abort(f"Invalid case priority '{priority}'. Valid options: {valid_opts}")
+
+    store = CaseStore()
+    manager = CaseManager(store=store)
+
+    try:
+        case = manager.create_case(
+            transaction_id=transaction_id,
+            fraud_score=fraud_score,
+            amount=amount,
+            currency=currency,
+            tenant_id=tenant_id,
+            priority=prio_enum,
+            sla_deadline_hours=sla_hours,
+            auto_assign=analyst,
+        )
+    except CaseError as exc:
+        _abort(f"Failed to create case: {exc}")
+
+    if store_file is not None:
+        try:
+            records: list[dict[str, Any]] = []
+            if store_file.is_file():
+                raw = store_file.read_text(encoding="utf-8")
+                records = json.loads(raw) if raw.strip() else []
+                if not isinstance(records, list):
+                    records = []
+            records.append(case.to_dict())
+            _atomic_write_text(json.dumps(records, indent=2), store_file)
+        except (OSError, json.JSONDecodeError) as exc:
+            _abort(f"Failed to persist case to store file: {exc}")
+
+    if output_format.lower() == "table":
+        typer.echo(f"Case ID:        {case.case_id}")
+        typer.echo(f"Transaction ID: {case.transaction_id}")
+        typer.echo(f"Tenant ID:      {case.tenant_id}")
+        typer.echo(f"Status:         {case.status.value}")
+        typer.echo(f"Priority:       {case.priority.value}")
+        typer.echo(f"Amount:         {case.amount} {case.currency}")
+        typer.echo(f"Fraud Score:    {case.fraud_score}")
+        typer.echo(f"Assigned To:    {case.assigned_analyst or 'Unassigned'}")
+        typer.echo(f"SLA Deadline:   {case.sla_expires_at}")
+    else:
+        typer.echo(json.dumps(case.to_dict(), indent=2))
+
+
+@app.command("case-list")
+def case_list(
+    store_file: Annotated[
+        Path,
+        typer.Option(
+            "--store-file",
+            "-s",
+            help="Path to JSON file containing case records.",
+        ),
+    ],
+    tenant_id: Annotated[
+        str | None,
+        typer.Option(
+            "--tenant-id",
+            "-t",
+            help="Filter by tenant ID.",
+        ),
+    ] = None,
+    status: Annotated[
+        str | None,
+        typer.Option(
+            "--status",
+            help="Filter by case status.",
+        ),
+    ] = None,
+    priority: Annotated[
+        str | None,
+        typer.Option(
+            "--priority",
+            "-p",
+            help="Filter by case priority.",
+        ),
+    ] = None,
+    analyst: Annotated[
+        str | None,
+        typer.Option(
+            "--analyst",
+            "-u",
+            help="Filter by assigned analyst.",
+        ),
+    ] = None,
+    sla_breached_only: Annotated[
+        bool,
+        typer.Option(
+            "--sla-breached-only",
+            help="Filter to show only SLA breached cases.",
+        ),
+    ] = False,
+    output_format: Annotated[
+        str,
+        typer.Option(
+            "--format",
+            "-f",
+            help="Output format: 'json' or 'table'.",
+        ),
+    ] = "json",
+) -> None:
+    """List stored fraud cases with optional multi-criteria filters."""
+    if not store_file.is_file():
+        _abort(f"Store file not found: {store_file}")
+
+    try:
+        raw = store_file.read_text(encoding="utf-8")
+        records = json.loads(raw)
+        if not isinstance(records, list):
+            _abort("Invalid store file format: expected a JSON array of case objects.")
+    except (OSError, json.JSONDecodeError) as exc:
+        _abort(f"Could not read store file: {exc}")
+
+    matched: list[dict[str, Any]] = []
+    for item in records:
+        if not isinstance(item, dict):
+            continue
+        if tenant_id and item.get("tenant_id") != tenant_id:
+            continue
+        if status and str(item.get("status", "")).upper() != status.upper():
+            continue
+        if priority and str(item.get("priority", "")).upper() != priority.upper():
+            continue
+        if analyst and item.get("assigned_analyst") != analyst:
+            continue
+        if sla_breached_only and not item.get("is_sla_breached"):
+            continue
+        matched.append(item)
+
+    if output_format.lower() == "table":
+        if not matched:
+            typer.echo("No fraud cases found.")
+            return
+        header = (
+            f"{'CASE ID':<18}  {'TENANT':<12}  {'PRIORITY':<10}  "
+            f"{'STATUS':<14}  {'AMOUNT':<10}  {'ANALYST':<14}  {'BREACHED':<8}"
+        )
+        typer.echo(header)
+        typer.echo("-" * len(header))
+        for m in matched:
+            c_id = str(m.get("case_id", ""))
+            t_id = str(m.get("tenant_id", ""))
+            p_val = str(m.get("priority", ""))
+            s_val = str(m.get("status", ""))
+            amt = f"{m.get('amount', 0.0):.2f}"
+            ans = str(m.get("assigned_analyst") or "None")
+            br = "YES" if m.get("is_sla_breached") else "NO"
+            typer.echo(
+                f"{c_id:<18}  {t_id:<12}  {p_val:<10}  {s_val:<14}  {amt:<10}  {ans:<14}  {br:<8}"
+            )
+    else:
+        typer.echo(json.dumps({"total_count": len(matched), "cases": matched}, indent=2))
+
+
+@app.command("case-inspect")
+def case_inspect(
+    store_file: Annotated[
+        Path,
+        typer.Option(
+            "--store-file",
+            "-s",
+            help="Path to JSON file containing case records.",
+        ),
+    ],
+    case_id: Annotated[
+        str,
+        typer.Option(
+            "--case-id",
+            "-c",
+            help="Case ID to inspect.",
+        ),
+    ],
+    output_format: Annotated[
+        str,
+        typer.Option(
+            "--format",
+            "-f",
+            help="Output format: 'json' or 'table'.",
+        ),
+    ] = "json",
+) -> None:
+    """Inspect full details, notes, and audit history of a fraud case."""
+    if not store_file.is_file():
+        _abort(f"Store file not found: {store_file}")
+
+    try:
+        raw = store_file.read_text(encoding="utf-8")
+        records = json.loads(raw)
+        if not isinstance(records, list):
+            _abort("Invalid store file format: expected a JSON array of case objects.")
+    except (OSError, json.JSONDecodeError) as exc:
+        _abort(f"Could not read store file: {exc}")
+
+    target: dict[str, Any] | None = None
+    for item in records:
+        if isinstance(item, dict) and item.get("case_id") == case_id:
+            target = item
+            break
+
+    if target is None:
+        _abort(f"Case '{case_id}' not found in store file.")
+
+    if output_format.lower() == "table":
+        typer.echo(f"Case ID:        {target.get('case_id')}")
+        typer.echo(f"Transaction ID: {target.get('transaction_id')}")
+        typer.echo(f"Tenant ID:      {target.get('tenant_id')}")
+        typer.echo(f"Status:         {target.get('status')}")
+        typer.echo(f"Priority:       {target.get('priority')}")
+        typer.echo(f"Disposition:    {target.get('disposition')}")
+        typer.echo(f"Amount:         {target.get('amount')} {target.get('currency')}")
+        typer.echo(f"Fraud Score:    {target.get('fraud_score')}")
+        typer.echo(f"Assigned To:    {target.get('assigned_analyst') or 'Unassigned'}")
+        typer.echo(f"SLA Breached:   {target.get('is_sla_breached')}")
+        typer.echo(f"Notes Count:    {len(target.get('notes') or [])}")
+        typer.echo(f"Audit Entries:  {len(target.get('audit_trail') or [])}")
+    else:
+        typer.echo(json.dumps(target, indent=2))
+
+
+@app.command("case-resolve")
+def case_resolve(
+    store_file: Annotated[
+        Path,
+        typer.Option(
+            "--store-file",
+            "-s",
+            help="Path to JSON file containing case records.",
+        ),
+    ],
+    case_id: Annotated[
+        str,
+        typer.Option(
+            "--case-id",
+            "-c",
+            help="Case ID to resolve.",
+        ),
+    ],
+    disposition: Annotated[
+        str,
+        typer.Option(
+            "--disposition",
+            "-d",
+            help="Resolution disposition (confirmed_fraud, false_positive, etc.).",
+        ),
+    ],
+    actor: Annotated[
+        str,
+        typer.Option(
+            "--actor",
+            help="Analyst or system resolving the case.",
+        ),
+    ] = "analyst",
+    notes: Annotated[
+        str,
+        typer.Option(
+            "--notes",
+            "-n",
+            help="Resolution explanation notes.",
+        ),
+    ] = "",
+    output_format: Annotated[
+        str,
+        typer.Option(
+            "--format",
+            "-f",
+            help="Output format: 'json' or 'table'.",
+        ),
+    ] = "json",
+) -> None:
+    """Resolve an active fraud case with a final disposition and conclusion notes."""
+    try:
+        disp_enum = CaseDisposition(disposition)
+    except ValueError:
+        valid_opts = [d.value for d in CaseDisposition if d != CaseDisposition.UNRESOLVED]
+        _abort(f"Invalid disposition '{disposition}'. Valid options: {valid_opts}")
+
+    if not store_file.is_file():
+        _abort(f"Store file not found: {store_file}")
+
+    try:
+        raw = store_file.read_text(encoding="utf-8")
+        records = json.loads(raw)
+        if not isinstance(records, list):
+            _abort("Invalid store file format: expected a JSON array of case objects.")
+    except (OSError, json.JSONDecodeError) as exc:
+        _abort(f"Could not read store file: {exc}")
+
+    target_idx: int | None = None
+    target_case: FraudCase | None = None
+    for idx, item in enumerate(records):
+        if isinstance(item, dict) and item.get("case_id") == case_id:
+            target_idx = idx
+            target_case = FraudCase.from_dict(item)
+            break
+
+    if target_case is None or target_idx is None:
+        _abort(f"Case '{case_id}' not found in store file.")
+
+    store = CaseStore()
+    store.put(target_case)
+    manager = CaseManager(store=store)
+
+    try:
+        resolved = manager.resolve_case(
+            case_id,
+            disposition=disp_enum,
+            actor=actor,
+            notes=notes,
+        )
+        records[target_idx] = resolved.to_dict()
+        _atomic_write_text(json.dumps(records, indent=2), store_file)
+    except CaseError as exc:
+        _abort(f"Failed to resolve case: {exc}")
+
+    if output_format.lower() == "table":
+        typer.echo(f"Case ID:     {resolved.case_id}")
+        typer.echo(f"Status:      {resolved.status.value}")
+        typer.echo(f"Disposition: {resolved.disposition.value}")
+        typer.echo(f"Resolved At: {resolved.resolved_at}")
+    else:
+        typer.echo(json.dumps(resolved.to_dict(), indent=2))
+
+
+@app.command("case-evidence")
+def case_evidence(
+    store_file: Annotated[
+        Path,
+        typer.Option(
+            "--store-file",
+            "-s",
+            help="Path to JSON file containing case records.",
+        ),
+    ],
+    case_id: Annotated[
+        str,
+        typer.Option(
+            "--case-id",
+            "-c",
+            help="Case ID to generate evidence for.",
+        ),
+    ],
+    output: Annotated[
+        Path | None,
+        typer.Option(
+            "--output",
+            "-o",
+            help="Optional path to write compiled evidence package JSON.",
+        ),
+    ] = None,
+    output_format: Annotated[
+        str,
+        typer.Option(
+            "--format",
+            "-f",
+            help="Output format: 'json' or 'table'.",
+        ),
+    ] = "json",
+) -> None:
+    """Compile and fingerprint a tamper-evident dispute evidence dossier."""
+    if not store_file.is_file():
+        _abort(f"Store file not found: {store_file}")
+
+    try:
+        raw = store_file.read_text(encoding="utf-8")
+        records = json.loads(raw)
+        if not isinstance(records, list):
+            _abort("Invalid store file format: expected a JSON array of case objects.")
+    except (OSError, json.JSONDecodeError) as exc:
+        _abort(f"Could not read store file: {exc}")
+
+    target_case: FraudCase | None = None
+    for item in records:
+        if isinstance(item, dict) and item.get("case_id") == case_id:
+            target_case = FraudCase.from_dict(item)
+            break
+
+    if target_case is None:
+        _abort(f"Case '{case_id}' not found in store file.")
+
+    store = CaseStore()
+    store.put(target_case)
+    manager = CaseManager(store=store)
+
+    tx_data = {
+        "amount": target_case.amount,
+        "currency": target_case.currency,
+        "transaction_id": target_case.transaction_id,
+    }
+    pkg = manager.generate_evidence_package(
+        case_id=case_id,
+        transaction_data=tx_data,
+        actor="cli",
+    )
+
+    if output is not None:
+        _atomic_write_text(json.dumps(pkg.to_dict(), indent=2), output)
+
+    if output_format.lower() == "table":
+        typer.echo(f"Package ID:   {pkg.package_id}")
+        typer.echo(f"Case ID:      {pkg.case_id}")
+        typer.echo(f"Created At:   {pkg.created_at}")
+        typer.echo(f"Fingerprint:  {pkg.sha256_fingerprint}")
+        typer.echo(f"Integrity:    {pkg.verify_integrity()}")
+    else:
+        typer.echo(json.dumps(pkg.to_dict(), indent=2))
+
+
+@app.command("chargeback-ingest")
+def chargeback_ingest(
+    transaction_id: Annotated[
+        str,
+        typer.Option(
+            "--transaction-id",
+            "-x",
+            help="Transaction identifier subject to chargeback.",
+        ),
+    ],
+    scheme: Annotated[
+        str,
+        typer.Option(
+            "--scheme",
+            help="Card scheme (visa, mastercard, amex, discover).",
+        ),
+    ],
+    reason_code: Annotated[
+        str,
+        typer.Option(
+            "--reason-code",
+            "-r",
+            help="Card network chargeback reason code.",
+        ),
+    ],
+    amount: Annotated[
+        float,
+        typer.Option(
+            "--amount",
+            "-a",
+            help="Disputed transaction amount.",
+        ),
+    ] = 0.0,
+    currency: Annotated[
+        str,
+        typer.Option(
+            "--currency",
+            "-c",
+            help="Transaction currency (e.g. USD, EUR).",
+        ),
+    ] = "USD",
+    tenant_id: Annotated[
+        str,
+        typer.Option(
+            "--tenant-id",
+            "-t",
+            help="Tenant identifier.",
+        ),
+    ] = "default",
+    scheme_dispute_id: Annotated[
+        str | None,
+        typer.Option(
+            "--scheme-dispute-id",
+            help="Scheme or gateway dispute reference.",
+        ),
+    ] = None,
+    deadline: Annotated[
+        str | None,
+        typer.Option(
+            "--deadline",
+            help="ISO timestamp representment deadline.",
+        ),
+    ] = None,
+    store_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--store-file",
+            "-s",
+            help="Optional path to persistent JSON file to append dispute record.",
+        ),
+    ] = None,
+    output_format: Annotated[
+        str,
+        typer.Option(
+            "--format",
+            "-f",
+            help="Output format: 'json' or 'table'.",
+        ),
+    ] = "json",
+) -> None:
+    """Ingest a new card scheme chargeback dispute."""
+    try:
+        scheme_enum = CardScheme(scheme.lower())
+    except ValueError:
+        valid_opts = [s.value for s in CardScheme]
+        _abort(f"Invalid card scheme '{scheme}'. Valid options: {valid_opts}")
+
+    store = ChargebackStore()
+    manager = ChargebackManager(store=store)
+
+    try:
+        dispute = manager.ingest_chargeback(
+            transaction_id=transaction_id,
+            scheme=scheme_enum,
+            reason_code=reason_code,
+            disputed_amount=amount,
+            currency=currency,
+            tenant_id=tenant_id,
+            scheme_dispute_id=scheme_dispute_id,
+            response_deadline=deadline,
+        )
+    except ChargebackError as exc:
+        _abort(f"Failed to ingest chargeback: {exc}")
+
+    if store_file is not None:
+        try:
+            records: list[dict[str, Any]] = []
+            if store_file.is_file():
+                raw = store_file.read_text(encoding="utf-8")
+                records = json.loads(raw) if raw.strip() else []
+                if not isinstance(records, list):
+                    records = []
+            records.append(dispute.to_dict())
+            _atomic_write_text(json.dumps(records, indent=2), store_file)
+        except (OSError, json.JSONDecodeError) as exc:
+            _abort(f"Failed to persist chargeback to store file: {exc}")
+
+    if output_format.lower() == "table":
+        typer.echo(f"Dispute ID:     {dispute.dispute_id}")
+        typer.echo(f"Transaction ID: {dispute.transaction_id}")
+        typer.echo(f"Scheme:         {dispute.scheme.value}")
+        typer.echo(f"Reason Code:    {dispute.reason_code}")
+        typer.echo(f"Category:       {dispute.category.value}")
+        typer.echo(f"Stage:          {dispute.stage.value}")
+        typer.echo(f"Amount:         {dispute.disputed_amount} {dispute.currency}")
+        typer.echo(f"Deadline:       {dispute.response_deadline}")
+        typer.echo(f"Winnability:    {dispute.winnability_score:.2f}")
+        typer.echo(f"Recommendation: {dispute.recommended_action.value}")
+    else:
+        typer.echo(json.dumps(dispute.to_dict(), indent=2))
+
+
+@app.command("chargeback-list")
+def chargeback_list(
+    store_file: Annotated[
+        Path,
+        typer.Option(
+            "--store-file",
+            "-s",
+            help="Path to JSON file containing dispute records.",
+        ),
+    ],
+    tenant_id: Annotated[
+        str | None,
+        typer.Option(
+            "--tenant-id",
+            "-t",
+            help="Filter by tenant ID.",
+        ),
+    ] = None,
+    scheme: Annotated[
+        str | None,
+        typer.Option(
+            "--scheme",
+            help="Filter by card scheme.",
+        ),
+    ] = None,
+    stage: Annotated[
+        str | None,
+        typer.Option(
+            "--stage",
+            help="Filter by chargeback stage.",
+        ),
+    ] = None,
+    category: Annotated[
+        str | None,
+        typer.Option(
+            "--category",
+            help="Filter by normalized chargeback category.",
+        ),
+    ] = None,
+    expired_only: Annotated[
+        bool,
+        typer.Option(
+            "--expired-only",
+            help="Filter to show only deadline-expired disputes.",
+        ),
+    ] = False,
+    output_format: Annotated[
+        str,
+        typer.Option(
+            "--format",
+            "-f",
+            help="Output format: 'json' or 'table'.",
+        ),
+    ] = "json",
+) -> None:
+    """List stored card scheme disputes with optional multi-criteria filters."""
+    if not store_file.is_file():
+        _abort(f"Store file not found: {store_file}")
+
+    try:
+        raw = store_file.read_text(encoding="utf-8")
+        records = json.loads(raw)
+        if not isinstance(records, list):
+            _abort("Invalid store file format: expected a JSON array of dispute objects.")
+    except (OSError, json.JSONDecodeError) as exc:
+        _abort(f"Could not read store file: {exc}")
+
+    matched: list[dict[str, Any]] = []
+    for item in records:
+        if not isinstance(item, dict):
+            continue
+        if tenant_id and item.get("tenant_id") != tenant_id:
+            continue
+        if scheme and str(item.get("scheme", "")).lower() != scheme.lower():
+            continue
+        if stage and str(item.get("stage", "")).lower() != stage.lower():
+            continue
+        if category and str(item.get("category", "")).lower() != category.lower():
+            continue
+        if expired_only and not item.get("is_expired"):
+            continue
+        matched.append(item)
+
+    if output_format.lower() == "table":
+        if not matched:
+            typer.echo("No chargeback disputes found.")
+            return
+        header = (
+            f"{'DISPUTE ID':<18}  {'TX ID':<16}  {'SCHEME':<10}  "
+            f"{'REASON':<8}  {'STAGE':<18}  {'AMOUNT':<10}  {'WINNABILITY':<11}"
+        )
+        typer.echo(header)
+        typer.echo("-" * len(header))
+        for m in matched:
+            d_id = str(m.get("dispute_id", ""))
+            tx_id = str(m.get("transaction_id", ""))
+            sc = str(m.get("scheme", ""))
+            rc = str(m.get("reason_code", ""))
+            st = str(m.get("stage", ""))
+            amt = f"{m.get('disputed_amount', 0.0):.2f}"
+            win = f"{m.get('winnability_score', 0.0):.2f}"
+            typer.echo(
+                f"{d_id:<18}  {tx_id:<16}  {sc:<10}  {rc:<8}  {st:<18}  {amt:<10}  {win:<11}"
+            )
+    else:
+        typer.echo(json.dumps({"total_count": len(matched), "disputes": matched}, indent=2))
+
+
+@app.command("chargeback-inspect")
+def chargeback_inspect(
+    store_file: Annotated[
+        Path,
+        typer.Option(
+            "--store-file",
+            "-s",
+            help="Path to JSON file containing dispute records.",
+        ),
+    ],
+    dispute_id: Annotated[
+        str,
+        typer.Option(
+            "--dispute-id",
+            "-d",
+            help="Dispute ID to inspect.",
+        ),
+    ],
+    output_format: Annotated[
+        str,
+        typer.Option(
+            "--format",
+            "-f",
+            help="Output format: 'json' or 'table'.",
+        ),
+    ] = "json",
+) -> None:
+    """Inspect full details, audit trail, and representment readiness of a dispute."""
+    if not store_file.is_file():
+        _abort(f"Store file not found: {store_file}")
+
+    try:
+        raw = store_file.read_text(encoding="utf-8")
+        records = json.loads(raw)
+        if not isinstance(records, list):
+            _abort("Invalid store file format: expected a JSON array of dispute objects.")
+    except (OSError, json.JSONDecodeError) as exc:
+        _abort(f"Could not read store file: {exc}")
+
+    target: dict[str, Any] | None = None
+    for item in records:
+        if isinstance(item, dict) and item.get("dispute_id") == dispute_id:
+            target = item
+            break
+
+    if target is None:
+        _abort(f"Dispute '{dispute_id}' not found in store file.")
+
+    if output_format.lower() == "table":
+        typer.echo(f"Dispute ID:      {target.get('dispute_id')}")
+        typer.echo(f"Transaction ID:  {target.get('transaction_id')}")
+        typer.echo(f"Tenant ID:       {target.get('tenant_id')}")
+        typer.echo(f"Scheme:          {target.get('scheme')}")
+        typer.echo(f"Reason Code:     {target.get('reason_code')}")
+        typer.echo(f"Category:        {target.get('category')}")
+        typer.echo(f"Stage:           {target.get('stage')}")
+        typer.echo(f"Amount:          {target.get('disputed_amount')} {target.get('currency')}")
+        typer.echo(f"Filing Date:     {target.get('filing_date')}")
+        typer.echo(f"Deadline:        {target.get('response_deadline')}")
+        typer.echo(f"Expired:         {target.get('is_expired')}")
+        typer.echo(f"Terminal:        {target.get('is_terminal')}")
+        typer.echo(f"Liability Shift: {target.get('liability_shift_proven')}")
+        typer.echo(f"Winnability:     {target.get('winnability_score')}")
+        typer.echo(f"Recommendation:  {target.get('recommended_action')}")
+        typer.echo(f"Package ID:      {target.get('representment_package_id') or 'None'}")
+        typer.echo(f"Audit Entries:   {len(target.get('audit_trail') or [])}")
+    else:
+        typer.echo(json.dumps(target, indent=2))
+
+
+@app.command("chargeback-represent")
+def chargeback_represent(
+    store_file: Annotated[
+        Path,
+        typer.Option(
+            "--store-file",
+            "-s",
+            help="Path to JSON file containing dispute records.",
+        ),
+    ],
+    dispute_id: Annotated[
+        str,
+        typer.Option(
+            "--dispute-id",
+            "-d",
+            help="Dispute ID to represent.",
+        ),
+    ],
+    package_id: Annotated[
+        str | None,
+        typer.Option(
+            "--package-id",
+            "-p",
+            help="Evidence package reference ID.",
+        ),
+    ] = None,
+    evidence_fingerprint: Annotated[
+        str | None,
+        typer.Option(
+            "--fingerprint",
+            help="Cryptographic SHA-256 fingerprint of evidence package.",
+        ),
+    ] = None,
+    notes: Annotated[
+        str,
+        typer.Option(
+            "--notes",
+            "-n",
+            help="Representment defense narrative or notes.",
+        ),
+    ] = "",
+    actor: Annotated[
+        str,
+        typer.Option(
+            "--actor",
+            help="Analyst or automated agent submitting representment.",
+        ),
+    ] = "analyst",
+    output_format: Annotated[
+        str,
+        typer.Option(
+            "--format",
+            "-f",
+            help="Output format: 'json' or 'table'.",
+        ),
+    ] = "json",
+) -> None:
+    """Submit dispute representment attaching evidence package and cryptographic digest."""
+    if not store_file.is_file():
+        _abort(f"Store file not found: {store_file}")
+
+    try:
+        raw = store_file.read_text(encoding="utf-8")
+        records = json.loads(raw)
+        if not isinstance(records, list):
+            _abort("Invalid store file format: expected a JSON array of dispute objects.")
+    except (OSError, json.JSONDecodeError) as exc:
+        _abort(f"Could not read store file: {exc}")
+
+    target_idx: int | None = None
+    target_dispute: ChargebackDispute | None = None
+    for idx, item in enumerate(records):
+        if isinstance(item, dict) and item.get("dispute_id") == dispute_id:
+            target_idx = idx
+            target_dispute = ChargebackDispute.from_dict(item)
+            break
+
+    if target_dispute is None or target_idx is None:
+        _abort(f"Dispute '{dispute_id}' not found in store file.")
+
+    store = ChargebackStore()
+    store.put(target_dispute)
+    manager = ChargebackManager(store=store)
+
+    try:
+        updated = manager.represent_dispute(
+            dispute_id=dispute_id,
+            package_id=package_id,
+            evidence_fingerprint=evidence_fingerprint,
+            notes=notes,
+            actor=actor,
+        )
+        records[target_idx] = updated.to_dict()
+        _atomic_write_text(json.dumps(records, indent=2), store_file)
+    except ChargebackError as exc:
+        _abort(f"Failed to represent dispute: {exc}")
+
+    if output_format.lower() == "table":
+        typer.echo(f"Dispute ID:     {updated.dispute_id}")
+        typer.echo(f"Stage:          {updated.stage.value}")
+        typer.echo(f"Package ID:     {updated.representment_package_id}")
+        typer.echo(f"Fingerprint:    {updated.evidence_fingerprint}")
+        typer.echo(f"Represented At: {updated.represented_at}")
+    else:
+        typer.echo(json.dumps(updated.to_dict(), indent=2))
+
+
+@app.command("chargeback-resolve")
+def chargeback_resolve(
+    store_file: Annotated[
+        Path,
+        typer.Option(
+            "--store-file",
+            "-s",
+            help="Path to JSON file containing dispute records.",
+        ),
+    ],
+    dispute_id: Annotated[
+        str,
+        typer.Option(
+            "--dispute-id",
+            "-d",
+            help="Dispute ID to resolve.",
+        ),
+    ],
+    outcome: Annotated[
+        str,
+        typer.Option(
+            "--outcome",
+            "-o",
+            help="Resolution outcome: resolved_won, resolved_lost, or accepted_liability.",
+        ),
+    ],
+    actor: Annotated[
+        str,
+        typer.Option(
+            "--actor",
+            help="Analyst or system resolving the dispute.",
+        ),
+    ] = "system",
+    notes: Annotated[
+        str,
+        typer.Option(
+            "--notes",
+            "-n",
+            help="Resolution explanation notes.",
+        ),
+    ] = "",
+    output_format: Annotated[
+        str,
+        typer.Option(
+            "--format",
+            "-f",
+            help="Output format: 'json' or 'table'.",
+        ),
+    ] = "json",
+) -> None:
+    """Finalize dispute with a terminal resolution outcome."""
+    try:
+        stage_enum = ChargebackStage(outcome.lower())
+    except ValueError:
+        valid_opts = [
+            ChargebackStage.RESOLVED_WON.value,
+            ChargebackStage.RESOLVED_LOST.value,
+            ChargebackStage.ACCEPTED_LIABILITY.value,
+        ]
+        _abort(f"Invalid outcome '{outcome}'. Valid options: {valid_opts}")
+
+    if not store_file.is_file():
+        _abort(f"Store file not found: {store_file}")
+
+    try:
+        raw = store_file.read_text(encoding="utf-8")
+        records = json.loads(raw)
+        if not isinstance(records, list):
+            _abort("Invalid store file format: expected a JSON array of dispute objects.")
+    except (OSError, json.JSONDecodeError) as exc:
+        _abort(f"Could not read store file: {exc}")
+
+    target_idx: int | None = None
+    target_dispute: ChargebackDispute | None = None
+    for idx, item in enumerate(records):
+        if isinstance(item, dict) and item.get("dispute_id") == dispute_id:
+            target_idx = idx
+            target_dispute = ChargebackDispute.from_dict(item)
+            break
+
+    if target_dispute is None or target_idx is None:
+        _abort(f"Dispute '{dispute_id}' not found in store file.")
+
+    store = ChargebackStore()
+    store.put(target_dispute)
+    manager = ChargebackManager(store=store)
+
+    try:
+        resolved = manager.resolve_dispute(
+            dispute_id=dispute_id,
+            outcome=stage_enum,
+            actor=actor,
+            notes=notes,
+        )
+        records[target_idx] = resolved.to_dict()
+        _atomic_write_text(json.dumps(records, indent=2), store_file)
+    except ChargebackError as exc:
+        _abort(f"Failed to resolve dispute: {exc}")
+
+    if output_format.lower() == "table":
+        typer.echo(f"Dispute ID:  {resolved.dispute_id}")
+        typer.echo(f"Stage:       {resolved.stage.value}")
+        typer.echo(f"Resolved At: {resolved.resolved_at}")
+        typer.echo(f"Terminal:    {resolved.is_terminal}")
+    else:
+        typer.echo(json.dumps(resolved.to_dict(), indent=2))
+
+
+# =========================================================================
+# Phase 47: Account Takeover (ATO) & Credential Stuffing CLI Commands
+# =========================================================================
+
+
+def _load_ato_state(
+    store_file: Path | None,
+) -> tuple[AccountProfileTracker, AtoStore]:
+    """Load persistent ATO profiles and assessment history from store file."""
+    tracker = AccountProfileTracker()
+    store = AtoStore()
+    if store_file is None or not store_file.exists():
+        return tracker, store
+
+    try:
+        raw = store_file.read_text(encoding="utf-8")
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            _abort("Invalid ATO store file format: expected JSON object with 'profiles'.")
+    except (OSError, json.JSONDecodeError) as exc:
+        _abort(f"Could not read ATO store file: {exc}")
+
+    profiles_data = data.get("profiles", {})
+    if isinstance(profiles_data, dict):
+        for uid, p_data in profiles_data.items():
+            if isinstance(p_data, dict):
+                p = AccountProfile.from_dict(p_data)
+                tracker._profiles[uid] = p  # noqa: SLF001
+
+    assessments_data = data.get("assessments", [])
+    if isinstance(assessments_data, list):
+        for a_data in assessments_data:
+            if isinstance(a_data, dict):
+                a = AtoRiskAssessment.from_dict(a_data)
+                store.record_assessment(a)
+
+    return tracker, store
+
+
+def _save_ato_state(
+    store_file: Path | None,
+    tracker: AccountProfileTracker,
+    store: AtoStore,
+) -> None:
+    """Save persistent ATO profiles and assessment history to store file."""
+    if store_file is None:
+        return
+    data = {
+        "profiles": {uid: p.to_dict() for uid, p in tracker._profiles.items()},  # noqa: SLF001
+        "assessments": [a.to_dict() for a in store.list_assessments(limit=1000)],
+    }
+    _atomic_write_text(json.dumps(data, indent=2), store_file)
+
+
+def _load_aml_state(
+    store_file: Path | None,
+) -> tuple[AmlEngine, SarManager, list[AmlTransactionEvent]]:
+    """Load persistent AML transactions, alerts, and SAR dossiers from store file."""
+    store = AmlStore()
+    engine = AmlEngine(store=store)
+    for wl_entry in DEFAULT_WATCHLIST_ENTRIES:
+        engine.screening_engine.add_entry(wl_entry)
+    sar_manager = SarManager(store=store)
+    transactions: list[AmlTransactionEvent] = []
+    if store_file is None or not store_file.exists():
+        return engine, sar_manager, transactions
+
+    try:
+        raw = store_file.read_text(encoding="utf-8")
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            _abort("Invalid AML store file format: expected JSON object.")
+    except (OSError, json.JSONDecodeError) as exc:
+        _abort(f"Could not read AML store file: {exc}")
+
+    for tx_data in data.get("transactions", []):
+        if isinstance(tx_data, dict):
+            tx = AmlTransactionEvent.from_dict(tx_data)
+            transactions.append(tx)
+            engine.structuring_detector.record_and_evaluate(tx)
+            engine.layering_detector.record_and_evaluate(tx)
+            engine.circular_detector.record_and_evaluate(tx)
+
+    for alert_data in data.get("alerts", []):
+        if isinstance(alert_data, dict):
+            store.record_alert(AmlAlert.from_dict(alert_data))
+
+    for sar_data in data.get("sars", []):
+        if isinstance(sar_data, dict):
+            store.record_sar(SarDossier.from_dict(sar_data))
+
+    return engine, sar_manager, transactions
+
+
+def _save_aml_state(
+    store_file: Path | None,
+    store: AmlStore,
+    transactions: list[AmlTransactionEvent],
+) -> None:
+    """Save persistent AML transactions, alerts, and SAR dossiers to store file."""
+    if store_file is None:
+        return
+    data = {
+        "transactions": [tx.to_dict() for tx in transactions[-5000:]],
+        "alerts": [alert.to_dict() for alert in store.list_alerts(limit=5000)],
+        "sars": [sar.to_dict() for sar in store.list_sars(limit=5000)],
+    }
+    _atomic_write_text(json.dumps(data, indent=2), store_file)
+
+
+@app.command("ato-login")
+def ato_login(
+    user_id: Annotated[
+        str,
+        typer.Option("--user-id", "-u", help="User identifier."),
+    ],
+    ip_address: Annotated[
+        str,
+        typer.Option("--ip-address", "-i", help="Client IP address."),
+    ] = "127.0.0.1",
+    outcome: Annotated[
+        str,
+        typer.Option(
+            "--outcome", "-o", help="Authentication outcome (success, failed_credentials)."
+        ),
+    ] = "success",
+    device_fingerprint: Annotated[
+        str | None,
+        typer.Option("--device", "-d", help="Client device fingerprint hash."),
+    ] = None,
+    latitude: Annotated[
+        float | None,
+        typer.Option("--latitude", help="Client geolocation latitude."),
+    ] = None,
+    longitude: Annotated[
+        float | None,
+        typer.Option("--longitude", help="Client geolocation longitude."),
+    ] = None,
+    tenant_id: Annotated[
+        str,
+        typer.Option("--tenant-id", help="Tenant organization partition."),
+    ] = "default",
+    store_file: Annotated[
+        Path | None,
+        typer.Option("--store-file", "-s", help="Path to JSON file storing ATO profiles."),
+    ] = None,
+    output_format: Annotated[
+        str,
+        typer.Option("--format", "-f", help="Output format (table or json)."),
+    ] = "table",
+) -> None:
+    """Evaluate an authentication attempt for Account Takeover risk."""
+    try:
+        outcome_enum = LoginOutcome(outcome.lower())
+    except ValueError:
+        _abort(f"Invalid outcome '{outcome}'. Expected: success, failed_credentials, failed_mfa.")
+
+    tracker, store = _load_ato_state(store_file)
+    engine = AtoEngine(profile_tracker=tracker, store=store, auto_quarantine=True)
+
+    event = LoginEvent(
+        user_id=user_id,
+        tenant_id=tenant_id,
+        ip_address=ip_address,
+        outcome=outcome_enum,
+        device_fingerprint=device_fingerprint,
+        latitude=latitude,
+        longitude=longitude,
+    )
+    assessment = engine.evaluate_attempt(event, action_type="login")
+    _save_ato_state(store_file, tracker, store)
+
+    if output_format.lower() == "table":
+        typer.echo(f"Assessment ID: {assessment.assessment_id}")
+        typer.echo(f"User ID:       {assessment.user_id}")
+        typer.echo(f"Risk Score:    {assessment.risk_score:.4f}")
+        typer.echo(f"Action:        {assessment.recommended_action.value.upper()}")
+        typer.echo(
+            f"Factors:       {', '.join(f.value for f in assessment.factors_triggered) or 'none'}"
+        )
+        typer.echo(f"Quarantined:   {assessment.quarantined}")
+    else:
+        typer.echo(json.dumps(assessment.to_dict(), indent=2))
+
+
+@app.command("ato-eval")
+def ato_eval(
+    user_id: Annotated[
+        str,
+        typer.Option("--user-id", "-u", help="User identifier."),
+    ],
+    action_type: Annotated[
+        str,
+        typer.Option(
+            "--action-type", "-a", help="Action type (transaction, transfer, profile_view)."
+        ),
+    ] = "transaction",
+    amount: Annotated[
+        float | None,
+        typer.Option("--amount", help="Transaction amount if applicable."),
+    ] = None,
+    ip_address: Annotated[
+        str,
+        typer.Option("--ip-address", "-i", help="Client IP address."),
+    ] = "127.0.0.1",
+    device_fingerprint: Annotated[
+        str | None,
+        typer.Option("--device", "-d", help="Client device fingerprint hash."),
+    ] = None,
+    latitude: Annotated[
+        float | None,
+        typer.Option("--latitude", help="Client geolocation latitude."),
+    ] = None,
+    longitude: Annotated[
+        float | None,
+        typer.Option("--longitude", help="Client geolocation longitude."),
+    ] = None,
+    tenant_id: Annotated[
+        str,
+        typer.Option("--tenant-id", help="Tenant organization partition."),
+    ] = "default",
+    store_file: Annotated[
+        Path | None,
+        typer.Option("--store-file", "-s", help="Path to JSON file storing ATO profiles."),
+    ] = None,
+    output_format: Annotated[
+        str,
+        typer.Option("--format", "-f", help="Output format (table or json)."),
+    ] = "table",
+) -> None:
+    """Evaluate an ongoing session action or card transaction for ATO compromise."""
+    tracker, store = _load_ato_state(store_file)
+    engine = AtoEngine(profile_tracker=tracker, store=store, auto_quarantine=True)
+
+    event = LoginEvent(
+        user_id=user_id,
+        tenant_id=tenant_id,
+        ip_address=ip_address,
+        outcome=LoginOutcome.SUCCESS,
+        device_fingerprint=device_fingerprint,
+        latitude=latitude,
+        longitude=longitude,
+    )
+    assessment = engine.evaluate_attempt(event, action_type=action_type, transaction_amount=amount)
+    _save_ato_state(store_file, tracker, store)
+
+    if output_format.lower() == "table":
+        typer.echo(f"Assessment ID: {assessment.assessment_id}")
+        typer.echo(f"User ID:       {assessment.user_id}")
+        typer.echo(f"Risk Score:    {assessment.risk_score:.4f}")
+        typer.echo(f"Action:        {assessment.recommended_action.value.upper()}")
+        typer.echo(
+            f"Factors:       {', '.join(f.value for f in assessment.factors_triggered) or 'none'}"
+        )
+        typer.echo(f"Quarantined:   {assessment.quarantined}")
+    else:
+        typer.echo(json.dumps(assessment.to_dict(), indent=2))
+
+
+@app.command("ato-inspect")
+def ato_inspect(
+    user_id: Annotated[
+        str,
+        typer.Option("--user-id", "-u", help="User identifier."),
+    ],
+    store_file: Annotated[
+        Path,
+        typer.Option("--store-file", "-s", help="Path to JSON file storing ATO profiles."),
+    ],
+    output_format: Annotated[
+        str,
+        typer.Option("--format", "-f", help="Output format (table or json)."),
+    ] = "table",
+) -> None:
+    """Inspect user baseline account profile, known devices, and quarantine status."""
+    tracker, _ = _load_ato_state(store_file)
+    profile = tracker.get_or_create_profile(user_id)
+
+    if output_format.lower() == "table":
+        typer.echo(f"User ID:        {profile.user_id}")
+        typer.echo(f"Known Devices:  {', '.join(sorted(profile.known_devices)) or 'none'}")
+        typer.echo(f"Known Locs:     {len(profile.known_locations)} recorded")
+        typer.echo(f"Last Known IP:  {profile.last_known_ip or 'none'}")
+        typer.echo(f"Quarantined:    {profile.is_quarantined}")
+        if profile.is_quarantined:
+            typer.echo(f"Reason:         {profile.quarantine_reason}")
+        typer.echo(f"Mutations:      {len(profile.mutations)} recorded")
+    else:
+        typer.echo(json.dumps(profile.to_dict(), indent=2))
+
+
+@app.command("ato-quarantine")
+def ato_quarantine(
+    user_id: Annotated[
+        str,
+        typer.Option("--user-id", "-u", help="User identifier."),
+    ],
+    reason: Annotated[
+        str,
+        typer.Option("--reason", "-r", help="Reason for placing account in security quarantine."),
+    ],
+    store_file: Annotated[
+        Path,
+        typer.Option("--store-file", "-s", help="Path to JSON file storing ATO profiles."),
+    ],
+    output_format: Annotated[
+        str,
+        typer.Option("--format", "-f", help="Output format (table or json)."),
+    ] = "table",
+) -> None:
+    """Administratively place a user account under security quarantine."""
+    tracker, store = _load_ato_state(store_file)
+    tracker.quarantine_account(user_id, reason=reason)
+    _save_ato_state(store_file, tracker, store)
+
+    if output_format.lower() == "table":
+        typer.echo(f"User ID:     {user_id}")
+        typer.echo("Status:      QUARANTINED")
+        typer.echo(f"Reason:      {reason}")
+    else:
+        typer.echo(
+            json.dumps({"status": "quarantined", "user_id": user_id, "reason": reason}, indent=2)
+        )
+
+
+@app.command("ato-release")
+def ato_release(
+    user_id: Annotated[
+        str,
+        typer.Option("--user-id", "-u", help="User identifier."),
+    ],
+    reason: Annotated[
+        str,
+        typer.Option("--reason", "-r", help="Reason for releasing account from quarantine."),
+    ],
+    store_file: Annotated[
+        Path,
+        typer.Option("--store-file", "-s", help="Path to JSON file storing ATO profiles."),
+    ],
+    output_format: Annotated[
+        str,
+        typer.Option("--format", "-f", help="Output format (table or json)."),
+    ] = "table",
+) -> None:
+    """Administratively release a user account from security quarantine."""
+    tracker, store = _load_ato_state(store_file)
+    tracker.release_account(user_id, reason=reason)
+    _save_ato_state(store_file, tracker, store)
+
+    if output_format.lower() == "table":
+        typer.echo(f"User ID:     {user_id}")
+        typer.echo("Status:      RELEASED")
+        typer.echo(f"Reason:      {reason}")
+    else:
+        typer.echo(
+            json.dumps({"status": "released", "user_id": user_id, "reason": reason}, indent=2)
+        )
+
+
+@app.command("ato-mutation")
+def ato_mutation(
+    user_id: Annotated[
+        str,
+        typer.Option("--user-id", "-u", help="User identifier."),
+    ],
+    mutation_type: Annotated[
+        str,
+        typer.Option(
+            "--type", "-m", help="Mutation type (password_change, email_change, mfa_reset)."
+        ),
+    ],
+    channel: Annotated[
+        str,
+        typer.Option(
+            "--channel", "-c", help="Channel where mutation occurred (web, mobile, support)."
+        ),
+    ] = "web",
+    store_file: Annotated[
+        Path,
+        typer.Option("--store-file", "-s", help="Path to JSON file storing ATO profiles."),
+    ] = Path("ato_store.json"),
+    output_format: Annotated[
+        str,
+        typer.Option("--format", "-f", help="Output format (table or json)."),
+    ] = "table",
+) -> None:
+    """Record a sensitive profile mutation for ATO surveillance."""
+    try:
+        m_type = AccountMutationType(mutation_type.lower())
+    except ValueError:
+        _abort(
+            f"Invalid mutation type '{mutation_type}'. "
+            "Expected: password_change, email_change, mfa_reset."
+        )
+
+    tracker, store = _load_ato_state(store_file)
+    rec = AccountMutationRecord(mutation_type=m_type, channel=channel)
+    tracker.record_mutation(user_id, rec)
+    _save_ato_state(store_file, tracker, store)
+
+    if output_format.lower() == "table":
+        typer.echo(f"Mutation ID: {rec.mutation_id}")
+        typer.echo(f"User ID:     {user_id}")
+        typer.echo(f"Type:        {rec.mutation_type.value}")
+        typer.echo(f"Channel:     {rec.channel}")
+    else:
+        typer.echo(json.dumps(rec.to_dict(), indent=2))
+
+
+@app.command("aml-monitor")
+def aml_monitor(
+    user_id: Annotated[
+        str,
+        typer.Option("--user-id", "-u", help="User or account identifier."),
+    ],
+    amount: Annotated[
+        float,
+        typer.Option("--amount", "-a", help="Transaction amount in currency units."),
+    ],
+    counterparty_id: Annotated[
+        str,
+        typer.Option("--counterparty-id", "-c", help="Counterparty account or entity ID."),
+    ] = "",
+    entity_name: Annotated[
+        str,
+        typer.Option(
+            "--entity-name", "-n", help="Legal name of counterparty/entity for screening."
+        ),
+    ] = "",
+    country: Annotated[
+        str,
+        typer.Option("--country", help="ISO country code (e.g. US, IR, KP, MM)."),
+    ] = "US",
+    direction: Annotated[
+        str,
+        typer.Option("--direction", "-d", help="Transaction direction (inbound or outbound)."),
+    ] = "outbound",
+    currency: Annotated[
+        str,
+        typer.Option("--currency", help="ISO currency code (e.g. USD, EUR)."),
+    ] = "USD",
+    store_file: Annotated[
+        Path,
+        typer.Option("--store-file", "-s", help="Path to AML state JSON file."),
+    ] = Path("aml_store.json"),
+    output_format: Annotated[
+        str,
+        typer.Option("--format", "-f", help="Output format (table or json)."),
+    ] = "table",
+) -> None:
+    """Monitor financial transaction for AML typologies, sanctions hits, and corridor risk."""
+    direction_normalized = direction.lower()
+    if direction_normalized in ("inflow", "inbound", "in"):
+        tx_dir = TransactionDirection.INFLOW
+    elif direction_normalized in ("outflow", "outbound", "out"):
+        tx_dir = TransactionDirection.OUTFLOW
+    else:
+        _abort(f"Invalid transaction direction '{direction}'. Expected 'inflow' or 'outflow'.")
+
+    engine, _, transactions = _load_aml_state(store_file)
+    event = AmlTransactionEvent(
+        transaction_id=str(uuid4()),
+        user_id=user_id,
+        amount=amount,
+        counterparty_id=counterparty_id,
+        country=country.upper(),
+        direction=tx_dir,
+        currency=currency.upper(),
+    )
+    assessment = engine.evaluate_transaction(event, entity_name=entity_name or None)
+    transactions.append(event)
+    _save_aml_state(store_file, engine.store, transactions)
+
+    if output_format.lower() == "table":
+        typer.echo(f"Transaction ID: {assessment.transaction_id}")
+        typer.echo(f"User ID:        {assessment.user_id}")
+        typer.echo(f"Risk Score:     {assessment.risk_score:.4f}")
+        typer.echo(f"Risk Level:     {assessment.risk_level.value}")
+        typer.echo(f"Policy Action:  {assessment.recommended_action.value}")
+        typs = ", ".join(t.value for t in assessment.triggered_typologies) or "none"
+        typer.echo(f"Typologies:     {typs}")
+        if assessment.alert:
+            typer.echo(f"Alert ID:       {assessment.alert.alert_id}")
+    else:
+        typer.echo(json.dumps(assessment.to_dict(), indent=2))
+
+
+@app.command("aml-screen")
+def aml_screen(
+    name: Annotated[
+        str,
+        typer.Option("--name", "-n", help="Entity or individual name to screen."),
+    ],
+    threshold: Annotated[
+        float,
+        typer.Option("--threshold", "-t", help="Fuzzy match similarity threshold [0.0 - 1.0]."),
+    ] = 0.85,
+    watchlist_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--watchlist-file", "-w", help="Optional JSON file with custom watchlist entries."
+        ),
+    ] = None,
+    output_format: Annotated[
+        str,
+        typer.Option("--format", "-f", help="Output format (table or json)."),
+    ] = "table",
+) -> None:
+    """Screen entity name against OFAC/PEP watchlists with fuzzy and phonetic matching."""
+    screening_engine = WatchlistScreeningEngine()
+    if watchlist_file is not None:
+        if not watchlist_file.exists():
+            _abort(f"Watchlist file not found: {watchlist_file}")
+        try:
+            raw = watchlist_file.read_text(encoding="utf-8")
+            entries_data = json.loads(raw)
+            if isinstance(entries_data, list):
+                for ed in entries_data:
+                    if isinstance(ed, dict):
+                        screening_engine.add_entry(WatchlistEntry.from_dict(ed))
+        except (OSError, json.JSONDecodeError) as exc:
+            _abort(f"Could not load watchlist file: {exc}")
+    else:
+        for wl_entry in DEFAULT_WATCHLIST_ENTRIES:
+            screening_engine.add_entry(wl_entry)
+
+    matches = screening_engine.screen_entity(name, threshold=threshold)
+
+    if output_format.lower() == "table":
+        typer.echo(f"Screening Query: {name}")
+        typer.echo(f"Threshold:       {threshold}")
+        typer.echo(f"Matches Found:   {len(matches)}")
+        if matches:
+            typer.echo("-" * 60)
+            for m in matches:
+                typer.echo(
+                    f"[{m.matched_entry.watchlist_type.value.upper()}] {m.matched_entry.name} "
+                    f"| Score: {m.similarity_score:.4f} | Method: {m.match_algorithm}"
+                )
+    else:
+        typer.echo(json.dumps([m.to_dict() for m in matches], indent=2))
+
+
+@app.command("aml-alerts")
+def aml_alerts(
+    user_id: Annotated[
+        str | None,
+        typer.Option("--user-id", "-u", help="Filter by user identifier."),
+    ] = None,
+    typology: Annotated[
+        str | None,
+        typer.Option("--typology", "-t", help="Filter by AML typology."),
+    ] = None,
+    risk_level: Annotated[
+        str | None,
+        typer.Option(
+            "--risk-level", "-r", help="Filter by risk level (low, medium, high, critical)."
+        ),
+    ] = None,
+    limit: Annotated[
+        int,
+        typer.Option("--limit", "-l", help="Maximum alerts to return."),
+    ] = 100,
+    store_file: Annotated[
+        Path,
+        typer.Option("--store-file", "-s", help="Path to AML state JSON file."),
+    ] = Path("aml_store.json"),
+    output_format: Annotated[
+        str,
+        typer.Option("--format", "-f", help="Output format (table or json)."),
+    ] = "table",
+) -> None:
+    """Inspect and filter AML detection alerts from store file."""
+    typology_enum: AmlTypology | None = None
+    if typology:
+        try:
+            typology_enum = AmlTypology(typology.lower())
+        except ValueError:
+            _abort(f"Invalid typology '{typology}'.")
+
+    risk_level_enum: AmlRiskLevel | None = None
+    if risk_level:
+        try:
+            risk_level_enum = AmlRiskLevel(risk_level.lower())
+        except ValueError:
+            _abort(f"Invalid risk level '{risk_level}'.")
+
+    engine, _, _ = _load_aml_state(store_file)
+    alerts = engine.store.list_alerts(
+        user_id=user_id,
+        typology=typology_enum,
+        risk_level=risk_level_enum,
+        limit=limit,
+    )
+
+    if output_format.lower() == "table":
+        typer.echo(f"Alerts ({len(alerts)}):")
+        for a in alerts:
+            typer.echo(
+                f"- ID: {a.alert_id} | User: {a.user_id} | Level: {a.risk_level.value.upper()} "
+                f"| Typology: {a.typology.value} | Action: {a.recommended_action.value} "
+                f"| Score: {a.risk_score:.2f}"
+            )
+    else:
+        typer.echo(json.dumps([a.to_dict() for a in alerts], indent=2))
+
+
+@app.command("aml-sar-generate")
+def aml_sar_generate(
+    user_id: Annotated[
+        str,
+        typer.Option("--user-id", "-u", help="Subject user identifier."),
+    ],
+    alert_ids: Annotated[
+        str,
+        typer.Option("--alert-ids", "-a", help="Comma-separated AML alert IDs."),
+    ],
+    suspect_name: Annotated[
+        str,
+        typer.Option("--suspect-name", "-n", help="Subject suspect legal name."),
+    ] = "",
+    narrative: Annotated[
+        str,
+        typer.Option("--narrative", help="Optional narrative summary or context."),
+    ] = "",
+    store_file: Annotated[
+        Path,
+        typer.Option("--store-file", "-s", help="Path to AML state JSON file."),
+    ] = Path("aml_store.json"),
+    output_format: Annotated[
+        str,
+        typer.Option("--format", "-f", help="Output format (table or json)."),
+    ] = "table",
+) -> None:
+    """Compile and package a regulatory SAR filing dossier from suspicious alerts."""
+    a_ids = [aid.strip() for aid in alert_ids.split(",") if aid.strip()]
+    if not a_ids:
+        _abort("At least one alert ID must be specified.")
+
+    engine, sar_manager, transactions = _load_aml_state(store_file)
+    dossier = sar_manager.generate_sar(
+        user_id=user_id,
+        alert_ids=a_ids,
+        suspect_name=suspect_name,
+        narrative_summary=narrative,
+    )
+    _save_aml_state(store_file, engine.store, transactions)
+
+    if output_format.lower() == "table":
+        typer.echo(f"SAR ID:        {dossier.sar_id}")
+        typer.echo(f"Filing Status: {dossier.status.value}")
+        subj = dossier.suspect_details.get("full_name") or dossier.user_id
+        typer.echo(f"Subject:       {subj}")
+        typer.echo(f"Alerts Count:  {len(dossier.alert_ids)}")
+        typer.echo(f"Narrative:     {dossier.narrative[:120]}...")
+    else:
+        typer.echo(json.dumps(dossier.to_dict(), indent=2))
+
+
+@app.command("aml-sar-list")
+def aml_sar_list(
+    status: Annotated[
+        str | None,
+        typer.Option(
+            "--status",
+            help="Filter by SAR filing status (draft, pending_review, approved, filed, rejected).",
+        ),
+    ] = None,
+    user_id: Annotated[
+        str | None,
+        typer.Option("--user-id", "-u", help="Filter by subject user identifier."),
+    ] = None,
+    limit: Annotated[
+        int,
+        typer.Option("--limit", "-l", help="Maximum SAR dossiers to return."),
+    ] = 100,
+    store_file: Annotated[
+        Path,
+        typer.Option("--store-file", "-s", help="Path to AML state JSON file."),
+    ] = Path("aml_store.json"),
+    output_format: Annotated[
+        str,
+        typer.Option("--format", "-f", help="Output format (table or json)."),
+    ] = "table",
+) -> None:
+    """List regulatory SAR dossiers filtered by filing status or subject user."""
+    status_enum: SarStatus | None = None
+    if status:
+        try:
+            status_enum = SarStatus(status.lower())
+        except ValueError:
+            _abort(f"Invalid SAR status '{status}'.")
+
+    _, sar_manager, _ = _load_aml_state(store_file)
+    sars = sar_manager.list_sars(status=status_enum, user_id=user_id, limit=limit)
+
+    if output_format.lower() == "table":
+        typer.echo(f"SAR Dossiers ({len(sars)}):")
+        for s in sars:
+            subj = s.suspect_details.get("full_name") or s.user_id
+            typer.echo(
+                f"- ID: {s.sar_id} | Status: {s.status.value.upper()} "
+                f"| Subject: {subj} | Alerts: {len(s.alert_ids)}"
+            )
+    else:
+        typer.echo(json.dumps([s.to_dict() for s in sars], indent=2))
+
+
+@app.command("aml-sar-status")
+def aml_sar_status(
+    sar_id: Annotated[
+        str,
+        typer.Option("--sar-id", help="SAR filing dossier ID."),
+    ],
+    status: Annotated[
+        str,
+        typer.Option(
+            "--status",
+            help="New target status (pending_review, approved, filed, rejected).",
+        ),
+    ],
+    reviewer: Annotated[
+        str,
+        typer.Option("--reviewer", "-r", help="Compliance officer / reviewer identifier."),
+    ] = "compliance_officer",
+    comment: Annotated[
+        str,
+        typer.Option("--comment", "-c", help="Status transition review comment."),
+    ] = "",
+    store_file: Annotated[
+        Path,
+        typer.Option("--store-file", "-s", help="Path to AML state JSON file."),
+    ] = Path("aml_store.json"),
+    output_format: Annotated[
+        str,
+        typer.Option("--format", "-f", help="Output format (table or json)."),
+    ] = "table",
+) -> None:
+    """Update regulatory SAR filing status according to strict compliance lifecycle."""
+    try:
+        new_status = SarStatus(status.lower())
+    except ValueError:
+        _abort(f"Invalid SAR status '{status}'.")
+
+    engine, sar_manager, transactions = _load_aml_state(store_file)
+    try:
+        updated = sar_manager.transition_status(
+            sar_id=sar_id,
+            new_status=new_status,
+            actor=reviewer,
+            notes=comment,
+        )
+    except KeyError:
+        _abort(f"SAR dossier '{sar_id}' not found.")
+    except (ValueError, RuntimeError) as exc:
+        _abort(str(exc))
+
+    _save_aml_state(store_file, engine.store, transactions)
+
+    if output_format.lower() == "table":
+        typer.echo(f"SAR ID:        {updated.sar_id}")
+        typer.echo(f"New Status:    {updated.status.value}")
+        typer.echo(f"Reviewer:      {reviewer}")
+        if updated.filing_date:
+            typer.echo(f"Filing Date:   {updated.filing_date}")
+    else:
+        typer.echo(json.dumps(updated.to_dict(), indent=2))
+
+
+def _load_sif_state(
+    store_file: Path | None,
+) -> tuple[SyntheticIdentityEngine, SyntheticIdentityStore]:
+    """Load persistent identity profiles and assessments from store file."""
+    store = SyntheticIdentityStore()
+    engine = SyntheticIdentityEngine(store=store)
+    if store_file is None or not store_file.exists():
+        return engine, store
+
+    try:
+        raw = store_file.read_text(encoding="utf-8")
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            _abort("Invalid SIF store file format: expected JSON object.")
+    except (OSError, json.JSONDecodeError) as exc:
+        _abort(f"Could not read SIF store file: {exc}")
+
+    for p_data in data.get("profiles", []):
+        if isinstance(p_data, dict):
+            store.add_profile(IdentityProfile.from_dict(p_data))
+
+    for a_data in data.get("assessments", []):
+        if isinstance(a_data, dict):
+            store.add_assessment(SifAssessment.from_dict(a_data))
+
+    return engine, store
+
+
+def _save_sif_state(
+    store_file: Path | None,
+    store: SyntheticIdentityStore,
+) -> None:
+    """Save persistent identity profiles and assessments to store file."""
+    if store_file is None:
+        return
+    data = {
+        "profiles": [p.to_dict() for p in store.list_profiles(limit=5000)],
+        "assessments": [a.to_dict() for a in store.list_assessments(limit=5000)],
+    }
+    _atomic_write_text(json.dumps(data, indent=2), store_file)
+
+
+@app.command("sif-eval")
+def sif_eval(
+    ssn: Annotated[str, typer.Option("--ssn", help="Applicant Social Security Number.")],
+    first_name: Annotated[str, typer.Option("--first-name", help="Applicant first name.")],
+    last_name: Annotated[str, typer.Option("--last-name", help="Applicant last name.")],
+    dob: Annotated[str, typer.Option("--dob", help="Date of birth in YYYY-MM-DD format.")],
+    address: Annotated[str, typer.Option("--address", help="Residential street address.")],
+    phone: Annotated[str, typer.Option("--phone", help="Contact phone number.")],
+    email: Annotated[str, typer.Option("--email", help="Contact email address.")],
+    applicant_id: Annotated[
+        str, typer.Option("--applicant-id", help="Optional applicant ID.")
+    ] = "",
+    credit_line: Annotated[
+        float, typer.Option("--credit-line", help="Requested credit line.")
+    ] = 5000.0,
+    tenant_id: Annotated[str, typer.Option("--tenant-id", help="Tenant identifier.")] = "default",
+    store_file: Annotated[
+        Path,
+        typer.Option("--store-file", "-s", help="Path to SIF state JSON file."),
+    ] = Path("sif_store.json"),
+    output_format: Annotated[
+        str, typer.Option("--format", "-f", help="Output format (table or json).")
+    ] = "table",
+) -> None:
+    """Evaluate an applicant credit profile for synthetic identity fraud."""
+    engine, store = _load_sif_state(store_file)
+    aid = applicant_id or f"app_{uuid4().hex[:12]}"
+    profile = IdentityProfile(
+        applicant_id=aid,
+        ssn=ssn,
+        first_name=first_name,
+        last_name=last_name,
+        dob=dob,
+        address=address,
+        phone=phone,
+        email=email,
+        credit_line_requested=credit_line,
+        tenant_id=tenant_id,
+    )
+    assessment = engine.evaluate(profile)
+    _save_sif_state(store_file, store)
+
+    if output_format.lower() == "table":
+        typer.echo(f"Assessment ID:    {assessment.assessment_id}")
+        typer.echo(f"Applicant ID:     {assessment.applicant_id}")
+        typer.echo(f"Risk Score:       {assessment.risk_score:.4f}")
+        typer.echo(f"Risk Level:       {assessment.risk_level.value}")
+        typer.echo(f"Policy Action:    {assessment.action.value}")
+        anoms = ", ".join(a.value for a in assessment.triggered_anomalies) or "none"
+        typer.echo(f"Anomalies:        {anoms}")
+        if assessment.ssn_validation:
+            typer.echo(f"SSN Status:       {assessment.ssn_validation.status.value}")
+            typer.echo(f"State Issued:     {assessment.ssn_validation.state_issued}")
+    else:
+        typer.echo(json.dumps(assessment.to_dict(), indent=2))
+
+
+@app.command("sif-check-ssn")
+def sif_check_ssn(
+    ssn: Annotated[str, typer.Option("--ssn", help="Social Security Number to audit.")],
+    dob: Annotated[str, typer.Option("--dob", help="Optional date of birth (YYYY-MM-DD).")] = "",
+    output_format: Annotated[
+        str, typer.Option("--format", "-f", help="Output format (table or json).")
+    ] = "table",
+) -> None:
+    """Validate SSN against SSA allocation tables, deceased registries, and birth year."""
+    validator = SsnValidator()
+    result = validator.validate(ssn, dob=dob or None)
+
+    if output_format.lower() == "table":
+        typer.echo(f"SSN Valid:        {result.is_valid}")
+        typer.echo(f"Status:           {result.status.value}")
+        typer.echo(f"Area Number:      {result.area_number:03d}")
+        typer.echo(f"Group Number:     {result.group_number:02d}")
+        typer.echo(f"State Issued:     {result.state_issued}")
+        if result.estimated_issuance_year_range:
+            y_start, y_end = result.estimated_issuance_year_range
+            typer.echo(f"Issuance Window:  {y_start}-{y_end}")
+        typer.echo(f"Is Deceased:      {result.is_deceased}")
+        typer.echo(f"Details:          {result.details}")
+    else:
+        typer.echo(json.dumps(result.to_dict(), indent=2))
+
+
+@app.command("sif-inspect")
+def sif_inspect(
+    applicant_id: Annotated[
+        str, typer.Option("--applicant-id", "-a", help="Applicant ID to inspect.")
+    ] = "",
+    assessment_id: Annotated[
+        str, typer.Option("--assessment-id", "-i", help="Assessment ID to inspect.")
+    ] = "",
+    store_file: Annotated[
+        Path,
+        typer.Option("--store-file", "-s", help="Path to SIF state JSON file."),
+    ] = Path("sif_store.json"),
+    output_format: Annotated[
+        str, typer.Option("--format", "-f", help="Output format (table or json).")
+    ] = "table",
+) -> None:
+    """Inspect stored applicant profile or synthetic identity assessment."""
+    if not applicant_id and not assessment_id:
+        _abort("Must provide either --applicant-id or --assessment-id to inspect.")
+
+    _, store = _load_sif_state(store_file)
+
+    if assessment_id:
+        assessment = store.get_assessment(assessment_id)
+        if assessment is None:
+            _abort(f"Assessment '{assessment_id}' not found in store.")
+        if output_format.lower() == "table":
+            typer.echo(f"Assessment ID:    {assessment.assessment_id}")
+            typer.echo(f"Applicant ID:     {assessment.applicant_id}")
+            typer.echo(f"Risk Score:       {assessment.risk_score:.4f}")
+            typer.echo(f"Risk Level:       {assessment.risk_level.value}")
+            typer.echo(f"Action:           {assessment.action.value}")
+            anoms = ", ".join(a.value for a in assessment.triggered_anomalies) or "none"
+            typer.echo(f"Anomalies:        {anoms}")
+        else:
+            typer.echo(json.dumps(assessment.to_dict(), indent=2))
+        return
+
+    profile = store.get_profile(applicant_id)
+    if profile is None:
+        _abort(f"Applicant profile '{applicant_id}' not found in store.")
+    if output_format.lower() == "table":
+        typer.echo(f"Applicant ID:     {profile.applicant_id}")
+        typer.echo(f"Name:             {profile.first_name} {profile.last_name}")
+        typer.echo(f"SSN (Masked):     {profile.ssn_masked()}")
+        typer.echo(f"DOB:              {profile.dob}")
+        typer.echo(f"Address:          {profile.address}")
+        typer.echo(f"Phone:            {profile.phone}")
+        typer.echo(f"Email:            {profile.email}")
+        typer.echo(f"Credit Line:      ${profile.credit_line_requested:,.2f}")
+    else:
+        typer.echo(json.dumps(profile.to_dict(), indent=2))
+
+
+@app.command("sif-summary")
+def sif_summary(
+    store_file: Annotated[
+        Path,
+        typer.Option("--store-file", "-s", help="Path to SIF state JSON file."),
+    ] = Path("sif_store.json"),
+    output_format: Annotated[
+        str, typer.Option("--format", "-f", help="Output format (table or json).")
+    ] = "table",
+) -> None:
+    """Display summary metrics of tracked applicant profiles and synthetic fraud assessments."""
+    _, store = _load_sif_state(store_file)
+    assessments = store.list_assessments(limit=50000)
+    profiles = store.list_profiles(limit=50000)
+
+    actions: dict[str, int] = defaultdict(int)
+    risk_levels: dict[str, int] = defaultdict(int)
+    for a in assessments:
+        actions[a.action.value] += 1
+        risk_levels[a.risk_level.value] += 1
+
+    summary_data = {
+        "total_profiles": len(profiles),
+        "total_assessments": len(assessments),
+        "actions": dict(actions),
+        "risk_levels": dict(risk_levels),
+    }
+
+    if output_format.lower() == "table":
+        typer.echo("Synthetic Identity Fraud Store Summary:")
+        typer.echo(f"  Total Profiles:     {summary_data['total_profiles']}")
+        typer.echo(f"  Total Assessments:  {summary_data['total_assessments']}")
+        typer.echo("  Actions:")
+        for act, cnt in actions.items():
+            typer.echo(f"    {act:25s}: {cnt}")
+        typer.echo("  Risk Levels:")
+        for rk, cnt in risk_levels.items():
+            typer.echo(f"    {rk:25s}: {cnt}")
+    else:
+        typer.echo(json.dumps(summary_data, indent=2))
+
+
 def _abort(message: str) -> NoReturn:
+
     typer.echo(f"Error: {message}", err=True)
     raise typer.Exit(code=2)
 

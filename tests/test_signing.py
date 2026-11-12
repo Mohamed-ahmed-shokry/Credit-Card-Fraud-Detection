@@ -137,3 +137,28 @@ def test_attestation_signature_helper_requires_object_and_signature(tmp_path: Pa
 
     assert verify_attestation_signature([], public_key)[0] is False
     assert verify_attestation_signature({"status": "PASSED"}, public_key)[0] is False
+
+
+def test_signing_coverage_edge_cases(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from fraud_detection.signing import _decode, _read_pem
+
+    # 1. _decode with non-string raises TypeError
+    with pytest.raises(TypeError, match="must be base64 strings"):
+        _decode(12345)
+
+    # 2. _read_pem with decoded len != 32 raises ValueError
+    bad_pem = tmp_path / "bad_len.pem"
+    bad_b64 = base64.b64encode(b"short_bytes").decode("ascii")
+    bad_pem.write_text(
+        f"-----BEGIN PUBLIC KEY-----\n{bad_b64}\n-----END PUBLIC KEY-----\n", encoding="ascii"
+    )
+    with pytest.raises(ValueError, match="must contain 32 decoded bytes"):
+        _read_pem(bad_pem, "PUBLIC KEY")
+
+    # 3. OSError when writing keypair raises SigningError
+    def _raise_os_error(*_args: object, **_kwargs: object) -> None:
+        raise OSError("write denied")
+
+    monkeypatch.setattr("fraud_detection.signing._atomic_write", _raise_os_error)
+    with pytest.raises(SigningError, match="Failed to write signing keys"):
+        write_keypair(tmp_path / "k1.pem", tmp_path / "k2.pem")

@@ -35,6 +35,10 @@ binary target contains exactly `0` (legitimate) and `1` (fraud).
   score distributions with automated alerting webhooks.
 - **Edge explanation parity:** quantized int8 linear explanations and streaming batch scoring
   in pure Python with zero external machine-learning dependencies.
+- **Real-time geolocation anomaly detection & velocity tracking:** in-process spherical Haversine
+  geodesic displacement math ($R = 6371.0\text{ km}$), sliding-window entity trajectory tracking,
+  in-process IP geocoding with CIDR matching and proxy/VPN/Tor classification, impossible travel
+  detection ($v > 900\text{ km/h}$), and decision rule integration.
 - **Quality gates:** formatting, linting, strict type checking, branch coverage of at
   least 97%, package builds, and Python 3.12/3.14 CI.
 
@@ -566,6 +570,14 @@ fraud-detect pipeline-eval \
   --fail-on-degraded \
   --json
 
+# Enable node caching and speculative model inference, reporting cache hit ratio
+fraud-detect pipeline-eval \
+  --model artifacts/model \
+  --input Dataset/eval.csv \
+  --enable-cache --cache-size 2000 --cache-ttl 120 \
+  --speculative \
+  --json
+
 # Serve API with real-time decision graph pipeline enabled
 fraud-detect serve artifacts/model \
   --rules rules/fraud_rules.json \
@@ -588,12 +600,205 @@ export FRAUD_PIPELINE_ENABLED="true"
   - `InferenceStageProcessor`: Model risk scoring and SHAP/Tree feature contributions.
   - `CalibrationStageProcessor`: Post-hoc probability recalibration (Platt scaling, isotonic regression, temperature scaling).
   - `ActionAggregatorStageProcessor`: Precedence arbitration and tiered thresholding (`ALLOW`, `REVIEW`, `DENY`).
+- **Node Caching**: Opt-in (`enable_pipeline_cache`, `FRAUD_PIPELINE_CACHE_ENABLED`) deterministic in-memory cache for pure stages with per-stage TTL (`FRAUD_PIPELINE_CACHE_TTL_SECONDS`) and LRU bounds (`FRAUD_PIPELINE_CACHE_MAX_SIZE`).
+- **Speculative Inference**: Opt-in (`enable_speculative_pipeline`, `FRAUD_PIPELINE_SPECULATIVE_ENABLED`) model inference that runs concurrently with enrichment; the result is adopted only if the model's features are unchanged after enrichment, and discarded and recomputed on feature changes or rule short-circuits.
 - **Operational Endpoints**:
   - `GET /v1/pipeline/topology`: Inspect registered graph DAG topology, node dependencies, stage types, and parallel execution wave plans.
   - `POST /v1/pipeline/score`: Execute real-time decision graph for an incoming transaction with full stage-by-stage latency breakdowns and lineage traces.
+  - `GET /v1/pipeline/circuits`: Inspect status, state (`CLOSED`, `OPEN`, `HALF_OPEN`), failure counts, short-circuit counts, and breaker policies for all graph stages.
+  - `POST /v1/pipeline/circuits/reset`: Reset all stage circuit breakers to `CLOSED` state.
+  - `GET /v1/pipeline/cache/stats`: Aggregate and per-node cache hits, misses, hit ratio, evictions, and size (404 when caching is disabled).
+  - `POST /v1/pipeline/cache/clear`: Drop all cached stage outputs.
+  - `POST /v1/pipeline/replay`: Replay historical scoring audit logs (`JSONL`) through the active decision graph, returning probability discrepancies, 3×3 decision turnover matrices (`ALLOW`, `CHALLENGE`, `DENY`), and stage-by-stage latency distributions.
+  - `POST /v1/pipeline/counterfactual`: Evaluate candidate tiered decision thresholds against baseline decisions or thresholds with optional ground-truth cost modeling.
+  - `POST /v1/pipeline/chaos`: Simulate deterministic stage faults (latency spikes, exceptions, corruption, timeouts) against a transaction batch with SLA verification.
 - **Prometheus Telemetry**:
   - `fraud_pipeline_stage_duration_seconds{stage="...", status="..."}`: Histogram monitoring per-stage execution durations.
   - `fraud_pipeline_executions_total{status="...", degraded="true|false"}`: Counter tracking total and degraded graph executions.
+  - `fraud_pipeline_circuit_state{stage="...", state="CLOSED|OPEN|HALF_OPEN"}`: Gauge tracking circuit breaker state per stage.
+  - `fraud_pipeline_circuit_short_circuits_total{stage="..."}`: Counter tracking executions short-circuited by tripped circuit breakers.
+  - `fraud_pipeline_chaos_injections_total{stage="...", fault_type="..."}`: Counter tracking simulated chaos faults injected per stage.
+  - `fraud_pipeline_cache_hits_total{stage="..."}` / `fraud_pipeline_cache_misses_total{stage="..."}`: Per-stage cache outcomes.
+  - `fraud_pipeline_speculative_executions_total` / `fraud_pipeline_speculative_hits_total`: Speculative launches and adopted results.
+  - `fraud_pipeline_replay_evaluations_total{status="..."}` / `fraud_pipeline_replay_discrepancies_total`: Pipeline replay evaluations and detected score discrepancies.
+- **Offline CLI Replay, Chaos & Counterfactual Analysis**:
+  - `fraud-detect pipeline-eval <input.csv> --model <artifact> [--enable-circuit-breakers] [--circuit-failure-threshold 5] [--circuit-recovery-timeout-seconds 30.0] [--fail-on-degraded] [--json]`
+  - `fraud-detect pipeline-chaos <input.csv> --model <artifact> [--fault-stage rules] [--fault-type latency_spike|transient_exception|payload_corruption|timeout] [--fault-rate 0.5] [--latency-spike-ms 50.0] [--sla-budget-ms 100.0] [--output reports/chaos.json] [--json]`
+  - `fraud-detect pipeline-replay <audit_log.jsonl> --model <artifact> [--rules <rules.json>] [--tolerance 1e-4] [--fail-on-divergence] [--json]`
+  - `fraud-detect pipeline-counterfactual <audit_log.jsonl> --candidate-review 0.3 --candidate-deny 0.75 [--baseline-review 0.5 --baseline-deny 0.8] [--json]`
+
+## Delayed Ground-Truth Ingestion, Label Maturation & Retraining Surveillance
+
+Production fraud detection suffers from chargeback and dispute lag (often 30–90+ days). Prematurely computing realized metrics on immature transaction cohorts introduces severe survivor bias (unreported frauds look like false positives or unconfirmed negatives). `fraud-detect` provides empirical label delay maturation modeling, cohort maturity gating, realized performance and financial cost tracking, and automated retraining triggers:
+
+```bash
+# Ingest delayed ground-truth labels (chargebacks, reviews, clearing logs) into a thread-safe store
+fraud-detect ingest-labels \
+  --labels-file data/chargebacks.jsonl \
+  --store-path data/labels_store.jsonl
+
+# Ingest an individual label directly from the CLI
+fraud-detect ingest-labels \
+  --transaction-id tx_1001 \
+  --ground-truth-label 1 \
+  --label-type chargeback \
+  --source issuer_network \
+  --timestamp 1718000000.0 \
+  --store-path data/labels_store.jsonl
+
+# Run feedback surveillance against historical scoring audit logs with empirical maturity gating
+fraud-detect feedback-surveillance \
+  --labels-file data/labels_store.jsonl \
+  --audit-log logs/scoring_audit.jsonl \
+  --maturation-days 90 \
+  --min-cohort-maturity 0.90 \
+  --output reports/feedback_surveillance.json
+
+# Gate CI/CD or automated orchestration: exits with code 3 if retraining triggers fire
+fraud-detect feedback-surveillance \
+  --labels-file data/labels_store.jsonl \
+  --audit-log logs/scoring_audit.jsonl \
+  --fail-on-retrain
+```
+
+### Delayed feedback architecture & capabilities
+
+- **Multi-Source Label Ingestion**: `DelayedLabelRecord` and thread-safe `LabelIngestionStore` support chargebacks, merchant disputes, manual analyst reviews, and confirmed non-fraud clears with monotonic timestamp validation.
+- **As-Of Audit Log Matching**: `match_feedback_with_audit_log` joins delayed labels with immutable JSONL scoring audit records via transaction ID, extracting decision, score probability, transaction amount, and inference timestamp to create `MatchedFeedbackRecord`.
+- **Empirical Label Maturation Curve**: `LabelMaturationCurve` fits empirical CDFs of reporting delay ($\Delta t = t_{\text{feedback}} - t_{\text{inference}}$), computing delay quantiles ($p_{50}, p_{75}, p_{90}, p_{95}, p_{99}$, max delay) and filtering immature transaction cohorts to eliminate survivor bias.
+- **Realized Metrics & Business Cost Surveillance**:
+  - `compute_realized_metrics` calculates precision, recall, specificity, F1, PR-AUC, ROC-AUC, and Brier score strictly on mature cohorts.
+  - Financial cost accounting models net financial loss ($C_{\text{FN}} \cdot \text{amount} + C_{\text{FP}} \cdot \text{amount} + C_{\text{review}} \cdot N_{\text{review}}$), fraud loss avoided, false positive friction cost, and net surveillance ROI.
+- **Automated Retraining Triggers**: `RetrainingTriggerPolicy` and `FeedbackSurveillanceAnalyzer` evaluate composite trigger criteria (requiring configurable minimum mature transactions and fraud incidents) across recall degradation, PR-AUC drops, net financial loss surges, and sustained feature drift. Emits exit code 3 (`EXIT_CODE_RETRAIN_TRIGGERED = 3`) for downstream orchestration.
+- **Operational API Endpoints**:
+  - `POST /v1/feedback/labels`: Ingest single or batch delayed labels.
+  - `GET /v1/feedback/maturation`: Retrieve fitted maturation curve percentiles and delay CDF points.
+  - `POST /v1/feedback/surveillance`: Evaluate realized metrics, financial costs, and retraining trigger conditions against audit log scoring data.
+- **Prometheus Telemetry**:
+  - `fraud_feedback_labels_ingested_total{label_type="...", source="..."}`: Ingested ground-truth labels.
+  - `fraud_feedback_matched_total` / `fraud_feedback_unmatched_total`: As-of audit log matching outcomes.
+  - `fraud_feedback_retraining_triggers_total{trigger_type="..."}`: Retraining triggers tripped by type.
+  - `fraud_feedback_realized_recall`, `fraud_feedback_realized_pr_auc`, `fraud_feedback_realized_net_financial_loss`: Realized surveillance gauges.
+
+## Automated Closed-Loop Retraining, Candidate Verification & Safe Promotion
+
+Phase 37 introduces end-to-end automated closed-loop model retraining, multi-metric challenger safety verification gating, cryptographic attestation, zero-downtime hot-reloading, and safe canary traffic promotion.
+
+```bash
+# Execute end-to-end closed-loop retraining and safety verification
+fraud-detect auto-retrain \
+  --audit-log-path logs/scoring_audit.jsonl \
+  --labels-path data/labels_store.jsonl \
+  --champion-model-path artifacts/model \
+  --output-dir artifacts/candidate \
+  --estimator logistic_regression \
+  --promote canary \
+  --canary-percentage 10.0 \
+  --json
+
+# Sign certified candidate artifact with Ed25519 private key
+fraud-detect auto-retrain \
+  --audit-log-path logs/scoring_audit.jsonl \
+  --labels-path data/labels_store.jsonl \
+  --champion-model-path artifacts/model \
+  --output-dir artifacts/candidate \
+  --signing-key-path keys/ed25519_private.pem \
+  --promote full
+
+# Trigger hot-reload / canary promotion directly on a running production API service
+fraud-detect auto-retrain \
+  --audit-log-path logs/scoring_audit.jsonl \
+  --labels-path data/labels_store.jsonl \
+  --champion-model-path artifacts/model \
+  --output-dir artifacts/candidate \
+  --promote canary \
+  --canary-percentage 20.0 \
+  --api-url http://localhost:8000
+```
+
+### Closed-Loop Retraining Architecture & Capabilities
+
+- **Dataset Materialization**: `RetrainingDatasetBuilder` joins mature feedback labels with production scoring audit logs, enforcing temporal holdout purge gaps, minimum sample and fraud count thresholds, and multi-class target assertions.
+- **Automated Challenger Training**: `ChallengerTrainer` supports Logistic Regression, Random Forest, and LightGBM with hyperparameter mapping, stratified/temporal CV splitting, decision threshold optimization, and training duration capture.
+- **Multi-Faceted Challenger Verification**: `ChallengerSafetyVerifier` evaluates candidate models against production champions on identical holdout data across five safety gates:
+  - Minimum PR-AUC delta ($\ge -0.02$)
+  - Recall non-regression ($\ge -0.03$)
+  - Expected Calibration Error increase ($\Delta \text{ECE} \le 0.03$)
+  - Net expected financial fraud cost change ($\le 5\%$)
+  - Sub-population slice disparity ($\le 0.25$)
+- **Cryptographic Attestation & Lineage Signing**: `export_certified_candidate` bundles model weights, metadata, verification reports, and SHA-256 manifests into an `attestation.json` signed with Ed25519; `verify_certified_candidate` validates file integrity and signatures.
+- **Zero-Downtime Hot-Reload & Safe Canary Promotion**:
+  - `POST /v1/models/reload`: Atomically swaps model in memory with optional cryptographic attestation verification.
+  - `POST /v1/models/promote`: Deploys candidate as canary with configurable traffic percentage (`0.0% - 100.0%`) or promotes to full primary champion.
+  - `POST /v1/retraining/trigger`: Programmatically triggers automated retraining, safety verification, and canary promotion from the API.
+- **CLI Workflow & Deterministic Exit Codes**: `fraud-detect auto-retrain` emits:
+  - `0`: Retraining and verification passed; candidate exported / promoted.
+  - `1`: Runtime failure (dataset materialization, training exception, promotion network error).
+  - `2`: Configuration or argument error (missing file, invalid percentage).
+  - `3`: Candidate rejected by safety verification gating (differentiates safety rejections from operational pipeline crashes in CI/CD, Airflow, or Kubeflow).
+- **Prometheus Telemetry & Structured Audit Events**:
+  - `fraud_retraining_runs_total{status="...", trigger_reason="..."}`
+  - `fraud_challenger_verification_status{status="..."}`
+  - `fraud_model_promotions_total{promotion_type="...", status="..."}`
+  - `challenger_retrained` and `model_promoted` structured audit events.
+
+## Real-Time Entity Link Analysis, Fraud Ring Detection & Graph Feature Aggregation
+
+Uncover organized fraud syndicates, botnet card-testing attacks, and collusion rings in real time using a streaming bipartite entity-transaction link graph engine:
+
+```bash
+# Detect organized fraud rings and card-testing syndicates from transaction data
+fraud-detect graph-rings \
+  --input-file data/transactions.csv \
+  --output reports/fraud_rings.json \
+  --window-seconds 86400 \
+  --min-cards-per-device 3 \
+  --min-devices-per-card 2 \
+  --card-testing-window-seconds 300 \
+  --card-testing-min-cards 4 \
+  --fail-on-rings
+
+# Output as raw JSON for automated downstream alert orchestration
+fraud-detect graph-rings \
+  --input-file data/transactions.json \
+  --json
+
+# Stream-enrich transactions with 26+ graph topological features without lookahead bias
+fraud-detect graph-enrich \
+  --input-file data/raw_transactions.csv \
+  --output-file data/enriched_transactions.csv \
+  --window-seconds 86400 \
+  --diffusion-damping 0.85 \
+  --diffusion-iterations 5
+```
+
+### Graph link analysis capabilities
+
+- **Streaming Bipartite Topology (`EntityGraph`)**: In-memory bipartite link graph with thread-safe operations (`RLock`), sliding temporal lookback windows, $O(1)$ adjacency lookups, and hard capacity capping. Connects discrete entities (`card_id`, `device_id`, `ip_address`, `merchant_id`, `user_id`, `session_id`, `terminal_id`) to transaction nodes.
+- **Lookahead-Safe Feature Extraction (`GraphFeatureExtractor`)**: Computes 26+ link features strictly before candidate transaction ingestion:
+  - Degree centrality across sliding time windows (e.g. 1h, 24h)
+  - 2-hop entity sharing (distinct cards sharing a device or IP, distinct devices per card)
+  - Connected syndicate network size and bipartite density
+  - Personalized PageRank risk diffusion scores ($\alpha=0.85, k=5$)
+  - Neighborhood average risk and confirmed fraud propagation
+- **Automated Fraud Ring Detection (`FraudRingDetector`)**: Discovers attack archetypes:
+  - **Dense Bicliques**: High-degree card-device/IP sharing clusters indicating organized fraud syndicates.
+  - **Star Card-Testing Botnets**: Rapid bursts of distinct cards tested on single merchant terminals, IPs, or devices within short windows ($\le 300\text{s}$).
+  - **Circular Flow Cycles**: Alternating cycles of cards and shared infrastructure.
+- **Pipeline & Rule Integration**:
+  - `GraphEnrichmentStageProcessor` wires the entity graph into the real-time decision graph DAG.
+  - `build_fraud_ring_rule` enforces automatic `CHALLENGE` or `DENY` policies on detected syndicate clusters.
+- **Operational Endpoints**:
+  - `GET /v1/graph/stats`: Live graph topology metrics (active nodes, edges, entity breakdown, timestamps).
+  - `GET /v1/graph/entity/{entity_type}/{entity_id}`: Inspects entity node degree, 2-hop reachability, and recent transactions.
+  - `GET /v1/graph/rings`: Discovers and returns active fraud rings and botnet clusters with severity breakdown.
+  - `POST /v1/graph/reset`: Resets link graph topology and clears active in-memory state.
+- **Prometheus Telemetry & Auditing**:
+  - `fraud_graph_nodes_total{entity_type="..."}`: Active entity nodes by type.
+  - `fraud_graph_edges_total`: Active bipartite graph edges.
+  - `fraud_graph_rings_detected_total{severity="..."}`: Detected fraud rings by severity.
+  - `fraud_graph_ring_detection_seconds`: Latency histogram for community ring detection.
+  - `fraud_ring_detected` structured audit events with automated Luhn PAN redaction.
 
 ## Train on the anonymized dataset
 
@@ -1480,7 +1685,482 @@ fraud-detect simulate-drift data/demo.csv \
   --anomaly-fraction 0.05
 ```
 
+### Real-time geolocation anomaly detection & travel velocity
+
+Detect credential stuffing, account takeover, and impossible travel ($v > 900\text{ km/h}$) across consecutive transactions using thread-safe sliding-window entity trajectory tracking and spherical Haversine geodesic displacement math ($R = 6371.0\text{ km}$):
+
+```bash
+# Evaluate impossible travel velocity across sequential transactions
+fraud-detect geo-velocity \
+  --input-file transactions.csv \
+  --speed-threshold 900.0 \
+  --fail-on-impossible \
+  --as-json \
+  --output reports/geo_velocity.json
+
+# Enrich transaction datasets with 7 streaming geolocation features
+fraud-detect geo-enrich \
+  --input-file data/transactions.csv \
+  --output-file data/enriched_geo.csv \
+  --format csv
+```
+
+Enriched features include:
+- `geo_distance_km`: Spherical Haversine geodesic displacement from previous event.
+- `geo_speed_kmh`: Physical travel velocity between sequential transactions.
+- `geo_time_delta_seconds`: Elapsed time between entity transactions.
+- `geo_is_impossible_travel`: Flag indicating velocity exceeding speed threshold ($v > 900\text{ km/h}$).
+- `geo_is_cross_border`: Flag indicating destination country differing from origin country.
+- `geo_is_proxy`: Flag indicating egress through anonymous proxy, VPN, or Tor exit node.
+- `geo_country_mismatch`: Flag indicating transaction country differing from billing country.
+
+FastAPI endpoints surface real-time trajectory velocity and operational status:
+- `GET /v1/geo/velocity/{entity_id}`: Retrieve current travel velocity from entity's latest trajectory.
+- `GET /v1/geo/stats`: Return operational capacity, tracked entities, and processed events.
+- `POST /v1/geo/assess`: Evaluate candidate location event without updating entity history.
+- `POST /v1/geo/reset`: Reset tracked entity trajectories.
+
+## Adaptive device and browser fingerprinting with anomaly clustering
+
+Online payments and account takeovers frequently involve credential stuffing, automated bots, card cycling, and device spoofing. The adaptive device fingerprinting subsystem captures client hardware attributes (screen geometry, concurrency, memory), rendering contexts (Canvas and WebGL hashes), audio contexts, and platform metadata without storing raw identifiers. It computes deterministic canonical SHA-256 hashes for identity and 64/128-bit SimHash bit-vectors for fuzzy clustering and device drift detection:
+
+```bash
+# Analyze transaction datasets for device card cycling, emulator bots, and fingerprint drift
+fraud-detect device-clusters \
+  --input-file data/transactions.csv \
+  --output reports/device_clusters.json \
+  --card-cycling-threshold 3 \
+  --device-cycling-threshold 3 \
+  --window-seconds 86400 \
+  --fail-on-anomaly \
+  --json
+
+# Enrich transaction datasets with 7 streaming device features sequentially without lookahead bias
+fraud-detect device-enrich \
+  --input-file data/transactions.csv \
+  --output-file data/enriched_device.csv \
+  --format csv
+```
+
+Enriched features include:
+- `device_seen_count`: Cumulative transactions recorded for this device profile.
+- `device_distinct_cards_24h`: Number of distinct payment cards associated with this device in the sliding window.
+- `device_card_distinct_devices_24h`: Number of distinct devices associated with this card in the sliding window.
+- `device_is_emulator`: Binary indicator for automated webdriver or headless emulator runtime signatures.
+- `device_entropy_score`: Shannon entropy metric measuring the information diversity of client attributes.
+- `device_is_card_cycling`: Flag indicating distinct cards exceeding the threshold on a single device.
+- `device_is_device_cycling`: Flag indicating distinct devices exceeding the threshold on a single card.
+
+FastAPI endpoints surface real-time device tracking and anomaly assessment:
+- `GET /v1/device/stats`: Return operational capacity, tracked devices, cards, and detected anomalies.
+- `GET /v1/device/profile/{device_id}`: Retrieve current device profile, baseline fingerprint, and card associations.
+- `POST /v1/device/assess`: Evaluate candidate transaction fingerprint without updating tracker state.
+- `POST /v1/device/reset`: Reset tracked device profiles and sliding windows.
+
+## Real-time merchant & MCC risk profiling, chargeback surveillance & bust-out detection
+
+Acquirers and payment processors face merchant collusion, high-chargeback rogue terminals, sudden bust-out ticket surges, and micro-transaction card-testing enumeration. The merchant surveillance subsystem maps ISO 18245 Merchant Category Codes (`MCC`) to baseline prior fraud rates and computes Empirical Bayes (Beta-Binomial) credibility-smoothed fraud rates ($\hat{p} = \frac{f + m \cdot p_0}{n + m}$), 95% Wilson score upper confidence bounds, and online Welford ticket-size Z-scores across sliding temporal windows:
+
+```bash
+# Analyze transaction datasets for merchant chargeback breaches, bust-outs, and card testing
+fraud-detect merchant-surveillance \
+  --input-file data/transactions.csv \
+  --output reports/merchant_surveillance.json \
+  --chargeback-rate-threshold 0.015 \
+  --min-chargeback-count 3 \
+  --bust-out-zscore-threshold 3.0 \
+  --window-seconds 86400 \
+  --fail-on-anomaly \
+  --json
+
+# Enrich transaction datasets with 8 streaming merchant risk features sequentially without lookahead bias
+fraud-detect merchant-enrich \
+  --input-file data/transactions.csv \
+  --output-file data/enriched_merchant.csv \
+  --format csv
+```
+
+Enriched features include:
+- `merchant_tx_count_24h`: Sliding-window transaction count for the merchant over the lookback window.
+- `merchant_smoothed_fraud_rate`: Empirical Bayes (Beta-Binomial) credibility-smoothed merchant fraud/chargeback rate anchored on the MCC prior.
+- `merchant_mcc_risk_score`: Intrinsic ISO 18245 Merchant Category Code risk score in $[0.0, 1.0]$.
+- `merchant_amount_zscore`: Online Welford ticket-size Z-score comparing the transaction amount against the merchant's historical mean and standard deviation.
+- `merchant_distinct_cards_24h`: Distinct payment cards transacting at the merchant within the sliding window.
+- `merchant_micro_tx_ratio`: Fraction of sliding-window transactions below the micro-transaction cutoff ($\le \$5.00$).
+- `merchant_is_high_chargeback`: Binary flag indicating merchant chargeback count and smoothed fraud rate breaching network monitoring thresholds.
+- `merchant_is_bust_out_surge`: Binary flag indicating a sudden ticket-size Z-score surge combined with elevated velocity.
+
+FastAPI endpoints surface real-time merchant risk profiling and surveillance:
+- `GET /v1/merchant/stats`: Return operational capacity, tracked merchants, total evaluations, and detected anomalies.
+- `GET /v1/merchant/profile/{merchant_id}`: Retrieve current merchant profile, Empirical Bayes smoothed fraud rate, Wilson upper bound, and Welford ticket statistics.
+- `POST /v1/merchant/assess`: Evaluate candidate merchant transaction event (optionally recording state via `"record": true` and emitting redacted audit events on anomaly).
+- `POST /v1/merchant/reset`: Reset tracked merchant profiles and sliding windows.
+
+## Multi-tenant policy partitioning, dynamic rule federation & account isolation
+
+Payment gateways and multi-client fraud management platforms require strict account isolation and custom risk thresholds without deploying redundant model instances. The multi-tenant policy subsystem (`tenant.py`) partitions transaction evaluations by client identity (`X-Tenant-ID`), enforces tenant-specific risk profiles (`decline_threshold`, `challenge_threshold`, `review_threshold`, `max_amount_per_tx`), dynamic rule federation (`OVERRIDE_ONLY`, `INHERIT_AND_OVERRIDE`, `ISOLATED`), thread-safe capacity bounding with LRU eviction, and PCI-DSS redacted audit logs:
+
+```bash
+# List registered tenant partitions and operational statuses
+fraud-detect tenant-list --format table
+
+# Validate a tenant manifest or configuration file against semantic and threshold constraints
+fraud-detect tenant-validate --manifest-file config/tenants.json --strict
+
+# Score a transaction batch under an explicit tenant policy partition and thresholds
+fraud-detect tenant-eval \
+  --input-file data/transactions.csv \
+  --tenant-id fintech_alpha \
+  --output-file reports/tenant_eval.csv \
+  --format table
+```
+
+FastAPI multi-tenant REST endpoints and telemetry:
+- `GET /v1/tenants`: List registered tenant partitions, rate limits, tiers, and operational statuses.
+- `GET /v1/tenants/{tenant_id}`: Retrieve full runtime context and custom risk profiles for a tenant.
+- `POST /v1/tenants`: Dynamically register a new tenant context with thread-safe LRU capacity bounding.
+- `POST /v1/tenants/{tenant_id}/status`: Transition tenant lifecycle state (`active`, `suspended`, `deprecated`). Requests from suspended tenants receive `403 Forbidden`.
+- `DELETE /v1/tenants/{tenant_id}`: Unregister a tenant partition (protected against deleting default tenant).
+- `X-Tenant-ID` header: Evaluates `/score` and `/predict` transactions against the designated tenant's federated rules and decision thresholds, recording Prometheus metrics (`fraud_tenant_evaluations_total`, `fraud_tenant_rule_overrides_total`).
+
+## Asynchronous Webhooks & Real-Time Event Bus
+
+Decoupled streaming domain events and outbound webhook notifications (`events.py`):
+
+```bash
+# List registered webhook subscriptions
+fraud-detect webhook-list --format table
+
+# Send a signed test notification ping with HMAC verification
+fraud-detect webhook-test --target-url https://api.example.com/webhook --tenant-id fintech_alpha
+
+# Inspect or replay undelivered dead-letter notifications
+fraud-detect webhook-replay-dlq --dlq-file dlq_dump.json --dry-run
+fraud-detect webhook-replay-dlq --dlq-file dlq_dump.json --tenant-id fintech_alpha
+```
+
+FastAPI webhook REST endpoints:
+- `GET /v1/webhooks`: List registered webhook subscriptions with optional `?tenant_id=` filter.
+- `POST /v1/webhooks`: Register a webhook notification endpoint with subscribed events, retry limits, and secret tokens.
+- `GET /v1/webhooks/{subscription_id}`: Retrieve subscription metadata (with secret tokens safely redacted).
+- `DELETE /v1/webhooks/{subscription_id}`: Unregister an active webhook subscription.
+- `POST /v1/webhooks/{subscription_id}/test`: Trigger an on-demand signed ping to test connectivity and latency.
+- `GET /v1/webhooks/dlq`: Inspect failed delivery records preserved in the Dead-Letter Queue.
+- `POST /v1/webhooks/dlq/replay`: Replay undelivered dead-letter events through the webhook dispatcher.
+- Prometheus metrics: `fraud_event_bus_published_total`, `fraud_webhook_dispatches_total`, and `fraud_webhook_dlq_size`.
+
+## Step-Up Authentication & Challenge Orchestration (Phase 44)
+
+Orchestrate Strong Customer Authentication (SCA) step-up challenges and 3-D Secure (3DS 2.3) workflows for friction decisions (`challenge.py`):
+
+```bash
+# Issue a step-up challenge session for a high-risk transaction
+fraud-detect challenge-create \
+  --transaction-id tx_88492 \
+  --user-id usr_42 \
+  --destination "+14155552671" \
+  --method sms_otp \
+  --store-file sessions.json \
+  --format table
+
+# Inspect stored challenge sessions
+fraud-detect challenge-inspect --store-file sessions.json --format table
+
+# Verify an entered OTP code
+fraud-detect challenge-verify --store-file sessions.json --challenge-id ch_0c39d3 --token 492018
+```
+
+FastAPI step-up challenge REST endpoints:
+- `POST /v1/challenges`: Create a new step-up friction challenge session with cryptographic OTP generation and destination masking.
+- `GET /v1/challenges`: List active and historical challenge sessions with optional `?tenant_id=` filter.
+- `GET /v1/challenges/{challenge_id}`: Retrieve challenge details, lifecycle status, attempts, and masked destination.
+- `POST /v1/challenges/{challenge_id}/verify`: Verify candidate OTP token with constant-time comparison, updating session status or enforcing brute-force lockouts.
+- `POST /v1/challenges/{challenge_id}/resend`: Request a fresh token subject to rate-limiting cooldown periods.
+- `DELETE /v1/challenges/{challenge_id}`: Cancel a pending challenge session.
+- Prometheus metrics: `fraud_challenges_issued_total`, `fraud_challenges_verified_total`, and `fraud_challenges_failed_total`.
+
+## Fraud Case Management & Dispute Evidence Packaging Engine (Phase 45)
+
+Manage operational investigation queues, analyst notes, SLA timers, and generate tamper-evident dispute evidence dossiers for card network representment (`cases.py`):
+
+```bash
+# Create a new fraud investigation case
+fraud-detect case-create \
+  --transaction-id tx_90412 \
+  --amount 1450.00 \
+  --currency USD \
+  --priority high \
+  --assign analyst_alice \
+  --fraud-score 0.94 \
+  --store-file cases.json \
+  --format table
+
+# List stored cases with multi-criteria filters
+fraud-detect case-list --store-file cases.json --status investigating --priority high --format table
+
+# Inspect full case details, notes, and audit trail
+fraud-detect case-inspect --store-file cases.json --case-id case_83f2a1b9 --format table
+
+# Resolve an investigation case with an analyst conclusion
+fraud-detect case-resolve \
+  --store-file cases.json \
+  --case-id case_83f2a1b9 \
+  --disposition confirmed_fraud \
+  --actor analyst_alice \
+  --notes "Cardholder confirmed stolen credentials." \
+  --format table
+
+# Compile and export a tamper-evident dispute evidence dossier
+fraud-detect case-evidence \
+  --store-file cases.json \
+  --case-id case_83f2a1b9 \
+  --output dispute_evidence.json \
+  --format table
+```
+
+FastAPI Case Management REST endpoints:
+- `POST /v1/cases`: Manually create a new fraud investigation case with SLA timers.
+- `GET /v1/cases`: Query stored cases with multi-criteria filtering (`tenant_id`, `status`, `priority`, `assigned_analyst`, `sla_breached_only`).
+- `GET /v1/cases/summary`: Aggregate metrics breakdown (total, open, resolved, breached counts).
+- `GET /v1/cases/{case_id}`: Retrieve full case record with audit log and analyst notes.
+- `PATCH /v1/cases/{case_id}`: Update case status or assign/reassign to an analyst.
+- `POST /v1/cases/{case_id}/notes`: Append an immutable investigation note to the audit trail.
+- `POST /v1/cases/{case_id}/resolve`: Close a case with a final disposition and conclusion notes.
+- `GET /v1/cases/{case_id}/evidence`: Compile and export a canonicalized SHA-256 fingerprinted dispute evidence dossier (Visa CE3.0 / Mastercard First-Party Trust ready).
+- Prometheus metrics: `fraud_cases_total`, `fraud_cases_resolved_total`, `fraud_case_sla_breaches_total`, `fraud_evidence_packages_generated_total`.
+
+## Card Scheme Chargeback & Automated Representment Gateway (Phase 46)
+
+Ingest inbound card scheme chargebacks, normalize network reason codes (Visa, Mastercard, Amex, Discover), evaluate representment viability (3DS liability shift and CE3.0 / First-Party Trust rules), defend disputes, and forward realized labels to continuous learning (`chargeback.py`):
+
+```bash
+# Ingest an incoming Visa chargeback dispute
+fraud-detect chargeback-ingest \
+  --transaction-id tx_88129 \
+  --scheme visa \
+  --reason-code 10.4 \
+  --amount 350.00 \
+  --currency USD \
+  --tenant-id default \
+  --scheme-dispute-id vrol_9812 \
+  --store-file chargebacks.json \
+  --format table
+
+# List stored disputes with multi-criteria filters
+fraud-detect chargeback-list --store-file chargebacks.json --scheme visa --stage first_chargeback --format table
+
+# Inspect full dispute details, viability score, liability shift, and audit history
+fraud-detect chargeback-inspect --store-file chargebacks.json --dispute-id dsp_38f2a1b9 --format table
+
+# Submit dispute representment with evidence package and cryptographic fingerprint
+fraud-detect chargeback-represent \
+  --store-file chargebacks.json \
+  --dispute-id dsp_38f2a1b9 \
+  --package-id pkg_rep_101 \
+  --fingerprint a4b8c9...64chars \
+  --notes "Visa CE3.0 compelling evidence attached: 2 prior undisputed matching transactions." \
+  --actor senior_analyst \
+  --format table
+
+# Finalize dispute resolution with terminal outcome
+fraud-detect chargeback-resolve \
+  --store-file chargebacks.json \
+  --dispute-id dsp_38f2a1b9 \
+  --outcome resolved_won \
+  --actor scheme_gateway \
+  --notes "Issuer arbitration concluded in merchant favor." \
+  --format table
+```
+
+FastAPI Chargeback Gateway REST endpoints:
+- `POST /v1/chargebacks`: Ingest, validate, and evaluate an incoming dispute with 3DS/CE3.0 viability engine.
+- `POST /v1/chargebacks/webhook`: Automated inbound webhook receiver from card scheme APIs or payment gateways.
+- `GET /v1/chargebacks`: Multi-criteria query interface (`tenant_id`, `scheme`, `stage`, `category`, `expired_only`).
+- `GET /v1/chargebacks/summary`: Portfolio-level aggregation (dispute counts, disputed amounts, stage & category breakdowns).
+- `GET /v1/chargebacks/{dispute_id}`: Retrieve detailed dispute state, deadlines, liability shift status, and audit trail.
+- `POST /v1/chargebacks/{dispute_id}/represent`: Submit representment evidence package and transition to `represented`.
+- `POST /v1/chargebacks/{dispute_id}/resolve`: Terminal dispute finalization (`resolved_won`, `resolved_lost`, `accepted_liability`) with automatic feedback label publication to `feedback.py`.
+- Prometheus metrics: `fraud_chargebacks_received_total`, `fraud_chargebacks_represented_total`, `fraud_chargebacks_won_total`, `fraud_chargebacks_lost_total`, `fraud_chargeback_financial_exposure_amount`.
+
+## Account Takeover (ATO) Detection & Credential Stuffing Defense (Phase 47)
+
+Ingest authentication events, track user behavioral baselines (known devices, locations, dormancy), detect distributed credential stuffing and password spraying attacks, calculate impossible travel velocities, and enforce automated account defense actions (`ato.py`):
+
+```bash
+# Ingest and evaluate an authentication attempt
+fraud-detect ato-login \
+  --user-id usr_9012 \
+  --ip-address 198.51.100.42 \
+  --outcome success \
+  --device dev_trusted_laptop \
+  --latitude 40.7128 \
+  --longitude -74.0060 \
+  --store-file data/ato_store.json \
+  --format table
+
+# Record a sensitive account mutation (password, email, or MFA reset)
+fraud-detect ato-mutation \
+  --user-id usr_9012 \
+  --type password_change \
+  --channel web \
+  --store-file data/ato_store.json \
+  --format table
+
+# Inspect account profile, known devices, locations, and quarantine state
+fraud-detect ato-inspect \
+  --user-id usr_9012 \
+  --store-file data/ato_store.json \
+  --format table
+
+# Evaluate an ongoing transaction or session action
+fraud-detect ato-eval \
+  --user-id usr_9012 \
+  --action-type checkout \
+  --amount 850.00 \
+  --ip-address 203.0.113.15 \
+  --device dev_unrecognized_device \
+  --store-file data/ato_store.json \
+  --format table
+
+# Administratively quarantine a compromised account
+fraud-detect ato-quarantine \
+  --user-id usr_9012 \
+  --reason "SOC flagged credential stuffing burst" \
+  --store-file data/ato_store.json \
+  --format table
+
+# Administratively release a verified account
+fraud-detect ato-release \
+  --user-id usr_9012 \
+  --reason "User identity verified via secondary phone challenge" \
+  --store-file data/ato_store.json \
+  --format table
+```
+
+FastAPI Account Takeover REST endpoints:
+- `POST /v1/ato/login`: Ingest authentication event and evaluate takeover risk.
+- `POST /v1/ato/evaluate`: Evaluate transaction or session action context for takeover indicators.
+- `GET /v1/ato/accounts/{user_id}`: Retrieve account behavioral profile, known devices, and security state.
+- `POST /v1/ato/accounts/{user_id}/mutations`: Log sensitive profile mutations for time-decay surveillance.
+- `POST /v1/ato/accounts/{user_id}/quarantine`: Place an account under security quarantine.
+- `POST /v1/ato/accounts/{user_id}/release`: Release an account from security quarantine.
+- `GET /v1/ato/assessments`: Query and filter historical ATO risk assessments.
+- `GET /v1/ato/assessments/{assessment_id}`: Retrieve detailed risk score breakdown, impossible travel speed, and factor telemetry.
+- Prometheus metrics: `fraud_ato_login_attempts_total`, `fraud_ato_risk_assessments_total`, `fraud_ato_quarantines_total`.
+
+### Anti-Money Laundering (AML) Transaction Monitoring & Regulatory SAR Engine
+
+Phase 48 introduces autonomous AML transaction monitoring, sub-CTR structuring/smurfing detection, rapid layering flow-through analysis, round-trip circular flow detection, phonetic/fuzzy OFAC/PEP watchlist screening, and FinCEN BSA Suspicious Activity Report (SAR) dossier management:
+
+```bash
+# Screen an individual or entity against OFAC SDN and PEP watchlists
+fraud-detect aml-screen \
+  --name "Vladimir Putin" \
+  --threshold 0.85 \
+  --format table
+
+# Monitor a transaction against all AML typologies and high-risk corridors
+fraud-detect aml-monitor \
+  --user-id usr_aml_101 \
+  --amount 9500.00 \
+  --counterparty-id entity_99 \
+  --country US \
+  --direction outbound \
+  --store-file data/aml_store.json \
+  --format table
+
+# List and filter AML alerts by typology or severity
+fraud-detect aml-alerts \
+  --typology structuring_smurfing \
+  --risk-level high \
+  --store-file data/aml_store.json \
+  --format table
+
+# Compile and package a regulatory SAR filing dossier
+fraud-detect aml-sar-generate \
+  --user-id usr_aml_101 \
+  --alert-ids "alt_structuring_01,alt_structuring_02" \
+  --suspect-name "John Doe" \
+  --narrative "Repeated structured withdrawals under currency transaction reporting threshold." \
+  --store-file data/aml_store.json \
+  --format table
+
+# Query regulatory SAR filing dossiers
+fraud-detect aml-sar-list \
+  --status draft \
+  --store-file data/aml_store.json \
+  --format table
+
+# Transition SAR dossier through compliance review lifecycle
+fraud-detect aml-sar-status \
+  --sar-id sar_84920 \
+  --status pending_review \
+  --reviewer "compliance_officer_jane" \
+  --comment "Escalated for principal officer approval." \
+  --store-file data/aml_store.json \
+  --format table
+```
+
+FastAPI Anti-Money Laundering REST endpoints:
+- `POST /v1/aml/monitor`: Ingest financial transaction and evaluate across structuring, layering, circular flows, sanctions, and FATF corridors.
+- `POST /v1/aml/watchlist/screen`: Screen entity names against watchlists using Soundex, Levenshtein, and Jaro-Winkler fuzzy matching.
+- `GET /v1/aml/alerts`: Query and filter AML surveillance alerts by user, typology, or risk level.
+- `GET /v1/aml/alerts/{alert_id}`: Retrieve detailed AML alert telemetry, evidence transactions, and trigger diagnostics.
+- `POST /v1/aml/sar`: Package and compile a formal FinCEN BSA SAR dossier from verified alerts.
+- `GET /v1/aml/sar`: List and filter SAR filing packages by status or subject user.
+- `GET /v1/aml/sar/{sar_id}`: Retrieve complete SAR dossier, narrative, financials, and audit history.
+- `GET /v1/aml/sar/{sar_id}/xml`: Export SAR dossier into standard FinCEN BSA XML compliant schema.
+- `POST /v1/aml/sar/{sar_id}/status`: Execute validated SAR state transition (`draft` -> `pending_review` -> `approved` -> `filed` / `rejected`).
+- Prometheus metrics: `fraud_aml_transactions_monitored_total`, `fraud_aml_alerts_total`, `fraud_aml_sanction_hits_total`, `fraud_aml_sars_created_total`, `fraud_aml_sars_filed_total`.
+
+### Synthetic Identity Fraud (SIF) Detection & Identity Verification Engine
+
+Phase 49 introduces autonomous Synthetic Identity Fraud (SIF) detection, SSA historical allocation verification, Death Master File screening, PII element fragmentation analysis, drop address and burner phone detection, and credit piggybacking defense:
+
+```bash
+# Audit an SSN against SSA allocation tables, deceased registries, and birth year
+fraud-detect sif-check-ssn \
+  --ssn 050-12-3456 \
+  --dob 1980-01-01 \
+  --format table
+
+# Evaluate an applicant credit profile for synthetic identity risk
+fraud-detect sif-eval \
+  --ssn 050-12-3456 \
+  --first-name "Tony" \
+  --last-name "Stark" \
+  --dob 1970-05-29 \
+  --address "10880 Malibu Point, Malibu, CA" \
+  --phone "+13105554321" \
+  --email "tony@starkindustries.com" \
+  --credit-line 50000.0 \
+  --store-file data/sif_store.json \
+  --format table
+
+# Inspect stored applicant profiles or risk assessments
+fraud-detect sif-inspect \
+  --applicant-id app_stark \
+  --store-file data/sif_store.json \
+  --format table
+
+# View summary of tracked identities, assessments, and policy actions
+fraud-detect sif-summary \
+  --store-file data/sif_store.json \
+  --format table
+```
+
+FastAPI Synthetic Identity REST endpoints:
+- `POST /v1/sif/evaluate`: Evaluate credit applicant profile against SSN issuance history, DMF registry, PII fragmentation, and synthetic velocity.
+- `GET /v1/sif/assessments/{assessment_id}`: Fetch detailed synthetic identity risk assessment report.
+- `GET /v1/sif/assessments`: Query and filter assessments with optional tenant filter.
+- `POST /v1/sif/profiles`: Store applicant identity profile in thread-safe registry.
+- `GET /v1/sif/applicants/{applicant_id}`: Retrieve stored applicant profile by ID.
+- `GET /v1/sif/profiles`: Query applicant profiles.
+- `GET /v1/sif/metrics`: Summary of tracked profiles and recorded assessments.
+- Prometheus metrics: `fraud_sif_evaluations_total`, `fraud_sif_anomalies_total`, `fraud_sif_high_risk_total`, `fraud_sif_blocks_total`.
+
 ## Reference label-delay analysis
+
 
 Chargeback and fraud labels often arrive days or weeks after the transaction
 date. If a hold-out evaluation uses a naive random split, late-arriving labels
@@ -1516,21 +2196,33 @@ Project layout:
 ```text
 src/fraud_detection/
 ├── api.py            # versioned online prediction service, circuit breakers, and traffic shadowing
+├── ato.py            # account takeover detection, credential stuffing defense, and identity session anomalies
 ├── audit.py          # structured JSONL audit logs with Luhn PAN redaction and log replay
+├── cases.py          # fraud case management, SLA tracking, and dispute evidence packaging
+├── chargeback.py     # card scheme dispute ingestion, reason code taxonomy, and automated representment
+├── challenge.py      # step-up authentication, 3DS challenge orchestration, and token verification
 ├── cli.py            # training, comparison, surveillance, profiling, simulation, and serving CLI
 ├── data.py           # ingestion, schema validation, and synthetic data
+├── device.py         # adaptive browser/device fingerprinting, simhash clustering, and bot detection
 ├── drift.py          # multi-window drift surveillance and streaming quantile profiler
+
 ├── edge.py           # dependency-light quantized logistic runtime
 ├── evaluation.py     # threshold tuning, imbalance-aware metrics, and calibration reports
 ├── explanations.py   # isolated explanation provider protocols and cost controls
 ├── features.py       # feature store contracts, point-in-time join, and skew surveillance
+├── feedback.py       # delayed ground truth ingestion, label maturation modeling, and retraining triggers
+├── geolocation.py    # real-time geographic anomaly detection, speed-of-travel velocity, and IP geocoding
+├── graph.py          # real-time bipartite entity link analysis, fraud ring detection, and risk diffusion
+├── merchant.py       # real-time merchant & MCC risk profiling, Empirical Bayes smoothing, and bust-out detection
 ├── model.py          # training, model card, inference, and cryptographic attestation
+├── pipeline.py       # decision graph execution, stage circuit breakers, and chaos simulation
 ├── recalibration.py  # ECE diagnostics, reliability curves, and post-hoc recalibration
 ├── reporting.py      # self-contained HTML compliance report rendering
 ├── routing.py        # champion/challenger multi-model routing and canary governance
 ├── rules.py          # declarative rule engine and expert override policies
 ├── signing.py        # Ed25519 signing and trusted public-key verification
 ├── telemetry.py      # trace propagation and optional OTLP export
+├── tenant.py         # multi-tenant policy partitioning, dynamic rule federation, and account isolation
 ├── trust.py          # rotating trust bundles and deployment admission
 └── velocity.py       # sliding-window behavioral aggregations and feature enrichment
 tests/                # unit, integration, CLI, and API tests

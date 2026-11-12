@@ -10,7 +10,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 from uuid import uuid4
 
 import numpy as np
@@ -22,6 +22,18 @@ from fraud_detection.evaluation import (
     TieredThresholds,
     backtest_policy_transition,
 )
+
+if TYPE_CHECKING:
+    from fraud_detection.device import DeviceAnomalyReport
+    from fraud_detection.feedback import DelayedLabelRecord, RetrainingTriggerEvent
+    from fraud_detection.geolocation import GeoLocationEvent, TravelVelocity
+    from fraud_detection.graph import FraudRingCluster
+    from fraud_detection.merchant import MerchantAnomalyReport
+    from fraud_detection.pipeline import PipelineChaosReport
+    from fraud_detection.retraining import (
+        ChallengerTrainingResult,
+        ChallengerVerificationReport,
+    )
 
 # Sensitive key keywords that must always be masked in audit payloads
 DEFAULT_SENSITIVE_KEYS: tuple[str, ...] = (
@@ -100,7 +112,16 @@ def redact_data(
         for key, value in data.items():
             str_key = str(key)
             normalized_key = str_key.lower().replace("-", "_").strip()
-            is_sensitive = any(sensitive in normalized_key for sensitive in sensitive_keys)
+            is_sensitive = False
+            for sensitive in sensitive_keys:
+                if sensitive in normalized_key:
+                    if normalized_key.startswith(("is_", "has_")) or normalized_key.endswith(
+                        ("_count", "_total", "_rate", "_ratio")
+                    ):
+                        continue
+                    is_sensitive = True
+                    break
+
             if is_sensitive:
                 redacted_dict[str_key] = mask_value
             else:
@@ -231,6 +252,11 @@ def build_scoring_audit_event(
     execution_trace: Mapping[str, Any] | None = None,
     pipeline_stages: Sequence[Mapping[str, Any]] | None = None,
     degraded_nodes: Sequence[str] | None = None,
+    cache_hits: int | None = None,
+    cache_misses: int | None = None,
+    speculative_executed: bool | None = None,
+    speculative_hit: bool | None = None,
+    circuit_short_circuits: Sequence[str] | None = None,
 ) -> AuditEvent:
     """Construct a structured scoring audit event."""
     fraud_count = sum(1 for p in predictions if p.get("is_fraud"))
@@ -250,6 +276,16 @@ def build_scoring_audit_event(
         payload["pipeline_stages"] = [dict(s) for s in pipeline_stages]
     if degraded_nodes is not None:
         payload["degraded_nodes"] = list(degraded_nodes)
+    if circuit_short_circuits is not None:
+        payload["circuit_short_circuits"] = list(circuit_short_circuits)
+    if cache_hits is not None:
+        payload["cache_hits"] = cache_hits
+    if cache_misses is not None:
+        payload["cache_misses"] = cache_misses
+    if speculative_executed is not None:
+        payload["speculative_executed"] = speculative_executed
+    if speculative_hit is not None:
+        payload["speculative_hit"] = speculative_hit
     if model_role is not None:
         payload["model_role"] = model_role
     if routed_model_version is not None:
@@ -351,6 +387,48 @@ def build_shadow_scoring_audit_event(
         event_type="shadow_scoring",
         model_version=shadow_model_version,
         dataset_fingerprint=shadow_dataset_fingerprint,
+        payload=payload,
+    )
+
+
+def build_pipeline_replay_audit_event(
+    *,
+    pipeline_name: str,
+    audit_source: str,
+    replayed_events: int,
+    total_transactions: int,
+    score_discrepancies: int,
+    decision_flips: int,
+    flip_rate: float,
+    status: str,
+    transition_matrix: Mapping[str, Any] | None = None,
+    mean_latency_ms: float | None = None,
+    p95_latency_ms: float | None = None,
+    metadata: Mapping[str, Any] | None = None,
+) -> AuditEvent:
+    """Construct a structured pipeline replay audit event."""
+    payload: dict[str, Any] = {
+        "pipeline_name": pipeline_name,
+        "audit_source": audit_source,
+        "replayed_events": replayed_events,
+        "total_transactions": total_transactions,
+        "score_discrepancies": score_discrepancies,
+        "decision_flips": decision_flips,
+        "flip_rate": flip_rate,
+        "status": status,
+    }
+    if transition_matrix is not None:
+        payload["transition_matrix"] = dict(transition_matrix)
+    if mean_latency_ms is not None:
+        payload["mean_latency_ms"] = mean_latency_ms
+    if p95_latency_ms is not None:
+        payload["p95_latency_ms"] = p95_latency_ms
+    if metadata is not None:
+        payload["metadata"] = dict(metadata)
+
+    return AuditEvent(
+        event_type="pipeline_replay",
+        model_version=pipeline_name,
         payload=payload,
     )
 
@@ -769,4 +847,563 @@ def backtest_audit_policy(
         manual_review_cost=manual_review_cost,
         false_deny_cost=false_deny_cost,
         missed_fraud_cost=missed_fraud_cost,
+    )
+
+
+def build_pipeline_chaos_audit_event(
+    *,
+    chaos_report: PipelineChaosReport | Mapping[str, Any],
+    model_version: str | None = None,
+    dataset_fingerprint: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> AuditEvent:
+    """Construct a structured pipeline chaos simulation audit event."""
+    report_dict = chaos_report.to_dict() if hasattr(chaos_report, "to_dict") else dict(chaos_report)
+    payload: dict[str, Any] = {
+        "simulation_type": "pipeline_chaos",
+        "status": str(report_dict.get("status", "UNKNOWN")),
+        "total_transactions": int(report_dict.get("total_transactions", 0)),
+        "circuit_breaker_enabled": bool(report_dict.get("circuit_breaker_enabled", False)),
+        "sla_budget_ms": float(report_dict.get("sla_budget_ms", 0.0)),
+        "sla_breaches": int(report_dict.get("sla_breaches", 0)),
+        "circuit_trips": int(report_dict.get("circuit_trips", 0)),
+        "short_circuited_calls": int(report_dict.get("short_circuited_calls", 0)),
+        "unhandled_errors": int(report_dict.get("unhandled_errors", 0)),
+        "degraded_transactions": int(report_dict.get("degraded_transactions", 0)),
+        "latencies_p50_ms": float(report_dict.get("latencies_p50_ms", 0.0)),
+        "latencies_p95_ms": float(report_dict.get("latencies_p95_ms", 0.0)),
+        "latencies_max_ms": float(report_dict.get("latencies_max_ms", 0.0)),
+        "recovered": bool(report_dict.get("recovered", False)),
+        "fault_specs": list(report_dict.get("fault_specs", [])),
+        "stage_metrics": dict(report_dict.get("stage_metrics", {})),
+    }
+    if metadata:
+        payload["metadata"] = dict(metadata)
+
+    return AuditEvent(
+        event_type="pipeline_chaos",
+        model_version=model_version,
+        dataset_fingerprint=dataset_fingerprint,
+        payload=payload,
+    )
+
+
+def build_delayed_label_audit_event(
+    *,
+    record: DelayedLabelRecord | Mapping[str, Any],
+    ingestion_status: str = "ingested",
+    model_version: str | None = None,
+    dataset_fingerprint: str | None = None,
+    metadata: Mapping[str, Any] | None = None,
+) -> AuditEvent:
+    """Construct a structured audit event for delayed label ingestion."""
+    record_dict = record.to_dict() if hasattr(record, "to_dict") else dict(record)
+    payload: dict[str, Any] = {
+        "transaction_id": str(record_dict.get("transaction_id", "")),
+        "event_timestamp": float(record_dict.get("event_timestamp", 0.0)),
+        "label_timestamp": float(record_dict.get("label_timestamp", 0.0)),
+        "delay_days": record_dict.get("delay_days"),
+        "dispute_type": str(record_dict.get("dispute_type", "")),
+        "is_fraud": bool(record_dict.get("is_fraud", True)),
+        "amount": float(record_dict.get("amount", 0.0)),
+        "label_source": str(record_dict.get("label_source", "")),
+        "entity_key": record_dict.get("entity_key"),
+        "ingestion_status": ingestion_status,
+    }
+    if metadata:
+        payload["metadata"] = dict(metadata)
+
+    return AuditEvent(
+        event_type="delayed_label_ingestion",
+        model_version=model_version,
+        dataset_fingerprint=dataset_fingerprint,
+        payload=payload,
+    )
+
+
+def build_retraining_trigger_audit_event(
+    *,
+    trigger_event: RetrainingTriggerEvent | Mapping[str, Any],
+    model_version: str | None = None,
+    dataset_fingerprint: str | None = None,
+    metadata: Mapping[str, Any] | None = None,
+) -> AuditEvent:
+    """Construct a structured audit event for automated retraining triggers."""
+    event_dict = (
+        trigger_event.to_dict() if hasattr(trigger_event, "to_dict") else dict(trigger_event)
+    )
+    payload: dict[str, Any] = {
+        "trigger_id": str(event_dict.get("trigger_id", "")),
+        "triggered_at": float(event_dict.get("triggered_at", 0.0)),
+        "cohort_id": event_dict.get("cohort_id"),
+        "reason": str(event_dict.get("reason", "")),
+        "breached_metrics": dict(event_dict.get("breached_metrics", {})),
+        "recommended_retrain_start": float(event_dict.get("recommended_retrain_start", 0.0)),
+        "recommended_retrain_end": float(event_dict.get("recommended_retrain_end", 0.0)),
+        "recommended_temporal_gap_seconds": float(
+            event_dict.get("recommended_temporal_gap_seconds", 0.0)
+        ),
+        "realized_metrics": (
+            dict(event_dict.get("realized_metrics", {}))
+            if isinstance(event_dict.get("realized_metrics"), (dict, Mapping))
+            else event_dict.get("realized_metrics")
+        ),
+    }
+    if metadata:
+        payload["metadata"] = dict(metadata)
+
+    return AuditEvent(
+        event_type="retraining_trigger",
+        model_version=model_version,
+        dataset_fingerprint=dataset_fingerprint,
+        payload=payload,
+    )
+
+
+def build_challenger_retrained_audit_event(
+    *,
+    candidate_result: ChallengerTrainingResult | Mapping[str, Any],
+    verification_report: ChallengerVerificationReport | Mapping[str, Any] | None = None,
+    attestation_digest: str | None = None,
+    model_version: str | None = None,
+    champion_version: str | None = None,
+    metadata: Mapping[str, Any] | None = None,
+) -> AuditEvent:
+    """Construct a structured audit event for an automated retraining run and candidate gating."""
+    result_dict = (
+        candidate_result.to_dict()
+        if hasattr(candidate_result, "to_dict")
+        else dict(candidate_result)
+    )
+    v_dict: dict[str, Any] | None = None
+    if verification_report is not None:
+        v_dict = (
+            verification_report.to_dict()
+            if hasattr(verification_report, "to_dict")
+            else dict(verification_report)
+        )
+
+    ver_status = "unverified"
+    if v_dict is not None:
+        ver_status = str(v_dict.get("status", "failed"))
+
+    is_passed = ver_status in {"PASSED", "passed"}
+    event_type = (
+        "fraud.retraining.completed"
+        if (is_passed or v_dict is None)
+        else "fraud.retraining.rejected"
+    )
+
+    cand_ver = (
+        model_version
+        or str(result_dict.get("model_version", ""))
+        or (str(v_dict.get("candidate_version", "")) if v_dict else "challenger")
+    )
+    champ_ver = champion_version or (
+        str(v_dict.get("champion_version", "")) if v_dict else "champion"
+    )
+    ds_fp = str(result_dict.get("dataset_fingerprint", ""))
+
+    payload: dict[str, Any] = {
+        "candidate_version": cand_ver,
+        "champion_version": champ_ver,
+        "dataset_fingerprint": ds_fp,
+        "training_duration_seconds": float(result_dict.get("training_duration_seconds", 0.0)),
+        "validation_metrics": dict(result_dict.get("validation_metrics", {})),
+        "test_metrics": dict(result_dict.get("test_metrics", {})),
+        "hyperparameters": dict(result_dict.get("config", {}).get("hyperparameters", {})),
+        "verification_status": ver_status,
+        "verification_report": v_dict,
+        "attestation_digest": attestation_digest,
+        "is_certified": attestation_digest is not None,
+    }
+    if metadata:
+        payload["metadata"] = dict(metadata)
+
+    return AuditEvent(
+        event_type=event_type,
+        model_version=cand_ver,
+        dataset_fingerprint=ds_fp or None,
+        payload=payload,
+    )
+
+
+def build_model_promoted_audit_event(
+    *,
+    previous_champion_version: str,
+    new_champion_version: str,
+    promotion_type: str = "full",
+    canary_percentage: float = 100.0,
+    attestation_digest: str | None = None,
+    promoted_by: str = "automated-safety-gate",
+    status: str = "promoted",
+    dataset_fingerprint: str | None = None,
+    metadata: Mapping[str, Any] | None = None,
+) -> AuditEvent:
+    """Construct a structured audit event for a model promotion or canary rollout."""
+    norm_prom_type = str(promotion_type).lower()
+    event_type = "fraud.canary.updated" if norm_prom_type == "canary" else "fraud.model.promoted"
+
+    payload: dict[str, Any] = {
+        "promotion_type": norm_prom_type,
+        "previous_champion_version": str(previous_champion_version),
+        "new_champion_version": str(new_champion_version),
+        "canary_percentage": float(canary_percentage),
+        "attestation_digest": attestation_digest,
+        "promoted_by": str(promoted_by),
+        "status": str(status),
+    }
+    if metadata:
+        payload["metadata"] = dict(metadata)
+
+    return AuditEvent(
+        event_type=event_type,
+        model_version=new_champion_version,
+        dataset_fingerprint=dataset_fingerprint,
+        payload=payload,
+    )
+
+
+def build_fraud_ring_detected_audit_event(
+    *,
+    cluster: FraudRingCluster | Mapping[str, Any],
+    transaction_id: str | None = None,
+    trigger_action: str = "DENY",
+    model_version: str = "v1",
+    dataset_fingerprint: str | None = None,
+    metadata: Mapping[str, Any] | None = None,
+) -> AuditEvent:
+    """Construct a structured audit event when a transaction triggers or belongs to a fraud ring."""
+    if isinstance(cluster, Mapping):
+        cluster_id = str(cluster.get("cluster_id", ""))
+        pattern_type = str(cluster.get("pattern_type", ""))
+        severity = str(cluster.get("severity", ""))
+        recommended_action = str(cluster.get("recommended_action", ""))
+        raw_entities = dict(cluster.get("entities", {}))
+        transaction_ids = tuple(cluster.get("transaction_ids", ()))
+        transaction_count = int(cluster.get("transaction_count", len(transaction_ids)))
+        total_amount = float(cluster.get("total_amount", 0.0))
+        density = float(cluster.get("density", 0.0))
+        risk_score = float(cluster.get("risk_score", 0.0))
+        description = str(cluster.get("description", ""))
+    else:
+        cluster_id = cluster.cluster_id
+        pattern_type = (
+            cluster.pattern_type.value
+            if hasattr(cluster.pattern_type, "value")
+            else str(cluster.pattern_type)
+        )
+        severity = (
+            cluster.severity.value if hasattr(cluster.severity, "value") else str(cluster.severity)
+        )
+        recommended_action = (
+            cluster.recommended_action.value
+            if hasattr(cluster.recommended_action, "value")
+            else str(cluster.recommended_action)
+        )
+        raw_entities = {
+            (k.value if hasattr(k, "value") else str(k)): list(v)
+            for k, v in cluster.entities.items()
+        }
+        transaction_ids = cluster.transaction_ids
+        transaction_count = cluster.transaction_count
+        total_amount = cluster.total_amount
+        density = cluster.density
+        risk_score = cluster.risk_score
+        description = cluster.description
+
+    payload: dict[str, Any] = {
+        "cluster_id": cluster_id,
+        "pattern_type": pattern_type,
+        "severity": severity,
+        "recommended_action": recommended_action,
+        "trigger_action": str(trigger_action),
+        "transaction_id": transaction_id,
+        "entities": raw_entities,
+        "transaction_count": transaction_count,
+        "transaction_ids": list(transaction_ids),
+        "total_amount": total_amount,
+        "density": density,
+        "risk_score": risk_score,
+        "description": description,
+    }
+    if metadata:
+        payload["metadata"] = dict(metadata)
+
+    return AuditEvent(
+        event_type="fraud.graph.ring_detected",
+        model_version=model_version,
+        dataset_fingerprint=dataset_fingerprint,
+        payload=redact_data(payload),
+    )
+
+
+def build_impossible_travel_audit_event(
+    *,
+    velocity: TravelVelocity | Mapping[str, Any],
+    transaction_id: str | None = None,
+    entity_id: str | None = None,
+    prev_event: GeoLocationEvent | Mapping[str, Any] | None = None,
+    curr_event: GeoLocationEvent | Mapping[str, Any] | None = None,
+    trigger_action: str = "DENY",
+    model_version: str = "v1",
+    dataset_fingerprint: str | None = None,
+    metadata: Mapping[str, Any] | None = None,
+) -> AuditEvent:
+    """Construct a structured audit event when impossible travel is detected."""
+    if isinstance(velocity, Mapping):
+        distance_km = float(velocity.get("distance_km", 0.0))
+        time_elapsed_seconds = float(
+            velocity.get("time_elapsed_seconds", velocity.get("time_delta_seconds", 0.0))
+        )
+        velocity_kmh = float(velocity.get("velocity_kmh", velocity.get("speed_kmh", 0.0)))
+        is_impossible_travel = bool(velocity.get("is_impossible_travel", True))
+        is_cross_border = bool(velocity.get("is_cross_border", False))
+        origin_country = velocity.get("origin_country")
+        destination_country = velocity.get("destination_country")
+        origin_city = velocity.get("origin_city")
+        destination_city = velocity.get("destination_city")
+    else:
+        distance_km = float(velocity.distance_km)
+        time_elapsed_seconds = float(velocity.time_elapsed_seconds)
+        velocity_kmh = float(velocity.velocity_kmh)
+        is_impossible_travel = bool(velocity.is_impossible_travel)
+        is_cross_border = bool(velocity.is_cross_border)
+        origin_country = velocity.origin_country
+        destination_country = velocity.destination_country
+        origin_city = velocity.origin_city
+        destination_city = velocity.destination_city
+
+    target_entity = entity_id
+    if target_entity is None:
+        if curr_event is not None:
+            if hasattr(curr_event, "entity_id"):
+                target_entity = curr_event.entity_id
+            elif isinstance(curr_event, Mapping):
+                target_entity = str(curr_event.get("entity_id", ""))
+        elif prev_event is not None:
+            if hasattr(prev_event, "entity_id"):
+                target_entity = prev_event.entity_id
+            elif isinstance(prev_event, Mapping):
+                target_entity = str(prev_event.get("entity_id", ""))
+
+    masked_entity = _mask_pans_in_string(str(target_entity)) if target_entity else None
+
+    prev_payload: dict[str, Any] | None = None
+    if prev_event is not None:
+        if hasattr(prev_event, "to_dict"):
+            prev_payload = prev_event.to_dict()
+        elif isinstance(prev_event, Mapping):
+            prev_payload = dict(prev_event)
+
+    curr_payload: dict[str, Any] | None = None
+    if curr_event is not None:
+        if hasattr(curr_event, "to_dict"):
+            curr_payload = curr_event.to_dict()
+        elif isinstance(curr_event, Mapping):
+            curr_payload = dict(curr_event)
+
+    payload: dict[str, Any] = {
+        "entity_id": masked_entity,
+        "transaction_id": transaction_id,
+        "distance_km": distance_km,
+        "time_elapsed_seconds": time_elapsed_seconds,
+        "velocity_kmh": velocity_kmh,
+        "is_impossible_travel": is_impossible_travel,
+        "is_cross_border": is_cross_border,
+        "origin_country": origin_country,
+        "destination_country": destination_country,
+        "origin_city": origin_city,
+        "destination_city": destination_city,
+        "trigger_action": str(trigger_action),
+    }
+    if prev_payload is not None:
+        payload["prev_event"] = prev_payload
+    if curr_payload is not None:
+        payload["curr_event"] = curr_payload
+    if metadata:
+        payload["metadata"] = dict(metadata)
+
+    return AuditEvent(
+        event_type="fraud.geo.impossible_travel",
+        model_version=model_version,
+        dataset_fingerprint=dataset_fingerprint,
+        payload=redact_data(payload),
+    )
+
+
+def build_device_anomaly_audit_event(
+    *,
+    report: DeviceAnomalyReport | Mapping[str, Any],
+    device_id: str | None = None,
+    card_id: str | None = None,
+    transaction_id: str | None = None,
+    trigger_action: str = "DENY",
+    model_version: str = "v1",
+    dataset_fingerprint: str | None = None,
+    metadata: Mapping[str, Any] | None = None,
+) -> AuditEvent:
+    """Construct a structured audit event when a device or browser anomaly is detected."""
+    if isinstance(report, Mapping):
+        dev_id = str(report.get("device_id", device_id or "unknown"))
+        c_id = report.get("card_id", card_id)
+        is_emulator = bool(report.get("is_emulator", False))
+        is_card_cycling = bool(report.get("is_card_cycling", False))
+        is_device_cycling = bool(report.get("is_device_cycling", False))
+        is_drift = bool(report.get("is_fingerprint_drift", False))
+        distinct_cards = int(report.get("distinct_cards_count", 0))
+        distinct_devices = int(report.get("distinct_devices_count", 0))
+        similarity = float(report.get("similarity_to_baseline", 1.0))
+        severity = str(report.get("severity", "LOW"))
+        raw_reasons = report.get("reasons", ())
+    else:
+        dev_id = str(report.device_id or device_id or "unknown")
+        c_id = report.card_id or card_id
+        is_emulator = bool(report.is_emulator)
+        is_card_cycling = bool(report.is_card_cycling)
+        is_device_cycling = bool(report.is_device_cycling)
+        is_drift = bool(report.is_fingerprint_drift)
+        distinct_cards = int(report.distinct_cards_count)
+        distinct_devices = int(report.distinct_devices_count)
+        similarity = float(report.similarity_to_baseline)
+        severity = str(report.severity)
+        raw_reasons = report.reasons
+
+    masked_card = _mask_pans_in_string(str(c_id)) if c_id else None
+    sanitized_reasons = [_mask_pans_in_string(str(r)) for r in raw_reasons]
+
+    payload: dict[str, Any] = {
+        "device_id": dev_id,
+        "card_id": masked_card,
+        "transaction_id": transaction_id,
+        "is_emulator": is_emulator,
+        "is_card_cycling": is_card_cycling,
+        "is_device_cycling": is_device_cycling,
+        "is_fingerprint_drift": is_drift,
+        "distinct_cards_count": distinct_cards,
+        "distinct_devices_count": distinct_devices,
+        "similarity_to_baseline": similarity,
+        "severity": severity,
+        "reasons": sanitized_reasons,
+        "trigger_action": str(trigger_action),
+    }
+    if metadata:
+        payload["metadata"] = dict(metadata)
+
+    return AuditEvent(
+        event_type="fraud.device.anomaly_detected",
+        model_version=model_version,
+        dataset_fingerprint=dataset_fingerprint,
+        payload=payload,
+    )
+
+
+def build_merchant_anomaly_audit_event(
+    *,
+    report: MerchantAnomalyReport | Mapping[str, Any],
+    merchant_id: str | None = None,
+    card_id: str | None = None,
+    transaction_id: str | None = None,
+    trigger_action: str = "DENY",
+    model_version: str = "v1",
+    dataset_fingerprint: str | None = None,
+    metadata: Mapping[str, Any] | None = None,
+) -> AuditEvent:
+    """Construct a structured audit event when a merchant risk or chargeback anomaly is detected."""
+    if isinstance(report, Mapping):
+        m_id = str(report.get("merchant_id", merchant_id or "unknown"))
+        mcc = str(report.get("mcc", "0000"))
+        is_high_cb = bool(report.get("is_high_chargeback", False))
+        is_bust_out = bool(report.get("is_bust_out_surge", False))
+        is_card_testing = bool(report.get("is_card_testing", False))
+        is_ticket_outlier = bool(report.get("is_ticket_outlier", False))
+        smoothed_rate = float(report.get("smoothed_fraud_rate", 0.0))
+        amount_zscore = float(report.get("amount_zscore", 0.0))
+        micro_ratio = float(report.get("micro_tx_ratio", 0.0))
+        distinct_cards = int(report.get("distinct_cards_count", 0))
+        tx_count = int(report.get("transaction_count", 0))
+        severity = str(report.get("severity", "LOW"))
+        raw_reasons = report.get("reasons", ())
+    else:
+        m_id = str(report.merchant_id or merchant_id or "unknown")
+        mcc = str(report.mcc)
+        is_high_cb = bool(report.is_high_chargeback)
+        is_bust_out = bool(report.is_bust_out_surge)
+        is_card_testing = bool(report.is_card_testing)
+        is_ticket_outlier = bool(report.is_ticket_outlier)
+        smoothed_rate = float(report.smoothed_fraud_rate)
+        amount_zscore = float(report.amount_zscore)
+        micro_ratio = float(report.micro_tx_ratio)
+        distinct_cards = int(report.distinct_cards_count)
+        tx_count = int(report.transaction_count)
+        severity = str(report.severity)
+        raw_reasons = report.reasons
+
+    masked_card = _mask_pans_in_string(str(card_id)) if card_id else None
+    sanitized_reasons = [_mask_pans_in_string(str(r)) for r in raw_reasons]
+
+    payload: dict[str, Any] = {
+        "merchant_id": m_id,
+        "mcc": mcc,
+        "card_id": masked_card,
+        "transaction_id": transaction_id,
+        "is_high_chargeback": is_high_cb,
+        "is_bust_out_surge": is_bust_out,
+        "is_card_testing": is_card_testing,
+        "is_ticket_outlier": is_ticket_outlier,
+        "smoothed_fraud_rate": smoothed_rate,
+        "amount_zscore": amount_zscore,
+        "micro_tx_ratio": micro_ratio,
+        "distinct_cards_count": distinct_cards,
+        "transaction_count": tx_count,
+        "severity": severity,
+        "reasons": sanitized_reasons,
+        "trigger_action": str(trigger_action),
+    }
+    if metadata:
+        payload["metadata"] = dict(metadata)
+
+    return AuditEvent(
+        event_type="fraud.merchant.anomaly_detected",
+        model_version=model_version,
+        dataset_fingerprint=dataset_fingerprint,
+        payload=payload,
+    )
+
+
+def build_tenant_audit_event(
+    *,
+    tenant_id: str,
+    tier: str = "standard",
+    status: str = "active",
+    transaction_id: str | None = None,
+    action: str | None = None,
+    matched_rule_id: str | None = None,
+    matched_rule_name: str | None = None,
+    is_suspended: bool = False,
+    thresholds: Mapping[str, float] | None = None,
+    model_version: str = "v1",
+    dataset_fingerprint: str | None = None,
+    metadata: Mapping[str, Any] | None = None,
+) -> AuditEvent:
+    """Construct a structured audit event when a multi-tenant policy is evaluated."""
+    payload: dict[str, Any] = {
+        "tenant_id": _mask_pans_in_string(str(tenant_id)),
+        "tier": str(tier),
+        "status": str(status),
+        "transaction_id": _mask_pans_in_string(str(transaction_id)) if transaction_id else None,
+        "action": str(action) if action is not None else None,
+        "matched_rule_id": str(matched_rule_id) if matched_rule_id is not None else None,
+        "matched_rule_name": str(matched_rule_name) if matched_rule_name is not None else None,
+        "is_suspended": bool(is_suspended),
+        "thresholds": dict(thresholds) if thresholds is not None else {},
+    }
+    if metadata:
+        payload["metadata"] = dict(metadata)
+
+    return AuditEvent(
+        event_type="fraud.tenant.policy_evaluated",
+        model_version=model_version,
+        dataset_fingerprint=dataset_fingerprint,
+        payload=payload,
     )

@@ -19,13 +19,44 @@ from fraud_detection.audit import (
     _is_luhn_valid,
     _mask_pans_in_string,
     backtest_audit_policy,
+    build_challenger_retrained_audit_event,
+    build_delayed_label_audit_event,
+    build_device_anomaly_audit_event,
+    build_fraud_ring_detected_audit_event,
+    build_impossible_travel_audit_event,
+    build_merchant_anomaly_audit_event,
+    build_model_promoted_audit_event,
+    build_pipeline_chaos_audit_event,
+    build_pipeline_replay_audit_event,
     build_promotion_audit_event,
+    build_retraining_trigger_audit_event,
     build_scoring_audit_event,
     build_shadow_scoring_audit_event,
+    build_tenant_audit_event,
     redact_data,
     replay_audit_log,
 )
+from fraud_detection.device import DeviceAnomalyReport
 from fraud_detection.evaluation import TieredThresholds
+from fraud_detection.feedback import (
+    DelayedLabelRecord,
+    DisputeType,
+    RealizedMetricsReport,
+    RetrainingTriggerEvent,
+)
+from fraud_detection.geolocation import (
+    GeoCoordinates,
+    GeoLocationEvent,
+    TravelVelocity,
+)
+from fraud_detection.graph import (
+    EntityType,
+    FraudRingCluster,
+    RingAction,
+    RingPatternType,
+    RingSeverity,
+)
+from fraud_detection.merchant import MerchantAnomalyReport
 
 
 def test_is_luhn_valid() -> None:
@@ -802,3 +833,675 @@ def test_build_scoring_audit_event_pipeline_execution_trace() -> None:
     assert parsed["payload"]["degraded_nodes"] == ["inference"]
 
 
+def test_build_scoring_audit_event_cache_and_speculative() -> None:
+    event = build_scoring_audit_event(
+        model_version="v2",
+        dataset_fingerprint="fp2",
+        threshold=0.5,
+        predictions=[{"fraud_probability": 0.1, "is_fraud": False}],
+        cache_hits=2,
+        cache_misses=1,
+        speculative_executed=True,
+        speculative_hit=True,
+    )
+    assert event.payload["cache_hits"] == 2
+    assert event.payload["cache_misses"] == 1
+    assert event.payload["speculative_executed"] is True
+    assert event.payload["speculative_hit"] is True
+
+    serialized = event.to_json(redact=True)
+    parsed = json.loads(serialized)
+    assert parsed["payload"]["cache_hits"] == 2
+    assert parsed["payload"]["speculative_hit"] is True
+
+
+def test_build_pipeline_replay_audit_event() -> None:
+    event = build_pipeline_replay_audit_event(
+        pipeline_name="custom_graph",
+        audit_source="/path/to/audit.jsonl",
+        replayed_events=100,
+        total_transactions=100,
+        score_discrepancies=5,
+        decision_flips=2,
+        flip_rate=0.02,
+        status="diverged",
+        transition_matrix={"approve_to_review": 2},
+        mean_latency_ms=1.45,
+        p95_latency_ms=3.12,
+        metadata={"env": "staging", "api_key": "secret_key_12345"},
+    )
+    assert event.event_type == "pipeline_replay"
+    assert event.model_version == "custom_graph"
+    assert event.payload["replayed_events"] == 100
+    assert event.payload["flip_rate"] == 0.02
+    assert event.payload["status"] == "diverged"
+    assert event.payload["transition_matrix"] == {"approve_to_review": 2}
+
+    # Verify redaction of sensitive metadata
+    serialized = event.to_json(redact=True)
+    parsed = json.loads(serialized)
+    assert parsed["payload"]["metadata"]["api_key"] == "[REDACTED]"
+    assert parsed["payload"]["metadata"]["env"] == "staging"
+
+    minimal_event = build_pipeline_replay_audit_event(
+        pipeline_name="min_graph",
+        audit_source="/path/to/min.jsonl",
+        replayed_events=10,
+        total_transactions=10,
+        score_discrepancies=0,
+        decision_flips=0,
+        flip_rate=0.0,
+        status="MATCH",
+    )
+    assert "transition_matrix" not in minimal_event.payload
+    assert "mean_latency_ms" not in minimal_event.payload
+    assert "p95_latency_ms" not in minimal_event.payload
+    assert "metadata" not in minimal_event.payload
+
+
+def test_build_scoring_audit_event_with_circuit_short_circuits() -> None:
+    event = build_scoring_audit_event(
+        model_version="v2",
+        dataset_fingerprint="fp123",
+        threshold=0.5,
+        predictions=[{"is_fraud": False, "decision": "ALLOW"}],
+        circuit_short_circuits=["enrichment", "rules"],
+    )
+    assert event.payload["circuit_short_circuits"] == ["enrichment", "rules"]
+    assert "enrichment" in event.to_dict()["payload"]["circuit_short_circuits"]
+
+
+def test_build_pipeline_chaos_audit_event() -> None:
+    raw_report = {
+        "status": "RESILIENT",
+        "total_transactions": 50,
+        "circuit_breaker_enabled": True,
+        "sla_budget_ms": 100.0,
+        "sla_breaches": 0,
+        "circuit_trips": 1,
+        "short_circuited_calls": 5,
+        "unhandled_errors": 0,
+        "degraded_transactions": 5,
+        "latencies_p50_ms": 1.2,
+        "latencies_p95_ms": 3.4,
+        "latencies_max_ms": 5.6,
+        "recovered": True,
+        "fault_specs": [{"node_name": "enrichment", "fault_type": "exception"}],
+        "stage_metrics": {
+            "enrichment": {
+                "node_name": "enrichment",
+                "fault_type": "exception",
+                "injected_count": 2,
+                "handled_count": 2,
+                "tripped_circuit": True,
+            }
+        },
+    }
+
+    event = build_pipeline_chaos_audit_event(
+        chaos_report=raw_report,
+        model_version="model_chaos_v1",
+        dataset_fingerprint="ds_chaos_fp",
+        metadata={"environment": "canary", "api_key": "dummy_key_12345"},
+    )
+
+    assert event.event_type == "pipeline_chaos"
+    assert event.model_version == "model_chaos_v1"
+    assert event.dataset_fingerprint == "ds_chaos_fp"
+    assert event.payload["simulation_type"] == "pipeline_chaos"
+    assert event.payload["status"] == "RESILIENT"
+    assert event.payload["total_transactions"] == 50
+    assert event.payload["circuit_breaker_enabled"] is True
+    assert event.payload["circuit_trips"] == 1
+    assert event.payload["short_circuited_calls"] == 5
+    assert event.payload["recovered"] is True
+
+    # Check redaction of metadata
+    d = event.to_dict(redact=True)
+    assert d["payload"]["metadata"]["environment"] == "canary"
+    assert d["payload"]["metadata"]["api_key"] == "[REDACTED]"
+
+
+def test_build_delayed_label_audit_event() -> None:
+    rec = DelayedLabelRecord(
+        transaction_id="tx_audit_100",
+        event_timestamp=1000.0,
+        label_timestamp=87400.0,
+        dispute_type=DisputeType.CHARGEBACK,
+        is_fraud=True,
+        amount=199.99,
+        entity_key="card_12345",
+        notes="Network report from issuer",
+    )
+
+    event = build_delayed_label_audit_event(
+        record=rec,
+        model_version="v2.1.0",
+        dataset_fingerprint="ds_fp_123",
+        metadata={"operator": "fraud_analyst", "user_id": "usr_999"},
+    )
+
+    assert event.event_type == "delayed_label_ingestion"
+    assert event.model_version == "v2.1.0"
+    assert event.dataset_fingerprint == "ds_fp_123"
+    assert event.payload["transaction_id"] == "tx_audit_100"
+    assert event.payload["event_timestamp"] == 1000.0
+    assert event.payload["label_timestamp"] == 87400.0
+    assert event.payload["delay_days"] == 1.0
+    assert event.payload["dispute_type"] == "chargeback"
+    assert event.payload["is_fraud"] is True
+    assert event.payload["amount"] == 199.99
+    assert event.payload["ingestion_status"] == "ingested"
+
+    # Redaction verification
+    d = event.to_dict(redact=True)
+    assert d["payload"]["metadata"]["operator"] == "fraud_analyst"
+    assert d["payload"]["metadata"]["user_id"] == "[REDACTED]"
+
+    # Test with dict record without metadata
+    event_dict = build_delayed_label_audit_event(
+        record={
+            "transaction_id": "tx_audit_101",
+            "event_timestamp": 2000.0,
+            "label_timestamp": 90000.0,
+            "dispute_type": "fraud_dispute",
+            "is_fraud": False,
+            "amount": 50.0,
+        }
+    )
+    assert event_dict.payload["transaction_id"] == "tx_audit_101"
+    assert event_dict.payload["is_fraud"] is False
+    assert "metadata" not in event_dict.payload
+
+
+def test_build_retraining_trigger_audit_event() -> None:
+    report = RealizedMetricsReport(
+        total_transactions=20,
+        actual_fraud_count=5,
+        actual_fraud_rate=0.25,
+        predicted_positive_count=6,
+        true_positives=3,
+        false_positives=3,
+        true_negatives=12,
+        false_negatives=2,
+        realized_precision=0.5,
+        realized_recall=0.6,
+        realized_f1=0.5455,
+        realized_fpr=0.2,
+        realized_auprc=0.48,
+        total_fraud_loss=500.0,
+        prevented_fraud_amount=300.0,
+        missed_fraud_amount=200.0,
+        false_positive_cost=45.0,
+        net_financial_savings=255.0,
+        decision_counts={"deny": 6, "allow": 14},
+        cohort_id="c_2026_w41",
+    )
+    trig = RetrainingTriggerEvent(
+        trigger_id="trig_retrain_1",
+        triggered_at=1700000000.0,
+        breached_metrics={"precision": {"observed": 0.5, "threshold": 0.7}},
+        realized_metrics=report,
+        recommended_retrain_start=1680000000.0,
+        recommended_retrain_end=1698000000.0,
+        recommended_temporal_gap_seconds=1209600.0,
+        reason="precision breached (0.5 vs threshold 0.7)",
+        cohort_id="c_2026_w41",
+    )
+
+    event = build_retraining_trigger_audit_event(
+        trigger_event=trig,
+        model_version="v2.1.0",
+        metadata={"initiator": "surveillance_cron", "token": "cron_tok_xyz"},
+    )
+
+    assert event.event_type == "retraining_trigger"
+    assert event.model_version == "v2.1.0"
+    assert event.payload["trigger_id"] == "trig_retrain_1"
+    assert event.payload["triggered_at"] == 1700000000.0
+    assert event.payload["cohort_id"] == "c_2026_w41"
+    assert event.payload["breached_metrics"]["precision"]["observed"] == 0.5
+    assert event.payload["recommended_temporal_gap_seconds"] == 1209600.0
+    assert event.payload["realized_metrics"]["total_transactions"] == 20
+
+    # Redaction verification
+    d = event.to_dict(redact=True)
+    assert d["payload"]["metadata"]["initiator"] == "surveillance_cron"
+    assert d["payload"]["metadata"]["token"] == "[REDACTED]"  # noqa: S105
+
+    # Test with dict trigger_event without metadata
+    event_dict = build_retraining_trigger_audit_event(
+        trigger_event={
+            "trigger_id": "trig_dict_2",
+            "triggered_at": 1700000000.0,
+            "cohort_id": "c_dict",
+            "reason": "fpr breached",
+            "breached_metrics": {"fpr": {"observed": 0.1, "threshold": 0.05}},
+            "recommended_retrain_start": 1600.0,
+            "recommended_retrain_end": 1700.0,
+            "recommended_temporal_gap_seconds": 100.0,
+            "realized_metrics": {"total_transactions": 15},
+        }
+    )
+    assert event_dict.payload["trigger_id"] == "trig_dict_2"
+    assert "metadata" not in event_dict.payload
+
+
+def test_build_challenger_retrained_audit_event_passed_and_rejected() -> None:
+    """Test challenger retrained audit event creation for both passing and rejected runs."""
+    cand_dict = {
+        "model_version": "cand_v2",
+        "dataset_fingerprint": "fp_retrain_123",
+        "training_duration_seconds": 12.34,
+        "validation_metrics": {"pr_auc": 0.88, "f1": 0.82},
+        "test_metrics": {"pr_auc": 0.87, "f1": 0.81},
+        "config": {"hyperparameters": {"regularization": 0.5}},
+    }
+    pass_report = {
+        "status": "passed",
+        "candidate_version": "cand_v2",
+        "champion_version": "champ_v1",
+        "summary": "Passed all safety gates",
+    }
+
+    # 1. Successful retraining run with attestation
+    event_pass = build_challenger_retrained_audit_event(
+        candidate_result=cand_dict,
+        verification_report=pass_report,
+        attestation_digest="sha256:abc1234567890",
+        metadata={"user": "mlops_agent", "api_key": "secret_key_123"},
+    )
+    assert event_pass.event_type == "fraud.retraining.completed"
+    assert event_pass.model_version == "cand_v2"
+    assert event_pass.dataset_fingerprint == "fp_retrain_123"
+    assert event_pass.payload["training_duration_seconds"] == 12.34
+    assert event_pass.payload["verification_status"] == "passed"
+    assert event_pass.payload["is_certified"] is True
+    assert event_pass.payload["attestation_digest"] == "sha256:abc1234567890"
+
+    # Redaction check
+    redacted = event_pass.to_dict(redact=True)
+    assert redacted["payload"]["metadata"]["user"] == "mlops_agent"
+    assert redacted["payload"]["metadata"]["api_key"] == "[REDACTED]"
+
+    # 2. Rejected retraining run
+    fail_report = {
+        "status": "failed",
+        "candidate_version": "cand_v3",
+        "champion_version": "champ_v1",
+        "summary": "Degraded recall",
+    }
+    event_fail = build_challenger_retrained_audit_event(
+        candidate_result=cand_dict,
+        verification_report=fail_report,
+    )
+    assert event_fail.event_type == "fraud.retraining.rejected"
+    assert event_fail.payload["verification_status"] == "failed"
+    assert event_fail.payload["is_certified"] is False
+
+
+def test_build_model_promoted_audit_event_full_and_canary() -> None:
+    """Test model promotion audit event for full rollout and canary shift."""
+    # 1. Full promotion
+    event_full = build_model_promoted_audit_event(
+        previous_champion_version="champ_v1",
+        new_champion_version="cand_v2",
+        promotion_type="full",
+        canary_percentage=100.0,
+        attestation_digest="digest_v2",
+        promoted_by="release_pipeline",
+        dataset_fingerprint="fp_promoted_999",
+        metadata={"actor": "deployer", "auth_token": "token_abc"},
+    )
+    assert event_full.event_type == "fraud.model.promoted"
+    assert event_full.model_version == "cand_v2"
+    assert event_full.dataset_fingerprint == "fp_promoted_999"
+    assert event_full.payload["previous_champion_version"] == "champ_v1"
+    assert event_full.payload["new_champion_version"] == "cand_v2"
+    assert event_full.payload["canary_percentage"] == 100.0
+    assert event_full.payload["promoted_by"] == "release_pipeline"
+
+    redacted = event_full.to_dict(redact=True)
+    assert redacted["payload"]["metadata"]["actor"] == "deployer"
+    assert redacted["payload"]["metadata"]["auth_token"] == "[REDACTED]"  # noqa: S105
+
+    # 2. Canary update
+    event_canary = build_model_promoted_audit_event(
+        previous_champion_version="champ_v1",
+        new_champion_version="cand_v2",
+        promotion_type="canary",
+        canary_percentage=20.0,
+    )
+    assert event_canary.event_type == "fraud.canary.updated"
+    assert event_canary.payload["promotion_type"] == "canary"
+    assert event_canary.payload["canary_percentage"] == 20.0
+
+
+def test_build_fraud_ring_detected_audit_event_redaction() -> None:
+    # 1. Cluster object with Luhn-valid PANs
+    cluster = FraudRingCluster(
+        cluster_id="ring_star_123",
+        pattern_type=RingPatternType.STAR_CARD_TESTING,
+        severity=RingSeverity.HIGH,
+        recommended_action=RingAction.DENY,
+        entities={
+            EntityType.CARD_ID: ("4111111111111111", "5500000000000004"),
+            EntityType.DEVICE_ID: ("dev_botnet_1",),
+        },
+        transaction_ids=("tx_1", "tx_2"),
+        transaction_count=2,
+        total_amount=150.0,
+        density=1.0,
+        risk_score=0.88,
+        description="High velocity card testing on dev_botnet_1",
+    )
+
+    event = build_fraud_ring_detected_audit_event(
+        cluster=cluster,
+        transaction_id="tx_test_trigger",
+        trigger_action="DENY",
+        model_version="v2",
+        metadata={"operator": "secops", "api_key": "secret_key_123"},
+    )
+
+    assert event.event_type == "fraud.graph.ring_detected"
+    assert event.model_version == "v2"
+    assert event.payload["cluster_id"] == "ring_star_123"
+    assert event.payload["severity"] == "high"
+    assert event.payload["recommended_action"] == "deny"
+    assert event.payload["trigger_action"] == "DENY"
+    assert event.payload["transaction_id"] == "tx_test_trigger"
+
+    # Redaction checks: sensitive card entities and api_key must be masked
+    d = event.to_dict(redact=True)
+    assert d["payload"]["metadata"]["operator"] == "secops"
+    assert d["payload"]["metadata"]["api_key"] == "[REDACTED]"
+    # Card entities under 'card_id' key should be redacted
+    assert d["payload"]["entities"]["card_id"] == "[REDACTED]"
+    assert d["payload"]["entities"]["device_id"] == ["dev_botnet_1"]
+
+    # 2. Test building from Mapping
+    mapping_cluster = {
+        "cluster_id": "ring_dict_456",
+        "pattern_type": "biclique",
+        "severity": "critical",
+        "recommended_action": "deny",
+        "entities": {"device_id": ["d1", "d2"]},
+        "transaction_ids": ["tx_a", "tx_b"],
+        "transaction_count": 2,
+        "total_amount": 5000.0,
+        "density": 0.9,
+        "risk_score": 0.95,
+        "description": "Dense syndicate ring",
+    }
+    event_dict = build_fraud_ring_detected_audit_event(
+        cluster=mapping_cluster,
+        transaction_id="tx_a",
+    )
+    assert event_dict.payload["cluster_id"] == "ring_dict_456"
+    assert event_dict.payload["severity"] == "critical"
+    assert event_dict.payload["total_amount"] == 5000.0
+
+
+def test_build_impossible_travel_audit_event() -> None:
+    # 1. Test building from typed objects and Luhn-valid PAN masking
+    pan_entity = "4532015112830366"  # Luhn valid
+    prev_loc = GeoCoordinates(latitude=51.5074, longitude=-0.1278, country_code="GB", city="London")
+    curr_loc = GeoCoordinates(
+        latitude=40.7128, longitude=-74.0060, country_code="US", city="New York"
+    )
+
+    prev_ev = GeoLocationEvent(
+        event_id="ev_lon",
+        entity_id=pan_entity,
+        timestamp=1000.0,
+        coordinates=prev_loc,
+        ip_address="198.51.100.1",
+    )
+    curr_ev = GeoLocationEvent(
+        event_id="ev_nyc",
+        entity_id=pan_entity,
+        timestamp=1600.0,
+        coordinates=curr_loc,
+        ip_address="198.51.100.2",
+    )
+
+    velocity = TravelVelocity(
+        distance_km=5570.0,
+        time_elapsed_seconds=600.0,
+        velocity_kmh=33420.0,
+        is_impossible_travel=True,
+        is_cross_border=True,
+        origin_country="GB",
+        destination_country="US",
+        origin_city="London",
+        destination_city="New York",
+    )
+
+    event = build_impossible_travel_audit_event(
+        velocity=velocity,
+        transaction_id="tx_nyc",
+        prev_event=prev_ev,
+        curr_event=curr_ev,
+        trigger_action="DENY",
+        model_version="v2",
+        metadata={"operator": "secops", "auth_token": "secret_jwt_xyz"},
+    )
+
+    assert event.event_type == "fraud.geo.impossible_travel"
+    assert event.model_version == "v2"
+    assert event.payload["transaction_id"] == "tx_nyc"
+    assert event.payload["distance_km"] == 5570.0
+    assert event.payload["velocity_kmh"] == 33420.0
+    assert event.payload["is_impossible_travel"] is True
+    assert event.payload["is_cross_border"] is True
+    assert event.payload["trigger_action"] == "DENY"
+
+    # Redaction checks: PAN in entity_id must be redacted
+    assert event.payload["entity_id"] == "[REDACTED_PAN]"
+    # Nested event entity IDs (Luhn valid) must also be redacted
+    assert event.payload["prev_event"]["entity_id"] == "[REDACTED_PAN]"
+    assert event.payload["curr_event"]["entity_id"] == "[REDACTED_PAN]"
+
+    # Metadata token redaction
+    d = event.to_dict(redact=True)
+    assert d["payload"]["metadata"]["operator"] == "secops"
+    assert d["payload"]["metadata"]["auth_token"] == "[REDACTED]"  # noqa: S105
+
+    # 2. Test building from Mapping with non-PAN entity
+    mapping_velocity = {
+        "distance_km": 1200.0,
+        "time_elapsed_seconds": 1800.0,
+        "velocity_kmh": 2400.0,
+        "is_impossible_travel": True,
+        "is_cross_border": False,
+        "origin_country": "US",
+        "destination_country": "US",
+        "origin_city": "Chicago",
+        "destination_city": "New York",
+    }
+    mapping_event = build_impossible_travel_audit_event(
+        velocity=mapping_velocity,
+        entity_id="user_chicago_nyc_999",
+        transaction_id="tx_map_1",
+    )
+    assert mapping_event.payload["entity_id"] == "user_chicago_nyc_999"
+    assert mapping_event.payload["distance_km"] == 1200.0
+    assert mapping_event.payload["velocity_kmh"] == 2400.0
+    assert mapping_event.payload["is_impossible_travel"] is True
+
+
+def test_build_device_anomaly_audit_event() -> None:
+    pan_card = "4532015112830366"  # Luhn-valid PAN
+    rep = DeviceAnomalyReport(
+        device_id="device_attack_cluster_99",
+        card_id=pan_card,
+        is_emulator=True,
+        is_card_cycling=True,
+        is_device_cycling=False,
+        is_fingerprint_drift=False,
+        distinct_cards_count=4,
+        distinct_devices_count=1,
+        similarity_to_baseline=1.0,
+        severity="CRITICAL",
+        reasons=(
+            "Device exhibits automated webdriver or emulator signatures.",
+            f"Device associated with card {pan_card}.",
+        ),
+    )
+
+    event = build_device_anomaly_audit_event(
+        report=rep,
+        transaction_id="tx_dev_anomaly_1",
+        trigger_action="DENY",
+        model_version="v2",
+        metadata={"operator": "fraud_ops", "api_key": "secret_key_123"},
+    )
+
+    assert event.event_type == "fraud.device.anomaly_detected"
+    assert event.model_version == "v2"
+    assert event.payload["device_id"] == "device_attack_cluster_99"
+    assert event.payload["transaction_id"] == "tx_dev_anomaly_1"
+    assert event.payload["is_emulator"] is True
+    assert event.payload["is_card_cycling"] is True
+    assert event.payload["distinct_cards_count"] == 4
+    assert event.payload["severity"] == "CRITICAL"
+    assert event.payload["trigger_action"] == "DENY"
+
+    # Redaction checks: PAN in card_id and reasons must be masked
+    assert event.payload["card_id"] == "[REDACTED_PAN]"
+    assert "[REDACTED_PAN]" in event.payload["reasons"][1]
+    assert pan_card not in event.payload["reasons"][1]
+
+    # Redaction of secret api_key in metadata
+    d = event.to_dict(redact=True)
+    assert d["payload"]["metadata"]["api_key"] == "[REDACTED]"
+    assert d["payload"]["metadata"]["operator"] == "fraud_ops"
+
+    # Mapping report test
+    mapping_rep = {
+        "device_id": "dev_map",
+        "card_id": "plain_user_1",
+        "is_emulator": False,
+        "is_card_cycling": True,
+        "distinct_cards_count": 5,
+        "severity": "HIGH",
+    }
+    mapping_event = build_device_anomaly_audit_event(
+        report=mapping_rep,
+        transaction_id="tx_map_dev",
+    )
+    assert mapping_event.payload["device_id"] == "dev_map"
+    assert mapping_event.payload["card_id"] == "plain_user_1"
+    assert mapping_event.payload["is_card_cycling"] is True
+    assert mapping_event.payload["distinct_cards_count"] == 5
+    assert mapping_event.payload["severity"] == "HIGH"
+
+
+def test_build_merchant_anomaly_audit_event() -> None:
+    pan_card = "4532015112830366"  # Luhn-valid PAN
+    rep = MerchantAnomalyReport(
+        merchant_id="m_collusion_99",
+        mcc="7995",
+        is_high_chargeback=True,
+        is_bust_out_surge=True,
+        is_card_testing=False,
+        is_ticket_outlier=True,
+        smoothed_fraud_rate=0.085,
+        amount_zscore=4.25,
+        micro_tx_ratio=0.10,
+        distinct_cards_count=6,
+        transaction_count=12,
+        severity="CRITICAL",
+        reasons=(
+            "high_chargeback_rate:0.0850",
+            f"bust_out_surge on card {pan_card}",
+        ),
+    )
+
+    event = build_merchant_anomaly_audit_event(
+        report=rep,
+        card_id=pan_card,
+        transaction_id="tx_merch_anomaly_1",
+        trigger_action="DENY",
+        model_version="v2",
+        metadata={"operator": "fraud_ops", "api_key": "secret_key_123"},
+    )
+
+    assert event.event_type == "fraud.merchant.anomaly_detected"
+    assert event.model_version == "v2"
+    assert event.payload["merchant_id"] == "m_collusion_99"
+    assert event.payload["mcc"] == "7995"
+    assert event.payload["transaction_id"] == "tx_merch_anomaly_1"
+    assert event.payload["is_high_chargeback"] is True
+    assert event.payload["is_bust_out_surge"] is True
+    assert event.payload["distinct_cards_count"] == 6
+    assert event.payload["severity"] == "CRITICAL"
+    assert event.payload["trigger_action"] == "DENY"
+
+    # Redaction checks: PAN in card_id and reasons must be masked
+    assert event.payload["card_id"] == "[REDACTED_PAN]"
+    assert "[REDACTED_PAN]" in event.payload["reasons"][1]
+    assert pan_card not in event.payload["reasons"][1]
+
+    # Redaction of secret api_key in metadata
+    d = event.to_dict(redact=True)
+    assert d["payload"]["metadata"]["api_key"] == "[REDACTED]"
+    assert d["payload"]["metadata"]["operator"] == "fraud_ops"
+
+    # Mapping report test
+    mapping_rep = {
+        "merchant_id": "m_map",
+        "mcc": "5817",
+        "is_high_chargeback": False,
+        "is_card_testing": True,
+        "distinct_cards_count": 7,
+        "transaction_count": 8,
+        "severity": "HIGH",
+    }
+    mapping_event = build_merchant_anomaly_audit_event(
+        report=mapping_rep,
+        card_id="plain_user_1",
+        transaction_id="tx_map_merch",
+    )
+    assert mapping_event.payload["merchant_id"] == "m_map"
+    assert mapping_event.payload["mcc"] == "5817"
+    assert mapping_event.payload["card_id"] == "plain_user_1"
+    assert mapping_event.payload["is_card_testing"] is True
+    assert mapping_event.payload["distinct_cards_count"] == 7
+    assert mapping_event.payload["severity"] == "HIGH"
+
+
+def test_build_tenant_audit_event() -> None:
+    """Validate construction and sanitization of tenant audit event."""
+    pan_id = "4532015112830366"  # Valid Luhn PAN inside transaction id
+    event = build_tenant_audit_event(
+        tenant_id="tenant_fintech_enterprise",
+        tier="enterprise",
+        status="active",
+        transaction_id=pan_id,
+        action="DENY",
+        matched_rule_id="RULE_TENANT_HIGH_RISK",
+        matched_rule_name="Tenant High Risk Block",
+        is_suspended=False,
+        thresholds={"decline": 0.90, "challenge": 0.65, "review": 0.40},
+        metadata={"operator": "fraud_lead", "api_key": "secret_key_123"},
+    )
+
+    assert event.event_type == "fraud.tenant.policy_evaluated"
+    assert event.payload["tenant_id"] == "tenant_fintech_enterprise"
+    assert event.payload["tier"] == "enterprise"
+    assert event.payload["status"] == "active"
+    assert event.payload["action"] == "DENY"
+    assert event.payload["matched_rule_id"] == "RULE_TENANT_HIGH_RISK"
+    assert event.payload["matched_rule_name"] == "Tenant High Risk Block"
+    assert event.payload["is_suspended"] is False
+    assert event.payload["thresholds"]["decline"] == 0.90
+
+    # Ensure PAN in transaction_id was redacted
+    assert event.payload["transaction_id"] == "[REDACTED_PAN]"
+
+    # Redaction test through to_dict
+    d = event.to_dict(redact=True)
+    assert d["payload"]["metadata"]["api_key"] == "[REDACTED]"
+    assert d["payload"]["metadata"]["operator"] == "fraud_lead"

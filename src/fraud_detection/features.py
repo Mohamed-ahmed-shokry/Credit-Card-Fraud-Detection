@@ -921,9 +921,9 @@ class FeatureSkewAnalyzer:
             null_curr = float(curr_col.isna().mean())
             null_delta = abs(null_curr - null_ref)
 
-            is_numeric = pd.api.types.is_numeric_dtype(
-                ref_col
-            ) and pd.api.types.is_numeric_dtype(curr_col)
+            is_numeric = pd.api.types.is_numeric_dtype(ref_col) and pd.api.types.is_numeric_dtype(
+                curr_col
+            )
 
             if is_numeric:
                 ref_arr = ref_col.dropna().to_numpy(dtype=float)

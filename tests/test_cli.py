@@ -34,6 +34,7 @@ from fraud_detection.model import (
     METADATA_FILENAME,
     MODEL_FILENAME,
     CalibrationMethod,
+    EstimatorType,
     FraudModel,
     ModelArtifactError,
     TrainingConfig,
@@ -5126,14 +5127,17 @@ def test_cli_recalibrate_error_handling(
 
 
 def test_cli_route_eval_help() -> None:
+    import re
+
     res = runner.invoke(app, ["route-eval", "--help"])
     assert res.exit_code == 0
-    assert "--champion" in res.output
-    assert "--challenger" in res.output
-    assert "--data" in res.output
-    assert "Evaluate decision discrepancies" in res.output
-    assert "--json" in res.output
-    assert "--output" in res.output
+    clean_output = re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", res.output)
+    assert "--champion" in clean_output
+    assert "--challenger" in clean_output
+    assert "--data" in clean_output
+    assert "Evaluate decision discrepancies" in clean_output
+    assert "--json" in clean_output
+    assert "--output" in clean_output
 
 
 def test_cli_route_eval_csv_and_json(
@@ -5631,9 +5635,7 @@ def test_cli_pipeline_eval_success(tmp_path: Path, trained_artifact: Path) -> No
     assert "action" in report["stage_latency_ms"]
 
 
-def test_cli_pipeline_eval_table_output_and_file(
-    tmp_path: Path, trained_artifact: Path
-) -> None:
+def test_cli_pipeline_eval_table_output_and_file(tmp_path: Path, trained_artifact: Path) -> None:
     data_path = tmp_path / "eval_data.csv"
     generate_synthetic_data(rows=250, random_state=42).to_csv(data_path, index=False)
     out_file = tmp_path / "pipeline_report.json"
@@ -5662,9 +5664,7 @@ def test_cli_pipeline_eval_table_output_and_file(
     assert saved_data["total_evaluated"] == 50
 
 
-def test_cli_pipeline_eval_with_rules_and_velocity(
-    tmp_path: Path, trained_artifact: Path
-) -> None:
+def test_cli_pipeline_eval_with_rules_and_velocity(tmp_path: Path, trained_artifact: Path) -> None:
     data_path = tmp_path / "eval_data.csv"
     generate_synthetic_data(rows=250, random_state=42).to_csv(data_path, index=False)
 
@@ -5679,9 +5679,7 @@ def test_cli_pipeline_eval_with_rules_and_velocity(
                         "description": "Deny amounts over 5000",
                         "action": "DENY",
                         "priority": 100,
-                        "conditions": [
-                            {"field": "Amount", "operator": ">", "value": 5000.0}
-                        ],
+                        "conditions": [{"field": "Amount", "operator": ">", "value": 5000.0}],
                     }
                 ]
             }
@@ -5776,5 +5774,4814 @@ def test_cli_pipeline_eval_corrupt_configs(tmp_path: Path, trained_artifact: Pat
     assert "Failed to load velocity config" in res_vc.output
 
 
+def test_cli_pipeline_eval_with_cache_and_speculation(
+    tmp_path: Path, trained_artifact: Path
+) -> None:
+    data_path = tmp_path / "data.csv"
+    generate_synthetic_data(rows=250, random_state=42).to_csv(data_path, index=False)
+
+    # 1. JSON report with cache and speculative evaluation enabled
+    res_json = runner.invoke(
+        app,
+        [
+            "pipeline-eval",
+            "--model",
+            str(trained_artifact),
+            "--input",
+            str(data_path),
+            "--enable-cache",
+            "--cache-size",
+            "200",
+            "--cache-ttl",
+            "120.0",
+            "--speculative",
+            "--json",
+        ],
+    )
+    assert res_json.exit_code == 0, res_json.output
+    report = json.loads(res_json.stdout)
+    assert report["total_evaluated"] == 250
+    assert "cache" in report
+    assert report["cache"]["enabled"] is True
+    assert report["cache"]["max_size"] == 200
+    assert report["cache"]["misses"] >= 1
+    assert "hit_ratio" in report["cache"]
+    assert "speculative" in report
+    assert report["speculative"]["enabled"] is True
+    assert "executed" in report["speculative"]
+    assert "hits" in report["speculative"]
+
+    # 2. Text table report displaying cache and speculative telemetry
+    res_text = runner.invoke(
+        app,
+        [
+            "pipeline-eval",
+            "--model",
+            str(trained_artifact),
+            "--input",
+            str(data_path),
+            "--max-records",
+            "20",
+            "--enable-cache",
+            "--speculative",
+        ],
+    )
+    assert res_text.exit_code == 0, res_text.output
+    assert "Cache: Hits=" in res_text.output
+    assert "Speculative Inference: Executed=" in res_text.output
 
 
+def test_cli_pipeline_eval_rejects_corrupt_model_and_empty_input(
+    tmp_path: Path, trained_artifact: Path
+) -> None:
+    data_path = tmp_path / "data.csv"
+    generate_synthetic_data(rows=250, random_state=42).to_csv(data_path, index=False)
+
+    corrupt_model_dir = tmp_path / "corrupt_model"
+    corrupt_model_dir.mkdir()
+    res_model = runner.invoke(
+        app,
+        ["pipeline-eval", "-m", str(corrupt_model_dir), "-i", str(data_path)],
+    )
+    assert res_model.exit_code == 2
+    assert "Failed to load model" in res_model.output
+
+    empty_csv = tmp_path / "empty.csv"
+    empty_csv.write_text("", encoding="utf-8")
+    res_csv = runner.invoke(
+        app,
+        ["pipeline-eval", "-m", str(trained_artifact), "-i", str(empty_csv)],
+    )
+    assert res_csv.exit_code == 2
+    assert "Failed to read input dataset" in res_csv.output
+
+
+def test_cli_pipeline_replay_and_counterfactual(tmp_path: Path, trained_artifact: Path) -> None:
+    df = generate_synthetic_data(rows=250, random_state=42)
+    feature_cols = [c for c in df.columns if c != "Class"]
+    rec1 = {str(k): float(v) for k, v in df[feature_cols].iloc[0].to_dict().items()}
+    rec2 = {str(k): float(v) for k, v in df[feature_cols].iloc[1].to_dict().items()}
+
+    audit_log = tmp_path / "audit_replay.jsonl"
+    ev = {
+        "event_id": "cli_ev_1",
+        "event_type": "scoring",
+        "payload": {
+            "review_threshold": 0.3,
+            "deny_threshold": 0.7,
+            "predictions": [
+                {"fraud_probability": 0.95, "decision": "DENY", "is_fraud": True},
+                {"fraud_probability": 0.05, "decision": "ALLOW", "is_fraud": False},
+            ],
+            "features": [rec1, rec2],
+        },
+    }
+    audit_log.write_text(json.dumps(ev) + "\n", encoding="utf-8")
+
+    report_out = tmp_path / "replay_report.json"
+    audit_sink_out = tmp_path / "replay_events.jsonl"
+
+    # 1. pipeline-replay JSON output + file output + audit sink output
+    res_json = runner.invoke(
+        app,
+        [
+            "pipeline-replay",
+            str(audit_log),
+            "--model",
+            str(trained_artifact),
+            "--output",
+            str(report_out),
+            "--audit-log",
+            str(audit_sink_out),
+            "--json",
+        ],
+    )
+    assert res_json.exit_code == 0, res_json.output
+    rep_data = json.loads(res_json.stdout)
+    assert rep_data["total_transactions"] == 2
+    assert report_out.is_file()
+    assert audit_sink_out.is_file()
+
+    # 2. pipeline-replay text output + fail-on-divergence
+    res_text = runner.invoke(
+        app,
+        [
+            "pipeline-replay",
+            str(audit_log),
+            "--model",
+            str(trained_artifact),
+            "--tolerance",
+            "0.0",
+            "--fail-on-divergence",
+        ],
+    )
+    assert res_text.exit_code == 1
+    assert "Decision Graph Pipeline Replay Report:" in res_text.output
+    assert "Transition Matrix (Logged -> Replayed):" in res_text.output
+
+    # 3. pipeline-replay validation errors
+    bad_prec = runner.invoke(
+        app,
+        [
+            "pipeline-replay",
+            str(audit_log),
+            "--model",
+            str(trained_artifact),
+            "--rule-precedence",
+            "invalid_prec",
+        ],
+    )
+    assert bad_prec.exit_code == 2
+    assert "Invalid --rule-precedence" in bad_prec.output
+
+    bad_rules = tmp_path / "corrupt_rules.json"
+    bad_rules.write_text("{bad", encoding="utf-8")
+    res_bad_rules = runner.invoke(
+        app,
+        [
+            "pipeline-replay",
+            str(audit_log),
+            "--model",
+            str(trained_artifact),
+            "--rules",
+            str(bad_rules),
+        ],
+    )
+    assert res_bad_rules.exit_code == 2
+    assert "Failed to load rules" in res_bad_rules.output
+
+    # 4. pipeline-counterfactual JSON and text output
+    cf_out = tmp_path / "cf_report.json"
+    res_cf_json = runner.invoke(
+        app,
+        [
+            "pipeline-counterfactual",
+            str(audit_log),
+            "--candidate-review",
+            "0.25",
+            "--candidate-deny",
+            "0.65",
+            "--output",
+            str(cf_out),
+            "--json",
+        ],
+    )
+    assert res_cf_json.exit_code == 0, res_cf_json.output
+    cf_data = json.loads(res_cf_json.stdout)
+    assert cf_data["rows"] == 2
+    assert cf_out.is_file()
+
+    res_cf_text = runner.invoke(
+        app,
+        [
+            "pipeline-counterfactual",
+            str(audit_log),
+            "--candidate-review",
+            "0.25",
+            "--candidate-deny",
+            "0.65",
+            "--baseline-review",
+            "0.4",
+            "--baseline-deny",
+            "0.8",
+        ],
+    )
+    assert res_cf_text.exit_code == 0, res_cf_text.output
+    assert "Pipeline Counterfactual Evaluation:" in res_cf_text.output
+    assert "Transition Matrix (Baseline -> Candidate):" in res_cf_text.output
+
+    # 5. pipeline-counterfactual validation errors
+    bad_cf_1 = runner.invoke(
+        app,
+        [
+            "pipeline-counterfactual",
+            str(audit_log),
+            "--candidate-review",
+            "0.8",
+            "--candidate-deny",
+            "0.4",
+        ],
+    )
+    assert bad_cf_1.exit_code == 2
+    assert "--candidate-review cannot exceed --candidate-deny" in bad_cf_1.output
+
+    bad_cf_2 = runner.invoke(
+        app,
+        [
+            "pipeline-counterfactual",
+            str(audit_log),
+            "--candidate-review",
+            "0.3",
+            "--candidate-deny",
+            "0.7",
+            "--baseline-review",
+            "0.4",
+        ],
+    )
+    assert bad_cf_2.exit_code == 2
+    assert "Both --baseline-review and --baseline-deny" in bad_cf_2.output
+
+    bad_cf_3 = runner.invoke(
+        app,
+        [
+            "pipeline-counterfactual",
+            str(audit_log),
+            "--candidate-review",
+            "0.3",
+            "--candidate-deny",
+            "0.7",
+            "--baseline-review",
+            "0.9",
+            "--baseline-deny",
+            "0.4",
+        ],
+    )
+    assert bad_cf_3.exit_code == 2
+    assert "--baseline-review cannot exceed --baseline-deny" in bad_cf_3.output
+
+    empty_log = tmp_path / "empty_log.jsonl"
+    empty_log.write_text("", encoding="utf-8")
+    bad_cf_4 = runner.invoke(
+        app,
+        [
+            "pipeline-counterfactual",
+            str(empty_log),
+            "--candidate-review",
+            "0.3",
+            "--candidate-deny",
+            "0.7",
+        ],
+    )
+    assert bad_cf_4.exit_code == 2
+    assert "No valid scoring transactions" in bad_cf_4.output
+
+    # 6. Additional branches: text output with --output, corrupt model, and noisy log
+    text_rep_out = tmp_path / "text_rep.json"
+    res_text_out = runner.invoke(
+        app,
+        [
+            "pipeline-replay",
+            str(audit_log),
+            "--model",
+            str(trained_artifact),
+            "--output",
+            str(text_rep_out),
+        ],
+    )
+    assert res_text_out.exit_code == 0, res_text_out.output
+    assert "Report written to:" in res_text_out.output
+
+    corrupt_dir = tmp_path / "corrupt_m"
+    corrupt_dir.mkdir()
+    res_corrupt = runner.invoke(
+        app,
+        ["pipeline-replay", str(audit_log), "--model", str(corrupt_dir)],
+    )
+    assert res_corrupt.exit_code == 2
+    assert "Failed to load model" in res_corrupt.output
+
+    noisy_log = tmp_path / "noisy.jsonl"
+    noisy_lines = [
+        "",
+        "{invalid json",
+        "[]",
+        json.dumps({"event_type": "other"}),
+        json.dumps({"event_type": "scoring", "payload": "not_a_dict"}),
+        json.dumps(
+            {
+                "event_type": "scoring",
+                "payload": {
+                    "review_threshold": "bad",
+                    "deny_threshold": "bad",
+                    "predictions": "bad",
+                },
+            }
+        ),
+        json.dumps(
+            {
+                "event_type": "scoring",
+                "payload": {
+                    "review_threshold": 0.4,
+                    "deny_threshold": 0.8,
+                    "predictions": [
+                        "not_a_dict",
+                        {"fraud_probability": None},
+                        {"fraud_probability": "bad_float"},
+                        {"fraud_probability": 1.5},
+                        {"fraud_probability": 0.75, "is_fraud": True},
+                        {"fraud_probability": 0.15, "is_fraud": False},
+                    ],
+                },
+            }
+        ),
+    ]
+    noisy_log.write_text("\n".join(noisy_lines) + "\n", encoding="utf-8")
+
+    cf_text_out = tmp_path / "cf_text_out.json"
+    res_noisy_cf = runner.invoke(
+        app,
+        [
+            "pipeline-counterfactual",
+            str(noisy_log),
+            "--candidate-review",
+            "0.3",
+            "--candidate-deny",
+            "0.7",
+            "--output",
+            str(cf_text_out),
+        ],
+    )
+    assert res_noisy_cf.exit_code == 0, res_noisy_cf.output
+    assert "Report written to:" in res_noisy_cf.output
+
+
+def test_pipeline_eval_cli_circuit_breaker_options(tmp_path: Path, trained_artifact: Path) -> None:
+    data_path = tmp_path / "tx.csv"
+    generate_synthetic_data(rows=200, random_state=42).iloc[:20].to_csv(data_path, index=False)
+    out_file = tmp_path / "eval_cb.json"
+
+    res = runner.invoke(
+        app,
+        [
+            "pipeline-eval",
+            "--model",
+            str(trained_artifact),
+            "--input",
+            str(data_path),
+            "--enable-circuit-breaker",
+            "--cb-failure-threshold",
+            "3",
+            "--cb-recovery-timeout",
+            "15.0",
+            "--output",
+            str(out_file),
+            "--json",
+        ],
+    )
+    assert res.exit_code == 0, res.output
+    data = json.loads(res.stdout)
+    assert data["circuit_breaker"]["enabled"] is True
+    assert "short_circuits_count" in data["circuit_breaker"]
+    assert "summary" in data["circuit_breaker"]
+
+    # Also test text output display
+    res_text = runner.invoke(
+        app,
+        [
+            "pipeline-eval",
+            "--model",
+            str(trained_artifact),
+            "--input",
+            str(data_path),
+            "--enable-circuit-breaker",
+        ],
+    )
+    assert res_text.exit_code == 0
+    assert "Circuit Breaker: Short Circuits=" in res_text.output
+
+
+def test_pipeline_chaos_cli_workflow(tmp_path: Path, trained_artifact: Path) -> None:
+    data_path = tmp_path / "tx_chaos.csv"
+    generate_synthetic_data(rows=200, random_state=42).iloc[:25].to_csv(data_path, index=False)
+
+    faults_path = tmp_path / "faults.json"
+    faults = [
+        {
+            "node_name": "rules",
+            "fault_type": "exception",
+            "start_index": 0,
+            "end_index": 5,
+            "error_message": "CLI Test Injected Chaos",
+        }
+    ]
+    faults_path.write_text(json.dumps(faults), encoding="utf-8")
+
+    out_json = tmp_path / "chaos_out.json"
+    audit_path = tmp_path / "chaos_audit.jsonl"
+
+    # Successful run with JSON output and audit logging
+    res = runner.invoke(
+        app,
+        [
+            "pipeline-chaos",
+            "--input",
+            str(data_path),
+            "--faults",
+            str(faults_path),
+            "--model",
+            str(trained_artifact),
+            "--sla-budget-ms",
+            "500.0",
+            "--enable-circuit-breaker",
+            "--cb-failure-threshold",
+            "2",
+            "--cb-recovery-timeout",
+            "0.01",
+            "--audit-log",
+            str(audit_path),
+            "--output",
+            str(out_json),
+            "--json",
+        ],
+    )
+    assert res.exit_code == 0, res.output
+    report = json.loads(res.stdout)
+    assert report["total_transactions"] == 25
+    assert report["circuit_breaker_enabled"] is True
+    assert report["circuit_trips"] >= 1
+    assert "rules" in report["stage_metrics"]
+    assert out_json.is_file()
+
+    # Check audit log written
+    assert audit_path.is_file()
+    lines = audit_path.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 1
+    ev = json.loads(lines[0])
+    assert ev["event_type"] == "pipeline_chaos"
+    assert ev["payload"]["circuit_trips"] >= 1
+
+    # Text output check
+    res_text = runner.invoke(
+        app,
+        [
+            "pipeline-chaos",
+            "--input",
+            str(data_path),
+            "--faults",
+            str(faults_path),
+            "--model",
+            str(trained_artifact),
+        ],
+    )
+    assert res_text.exit_code == 0
+    assert "Pipeline Chaos Resilience Report:" in res_text.output
+    assert "Status:" in res_text.output
+
+    # Default model fallback when --model is omitted
+    res_default_model = runner.invoke(
+        app,
+        [
+            "pipeline-chaos",
+            "--input",
+            str(data_path),
+            "--faults",
+            str(faults_path),
+            "--max-records",
+            "5",
+            "--json",
+        ],
+    )
+    assert res_default_model.exit_code == 0, res_default_model.output
+
+    # Failure exits: invalid faults file
+    bad_faults = tmp_path / "bad_faults.json"
+    bad_faults.write_text('{"not": "a list"}', encoding="utf-8")
+    res_bad_faults = runner.invoke(
+        app,
+        ["pipeline-chaos", "--input", str(data_path), "--faults", str(bad_faults)],
+    )
+    assert res_bad_faults.exit_code == 2
+
+    # Failure exits: --fail-on-sla-breach
+    res_sla_fail = runner.invoke(
+        app,
+        [
+            "pipeline-chaos",
+            "--input",
+            str(data_path),
+            "--faults",
+            str(faults_path),
+            "--sla-budget-ms",
+            "0.001",
+            "--fail-on-sla-breach",
+        ],
+    )
+    assert res_sla_fail.exit_code == 1
+
+    # Failure exits: --fail-on-unrecovered
+    unrecovered_faults = tmp_path / "unrec_faults.json"
+    unrec = [
+        {
+            "node_name": "rules",
+            "fault_type": "exception",
+            "start_index": 0,
+            "end_index": 25,
+        }
+    ]
+    unrecovered_faults.write_text(json.dumps(unrec), encoding="utf-8")
+    res_unrec_fail = runner.invoke(
+        app,
+        [
+            "pipeline-chaos",
+            "--input",
+            str(data_path),
+            "--faults",
+            str(unrecovered_faults),
+            "--cb-recovery-timeout",
+            "60.0",
+            "--fail-on-unrecovered",
+        ],
+    )
+    assert res_unrec_fail.exit_code == 1
+
+    # Text output check with --output option
+    res_text_out = runner.invoke(
+        app,
+        [
+            "pipeline-chaos",
+            "--input",
+            str(data_path),
+            "--faults",
+            str(faults_path),
+            "--model",
+            str(trained_artifact),
+            "--output",
+            str(tmp_path / "text_chaos_out.json"),
+        ],
+    )
+    assert res_text_out.exit_code == 0
+    assert "Report written to:" in res_text_out.output
+
+    # Error handling: non-existent model
+    res_bad_model = runner.invoke(
+        app,
+        [
+            "pipeline-chaos",
+            "--input",
+            str(data_path),
+            "--faults",
+            str(faults_path),
+            "--model",
+            str(tmp_path / "non_existent_model_dir"),
+        ],
+    )
+    assert res_bad_model.exit_code == 2
+    assert "Failed to load model" in res_bad_model.output
+
+    # Error handling: non-existent rules
+    res_bad_rules = runner.invoke(
+        app,
+        [
+            "pipeline-chaos",
+            "--input",
+            str(data_path),
+            "--faults",
+            str(faults_path),
+            "--rules",
+            str(tmp_path / "non_existent_rules.json"),
+        ],
+    )
+    assert res_bad_rules.exit_code == 2
+    assert "Failed to load rules" in res_bad_rules.output
+
+    # Error handling: empty input dataset triggering pd.read_csv EmptyDataError
+    empty_csv = tmp_path / "empty_input.csv"
+    empty_csv.write_text("", encoding="utf-8")
+    res_bad_input = runner.invoke(
+        app,
+        [
+            "pipeline-chaos",
+            "--input",
+            str(empty_csv),
+            "--faults",
+            str(faults_path),
+        ],
+    )
+    assert res_bad_input.exit_code == 2
+    assert "Failed to read input dataset" in res_bad_input.output
+
+    # Error handling: malformed JSON faults file
+    corrupt_faults = tmp_path / "corrupt_faults.json"
+    corrupt_faults.write_text("{malformed json", encoding="utf-8")
+    res_corrupt_faults = runner.invoke(
+        app,
+        [
+            "pipeline-chaos",
+            "--input",
+            str(data_path),
+            "--faults",
+            str(corrupt_faults),
+        ],
+    )
+    assert res_corrupt_faults.exit_code == 2
+    assert "Failed to read/parse fault specifications" in res_corrupt_faults.output
+
+    # Error handling: simulation failure from unknown target node
+    bad_node_faults = tmp_path / "bad_node_faults.json"
+    bad_node_faults.write_text(
+        json.dumps([{"node_name": "unknown_node", "fault_type": "exception"}]),
+        encoding="utf-8",
+    )
+    res_sim_fail = runner.invoke(
+        app,
+        [
+            "pipeline-chaos",
+            "--input",
+            str(data_path),
+            "--faults",
+            str(bad_node_faults),
+        ],
+    )
+    assert res_sim_fail.exit_code == 2
+    assert "Chaos simulation failed" in res_sim_fail.output
+
+
+def test_ingest_labels_cli_workflows(tmp_path: Path) -> None:
+    # 1. Ingest from CSV
+    csv_path = tmp_path / "delayed_labels.csv"
+    csv_content = (
+        "transaction_id,event_timestamp,label_timestamp,dispute_type,is_fraud,amount\n"
+        "tx_cli_1,1000.0,87400.0,chargeback,True,150.0\n"
+        "tx_cli_2,1000.0,90000.0,fraud_dispute,True,200.0\n"
+    )
+    csv_path.write_text(csv_content, encoding="utf-8")
+    out_json = tmp_path / "ingest_report.json"
+
+    res_csv = runner.invoke(
+        app,
+        ["ingest-labels", "--labels-path", str(csv_path), "--output", str(out_json)],
+    )
+    assert res_csv.exit_code == 0
+    assert "Successfully ingested 2 delayed label(s)" in res_csv.output
+    assert out_json.is_file()
+    rep = json.loads(out_json.read_text(encoding="utf-8"))
+    assert rep["ingested_count"] == 2
+    assert rep["status"] == "success"
+
+    # 2. Ingest from JSONL with --json flag
+    jsonl_path = tmp_path / "delayed_labels.jsonl"
+    jsonl_content = (
+        json.dumps(
+            {
+                "transaction_id": "tx_cli_3",
+                "event_timestamp": 1000.0,
+                "label_timestamp": 88000.0,
+                "dispute_type": "merchant_inquiry",
+                "is_fraud": False,
+                "amount": 50.0,
+            }
+        )
+        + "\n"
+    )
+    jsonl_path.write_text(jsonl_content, encoding="utf-8")
+
+    res_jsonl = runner.invoke(
+        app,
+        ["ingest-labels", "--labels-path", str(jsonl_path), "--json"],
+    )
+    assert res_jsonl.exit_code == 0
+    parsed = json.loads(res_jsonl.output)
+    assert parsed["ingested_count"] == 1
+
+    # 3. Unsupported file extension error handling
+    txt_path = tmp_path / "delayed_labels.txt"
+    txt_path.write_text("dummy", encoding="utf-8")
+    res_unsupported = runner.invoke(
+        app,
+        ["ingest-labels", "--labels-path", str(txt_path)],
+    )
+    assert res_unsupported.exit_code == 2
+    assert "Unsupported labels file extension" in res_unsupported.output
+
+
+def test_feedback_surveillance_cli_workflows(tmp_path: Path) -> None:
+    # Build audit log and labels
+    audit_file = tmp_path / "audit_cli.jsonl"
+    audit_lines = [
+        json.dumps(
+            {
+                "event_type": "scoring",
+                "timestamp": 1000.0,
+                "payload": {
+                    "predictions": [
+                        {
+                            "transaction_id": "tx_c1",
+                            "fraud_probability": 0.9,
+                            "decision": "deny",
+                            "amount": 300.0,
+                        }
+                    ]
+                },
+            }
+        ),
+        json.dumps(
+            {
+                "event_type": "scoring",
+                "timestamp": 1000.0,
+                "payload": {
+                    "predictions": [
+                        {
+                            "transaction_id": "tx_c2",
+                            "fraud_probability": 0.05,
+                            "decision": "allow",
+                            "amount": 80.0,
+                        }
+                    ]
+                },
+            }
+        ),
+    ]
+    audit_file.write_text("\n".join(audit_lines) + "\n", encoding="utf-8")
+
+    labels_file = tmp_path / "labels_cli.jsonl"
+    labels_lines = [
+        json.dumps(
+            {
+                "transaction_id": "tx_c1",
+                "event_timestamp": 1000.0,
+                "label_timestamp": 87400.0,
+                "dispute_type": "chargeback",
+                "is_fraud": True,
+                "amount": 300.0,
+            }
+        ),
+        json.dumps(
+            {
+                "transaction_id": "tx_c2",
+                "event_timestamp": 1000.0,
+                "label_timestamp": 90000.0,
+                "dispute_type": "merchant_inquiry",
+                "is_fraud": False,
+                "amount": 80.0,
+            }
+        ),
+    ]
+    labels_file.write_text("\n".join(labels_lines) + "\n", encoding="utf-8")
+
+    out_surv = tmp_path / "surv_report.json"
+
+    # 1. Normal surveillance run
+    res_normal = runner.invoke(
+        app,
+        [
+            "feedback-surveillance",
+            "--audit-log",
+            str(audit_file),
+            "--labels-path",
+            str(labels_file),
+            "--target-maturity-level",
+            "0.0",
+            "--min-transactions",
+            "2",
+            "--output",
+            str(out_surv),
+        ],
+    )
+    assert res_normal.exit_code == 0
+    assert "Realized Precision: 1.0000" in res_normal.output
+    assert "[POLICY OK]" in res_normal.output
+    assert out_surv.is_file()
+
+    # 2. JSON stdout output
+    res_json = runner.invoke(
+        app,
+        [
+            "feedback-surveillance",
+            "--audit-log",
+            str(audit_file),
+            "--labels-path",
+            str(labels_file),
+            "--target-maturity-level",
+            "0.0",
+            "--min-transactions",
+            "2",
+            "--json",
+        ],
+    )
+    assert res_json.exit_code == 0
+    parsed = json.loads(res_json.output)
+    assert parsed["policy_breached"] is False
+    assert parsed["total_matured_transactions"] == 2
+
+    # 3. Retraining trigger gate breach exit code 1
+    # Add a false positive to trigger precision drop
+    audit_lines.append(
+        json.dumps(
+            {
+                "event_type": "scoring",
+                "timestamp": 1000.0,
+                "payload": {
+                    "predictions": [
+                        {
+                            "transaction_id": "tx_c3",
+                            "fraud_probability": 0.85,
+                            "decision": "deny",
+                            "amount": 100.0,
+                        }
+                    ]
+                },
+            }
+        )
+    )
+    audit_file.write_text("\n".join(audit_lines) + "\n", encoding="utf-8")
+
+    labels_lines.append(
+        json.dumps(
+            {
+                "transaction_id": "tx_c3",
+                "event_timestamp": 1000.0,
+                "label_timestamp": 88000.0,
+                "dispute_type": "friendly_fraud",
+                "is_fraud": False,
+                "amount": 100.0,
+            }
+        )
+    )
+    labels_file.write_text("\n".join(labels_lines) + "\n", encoding="utf-8")
+
+    # Realized precision is now 1/2 = 0.5. With min_precision=0.7 and gate=True, exit code 1
+    res_gate = runner.invoke(
+        app,
+        [
+            "feedback-surveillance",
+            "--audit-log",
+            str(audit_file),
+            "--labels-path",
+            str(labels_file),
+            "--target-maturity-level",
+            "0.0",
+            "--min-transactions",
+            "2",
+            "--min-precision",
+            "0.70",
+            "--gate",
+        ],
+    )
+    assert res_gate.exit_code == 1
+    assert "[RETRAINING TRIGGERED]" in res_gate.output
+
+    # 4. Error handling on invalid parameter
+    res_invalid_param = runner.invoke(
+        app,
+        [
+            "feedback-surveillance",
+            "--audit-log",
+            str(audit_file),
+            "--labels-path",
+            str(labels_file),
+            "--min-precision",
+            "1.5",
+        ],
+    )
+    assert res_invalid_param.exit_code == 2
+    assert "Feedback surveillance failed" in res_invalid_param.output
+
+
+def test_cli_auto_retrain_workflow_and_exit_codes(tmp_path: Path) -> None:
+    """Test fraud-detect auto-retrain command end-to-end including exit code gating."""
+    raw_df = generate_synthetic_data(rows=200, fraud_rate=0.1, random_state=42)
+    features_df = raw_df.drop(columns=["Class"])
+
+    # 1. Train and save champion model
+    dataset = validate_frame(raw_df)
+    champ_cfg = TrainingConfig(estimator=EstimatorType.LOGISTIC_REGRESSION, random_state=42)
+    champ_model = train_model(dataset, config=champ_cfg)
+    champ_dir = tmp_path / "champion_model"
+    save_model(champ_model, champ_dir)
+
+    # 2. Prepare audit log and labels files
+    audit_file = tmp_path / "scoring_audit.jsonl"
+    labels_file = tmp_path / "labels.jsonl"
+    audit_lines = []
+    labels_lines = []
+    for i, row in raw_df.iterrows():
+        tx_id = f"tx_retrain_{i:04d}"
+        feat_dict = {c: float(row[c]) for c in features_df.columns}
+        is_fraud = int(row["Class"])
+        audit_lines.append(
+            json.dumps(
+                {
+                    "event_type": "scoring",
+                    "timestamp": 1000.0 + float(i),
+                    "payload": {
+                        "predictions": [
+                            {
+                                "transaction_id": tx_id,
+                                "fraud_probability": 0.85 if is_fraud else 0.05,
+                                "decision": "deny" if is_fraud else "allow",
+                                "amount": float(feat_dict.get("Amount", 50.0)),
+                            }
+                        ],
+                        "features": [feat_dict],
+                    },
+                }
+            )
+        )
+        labels_lines.append(
+            json.dumps(
+                {
+                    "transaction_id": tx_id,
+                    "event_timestamp": 1000.0 + float(i),
+                    "label_timestamp": 1000.0 + float(i) + 1800.0,
+                    "dispute_type": "chargeback" if is_fraud else "friendly_fraud",
+                    "is_fraud": bool(is_fraud),
+                    "amount": float(feat_dict.get("Amount", 50.0)),
+                }
+            )
+        )
+    audit_file.write_text("\n".join(audit_lines) + "\n", encoding="utf-8")
+    labels_file.write_text("\n".join(labels_lines) + "\n", encoding="utf-8")
+
+    # Keypair for cryptographic attestation
+    key_dir = tmp_path / "keys"
+    key_dir.mkdir()
+    priv_key = key_dir / "ed25519.pem"
+    pub_key = key_dir / "ed25519.pub"
+    write_keypair(priv_key, pub_key)
+
+    # 3. Success run with --json (exit code 0)
+    cand_dir = tmp_path / "candidate_model"
+    res_success = runner.invoke(
+        app,
+        [
+            "auto-retrain",
+            "--audit-log-path",
+            str(audit_file),
+            "--labels-path",
+            str(labels_file),
+            "--champion-model-path",
+            str(champ_dir),
+            "--output-dir",
+            str(cand_dir),
+            "--estimator",
+            "logistic_regression",
+            "--signing-key-path",
+            str(priv_key),
+            "--promote",
+            "canary",
+            "--canary-percentage",
+            "20.0",
+            "--min-pr-auc-delta",
+            "-0.10",
+            "--json",
+        ],
+    )
+    assert res_success.exit_code == 0
+    report_data = json.loads(res_success.output)
+    assert report_data["status"] == "completed"
+    assert report_data["verification_status"] == "passed"
+    assert report_data["promoted"] is True
+    assert report_data["promotion_type"] == "canary"
+    assert (cand_dir / "attestation.json").is_file()
+
+    # 4. Text output run without json flag
+    cand_dir_text = tmp_path / "candidate_model_text"
+    res_text = runner.invoke(
+        app,
+        [
+            "auto-retrain",
+            "--audit-log-path",
+            str(audit_file),
+            "--labels-path",
+            str(labels_file),
+            "--champion-model-path",
+            str(champ_dir),
+            "--output-dir",
+            str(cand_dir_text),
+            "--estimator",
+            "logistic_regression",
+            "--min-pr-auc-delta",
+            "-0.10",
+        ],
+    )
+    assert res_text.exit_code == 0
+    assert "Candidate Retraining Complete:" in res_text.output
+    assert "PASSED" in res_text.output
+
+    # 5. Candidate safety verification rejection (exit code 3)
+    cand_dir_reject = tmp_path / "candidate_rejected"
+    res_reject = runner.invoke(
+        app,
+        [
+            "auto-retrain",
+            "--audit-log-path",
+            str(audit_file),
+            "--labels-path",
+            str(labels_file),
+            "--champion-model-path",
+            str(champ_dir),
+            "--output-dir",
+            str(cand_dir_reject),
+            "--min-pr-auc-delta",
+            "0.99",  # Impossible requirement to trigger safety gate failure
+        ],
+    )
+    assert res_reject.exit_code == 3
+    assert "FAILED" in res_reject.output
+    # Artifact bundle is preserved for audit trail even when rejected
+    assert (cand_dir_reject / "attestation.json").is_file()
+
+    # 6. Exit code 2 on configuration/argument errors
+    # Invalid promote option
+    res_bad_promote = runner.invoke(
+        app,
+        [
+            "auto-retrain",
+            "--audit-log-path",
+            str(audit_file),
+            "--labels-path",
+            str(labels_file),
+            "--champion-model-path",
+            str(champ_dir),
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--promote",
+            "invalid_option",
+        ],
+    )
+    assert res_bad_promote.exit_code == 2
+
+    # Invalid canary percentage
+    res_bad_pct = runner.invoke(
+        app,
+        [
+            "auto-retrain",
+            "--audit-log-path",
+            str(audit_file),
+            "--labels-path",
+            str(labels_file),
+            "--champion-model-path",
+            str(champ_dir),
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--canary-percentage",
+            "150.0",
+        ],
+    )
+    assert res_bad_pct.exit_code == 2
+
+    # Malformed hyperparameters json
+    res_bad_hparams = runner.invoke(
+        app,
+        [
+            "auto-retrain",
+            "--audit-log-path",
+            str(audit_file),
+            "--labels-path",
+            str(labels_file),
+            "--champion-model-path",
+            str(champ_dir),
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--hyperparameters-json",
+            "{not_valid_json",
+        ],
+    )
+    assert res_bad_hparams.exit_code == 2
+
+    # Invalid labels extension
+    bad_labels_file = tmp_path / "labels.txt"
+    bad_labels_file.write_text("dummy")
+    res_bad_ext = runner.invoke(
+        app,
+        [
+            "auto-retrain",
+            "--audit-log-path",
+            str(audit_file),
+            "--labels-path",
+            str(bad_labels_file),
+            "--champion-model-path",
+            str(champ_dir),
+            "--output-dir",
+            str(tmp_path / "out"),
+        ],
+    )
+    assert res_bad_ext.exit_code == 2
+
+    # 7. Exit code 1 on dataset materialization failure (empty audit log)
+    empty_log = tmp_path / "empty_audit.jsonl"
+    empty_log.write_text("")
+    res_dataset_err = runner.invoke(
+        app,
+        [
+            "auto-retrain",
+            "--audit-log-path",
+            str(empty_log),
+            "--labels-path",
+            str(labels_file),
+            "--champion-model-path",
+            str(champ_dir),
+            "--output-dir",
+            str(tmp_path / "out"),
+        ],
+    )
+    assert res_dataset_err.exit_code == 1
+
+    # 8. Promotion via API URL
+    cand_dir_api = tmp_path / "candidate_api"
+    with patch("urllib.request.urlopen") as mock_urlopen:
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = json.dumps(
+            {"status": "promoted", "message": "Promoted via mock API"}
+        ).encode("utf-8")
+        mock_resp.__enter__.return_value = mock_resp
+        mock_urlopen.return_value = mock_resp
+
+        res_api_promo = runner.invoke(
+            app,
+            [
+                "auto-retrain",
+                "--audit-log-path",
+                str(audit_file),
+                "--labels-path",
+                str(labels_file),
+                "--champion-model-path",
+                str(champ_dir),
+                "--output-dir",
+                str(cand_dir_api),
+                "--promote",
+                "canary",
+                "--min-pr-auc-delta",
+                "-0.10",
+                "--api-url",
+                "http://localhost:8000",
+                "--json",
+            ],
+        )
+        assert res_api_promo.exit_code == 0
+        parsed_api = json.loads(res_api_promo.output)
+        assert parsed_api["promoted"] is True
+        assert "Promoted via mock API" in parsed_api["promotion_message"]
+
+
+def test_cli_auto_retrain_additional_branches(tmp_path: Path) -> None:
+    """Test hyperparameters-file, csv labels, report-output, human formatting, and API errors."""
+    raw_df = generate_synthetic_data(rows=200, fraud_rate=0.1, random_state=42)
+    raw_df["channel"] = [0.0 if i % 2 == 0 else 1.0 for i in range(len(raw_df))]
+    champ_dir = tmp_path / "champ_cli2"
+    champ_dataset = validate_frame(raw_df)
+    champ_cfg = TrainingConfig(estimator=EstimatorType.LOGISTIC_REGRESSION, random_state=42)
+    champ_model = train_model(champ_dataset, config=champ_cfg)
+    save_model(champ_model, champ_dir)
+
+    # 1. Prepare CSV labels
+    labels_csv = tmp_path / "labels.csv"
+    with labels_csv.open("w", encoding="utf-8") as f:
+        f.write("transaction_id,event_timestamp,label_timestamp,dispute_type,is_fraud,amount\n")
+        for idx in range(150):
+            is_f = 1 if raw_df.iloc[idx]["Class"] == 1 else 0
+            f.write(
+                f"tx_{idx},1700000000.0,1700003600.0,chargeback,{is_f},{raw_df.iloc[idx]['Amount']}\n"
+            )
+
+    # Prepare audit log with slice column "channel"
+    audit_file = tmp_path / "audit2.jsonl"
+    with audit_file.open("w", encoding="utf-8") as f:
+        for idx in range(150):
+            row = raw_df.iloc[idx].to_dict()
+            rec = {
+                "event_type": "scoring",
+                "timestamp": 1700000000.0 + float(idx),
+                "payload": {
+                    "request_id": f"req_{idx}",
+                    "predictions": [
+                        {"transaction_id": f"tx_{idx}", "amount": float(row["Amount"])}
+                    ],
+                    "features": [row],
+                },
+            }
+            f.write(json.dumps(rec) + "\n")
+
+    # Hyperparameters file
+    hp_file = tmp_path / "hparams.json"
+    hp_file.write_text(json.dumps({"regularization": 0.5}), encoding="utf-8")
+
+    # 2. Run with hyperparameters-file, csv labels, report-output, and human formatting
+    rep_file = tmp_path / "out_report.json"
+    cand_dir = tmp_path / "cand_out2"
+    res_human = runner.invoke(
+        app,
+        [
+            "auto-retrain",
+            "--audit-log-path",
+            str(audit_file),
+            "--labels-path",
+            str(labels_csv),
+            "--champion-model-path",
+            str(champ_dir),
+            "--output-dir",
+            str(cand_dir),
+            "--hyperparameters-file",
+            str(hp_file),
+            "--slice-column",
+            "channel",
+            "--promote",
+            "full",
+            "--report-output",
+            str(rep_file),
+        ],
+    )
+    assert res_human.exit_code == 0, res_human.output
+    assert "Candidate Retraining Complete:" in res_human.output
+    assert rep_file.is_file()
+    saved_rep = json.loads(rep_file.read_text(encoding="utf-8"))
+    assert saved_rep["status"] == "completed"
+
+    # 3. Corrupt hyperparameters file
+    bad_hp = tmp_path / "bad_hp.json"
+    bad_hp.write_text("invalid json {{{", encoding="utf-8")
+    res_bad_hp = runner.invoke(
+        app,
+        [
+            "auto-retrain",
+            "--audit-log-path",
+            str(audit_file),
+            "--labels-path",
+            str(labels_csv),
+            "--champion-model-path",
+            str(champ_dir),
+            "--output-dir",
+            str(cand_dir),
+            "--hyperparameters-file",
+            str(bad_hp),
+        ],
+    )
+    assert res_bad_hp.exit_code == 2
+    assert "Failed to read hyperparameters file" in res_bad_hp.output
+
+    # 4. Corrupt champion model
+    bad_champ = tmp_path / "bad_champ"
+    bad_champ.mkdir()
+    res_bad_champ = runner.invoke(
+        app,
+        [
+            "auto-retrain",
+            "--audit-log-path",
+            str(audit_file),
+            "--labels-path",
+            str(labels_csv),
+            "--champion-model-path",
+            str(bad_champ),
+            "--output-dir",
+            str(cand_dir),
+        ],
+    )
+    assert res_bad_champ.exit_code == 2
+    assert "Failed to load champion model" in res_bad_champ.output
+
+    # 5. Invalid api-url scheme (not http/https)
+    res_bad_url = runner.invoke(
+        app,
+        [
+            "auto-retrain",
+            "--audit-log-path",
+            str(audit_file),
+            "--labels-path",
+            str(labels_csv),
+            "--champion-model-path",
+            str(champ_dir),
+            "--output-dir",
+            str(cand_dir),
+            "--promote",
+            "canary",
+            "--api-url",
+            "ftp://localhost:8000",
+        ],
+    )
+    assert res_bad_url.exit_code == 2
+    assert "Invalid api-url" in res_bad_url.output
+
+    # 6. API call network failure raises exit code 1
+    with patch("urllib.request.urlopen") as mock_url:
+        mock_url.side_effect = urllib.error.URLError("Connection refused")
+        res_promo_fail = runner.invoke(
+            app,
+            [
+                "auto-retrain",
+                "--audit-log-path",
+                str(audit_file),
+                "--labels-path",
+                str(labels_csv),
+                "--champion-model-path",
+                str(champ_dir),
+                "--output-dir",
+                str(cand_dir),
+                "--promote",
+                "canary",
+                "--api-url",
+                "http://localhost:8000",
+            ],
+        )
+        assert res_promo_fail.exit_code == 1
+        assert "API promotion call failed" in res_promo_fail.output
+
+    # 7. ChallengerTrainer failure
+    with patch("fraud_detection.cli.ChallengerTrainer.train") as mock_tr:
+        from fraud_detection.retraining import RetrainingError
+
+        mock_tr.side_effect = RetrainingError("Synthetic train failure")
+        res_tr_fail = runner.invoke(
+            app,
+            [
+                "auto-retrain",
+                "--audit-log-path",
+                str(audit_file),
+                "--labels-path",
+                str(labels_csv),
+                "--champion-model-path",
+                str(champ_dir),
+                "--output-dir",
+                str(cand_dir),
+            ],
+        )
+        assert res_tr_fail.exit_code == 1
+        assert "Challenger model training failed" in res_tr_fail.output
+
+    # 8. ChallengerSafetyVerifier failure
+    with patch("fraud_detection.cli.ChallengerSafetyVerifier.verify_candidate") as mock_vf:
+        mock_vf.side_effect = RetrainingError("Synthetic verify failure")
+        res_vf_fail = runner.invoke(
+            app,
+            [
+                "auto-retrain",
+                "--audit-log-path",
+                str(audit_file),
+                "--labels-path",
+                str(labels_csv),
+                "--champion-model-path",
+                str(champ_dir),
+                "--output-dir",
+                str(cand_dir),
+            ],
+        )
+        assert res_vf_fail.exit_code == 1
+        assert "Candidate verification error" in res_vf_fail.output
+
+    # 9. export_certified_candidate failure
+    with patch("fraud_detection.cli.export_certified_candidate") as mock_exp:
+        mock_exp.side_effect = RetrainingError("Synthetic export failure")
+        res_exp_fail = runner.invoke(
+            app,
+            [
+                "auto-retrain",
+                "--audit-log-path",
+                str(audit_file),
+                "--labels-path",
+                str(labels_csv),
+                "--champion-model-path",
+                str(champ_dir),
+                "--output-dir",
+                str(cand_dir),
+            ],
+        )
+        assert res_exp_fail.exit_code == 1
+        assert "Failed to export candidate artifact" in res_exp_fail.output
+
+
+def test_cli_graph_rings_workflow(tmp_path: Path) -> None:
+    """Verify graph-rings CLI command with CSV, JSON options, and failure thresholds."""
+    runner = CliRunner()
+
+    rows = [
+        {
+            "transaction_id": f"tx_bot_{i}",
+            "Time": 100.0 + i * 10.0,
+            "Amount": 1.50,
+            "card_id": f"card_bot_{i}",
+            "device_id": "dev_bot",
+            "ip_address": "192.168.1.10",
+            "Class": 1,
+            "risk_score": 0.95,
+        }
+        for i in range(5)
+    ] + [
+        {
+            "transaction_id": f"tx_legit_{i}",
+            "Time": 500.0 + i * 20.0,
+            "Amount": 45.0,
+            "card_id": f"card_legit_{i}",
+            "device_id": f"dev_legit_{i}",
+            "ip_address": f"10.0.0.{i}",
+            "Class": 0,
+            "risk_score": 0.05,
+        }
+        for i in range(3)
+    ]
+
+    tx_csv = tmp_path / "transactions.csv"
+    pd.DataFrame(rows).to_csv(tx_csv, index=False)
+
+    out_json = tmp_path / "rings_report.json"
+
+    # 1. Successful run with json flag and output persistence
+    res = runner.invoke(
+        app,
+        [
+            "graph-rings",
+            "--input-file",
+            str(tx_csv),
+            "--output",
+            str(out_json),
+            "--json",
+            "--min-risk",
+            "0.5",
+        ],
+    )
+    assert res.exit_code == 0
+    assert out_json.exists()
+    report_data = json.loads(res.output)
+    assert report_data["total_clusters"] >= 1
+    assert report_data["critical_count"] >= 1
+
+    # 2. Refuse overwrite without flag
+    res_overwrite_err = runner.invoke(
+        app,
+        [
+            "graph-rings",
+            "--input-file",
+            str(tx_csv),
+            "--output",
+            str(out_json),
+        ],
+    )
+    assert res_overwrite_err.exit_code == 2
+    assert "Output already exists" in res_overwrite_err.output
+
+    # 3. Allow overwrite with flag and test human-readable output
+    res_table = runner.invoke(
+        app,
+        [
+            "graph-rings",
+            "--input-file",
+            str(tx_csv),
+            "--output",
+            str(out_json),
+            "--overwrite",
+        ],
+    )
+    assert res_table.exit_code == 0
+    assert "Fraud Ring Link Analysis Report:" in res_table.output
+    assert "Critical Severity:" in res_table.output
+
+    # 4. Fail on rings when critical or high detected
+    res_fail = runner.invoke(
+        app,
+        [
+            "graph-rings",
+            "--input-file",
+            str(tx_csv),
+            "--fail-on-rings",
+        ],
+    )
+    assert res_fail.exit_code == 3
+    assert "Fraud rings detected" in res_fail.output
+
+    # 5. Missing input file
+    res_missing = runner.invoke(
+        app,
+        [
+            "graph-rings",
+            "--input-file",
+            str(tmp_path / "missing.csv"),
+        ],
+    )
+    assert res_missing.exit_code == 2
+    assert "Input file not found" in res_missing.output
+
+
+def test_cli_graph_rings_json_input(tmp_path: Path) -> None:
+    """Verify graph-rings with JSON input format."""
+    runner = CliRunner()
+    tx_json = tmp_path / "transactions.json"
+    records = [
+        {
+            "transaction_id": "tx1",
+            "Time": 10.0,
+            "Amount": 10.0,
+            "card_id": "card_a",
+            "device_id": "dev_shared",
+            "ip_address": "1.1.1.1",
+        },
+        {
+            "transaction_id": "tx2",
+            "Time": 20.0,
+            "Amount": 15.0,
+            "card_id": "card_b",
+            "device_id": "dev_shared",
+            "ip_address": "1.1.1.1",
+        },
+    ]
+    tx_json.write_text(json.dumps(records), encoding="utf-8")
+
+    res = runner.invoke(
+        app,
+        [
+            "graph-rings",
+            "--input-file",
+            str(tx_json),
+            "--json",
+        ],
+    )
+    assert res.exit_code == 0
+    data = json.loads(res.output)
+    assert "total_clusters" in data
+
+
+def test_cli_graph_enrich_workflow(tmp_path: Path) -> None:
+    """Verify graph-enrich CLI command and streaming feature column creation."""
+    runner = CliRunner()
+
+    df_in = pd.DataFrame(
+        [
+            {
+                "transaction_id": "tx1",
+                "Time": 100.0,
+                "Amount": 25.0,
+                "card_id": "card_1",
+                "device_id": "dev_1",
+                "ip_address": "10.0.0.1",
+                "V1": 0.5,
+                "Class": 0,
+            },
+            {
+                "transaction_id": "tx2",
+                "Time": 200.0,
+                "Amount": 125.0,
+                "card_id": "card_2",
+                "device_id": "dev_1",
+                "ip_address": "10.0.0.1",
+                "V1": -0.2,
+                "Class": 1,
+            },
+            {
+                "transaction_id": "tx3",
+                "Time": 300.0,
+                "Amount": 300.0,
+                "card_id": "card_1",
+                "device_id": "dev_2",
+                "ip_address": "10.0.0.2",
+                "V1": 1.2,
+                "Class": 0,
+            },
+        ]
+    )
+    in_csv = tmp_path / "raw_tx.csv"
+    df_in.to_csv(in_csv, index=False)
+    out_csv = tmp_path / "enriched_tx.csv"
+
+    # 1. Successful enrichment
+    res = runner.invoke(
+        app,
+        [
+            "graph-enrich",
+            "--input-file",
+            str(in_csv),
+            "--output-file",
+            str(out_csv),
+            "--window-seconds",
+            "3600.0",
+        ],
+    )
+    assert res.exit_code == 0
+    assert "Successfully enriched 3 transactions" in res.output
+    assert out_csv.exists()
+
+    df_out = pd.read_csv(out_csv)
+    assert len(df_out) == len(df_in)
+    assert len(df_out.columns) > len(df_in.columns)
+    assert "graph_card_id_tx_count_3600s" in df_out.columns
+    assert "graph_risk_diffusion" in df_out.columns
+
+    # 2. Refuse overwrite without flag
+    res_ov = runner.invoke(
+        app,
+        [
+            "graph-enrich",
+            "--input-file",
+            str(in_csv),
+            "--output-file",
+            str(out_csv),
+        ],
+    )
+    assert res_ov.exit_code == 2
+    assert "Output already exists" in res_ov.output
+
+    # 3. Missing input file
+    res_miss = runner.invoke(
+        app,
+        [
+            "graph-enrich",
+            "--input-file",
+            str(tmp_path / "no_such_file.csv"),
+            "--output-file",
+            str(tmp_path / "out.csv"),
+        ],
+    )
+    assert res_miss.exit_code == 2
+    assert "Input file not found" in res_miss.output
+
+
+def test_cli_geo_velocity_csv_workflow(tmp_path: Path) -> None:
+    """Verify geo-velocity command evaluating CSV transactions and detecting impossible travel."""
+    runner = CliRunner()
+
+    df_in = pd.DataFrame(
+        [
+            {
+                "transaction_id": "tx1",
+                "card_id": "card_99",
+                "Time": 100.0,
+                "Amount": 50.0,
+                "latitude": 51.5074,
+                "longitude": -0.1278,
+                "country_code": "GB",
+            },
+            {
+                "transaction_id": "tx2",
+                "card_id": "card_99",
+                "Time": 200.0,
+                "Amount": 150.0,
+                "latitude": 40.7128,
+                "longitude": -74.0060,
+                "country_code": "US",
+            },
+        ]
+    )
+    in_csv = tmp_path / "geo_tx.csv"
+    df_in.to_csv(in_csv, index=False)
+    out_json = tmp_path / "velocity_report.json"
+
+    # 1. Successful evaluation with JSON output
+    res = runner.invoke(
+        app,
+        [
+            "geo-velocity",
+            "--input-file",
+            str(in_csv),
+            "--as-json",
+            "--output",
+            str(out_json),
+        ],
+    )
+    assert res.exit_code == 0
+    assert out_json.exists()
+    data = json.loads(out_json.read_text(encoding="utf-8"))
+    assert data["total_entities"] == 1
+    assert data["evaluated_transitions_count"] == 1
+    assert data["impossible_travel_count"] == 1
+    assert data["max_speed_kmh"] > 900.0
+    assert len(data["impossible_anomalies"]) == 1
+
+    # 2. Text report format
+    res_text = runner.invoke(
+        app,
+        [
+            "geo-velocity",
+            "--input-file",
+            str(in_csv),
+        ],
+    )
+    assert res_text.exit_code == 0
+    assert "Geolocation Travel Velocity Analysis Report:" in res_text.output
+    assert "IMPOSSIBLE TRAVEL" in res_text.output
+
+    # 3. Fail on impossible travel
+    res_fail = runner.invoke(
+        app,
+        [
+            "geo-velocity",
+            "--input-file",
+            str(in_csv),
+            "--fail-on-impossible",
+        ],
+    )
+    assert res_fail.exit_code == 3
+    assert "Error: Impossible travel detected" in res_fail.output
+
+    # 4. Overwrite guard
+    res_ov = runner.invoke(
+        app,
+        [
+            "geo-velocity",
+            "--input-file",
+            str(in_csv),
+            "--output",
+            str(out_json),
+        ],
+    )
+    assert res_ov.exit_code == 2
+    assert "Output already exists" in res_ov.output
+
+    # 5. Overwrite success
+    res_ov_ok = runner.invoke(
+        app,
+        [
+            "geo-velocity",
+            "--input-file",
+            str(in_csv),
+            "--output",
+            str(out_json),
+            "--overwrite",
+        ],
+    )
+    assert res_ov_ok.exit_code == 0
+
+    # 6. Missing input file
+    res_miss = runner.invoke(
+        app,
+        [
+            "geo-velocity",
+            "--input-file",
+            str(tmp_path / "missing.csv"),
+        ],
+    )
+    assert res_miss.exit_code == 2
+    assert "Input file not found" in res_miss.output
+
+    # 7. Empty CSV
+    empty_csv = tmp_path / "empty.csv"
+    pd.DataFrame().to_csv(empty_csv, index=False)
+    res_empty = runner.invoke(
+        app,
+        [
+            "geo-velocity",
+            "--input-file",
+            str(empty_csv),
+        ],
+    )
+    assert res_empty.exit_code == 2
+
+
+def test_cli_geo_velocity_json_and_ip_workflow(tmp_path: Path) -> None:
+    """Verify geo-velocity parsing JSON array and JSONL with IP address resolution."""
+    runner = CliRunner()
+
+    records = [
+        {
+            "transaction_id": "tx1",
+            "entity_id": "user_42",
+            "timestamp": 1000.0,
+            "ip_address": "185.86.151.25",
+        },
+        {
+            "transaction_id": "tx2",
+            "entity_id": "user_42",
+            "timestamp": 1500.0,
+            "ip_address": "198.51.100.12",
+        },
+    ]
+
+    # Test JSON array
+    json_path = tmp_path / "events.json"
+    json_path.write_text(json.dumps(records), encoding="utf-8")
+
+    res_json = runner.invoke(
+        app,
+        [
+            "geo-velocity",
+            "--input-file",
+            str(json_path),
+            "--as-json",
+        ],
+    )
+    assert res_json.exit_code == 0
+    report = json.loads(res_json.output)
+    assert report["total_entities"] == 1
+    assert report["impossible_travel_count"] == 1
+
+    # Test JSONL
+    jsonl_path = tmp_path / "events.jsonl"
+    jsonl_path.write_text("\n".join(json.dumps(r) for r in records), encoding="utf-8")
+
+    res_jsonl = runner.invoke(
+        app,
+        [
+            "geo-velocity",
+            "--input-file",
+            str(jsonl_path),
+            "--as-json",
+        ],
+    )
+    assert res_jsonl.exit_code == 0
+    report_jsonl = json.loads(res_jsonl.output)
+    assert report_jsonl["total_entities"] == 1
+    assert report_jsonl["impossible_travel_count"] == 1
+
+    # Test empty JSON
+    empty_json = tmp_path / "empty.json"
+    empty_json.write_text("", encoding="utf-8")
+    res_empty = runner.invoke(app, ["geo-velocity", "-i", str(empty_json)])
+    assert res_empty.exit_code == 2
+
+    # Test malformed JSON array
+    bad_json = tmp_path / "bad.json"
+    bad_json.write_text("[{invalid", encoding="utf-8")
+    res_bad_json = runner.invoke(app, ["geo-velocity", "-i", str(bad_json)])
+    assert res_bad_json.exit_code == 2
+
+    # Test malformed JSONL line
+    bad_jsonl = tmp_path / "bad.jsonl"
+    bad_jsonl.write_text('{"a": 1}\n{bad_line\n', encoding="utf-8")
+    res_bad_jsonl = runner.invoke(app, ["geo-velocity", "-i", str(bad_jsonl)])
+    assert res_bad_jsonl.exit_code == 2
+
+    # Test empty array JSON
+    empty_arr = tmp_path / "empty_arr.json"
+    empty_arr.write_text("[]", encoding="utf-8")
+    res_empty_arr = runner.invoke(app, ["geo-velocity", "-i", str(empty_arr)])
+    assert res_empty_arr.exit_code == 2
+
+
+def test_cli_geo_enrich_workflow(tmp_path: Path) -> None:
+    """Verify geo-enrich command enriching dataset with 7 geolocation features."""
+    runner = CliRunner()
+
+    df_in = pd.DataFrame(
+        [
+            {
+                "transaction_id": "tx_a",
+                "card_id": "card_10",
+                "timestamp": 1000.0,
+                "latitude": 51.5074,
+                "longitude": -0.1278,
+                "billing_country": "GB",
+                "ip_address": "185.86.151.1",
+            },
+            {
+                "transaction_id": "tx_b",
+                "card_id": "card_10",
+                "timestamp": 2000.0,
+                "latitude": 40.7128,
+                "longitude": -74.0060,
+                "billing_country": "GB",
+                "ip_address": "198.51.100.1",
+            },
+        ]
+    )
+    in_csv = tmp_path / "in.csv"
+    df_in.to_csv(in_csv, index=False)
+    out_csv = tmp_path / "out_enriched.csv"
+
+    # 1. CSV enrichment
+    res = runner.invoke(
+        app,
+        [
+            "geo-enrich",
+            "--input-file",
+            str(in_csv),
+            "--output-file",
+            str(out_csv),
+        ],
+    )
+    assert res.exit_code == 0
+    assert "Successfully enriched 2 transactions with 7 geolocation features" in res.output
+    assert out_csv.exists()
+
+    df_out = pd.read_csv(out_csv)
+    assert len(df_out) == 2
+    assert "geo_distance_km" in df_out.columns
+    assert "geo_speed_kmh" in df_out.columns
+    assert "geo_time_delta_seconds" in df_out.columns
+    assert "geo_is_impossible_travel" in df_out.columns
+    assert "geo_is_cross_border" in df_out.columns
+    assert "geo_is_proxy" in df_out.columns
+    assert "geo_country_mismatch" in df_out.columns
+
+    assert df_out["geo_is_impossible_travel"].iloc[1] == 1.0
+
+    # 2. JSON format export
+    out_json = tmp_path / "out_enriched.json"
+    res_json = runner.invoke(
+        app,
+        [
+            "geo-enrich",
+            "-i",
+            str(in_csv),
+            "-o",
+            str(out_json),
+            "--format",
+            "json",
+        ],
+    )
+    assert res_json.exit_code == 0
+    assert out_json.exists()
+    json_data = json.loads(out_json.read_text(encoding="utf-8"))
+    assert len(json_data) == 2
+    assert "geo_is_impossible_travel" in json_data[1]
+
+    # 3. Guard overwrite
+    res_ov = runner.invoke(
+        app,
+        [
+            "geo-enrich",
+            "-i",
+            str(in_csv),
+            "-o",
+            str(out_csv),
+        ],
+    )
+    assert res_ov.exit_code == 2
+    assert "Output already exists" in res_ov.output
+
+    # 4. Overwrite allowed
+    res_ov_ok = runner.invoke(
+        app,
+        [
+            "geo-enrich",
+            "-i",
+            str(in_csv),
+            "-o",
+            str(out_csv),
+            "--overwrite",
+        ],
+    )
+    assert res_ov_ok.exit_code == 0
+
+    # 5. Missing input file
+    res_miss = runner.invoke(
+        app,
+        [
+            "geo-enrich",
+            "-i",
+            str(tmp_path / "missing.csv"),
+            "-o",
+            str(tmp_path / "dummy.csv"),
+        ],
+    )
+    assert res_miss.exit_code == 2
+
+
+def test_geo_velocity_cli_empty_csv(tmp_path: Path) -> None:
+    empty_csv = tmp_path / "empty_with_headers.csv"
+    empty_csv.write_text("card_id,lat,lon,timestamp\n", encoding="utf-8")
+    res = runner.invoke(app, ["geo-velocity", "-i", str(empty_csv)])
+    assert res.exit_code == 2
+    assert "Input file contains no transactions" in res.output
+
+
+def test_geo_enrich_cli_empty_csv(tmp_path: Path) -> None:
+    empty_csv = tmp_path / "empty_with_headers.csv"
+    empty_csv.write_text("card_id,lat,lon,timestamp\n", encoding="utf-8")
+    out_csv = tmp_path / "out.csv"
+    res = runner.invoke(app, ["geo-enrich", "-i", str(empty_csv), "-o", str(out_csv)])
+    assert res.exit_code == 2
+    assert "Input file contains no transactions" in res.output
+
+
+def test_geo_velocity_cli_edge_branches(tmp_path: Path) -> None:
+    jsonl_path = tmp_path / "edges.jsonl"
+    jsonl_path.write_text(
+        "\n"
+        '{"card_id": null, "lat": 40.0, "lon": -74.0}\n'
+        '{"card_id": "nan", "lat": 40.0, "lon": -74.0}\n'
+        '{"card_id": "c1", "timestamp": "invalid_ts", "lat": 40.0, "lon": -74.0}\n'
+        '{"card_id": "c1", "timestamp": 10.0, "lat": 999.0, "lon": -74.0}\n'
+        '{"card_id": "c1", "timestamp": 20.0, "ip": "10.0.0.1"}\n'
+        '{"card_id": "c1", "timestamp": 30.0, "lat": 40.7128, "lon": -74.0060}\n'
+        '{"card_id": "c1", "timestamp": 35.0, "lat": 48.8566, "lon": 2.3522}\n',
+        encoding="utf-8",
+    )
+    res = runner.invoke(app, ["geo-velocity", "-i", str(jsonl_path), "--as-json"])
+    assert res.exit_code == 0
+    data = json.loads(res.output)
+    assert data["total_entities"] == 1
+    assert data["impossible_travel_count"] == 2
+
+
+def test_device_clusters_cli_happy_path(tmp_path: Path) -> None:
+    csv_path = tmp_path / "transactions.csv"
+    csv_path.write_text(
+        "device_id,card_id,timestamp,user_agent,screen_width,screen_height\n"
+        "d_normal,c1,1000.0,Mozilla/5.0,1920,1080\n"
+        "d_normal,c1,1010.0,Mozilla/5.0,1920,1080\n"
+        "d_cycling,c2,1020.0,Mozilla/5.0,1920,1080\n"
+        "d_cycling,c3,1030.0,Mozilla/5.0,1920,1080\n"
+        "d_cycling,c4,1040.0,Mozilla/5.0,1920,1080\n"
+        "d_emu,c5,1050.0,HeadlessChrome/91.0,1920,1080\n",
+        encoding="utf-8",
+    )
+    rep_path = tmp_path / "report.json"
+
+    # 1. JSON output and file emission
+    res_json = runner.invoke(
+        app,
+        [
+            "device-clusters",
+            "-i",
+            str(csv_path),
+            "-o",
+            str(rep_path),
+            "--json",
+            "--card-cycling-threshold",
+            "2",
+        ],
+    )
+    assert res_json.exit_code == 0, res_json.output
+    data = json.loads(res_json.output)
+    assert data["total_events_processed"] == 6
+    assert data["total_devices_tracked"] == 3
+    assert data["card_cycling_anomalies_count"] >= 1
+    assert data["emulator_anomalies_count"] >= 1
+    assert rep_path.exists()
+    file_data = json.loads(rep_path.read_text(encoding="utf-8"))
+    assert file_data["total_devices_tracked"] == 3
+
+    # 2. Human readable summary output
+    res_text = runner.invoke(
+        app,
+        [
+            "device-clusters",
+            "-i",
+            str(csv_path),
+            "--card-cycling-threshold",
+            "2",
+        ],
+    )
+    assert res_text.exit_code == 0, res_text.output
+    assert "Device Fingerprinting & Anomaly Clustering Report:" in res_text.output
+    assert "Total Devices Tracked:" in res_text.output
+
+
+def test_device_clusters_cli_fail_on_anomaly(tmp_path: Path) -> None:
+    csv_path = tmp_path / "transactions_emu.csv"
+    csv_path.write_text(
+        "device_id,card_id,timestamp,user_agent\n"
+        "d_bot,c1,1000.0,HeadlessChrome/91.0\n"
+        "d_bot,c2,1010.0,HeadlessChrome/91.0\n",
+        encoding="utf-8",
+    )
+    res = runner.invoke(
+        app,
+        [
+            "device-clusters",
+            "-i",
+            str(csv_path),
+            "--fail-on-anomaly",
+            "--card-cycling-threshold",
+            "2",
+        ],
+    )
+    assert res.exit_code == 3
+    assert "Failing per --fail-on-anomaly" in res.output
+
+
+def test_device_clusters_cli_guard_and_errors(tmp_path: Path) -> None:
+    # 1. Missing input file
+    res_miss = runner.invoke(app, ["device-clusters", "-i", str(tmp_path / "missing.csv")])
+    assert res_miss.exit_code == 2
+
+    # 2. Empty CSV
+    empty_csv = tmp_path / "empty.csv"
+    empty_csv.write_text("device_id,card_id,timestamp\n", encoding="utf-8")
+    res_empty = runner.invoke(app, ["device-clusters", "-i", str(empty_csv)])
+    assert res_empty.exit_code == 2
+    assert "Input file contains no transactions" in res_empty.output
+
+    # 3. Output exists without overwrite
+    in_csv = tmp_path / "in.csv"
+    in_csv.write_text("device_id,card_id,timestamp\nd1,c1,1000.0\n", encoding="utf-8")
+    out_rep = tmp_path / "rep.json"
+    out_rep.write_text("{}", encoding="utf-8")
+
+    res_ov = runner.invoke(app, ["device-clusters", "-i", str(in_csv), "-o", str(out_rep)])
+    assert res_ov.exit_code == 2
+    assert "Output already exists" in res_ov.output
+
+    # 4. Output exists with overwrite
+    res_ov_ok = runner.invoke(
+        app, ["device-clusters", "-i", str(in_csv), "-o", str(out_rep), "--overwrite"]
+    )
+    assert res_ov_ok.exit_code == 0
+
+
+def test_device_enrich_cli_happy_path(tmp_path: Path) -> None:
+    in_csv = tmp_path / "tx_enrich.csv"
+    in_csv.write_text(
+        "device_id,card_id,timestamp,screen_width,screen_height,user_agent\n"
+        "d1,c1,1000.0,1920,1080,Mozilla/5.0\n"
+        "d1,c2,1010.0,1920,1080,Mozilla/5.0\n",
+        encoding="utf-8",
+    )
+    out_csv = tmp_path / "tx_enriched.csv"
+
+    # CSV output
+    res = runner.invoke(
+        app,
+        [
+            "device-enrich",
+            "-i",
+            str(in_csv),
+            "-o",
+            str(out_csv),
+        ],
+    )
+    assert res.exit_code == 0, res.output
+    assert "Successfully enriched" in res.output
+    df_res = pd.read_csv(out_csv)
+    for col in (
+        "device_seen_count",
+        "device_distinct_cards_24h",
+        "device_card_distinct_devices_24h",
+        "device_is_emulator",
+        "device_entropy_score",
+        "device_is_card_cycling",
+        "device_is_device_cycling",
+    ):
+        assert col in df_res.columns
+
+    # JSON output format
+    out_json = tmp_path / "tx_enriched.json"
+    res_json = runner.invoke(
+        app,
+        [
+            "device-enrich",
+            "-i",
+            str(in_csv),
+            "-o",
+            str(out_json),
+            "--format",
+            "json",
+        ],
+    )
+    assert res_json.exit_code == 0, res_json.output
+    json_data = json.loads(out_json.read_text(encoding="utf-8"))
+    assert len(json_data) == 2
+    assert "device_distinct_cards_24h" in json_data[0]
+
+
+def test_device_enrich_cli_guard_and_errors(tmp_path: Path) -> None:
+    # 1. Missing input file
+    res_miss = runner.invoke(
+        app,
+        ["device-enrich", "-i", str(tmp_path / "missing.csv"), "-o", str(tmp_path / "out.csv")],
+    )
+    assert res_miss.exit_code == 2
+
+    # 2. Empty CSV
+    empty_csv = tmp_path / "empty.csv"
+    empty_csv.write_text("device_id,card_id,timestamp\n", encoding="utf-8")
+    res_empty = runner.invoke(
+        app, ["device-enrich", "-i", str(empty_csv), "-o", str(tmp_path / "out.csv")]
+    )
+    assert res_empty.exit_code == 2
+
+    # 3. Output exists without overwrite
+    in_csv = tmp_path / "in.csv"
+    in_csv.write_text("device_id,card_id,timestamp\nd1,c1,1000.0\n", encoding="utf-8")
+    out_file = tmp_path / "out.csv"
+    out_file.write_text("dummy", encoding="utf-8")
+
+    res_ov = runner.invoke(app, ["device-enrich", "-i", str(in_csv), "-o", str(out_file)])
+    assert res_ov.exit_code == 2
+    assert "Output already exists" in res_ov.output
+
+    # 4. Output exists with overwrite
+    res_ov_ok = runner.invoke(
+        app, ["device-enrich", "-i", str(in_csv), "-o", str(out_file), "--overwrite"]
+    )
+    assert res_ov_ok.exit_code == 0
+
+
+def test_device_clusters_and_enrich_advanced_branches(tmp_path: Path) -> None:
+    csv_path = tmp_path / "advanced.csv"
+    csv_path.write_text(
+        "device_id,card_id,timestamp,user_agent,screen_width,screen_height,hardware_concurrency,device_memory_gb,canvas_hash,audio_hash\n"
+        "d_base,c_shared,1000.0,Mozilla/5.0,1920,1080,8,16.0,c1,a1\n"
+        "d_other,c_shared,1005.0,Mozilla/5.0,1920,1080,8,16.0,c1,a1\n"
+        "d_drift,c_drift,1010.0,Mozilla/5.0,1920,1080,8,16.0,c1,a1\n"
+        "d_drift,c_drift,1015.0,DifferentUA/2.0,100,100,2,2.0,c2,a2\n"
+        ",c_auto,1020.0,AutoDevice/1.0,1920,1080,4,8.0,,\n"
+        ",,1025.0,,,,,,,\n"
+        "d_bad_scr,c_bad,1030.0,Mozilla/5.0,-10,not_int,4,8.0,,\n",
+        encoding="utf-8",
+    )
+    res = runner.invoke(
+        app,
+        [
+            "device-clusters",
+            "-i",
+            str(csv_path),
+            "--device-cycling-threshold",
+            "2",
+            "--similarity-threshold",
+            "0.8",
+            "--json",
+        ],
+    )
+    assert res.exit_code == 0
+    data = json.loads(res.output)
+    assert data["device_cycling_anomalies_count"] >= 1
+    assert data["drift_anomalies_count"] >= 1
+
+    # EmptyDataError check (completely empty file without headers)
+    zero_file = tmp_path / "zero.csv"
+    zero_file.write_text("", encoding="utf-8")
+    res_zero_clusters = runner.invoke(app, ["device-clusters", "-i", str(zero_file)])
+    assert res_zero_clusters.exit_code == 2
+
+    res_zero_enrich = runner.invoke(
+        app, ["device-enrich", "-i", str(zero_file), "-o", str(tmp_path / "out.csv")]
+    )
+    assert res_zero_enrich.exit_code == 2
+
+
+def test_merchant_surveillance_cli_happy_path_and_fail_on_anomaly(tmp_path: Path) -> None:
+    csv_path = tmp_path / "merchant_tx.csv"
+    csv_path.write_text(
+        "merchant_id,mcc,amount,timestamp,card_id,is_fraud,is_chargeback\n"
+        "m_cb,7995,20.0,1000.0,c1,true,true\n"
+        "m_cb,7995,21.0,1010.0,c2,true,true\n"
+        "m_cb,7995,22.0,1020.0,c3,true,true\n"
+        "m_cb,7995,23.0,1030.0,c4,false,false\n"
+        "m_cb,7995,24.0,1040.0,c5,false,false\n"
+        "m_cb,7995,5000.0,1050.0,c6,false,false\n"
+        "m_test,5734,1.0,2000.0,tc1,false,false\n"
+        "m_test,5734,1.5,2010.0,tc2,false,false\n"
+        "m_test,5734,2.0,2020.0,tc3,false,false\n",
+        encoding="utf-8",
+    )
+    rep_path = tmp_path / "merchant_report.json"
+
+    # 1. JSON output + report file
+    res_json = runner.invoke(
+        app,
+        [
+            "merchant-surveillance",
+            "-i",
+            str(csv_path),
+            "-o",
+            str(rep_path),
+            "--json",
+            "--min-chargeback-count",
+            "2",
+            "--min-distinct-cards-for-testing",
+            "3",
+        ],
+    )
+    assert res_json.exit_code == 0, res_json.output
+    data = json.loads(res_json.output)
+    assert data["total_events_processed"] == 9
+    assert data["total_merchants_tracked"] == 2
+    assert data["chargeback_anomalies_count"] >= 1
+    assert data["bust_out_anomalies_count"] >= 1
+    assert data["card_testing_anomalies_count"] >= 1
+    assert data["ticket_outlier_anomalies_count"] >= 1
+    assert rep_path.exists()
+
+    # 2. Human-readable summary + --fail-on-anomaly exit code 3
+    res_fail = runner.invoke(
+        app,
+        [
+            "merchant-surveillance",
+            "-i",
+            str(csv_path),
+            "--min-chargeback-count",
+            "2",
+            "--fail-on-anomaly",
+        ],
+    )
+    assert res_fail.exit_code == 3
+    assert "Merchant Risk Profiling & Chargeback Surveillance Report:" in res_fail.output
+    assert "Failing per --fail-on-anomaly" in res_fail.output
+
+
+def test_merchant_enrich_and_input_validation_branches(tmp_path: Path) -> None:
+    # 1. JSON input file for merchant-enrich -> CSV and JSON outputs
+    json_in = tmp_path / "merchant_in.json"
+    json_in.write_text(
+        json.dumps(
+            [
+                {
+                    "merchant": "m_json",
+                    "merchant_category_code": "5411",
+                    "amt": 15.0,
+                    "unix_time": 1000.0,
+                    "cc_num": "card_a",
+                },
+                {
+                    "merchant": "m_json",
+                    "merchant_category_code": "invalid_mcc",
+                    "amt": "bad_amt",
+                    "unix_time": "bad_ts",
+                },
+            ]
+        ),
+        encoding="utf-8",
+    )
+    out_csv = tmp_path / "merchant_enriched.csv"
+    res_csv = runner.invoke(
+        app,
+        ["merchant-enrich", "-i", str(json_in), "-o", str(out_csv)],
+    )
+    assert res_csv.exit_code == 0, res_csv.output
+    assert "Successfully enriched 2 transactions with 8 merchant features" in res_csv.output
+    df_out = pd.read_csv(out_csv)
+    assert "merchant_smoothed_fraud_rate" in df_out.columns
+    assert "merchant_is_high_chargeback" in df_out.columns
+
+    out_json = tmp_path / "merchant_enriched.json"
+    res_json = runner.invoke(
+        app,
+        ["merchant-enrich", "-i", str(json_in), "-o", str(out_json), "--format", "json"],
+    )
+    assert res_json.exit_code == 0, res_json.output
+    parsed_json = json.loads(out_json.read_text(encoding="utf-8"))
+    assert len(parsed_json) == 2
+    assert "merchant_mcc_risk_score" in parsed_json[0]
+
+    # 2. Missing file, non-list JSON, and empty CSV error branches
+    res_missing = runner.invoke(
+        app, ["merchant-surveillance", "-i", str(tmp_path / "does_not_exist.csv")]
+    )
+    assert res_missing.exit_code == 2
+
+    non_list_json = tmp_path / "non_list.json"
+    non_list_json.write_text('{"not": "a list"}', encoding="utf-8")
+    res_non_list = runner.invoke(app, ["merchant-surveillance", "-i", str(non_list_json)])
+    assert res_non_list.exit_code == 2
+    assert "must contain a list of records" in res_non_list.output
+
+    bad_json = tmp_path / "bad.json"
+    bad_json.write_text("{corrupt", encoding="utf-8")
+    res_bad_json = runner.invoke(app, ["merchant-surveillance", "-i", str(bad_json)])
+    assert res_bad_json.exit_code == 2
+
+    empty_csv = tmp_path / "empty_merch.csv"
+    empty_csv.write_text("merchant_id,amount\n", encoding="utf-8")
+    res_empty = runner.invoke(app, ["merchant-surveillance", "-i", str(empty_csv)])
+    assert res_empty.exit_code == 2
+    assert "Input file contains no transactions" in res_empty.output
+
+    # 3. Also exercise _row_to_merchant_event fallback branches via merchant-surveillance
+    fallback_csv = tmp_path / "fallback.csv"
+    fallback_csv.write_text(
+        "merchant,category_code,Amount,Time,account_id\n,bad_mcc,bad_amt,bad_ts,\n",
+        encoding="utf-8",
+    )
+    res_fb = runner.invoke(app, ["merchant-surveillance", "-i", str(fallback_csv), "--json"])
+    assert res_fb.exit_code == 0, res_fb.output
+
+
+def test_tenant_cli_commands(tmp_path: Path) -> None:
+    """Validate tenant-list, tenant-validate, and tenant-eval CLI workflows."""
+    # 1. tenant-list default
+    res_list_default = runner.invoke(app, ["tenant-list"])
+    assert res_list_default.exit_code == 0, res_list_default.output
+    data_def = json.loads(res_list_default.output)
+    assert data_def["total_count"] >= 1
+    assert any(t["tenant_id"] == "default" for t in data_def["tenants"])
+
+    # Table format
+    res_list_tbl = runner.invoke(app, ["tenant-list", "--format", "table"])
+    assert res_list_tbl.exit_code == 0, res_list_tbl.output
+    assert "Tenant ID" in res_list_tbl.output
+    assert "default" in res_list_tbl.output
+
+    # List with custom registry file
+    reg_file = tmp_path / "tenants_registry.json"
+    manifest_data = {
+        "config": {"max_tenants": 1000, "default_tenant_id": "default"},
+        "tenants": [
+            {
+                "tenant_id": "tenant_alpha",
+                "tier": "enterprise",
+                "status": "active",
+                "rate_limit_rpm": 2500,
+                "tags": ["corp"],
+                "risk_profile": {
+                    "decline_threshold": 0.90,
+                    "challenge_threshold": 0.65,
+                    "review_threshold": 0.40,
+                },
+            },
+            {
+                "tenant_id": "tenant_beta",
+                "tier": "free",
+                "status": "suspended",
+                "rate_limit_rpm": 500,
+                "tags": ["trial"],
+                "risk_profile": {
+                    "decline_threshold": 0.85,
+                    "challenge_threshold": 0.60,
+                    "review_threshold": 0.35,
+                },
+            },
+        ],
+    }
+    reg_file.write_text(json.dumps(manifest_data), encoding="utf-8")
+
+    res_list_custom = runner.invoke(
+        app, ["tenant-list", "-r", str(reg_file), "--tier", "enterprise"]
+    )
+    assert res_list_custom.exit_code == 0, res_list_custom.output
+    data_custom = json.loads(res_list_custom.output)
+    assert data_custom["total_count"] == 1
+    assert data_custom["tenants"][0]["tenant_id"] == "tenant_alpha"
+
+    # Missing registry file -> exit 2
+    res_list_missing = runner.invoke(
+        app, ["tenant-list", "-r", str(tmp_path / "non_existent.json")]
+    )
+    assert res_list_missing.exit_code == 2
+
+    # 2. tenant-validate
+    valid_manifest = tmp_path / "valid_manifest.json"
+    valid_manifest.write_text(json.dumps(manifest_data), encoding="utf-8")
+    res_val_ok = runner.invoke(app, ["tenant-validate", "-m", str(valid_manifest)])
+    assert res_val_ok.exit_code == 0, res_val_ok.output
+    val_out = json.loads(res_val_ok.output)
+    assert val_out["status"] == "VALID"
+    assert val_out["valid_count"] == 2
+
+    # Strict mode failure (tenant missing tags)
+    untagged_manifest = tmp_path / "untagged_manifest.json"
+    untagged_manifest.write_text(
+        json.dumps([{"tenant_id": "tenant_no_tags", "tags": []}]),
+        encoding="utf-8",
+    )
+    res_val_strict = runner.invoke(
+        app, ["tenant-validate", "-m", str(untagged_manifest), "--strict"]
+    )
+    assert res_val_strict.exit_code == 2
+    assert "Strict mode requires at least one tag" in res_val_strict.output
+
+    # Invalid threshold order
+    invalid_manifest = tmp_path / "invalid_manifest.json"
+    invalid_manifest.write_text(
+        json.dumps(
+            [
+                {
+                    "tenant_id": "tenant_bad_thresh",
+                    "risk_profile": {
+                        "decline_threshold": 0.20,
+                        "review_threshold": 0.80,
+                    },
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    res_val_bad = runner.invoke(app, ["tenant-validate", "-m", str(invalid_manifest)])
+    assert res_val_bad.exit_code == 2
+    assert "Threshold order constraint violated" in res_val_bad.output
+
+    # Missing manifest file -> exit 2
+    assert (
+        runner.invoke(app, ["tenant-validate", "-m", str(tmp_path / "missing.json")]).exit_code == 2
+    )
+
+    # 3. tenant-eval
+    csv_file = tmp_path / "transactions.csv"
+    csv_file.write_text(
+        "Time,Amount,V1,V2,V3\n10.0,50.0,-0.5,0.2,0.1\n20.0,1200.0,2.5,-1.2,0.8\n",
+        encoding="utf-8",
+    )
+
+    out_eval = tmp_path / "eval_out.csv"
+    res_eval = runner.invoke(
+        app,
+        [
+            "tenant-eval",
+            "-i",
+            str(csv_file),
+            "-t",
+            "default",
+            "-o",
+            str(out_eval),
+        ],
+    )
+    assert res_eval.exit_code == 0, res_eval.output
+    eval_json = json.loads(res_eval.output)
+    assert eval_json["tenant_id"] == "default"
+    assert eval_json["total_evaluated"] == 2
+    assert "decisions" in eval_json
+    assert out_eval.is_file()
+
+    # Table format
+    res_eval_tbl = runner.invoke(
+        app,
+        ["tenant-eval", "-i", str(csv_file), "-t", "default", "--format", "table"],
+    )
+    assert res_eval_tbl.exit_code == 0, res_eval_tbl.output
+    assert "Tenant Policy Evaluation: default" in res_eval_tbl.output
+
+    # Eval under suspended tenant -> exit 2
+    res_eval_suspended = runner.invoke(
+        app,
+        [
+            "tenant-eval",
+            "-i",
+            str(csv_file),
+            "-r",
+            str(reg_file),
+            "-t",
+            "tenant_beta",
+        ],
+    )
+    assert res_eval_suspended.exit_code == 2
+    assert "cannot process requests" in res_eval_suspended.output
+
+
+def test_webhook_cli_commands(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Validate webhook-list, webhook-test, and webhook-replay-dlq CLI workflows."""
+    from fraud_detection.events import (
+        EventType,
+        FraudDomainEvent,
+        WebhookDispatcher,
+        WebhookSubscription,
+    )
+
+    # 1. webhook-list default (empty registry)
+    res_list_def = runner.invoke(app, ["webhook-list"])
+    assert res_list_def.exit_code == 0, res_list_def.output
+    data_def = json.loads(res_list_def.output)
+    assert data_def["total_count"] == 0
+
+    # Table format
+    res_list_tbl = runner.invoke(app, ["webhook-list", "--format", "table"])
+    assert res_list_tbl.exit_code == 0, res_list_tbl.output
+    assert "Subscription ID" in res_list_tbl.output
+
+    # Missing manifest file -> exit 2
+    res_list_missing = runner.invoke(
+        app, ["webhook-list", "-m", str(tmp_path / "non_existent.json")]
+    )
+    assert res_list_missing.exit_code == 2
+
+    # Manifest file with subscriptions
+    sub1 = WebhookSubscription(
+        subscription_id="sub_alpha_001",
+        tenant_id="fintech_alpha",
+        target_url="https://alpha.example.com/webhook",
+        secret_token="tok_" + "a" * 20,
+    )
+    sub2 = WebhookSubscription(
+        subscription_id="sub_beta_002",
+        tenant_id="fintech_beta",
+        target_url="https://beta.example.com/webhook",
+        secret_token="tok_" + "b" * 20,
+    )
+    manifest_data = {
+        "version": "1.0",
+        "subscriptions": [
+            sub1.to_dict(include_secret=True),
+            sub2.to_dict(include_secret=True),
+        ],
+    }
+    manifest_file = tmp_path / "webhooks_manifest.json"
+    manifest_file.write_text(json.dumps(manifest_data), encoding="utf-8")
+
+    res_list_filtered = runner.invoke(
+        app, ["webhook-list", "-m", str(manifest_file), "-t", "fintech_alpha"]
+    )
+    assert res_list_filtered.exit_code == 0, res_list_filtered.output
+    filtered_data = json.loads(res_list_filtered.output)
+    assert filtered_data["total_count"] == 1
+    assert filtered_data["subscriptions"][0]["subscription_id"] == "sub_alpha_001"
+
+    # 2. webhook-test
+    # Invalid event type -> exit 2
+    res_test_invalid_ev = runner.invoke(
+        app, ["webhook-test", "-u", "https://api.example.com/wh", "-e", "non.existent.event"]
+    )
+    assert res_test_invalid_ev.exit_code == 2
+    assert "Unknown event type" in res_test_invalid_ev.output
+
+    # Invalid URL scheme -> exit 2
+    res_test_invalid_url = runner.invoke(app, ["webhook-test", "-u", "ftp://invalid.com/wh"])
+    assert res_test_invalid_url.exit_code == 2
+
+    # Successful test delivery via monkeypatched transport
+    monkeypatch.setattr(
+        WebhookDispatcher,
+        "_default_http_transport",
+        staticmethod(lambda _url, _body, _headers, _timeout: (200, b'{"received": true}')),
+    )
+    res_test_ok = runner.invoke(
+        app,
+        [
+            "webhook-test",
+            "-u",
+            "https://api.example.com/wh",
+            "-t",
+            "fintech_alpha",
+            "-s",
+            "tok_" + "c" * 20,
+        ],
+    )
+    assert res_test_ok.exit_code == 0, res_test_ok.output
+    test_data = json.loads(res_test_ok.output)
+    assert test_data["status"] == "delivered"
+    assert test_data["status_code"] == 200
+
+    # Failing delivery via monkeypatched transport -> exit 1
+    monkeypatch.setattr(
+        WebhookDispatcher,
+        "_default_http_transport",
+        staticmethod(lambda _url, _body, _headers, _timeout: (500, b"Server Error")),
+    )
+    res_test_fail = runner.invoke(
+        app,
+        [
+            "webhook-test",
+            "-u",
+            "https://api.example.com/wh",
+            "-t",
+            "fintech_alpha",
+            "-s",
+            "tok_" + "c" * 20,
+        ],
+    )
+    assert res_test_fail.exit_code == 1
+    fail_data = json.loads(res_test_fail.output)
+    assert fail_data["status"] == "dead_letter"
+
+    # 3. webhook-replay-dlq
+    # Missing DLQ file -> exit 2
+    res_dlq_missing = runner.invoke(
+        app, ["webhook-replay-dlq", "-d", str(tmp_path / "missing_dlq.json")]
+    )
+    assert res_dlq_missing.exit_code == 2
+
+    # Prepare DLQ file
+    dlq_event1 = FraudDomainEvent(
+        event_type=EventType.TRANSACTION_SCORED,
+        tenant_id="fintech_alpha",
+        payload={"amount": 100.0},
+    )
+    dlq_event2 = FraudDomainEvent(
+        event_type=EventType.DECISION_DENIED,
+        tenant_id="fintech_beta",
+        payload={"amount": 5000.0},
+    )
+    dlq_file = tmp_path / "dlq_dump.json"
+    dlq_data = {
+        "records": [
+            {
+                "record_id": "rec_001",
+                "subscription_id": "sub_alpha_001",
+                "target_url": "https://alpha.example.com/webhook",
+                "error_reason": "HTTP 500 Server error",
+                "attempt_count": 3,
+                "event": dlq_event1.to_dict(),
+                "payload": {},
+            },
+            {
+                "record_id": "rec_002",
+                "subscription_id": "sub_beta_002",
+                "target_url": "https://beta.example.com/webhook",
+                "error_reason": "Connection timeout",
+                "attempt_count": 3,
+                "event": dlq_event2.to_dict(),
+                "payload": {},
+            },
+        ]
+    }
+    dlq_file.write_text(json.dumps(dlq_data), encoding="utf-8")
+
+    # Dry-run
+    res_dlq_dry = runner.invoke(app, ["webhook-replay-dlq", "-d", str(dlq_file), "--dry-run"])
+    assert res_dlq_dry.exit_code == 0, res_dlq_dry.output
+    dry_out = json.loads(res_dlq_dry.output)
+    assert dry_out["total_matched"] == 2
+    assert dry_out["dry_run"] is True
+    assert dry_out["replayed_count"] == 0
+
+    # Actual replay filtered by tenant fintech_alpha with successful transport
+    monkeypatch.setattr(
+        WebhookDispatcher,
+        "_default_http_transport",
+        staticmethod(lambda _url, _body, _headers, _timeout: (200, b"replayed")),
+    )
+    res_dlq_replay = runner.invoke(
+        app,
+        ["webhook-replay-dlq", "-d", str(dlq_file), "-t", "fintech_alpha"],
+    )
+    assert res_dlq_replay.exit_code == 0, res_dlq_replay.output
+    replay_out = json.loads(res_dlq_replay.output)
+    assert replay_out["total_matched"] == 1
+    assert replay_out["replayed_count"] == 1
+    assert replay_out["succeeded_count"] == 1
+    assert replay_out["failed_count"] == 0
+
+    # Replay with failing transport
+    monkeypatch.setattr(
+        WebhookDispatcher,
+        "_default_http_transport",
+        staticmethod(lambda _url, _body, _headers, _timeout: (500, b"fail")),
+    )
+    res_dlq_fail = runner.invoke(
+        app,
+        ["webhook-replay-dlq", "-d", str(dlq_file), "-t", "fintech_alpha"],
+    )
+    assert res_dlq_fail.exit_code == 0, res_dlq_fail.output
+    fail_replay_out = json.loads(res_dlq_fail.output)
+    assert fail_replay_out["failed_count"] == 1
+
+    # Corrupt DLQ JSON
+    corrupt_dlq = tmp_path / "corrupt_dlq.json"
+    corrupt_dlq.write_text("{invalid_json", encoding="utf-8")
+    assert runner.invoke(app, ["webhook-replay-dlq", "-d", str(corrupt_dlq)]).exit_code == 2
+
+    # DLQ without records array
+    no_records_dlq = tmp_path / "no_records_dlq.json"
+    no_records_dlq.write_text(json.dumps({"wrong_key": []}), encoding="utf-8")
+    assert runner.invoke(app, ["webhook-replay-dlq", "-d", str(no_records_dlq)]).exit_code == 2
+
+    # DLQ with corrupted record inside records
+    bad_item_dlq = tmp_path / "bad_item_dlq.json"
+    bad_item_dlq.write_text(json.dumps({"records": [{"bad": "data"}]}), encoding="utf-8")
+    assert runner.invoke(app, ["webhook-replay-dlq", "-d", str(bad_item_dlq)]).exit_code == 2
+
+
+def test_challenge_cli_commands(tmp_path: Path) -> None:
+    """Validate challenge-create, challenge-verify, and challenge-inspect CLI workflows."""
+    runner = CliRunner()
+    store_file = tmp_path / "challenge_sessions.json"
+
+    # 1. challenge-create (JSON format)
+    res_create = runner.invoke(
+        app,
+        [
+            "challenge-create",
+            "-x",
+            "tx_cli_101",
+            "-u",
+            "usr_bob",
+            "-d",
+            "+15551234567",
+            "-t",
+            "fintech_alpha",
+            "-m",
+            "sms_otp",
+            "-s",
+            str(store_file),
+            "-f",
+            "json",
+        ],
+    )
+    assert res_create.exit_code == 0, res_create.output
+    created_data = json.loads(res_create.output)
+    ch_id = created_data["challenge_id"]
+    raw_token = created_data["raw_token"]
+    assert ch_id.startswith("ch_")
+    assert created_data["status"] == "pending"
+    assert created_data["target_masked"] == "+1 ***-***-4567"
+
+    # 2. challenge-create (Table format)
+    res_create_table = runner.invoke(
+        app,
+        [
+            "challenge-create",
+            "-x",
+            "tx_cli_102",
+            "-u",
+            "usr_alice",
+            "-d",
+            "alice@example.com",
+            "-m",
+            "email_otp",
+            "-f",
+            "table",
+        ],
+    )
+    assert res_create_table.exit_code == 0, res_create_table.output
+    assert "Challenge ID:" in res_create_table.output
+
+    # Invalid method -> exit 2
+    res_bad_method = runner.invoke(
+        app,
+        [
+            "challenge-create",
+            "-x",
+            "tx_1",
+            "-u",
+            "u1",
+            "-d",
+            "d1",
+            "-m",
+            "carrier_pigeon",
+        ],
+    )
+    assert res_bad_method.exit_code == 2
+
+    # 3. challenge-inspect
+    res_inspect = runner.invoke(
+        app,
+        ["challenge-inspect", "-s", str(store_file), "-c", ch_id],
+    )
+    assert res_inspect.exit_code == 0, res_inspect.output
+    inspect_data = json.loads(res_inspect.output)
+    assert inspect_data["total_count"] == 1
+    assert inspect_data["challenges"][0]["challenge_id"] == ch_id
+
+    # Table format inspect
+    res_inspect_table = runner.invoke(
+        app,
+        ["challenge-inspect", "-s", str(store_file), "-f", "table"],
+    )
+    assert res_inspect_table.exit_code == 0
+    assert "CHALLENGE ID" in res_inspect_table.output
+
+    # Missing challenge in inspect -> exit 2
+    res_inspect_missing = runner.invoke(
+        app,
+        ["challenge-inspect", "-s", str(store_file), "-c", "ch_nonexistent"],
+    )
+    assert res_inspect_missing.exit_code == 2
+
+    # 4. challenge-verify with wrong token -> exit 1
+    res_verify_fail = runner.invoke(
+        app,
+        [
+            "challenge-verify",
+            "-s",
+            str(store_file),
+            "-c",
+            ch_id,
+            "--token",
+            "000000",
+        ],
+    )
+    assert res_verify_fail.exit_code == 1
+    verify_fail_data = json.loads(res_verify_fail.output)
+    assert verify_fail_data["verified"] is False
+
+    # 5. challenge-verify with correct token -> exit 0
+    res_verify_ok = runner.invoke(
+        app,
+        [
+            "challenge-verify",
+            "-s",
+            str(store_file),
+            "-c",
+            ch_id,
+            "--token",
+            raw_token,
+        ],
+    )
+    assert res_verify_ok.exit_code == 0, res_verify_ok.output
+    verify_ok_data = json.loads(res_verify_ok.output)
+    assert verify_ok_data["verified"] is True
+    assert verify_ok_data["status"] == "verified"
+
+
+def test_challenge_cli_error_and_edge_cases(tmp_path: Path) -> None:
+    """Test challenge CLI error branches, filters, table formatting, and invalid inputs."""
+    runner = CliRunner()
+
+    # 1. challenge-create with invalid method -> exit 2
+    res_bad_method = runner.invoke(
+        app,
+        [
+            "challenge-create",
+            "-x",
+            "tx_bad",
+            "-u",
+            "usr_bad",
+            "-d",
+            "+14155551234",
+            "-m",
+            "smoke_signal",
+        ],
+    )
+    assert res_bad_method.exit_code == 2
+    assert "Invalid challenge method" in res_bad_method.output
+
+    # 2. challenge-create with table format output
+    store_file = tmp_path / "challenges.json"
+    res_table = runner.invoke(
+        app,
+        [
+            "challenge-create",
+            "-x",
+            "tx_tbl",
+            "-u",
+            "usr_tbl",
+            "--tenant-id",
+            "fintech_gamma",
+            "-d",
+            "gamma@example.com",
+            "-m",
+            "email_otp",
+            "-s",
+            str(store_file),
+            "-f",
+            "table",
+        ],
+    )
+    assert res_table.exit_code == 0
+    assert "Challenge ID:" in res_table.output
+    assert "Issued OTP:" in res_table.output
+
+    # 3. challenge-create store file write failure -> exit 2
+    bad_store_dir = tmp_path / "as_dir"
+    bad_store_dir.mkdir()
+    res_store_fail = runner.invoke(
+        app,
+        [
+            "challenge-create",
+            "-x",
+            "tx_fail",
+            "-u",
+            "usr_fail",
+            "-d",
+            "+14155551234",
+            "-s",
+            str(bad_store_dir),
+        ],
+    )
+    assert res_store_fail.exit_code == 2
+    assert "Failed to persist challenge session" in res_store_fail.output
+
+    # 4. challenge-verify store file not found -> exit 2
+    res_v_missing_store = runner.invoke(
+        app,
+        [
+            "challenge-verify",
+            "-s",
+            str(tmp_path / "nonexistent.json"),
+            "-c",
+            "ch_xyz",
+            "--token",
+            "123456",
+        ],
+    )
+    assert res_v_missing_store.exit_code == 2
+    assert "Store file not found" in res_v_missing_store.output
+
+    # 5. challenge-verify store file corrupt JSON / non-list -> exit 2
+    corrupt_store = tmp_path / "corrupt.json"
+    corrupt_store.write_text("{not json}", encoding="utf-8")
+    res_v_corrupt = runner.invoke(
+        app,
+        [
+            "challenge-verify",
+            "-s",
+            str(corrupt_store),
+            "-c",
+            "ch_xyz",
+            "--token",
+            "123456",
+        ],
+    )
+    assert res_v_corrupt.exit_code == 2
+    assert "Could not read store file" in res_v_corrupt.output
+
+    non_list_store = tmp_path / "non_list.json"
+    non_list_store.write_text('{"key": "val"}', encoding="utf-8")
+    res_v_non_list = runner.invoke(
+        app,
+        [
+            "challenge-verify",
+            "-s",
+            str(non_list_store),
+            "-c",
+            "ch_xyz",
+            "--token",
+            "123456",
+        ],
+    )
+    assert res_v_non_list.exit_code == 2
+    assert "expected a JSON array" in res_v_non_list.output
+
+    # 6. challenge-verify missing challenge_id in store -> exit 2
+    res_v_not_found = runner.invoke(
+        app,
+        [
+            "challenge-verify",
+            "-s",
+            str(store_file),
+            "-c",
+            "ch_nonexistent",
+            "--token",
+            "123456",
+        ],
+    )
+    assert res_v_not_found.exit_code == 2
+    assert "not found in store file" in res_v_not_found.output
+
+    # 7. challenge-verify table format with error -> exit 1
+    # Get the challenge ID from store_file
+    stored_records = json.loads(store_file.read_text(encoding="utf-8"))
+    ch_id = stored_records[0]["challenge_id"]
+    res_v_table_err = runner.invoke(
+        app,
+        [
+            "challenge-verify",
+            "-s",
+            str(store_file),
+            "-c",
+            ch_id,
+            "--token",
+            "000000",
+            "-f",
+            "table",
+        ],
+    )
+    assert res_v_table_err.exit_code == 1
+    assert "Error:" in res_v_table_err.output
+    assert "Verified:      False" in res_v_table_err.output
+
+    # 7b. challenge-verify table format on SUCCESS -> exit 0
+    # Create another challenge with known OTP to verify via table format
+    res_create_succ = runner.invoke(
+        app,
+        [
+            "challenge-create",
+            "-x",
+            "tx_tbl_succ",
+            "-u",
+            "usr_tbl_succ",
+            "-d",
+            "succ@example.com",
+            "-s",
+            str(store_file),
+        ],
+    )
+    assert res_create_succ.exit_code == 0
+    succ_data = json.loads(res_create_succ.output)
+    ch_succ_id = succ_data["challenge_id"]
+    otp_succ = succ_data["raw_token"]
+    res_v_table_ok = runner.invoke(
+        app,
+        [
+            "challenge-verify",
+            "-s",
+            str(store_file),
+            "-c",
+            ch_succ_id,
+            "--token",
+            otp_succ,
+            "-f",
+            "table",
+        ],
+    )
+    assert res_v_table_ok.exit_code == 0
+    assert "Verified:      True" in res_v_table_ok.output
+
+    # 8. challenge-inspect store file not found -> exit 2
+    res_i_missing = runner.invoke(
+        app,
+        ["challenge-inspect", "-s", str(tmp_path / "nonexistent.json")],
+    )
+    assert res_i_missing.exit_code == 2
+
+    # 9. challenge-inspect corrupt store file -> exit 2
+    res_i_corrupt = runner.invoke(
+        app,
+        ["challenge-inspect", "-s", str(corrupt_store)],
+    )
+    assert res_i_corrupt.exit_code == 2
+
+    # 10. challenge-inspect non-list store file -> exit 2
+    res_i_non_list = runner.invoke(
+        app,
+        ["challenge-inspect", "-s", str(non_list_store)],
+    )
+    assert res_i_non_list.exit_code == 2
+
+    # 11. challenge-inspect with tenant-id filter matching and skipping
+    # Also inject a non-dict element to verify non-dict item skip (line 8862)
+    records_with_non_dict = json.loads(store_file.read_text(encoding="utf-8"))
+    records_with_non_dict.append("invalid_record_string")
+    store_file.write_text(json.dumps(records_with_non_dict), encoding="utf-8")
+
+    res_i_tenant_match = runner.invoke(
+        app,
+        ["challenge-inspect", "-s", str(store_file), "-t", "fintech_gamma"],
+    )
+    assert res_i_tenant_match.exit_code == 0
+    match_data = json.loads(res_i_tenant_match.output)
+    assert match_data["total_count"] == 1
+
+    res_i_tenant_skip = runner.invoke(
+        app,
+        ["challenge-inspect", "-s", str(store_file), "-t", "nonexistent_tenant"],
+    )
+    assert res_i_tenant_skip.exit_code == 0
+    skip_data = json.loads(res_i_tenant_skip.output)
+    assert skip_data["total_count"] == 0
+
+    # 12. challenge-inspect table format with empty matched -> "No challenge sessions found."
+    res_i_table_empty = runner.invoke(
+        app,
+        [
+            "challenge-inspect",
+            "-s",
+            str(store_file),
+            "-t",
+            "nonexistent_tenant",
+            "-f",
+            "table",
+        ],
+    )
+    assert res_i_table_empty.exit_code == 0
+    assert "No challenge sessions found." in res_i_table_empty.output
+
+
+def test_case_management_cli(tmp_path: Path) -> None:
+    store_file = tmp_path / "cases.json"
+    corrupt_store = tmp_path / "corrupt_cases.json"
+    corrupt_store.write_text("{not valid json", encoding="utf-8")
+    non_list_store = tmp_path / "non_list_cases.json"
+    non_list_store.write_text('{"error": "not a list"}', encoding="utf-8")
+
+    # 1. case-create invalid priority -> exit 2
+    res_c_bad_prio = runner.invoke(
+        app,
+        [
+            "case-create",
+            "-x",
+            "tx_001",
+            "-p",
+            "invalid_priority",
+        ],
+    )
+    assert res_c_bad_prio.exit_code == 2
+    assert "Invalid case priority" in res_c_bad_prio.output
+
+    # 1b. case-create validation error (negative amount) -> exit 2
+    res_c_bad_amt = runner.invoke(
+        app,
+        [
+            "case-create",
+            "-x",
+            "tx_bad_amt",
+            "-a",
+            "-50.0",
+        ],
+    )
+    assert res_c_bad_amt.exit_code == 2
+    assert "Failed to create case" in res_c_bad_amt.output
+
+    # 1c. case-create without store_file -> exit 0
+    res_c_no_store = runner.invoke(
+        app,
+        [
+            "case-create",
+            "-x",
+            "tx_no_store",
+            "-a",
+            "100.0",
+        ],
+    )
+    assert res_c_no_store.exit_code == 0
+    assert "case_id" in json.loads(res_c_no_store.output)
+
+    # 2. case-create store persistence failure -> exit 2
+    bad_dir = tmp_path / "bad_store_dir"
+    bad_dir.mkdir()
+    res_c_fail_persist = runner.invoke(
+        app,
+        [
+            "case-create",
+            "-x",
+            "tx_001",
+            "-s",
+            str(bad_dir),
+        ],
+    )
+    assert res_c_fail_persist.exit_code == 2
+    assert "Failed to persist case to store file" in res_c_fail_persist.output
+
+    # 3. case-create valid JSON output & write to store_file
+    res_c1 = runner.invoke(
+        app,
+        [
+            "case-create",
+            "-x",
+            "tx_1001",
+            "-a",
+            "2500.50",
+            "-c",
+            "USD",
+            "-s",
+            str(store_file),
+            "-t",
+            "fintech_a",
+            "-p",
+            "high",
+            "-u",
+            "analyst_alice",
+            "--fraud-score",
+            "0.92",
+        ],
+    )
+    assert res_c1.exit_code == 0
+    c1_data = json.loads(res_c1.output)
+    case_1_id = c1_data["case_id"]
+    assert c1_data["transaction_id"] == "tx_1001"
+    assert c1_data["priority"] == "high"
+    assert c1_data["assigned_analyst"] == "analyst_alice"
+
+    # 4. case-create table output on existing store file
+    res_c2 = runner.invoke(
+        app,
+        [
+            "case-create",
+            "-x",
+            "tx_1002",
+            "-a",
+            "50.00",
+            "-c",
+            "EUR",
+            "-s",
+            str(store_file),
+            "-t",
+            "fintech_b",
+            "-p",
+            "low",
+            "-u",
+            "analyst_bob",
+            "--fraud-score",
+            "0.25",
+            "-f",
+            "table",
+        ],
+    )
+    assert res_c2.exit_code == 0
+    assert "Case ID:" in res_c2.output
+    assert "Transaction ID: tx_1002" in res_c2.output
+
+    # Parse case_2_id from store_file
+    stored_cases = json.loads(store_file.read_text(encoding="utf-8"))
+    assert len(stored_cases) == 2
+    case_2_id = stored_cases[1]["case_id"]
+
+    # 4b. case-create with non-list existing store file (recovers cleanly)
+    recover_store = tmp_path / "recover_store.json"
+    recover_store.write_text('{"broken": true}', encoding="utf-8")
+    res_c_recover = runner.invoke(
+        app,
+        [
+            "case-create",
+            "-x",
+            "tx_rec",
+            "-s",
+            str(recover_store),
+        ],
+    )
+    assert res_c_recover.exit_code == 0
+    rec_cases = json.loads(recover_store.read_text(encoding="utf-8"))
+    assert len(rec_cases) == 1
+
+    # 5. case-list missing store file -> exit 2
+    res_l_missing = runner.invoke(
+        app,
+        ["case-list", "-s", str(tmp_path / "nonexistent.json")],
+    )
+    assert res_l_missing.exit_code == 2
+
+    # 6. case-list corrupt store file -> exit 2
+    res_l_corrupt = runner.invoke(
+        app,
+        ["case-list", "-s", str(corrupt_store)],
+    )
+    assert res_l_corrupt.exit_code == 2
+
+    # 7. case-list non-list store file -> exit 2
+    res_l_non_list = runner.invoke(
+        app,
+        ["case-list", "-s", str(non_list_store)],
+    )
+    assert res_l_non_list.exit_code == 2
+
+    # 8. case-list table format empty store
+    empty_store = tmp_path / "empty_cases.json"
+    empty_store.write_text("[]", encoding="utf-8")
+    res_l_empty_tbl = runner.invoke(
+        app,
+        ["case-list", "-s", str(empty_store), "-f", "table"],
+    )
+    assert res_l_empty_tbl.exit_code == 0
+    assert "No fraud cases found." in res_l_empty_tbl.output
+
+    # Add a non-dict item and an SLA breached case to store_file
+    stored_cases.append("not_a_dict_case")
+    # Mark case 2 as SLA breached in stored data for filter testing
+    stored_cases[1]["is_sla_breached"] = True
+    store_file.write_text(json.dumps(stored_cases), encoding="utf-8")
+
+    # 9. case-list json format without filters
+    res_l_all = runner.invoke(
+        app,
+        ["case-list", "-s", str(store_file)],
+    )
+    assert res_l_all.exit_code == 0
+    all_data = json.loads(res_l_all.output)
+    assert all_data["total_count"] == 2
+
+    # 10. case-list table format
+    res_l_tbl = runner.invoke(
+        app,
+        ["case-list", "-s", str(store_file), "-f", "table"],
+    )
+    assert res_l_tbl.exit_code == 0
+    assert "CASE ID" in res_l_tbl.output
+    assert "TENANT" in res_l_tbl.output
+    assert "YES" in res_l_tbl.output
+
+    # 11. case-list filters: tenant, status, priority, analyst, sla_breached
+    res_l_tenant = runner.invoke(
+        app,
+        ["case-list", "-s", str(store_file), "-t", "fintech_a"],
+    )
+    assert json.loads(res_l_tenant.output)["total_count"] == 1
+
+    res_l_status = runner.invoke(
+        app,
+        ["case-list", "-s", str(store_file), "--status", "investigating"],
+    )
+    assert json.loads(res_l_status.output)["total_count"] == 2
+
+    res_l_prio = runner.invoke(
+        app,
+        ["case-list", "-s", str(store_file), "-p", "low"],
+    )
+    assert json.loads(res_l_prio.output)["total_count"] == 1
+
+    res_l_analyst = runner.invoke(
+        app,
+        ["case-list", "-s", str(store_file), "-u", "analyst_bob"],
+    )
+    assert json.loads(res_l_analyst.output)["total_count"] == 1
+
+    res_l_breached = runner.invoke(
+        app,
+        ["case-list", "-s", str(store_file), "--sla-breached-only"],
+    )
+    assert json.loads(res_l_breached.output)["total_count"] == 1
+
+    # 12. case-inspect errors
+    res_i_missing = runner.invoke(
+        app,
+        ["case-inspect", "-s", str(tmp_path / "none.json"), "-c", "c_1"],
+    )
+    assert res_i_missing.exit_code == 2
+
+    res_i_corrupt = runner.invoke(
+        app,
+        ["case-inspect", "-s", str(corrupt_store), "-c", "c_1"],
+    )
+    assert res_i_corrupt.exit_code == 2
+
+    res_i_non_list = runner.invoke(
+        app,
+        ["case-inspect", "-s", str(non_list_store), "-c", "c_1"],
+    )
+    assert res_i_non_list.exit_code == 2
+
+    res_i_not_found = runner.invoke(
+        app,
+        ["case-inspect", "-s", str(store_file), "-c", "nonexistent_case"],
+    )
+    assert res_i_not_found.exit_code == 2
+    assert "not found in store file" in res_i_not_found.output
+
+    # 13. case-inspect success (json and table)
+    res_i_json = runner.invoke(
+        app,
+        ["case-inspect", "-s", str(store_file), "-c", case_1_id],
+    )
+    assert res_i_json.exit_code == 0
+    assert json.loads(res_i_json.output)["case_id"] == case_1_id
+
+    res_i_tbl = runner.invoke(
+        app,
+        ["case-inspect", "-s", str(store_file), "-c", case_1_id, "-f", "table"],
+    )
+    assert res_i_tbl.exit_code == 0
+    assert f"Case ID:        {case_1_id}" in res_i_tbl.output
+
+    # 14. case-resolve errors
+    res_r_bad_disp = runner.invoke(
+        app,
+        [
+            "case-resolve",
+            "-s",
+            str(store_file),
+            "-c",
+            case_1_id,
+            "-d",
+            "invalid_disp",
+        ],
+    )
+    assert res_r_bad_disp.exit_code == 2
+    assert "Invalid disposition" in res_r_bad_disp.output
+
+    res_r_missing = runner.invoke(
+        app,
+        [
+            "case-resolve",
+            "-s",
+            str(tmp_path / "none.json"),
+            "-c",
+            case_1_id,
+            "-d",
+            "confirmed_fraud",
+        ],
+    )
+    assert res_r_missing.exit_code == 2
+
+    res_r_corrupt = runner.invoke(
+        app,
+        [
+            "case-resolve",
+            "-s",
+            str(corrupt_store),
+            "-c",
+            case_1_id,
+            "-d",
+            "confirmed_fraud",
+        ],
+    )
+    assert res_r_corrupt.exit_code == 2
+
+    res_r_non_list = runner.invoke(
+        app,
+        [
+            "case-resolve",
+            "-s",
+            str(non_list_store),
+            "-c",
+            case_1_id,
+            "-d",
+            "confirmed_fraud",
+        ],
+    )
+    assert res_r_non_list.exit_code == 2
+
+    res_r_not_found = runner.invoke(
+        app,
+        [
+            "case-resolve",
+            "-s",
+            str(store_file),
+            "-c",
+            "nonexistent_case",
+            "-d",
+            "confirmed_fraud",
+        ],
+    )
+    assert res_r_not_found.exit_code == 2
+
+    # 14b. case-resolve CaseError exception handling -> exit 2
+    from fraud_detection.cases import CaseValidationError
+
+    with patch(
+        "fraud_detection.cli.CaseManager.resolve_case",
+        side_effect=CaseValidationError("Forced resolution failure"),
+    ):
+        res_r_fail = runner.invoke(
+            app,
+            [
+                "case-resolve",
+                "-s",
+                str(store_file),
+                "-c",
+                case_1_id,
+                "-d",
+                "confirmed_fraud",
+            ],
+        )
+        assert res_r_fail.exit_code == 2
+        assert "Failed to resolve case" in res_r_fail.output
+
+    # 15. case-resolve success (json and table)
+    res_r_json = runner.invoke(
+        app,
+        [
+            "case-resolve",
+            "-s",
+            str(store_file),
+            "-c",
+            case_1_id,
+            "-d",
+            "confirmed_fraud",
+            "--actor",
+            "lead_analyst",
+            "-n",
+            "Confirmed account takeover.",
+        ],
+    )
+    assert res_r_json.exit_code == 0
+    r_json_data = json.loads(res_r_json.output)
+    assert r_json_data["status"] == "resolved"
+    assert r_json_data["disposition"] == "confirmed_fraud"
+
+    res_r_tbl = runner.invoke(
+        app,
+        [
+            "case-resolve",
+            "-s",
+            str(store_file),
+            "-c",
+            case_2_id,
+            "-d",
+            "false_positive",
+            "-f",
+            "table",
+        ],
+    )
+    assert res_r_tbl.exit_code == 0
+    assert "Disposition: false_positive" in res_r_tbl.output
+
+    # 16. case-evidence errors
+    res_e_missing = runner.invoke(
+        app,
+        ["case-evidence", "-s", str(tmp_path / "none.json"), "-c", case_1_id],
+    )
+    assert res_e_missing.exit_code == 2
+
+    res_e_corrupt = runner.invoke(
+        app,
+        ["case-evidence", "-s", str(corrupt_store), "-c", case_1_id],
+    )
+    assert res_e_corrupt.exit_code == 2
+
+    res_e_non_list = runner.invoke(
+        app,
+        ["case-evidence", "-s", str(non_list_store), "-c", case_1_id],
+    )
+    assert res_e_non_list.exit_code == 2
+
+    res_e_not_found = runner.invoke(
+        app,
+        ["case-evidence", "-s", str(store_file), "-c", "unknown_c"],
+    )
+    assert res_e_not_found.exit_code == 2
+
+    # 17. case-evidence success (json, table, output file)
+    evidence_file = tmp_path / "evidence_export.json"
+    res_e_json = runner.invoke(
+        app,
+        [
+            "case-evidence",
+            "-s",
+            str(store_file),
+            "-c",
+            case_1_id,
+            "-o",
+            str(evidence_file),
+        ],
+    )
+    assert res_e_json.exit_code == 0
+    e_data = json.loads(res_e_json.output)
+    assert e_data["case_id"] == case_1_id
+    assert "sha256_fingerprint" in e_data
+    assert evidence_file.is_file()
+    assert (
+        json.loads(evidence_file.read_text(encoding="utf-8"))["package_id"] == e_data["package_id"]
+    )
+
+    res_e_tbl = runner.invoke(
+        app,
+        [
+            "case-evidence",
+            "-s",
+            str(store_file),
+            "-c",
+            case_1_id,
+            "-f",
+            "table",
+        ],
+    )
+    assert res_e_tbl.exit_code == 0
+    assert f"Case ID:      {case_1_id}" in res_e_tbl.output
+    assert "Integrity:    True" in res_e_tbl.output
+
+
+def test_chargeback_cli_commands(tmp_path: Path) -> None:
+    """Validate all chargeback-* CLI commands: ingest, list, inspect, represent, resolve."""
+    from fraud_detection.cli import app
+
+    runner = CliRunner()
+    store_file = tmp_path / "chargebacks.json"
+
+    # 1. chargeback-ingest: invalid scheme -> exit 2
+    res_bad_scheme = runner.invoke(
+        app,
+        [
+            "chargeback-ingest",
+            "-x",
+            "tx1",
+            "--scheme",
+            "invalid_scheme",
+            "-r",
+            "10.4",
+        ],
+    )
+    assert res_bad_scheme.exit_code == 2
+    assert "Invalid card scheme" in res_bad_scheme.output
+
+    # 1b. chargeback-ingest: validation error (negative amount) -> exit 2
+    res_bad_amt = runner.invoke(
+        app,
+        [
+            "chargeback-ingest",
+            "-x",
+            "tx1",
+            "--scheme",
+            "visa",
+            "-r",
+            "10.4",
+            "-a",
+            "-50.0",
+        ],
+    )
+    assert res_bad_amt.exit_code == 2
+    assert "Failed to ingest chargeback" in res_bad_amt.output
+
+    # 1c. chargeback-ingest: without store_file -> exit 0
+    res_no_store = runner.invoke(
+        app,
+        [
+            "chargeback-ingest",
+            "-x",
+            "tx_no_store",
+            "--scheme",
+            "visa",
+            "-r",
+            "10.4",
+            "-a",
+            "200.0",
+        ],
+    )
+    assert res_no_store.exit_code == 0
+    parsed_no_store = json.loads(res_no_store.output)
+    assert parsed_no_store["transaction_id"] == "tx_no_store"
+    assert parsed_no_store["dispute_id"].startswith("dsp_")
+
+    # 2. chargeback-ingest: valid ingest writing to store_file
+    res_ingest_1 = runner.invoke(
+        app,
+        [
+            "chargeback-ingest",
+            "-x",
+            "tx_cli_001",
+            "--scheme",
+            "visa",
+            "-r",
+            "10.4",
+            "-a",
+            "450.0",
+            "-c",
+            "USD",
+            "-t",
+            "tenant_omega",
+            "--scheme-dispute-id",
+            "vrol_99",
+            "-s",
+            str(store_file),
+        ],
+    )
+    assert res_ingest_1.exit_code == 0
+    d1 = json.loads(res_ingest_1.output)
+    d1_id = d1["dispute_id"]
+    assert d1_id.startswith("dsp_")
+    assert store_file.is_file()
+
+    # 3. chargeback-ingest: table format
+    res_ingest_2 = runner.invoke(
+        app,
+        [
+            "chargeback-ingest",
+            "-x",
+            "tx_cli_002",
+            "--scheme",
+            "mastercard",
+            "-r",
+            "4853",
+            "-a",
+            "120.0",
+            "-t",
+            "tenant_omega",
+            "-s",
+            str(store_file),
+            "-f",
+            "table",
+        ],
+    )
+    assert res_ingest_2.exit_code == 0
+    assert "Dispute ID:" in res_ingest_2.output
+    assert "Scheme:         mastercard" in res_ingest_2.output
+    assert "Category:       consumer_dispute" in res_ingest_2.output
+
+    # Read back records from store_file
+    stored_records = json.loads(store_file.read_text(encoding="utf-8"))
+    assert len(stored_records) == 2
+    d2_id = stored_records[1]["dispute_id"]
+
+    # 4. chargeback-list: invalid / missing store file -> exit 2
+    res_l_missing = runner.invoke(app, ["chargeback-list", "-s", str(tmp_path / "none.json")])
+    assert res_l_missing.exit_code == 2
+
+    corrupt_store = tmp_path / "corrupt.json"
+    corrupt_store.write_text("{corrupt", encoding="utf-8")
+    res_l_corrupt = runner.invoke(app, ["chargeback-list", "-s", str(corrupt_store)])
+    assert res_l_corrupt.exit_code == 2
+
+    non_list_store = tmp_path / "non_list.json"
+    non_list_store.write_text('{"key": "val"}', encoding="utf-8")
+    res_l_non_list = runner.invoke(app, ["chargeback-list", "-s", str(non_list_store)])
+    assert res_l_non_list.exit_code == 2
+
+    # 5. chargeback-list: filters
+    res_l_all = runner.invoke(app, ["chargeback-list", "-s", str(store_file)])
+    assert res_l_all.exit_code == 0
+    assert json.loads(res_l_all.output)["total_count"] == 2
+
+    res_l_visa = runner.invoke(
+        app,
+        ["chargeback-list", "-s", str(store_file), "--scheme", "visa"],
+    )
+    assert res_l_visa.exit_code == 0
+    assert json.loads(res_l_visa.output)["total_count"] == 1
+
+    res_l_cat = runner.invoke(
+        app,
+        ["chargeback-list", "-s", str(store_file), "--category", "consumer_dispute"],
+    )
+    assert res_l_cat.exit_code == 0
+    assert json.loads(res_l_cat.output)["total_count"] == 1
+
+    res_l_tenant = runner.invoke(
+        app,
+        ["chargeback-list", "-s", str(store_file), "-t", "tenant_omega"],
+    )
+    assert res_l_tenant.exit_code == 0
+    assert json.loads(res_l_tenant.output)["total_count"] == 2
+
+    res_l_stage = runner.invoke(
+        app,
+        ["chargeback-list", "-s", str(store_file), "--stage", "first_chargeback"],
+    )
+    assert res_l_stage.exit_code == 0
+    assert json.loads(res_l_stage.output)["total_count"] == 2
+
+    res_l_exp = runner.invoke(
+        app,
+        ["chargeback-list", "-s", str(store_file), "--expired-only"],
+    )
+    assert res_l_exp.exit_code == 0
+    assert json.loads(res_l_exp.output)["total_count"] == 0
+
+    # Table format list
+    res_l_tbl = runner.invoke(
+        app,
+        ["chargeback-list", "-s", str(store_file), "-f", "table"],
+    )
+    assert res_l_tbl.exit_code == 0
+    assert "DISPUTE ID" in res_l_tbl.output
+    assert "WINNABILITY" in res_l_tbl.output
+
+    # Table format empty match
+    res_l_empty = runner.invoke(
+        app,
+        ["chargeback-list", "-s", str(store_file), "-t", "nonexistent_tenant", "-f", "table"],
+    )
+    assert res_l_empty.exit_code == 0
+    assert "No chargeback disputes found." in res_l_empty.output
+
+    # 6. chargeback-inspect: missing / not found / valid
+    res_i_missing = runner.invoke(
+        app,
+        ["chargeback-inspect", "-s", str(tmp_path / "none.json"), "-d", d1_id],
+    )
+    assert res_i_missing.exit_code == 2
+
+    res_i_not_found = runner.invoke(
+        app,
+        ["chargeback-inspect", "-s", str(store_file), "-d", "dsp_nonexistent"],
+    )
+    assert res_i_not_found.exit_code == 2
+    assert "not found in store file" in res_i_not_found.output
+
+    res_i_json = runner.invoke(
+        app,
+        ["chargeback-inspect", "-s", str(store_file), "-d", d1_id],
+    )
+    assert res_i_json.exit_code == 0
+    assert json.loads(res_i_json.output)["dispute_id"] == d1_id
+
+    res_i_tbl = runner.invoke(
+        app,
+        ["chargeback-inspect", "-s", str(store_file), "-d", d1_id, "-f", "table"],
+    )
+    assert res_i_tbl.exit_code == 0
+    assert f"Dispute ID:      {d1_id}" in res_i_tbl.output
+    assert "Scheme:          visa" in res_i_tbl.output
+
+    # 7. chargeback-represent: missing / not found / valid
+    res_rep_missing = runner.invoke(
+        app,
+        ["chargeback-represent", "-s", str(tmp_path / "none.json"), "-d", d1_id],
+    )
+    assert res_rep_missing.exit_code == 2
+
+    res_rep_not_found = runner.invoke(
+        app,
+        ["chargeback-represent", "-s", str(store_file), "-d", "dsp_nonexistent"],
+    )
+    assert res_rep_not_found.exit_code == 2
+
+    res_rep_valid = runner.invoke(
+        app,
+        [
+            "chargeback-represent",
+            "-s",
+            str(store_file),
+            "-d",
+            d1_id,
+            "-p",
+            "pkg_cli_01",
+            "--fingerprint",
+            "f" * 64,
+            "-n",
+            "Compelling evidence attached",
+            "--actor",
+            "analyst_bob",
+            "-f",
+            "table",
+        ],
+    )
+    assert res_rep_valid.exit_code == 0
+    assert "Stage:          represented" in res_rep_valid.output
+    assert "Package ID:     pkg_cli_01" in res_rep_valid.output
+
+    # Represent second dispute with JSON format
+    res_rep_d2 = runner.invoke(
+        app,
+        [
+            "chargeback-represent",
+            "-s",
+            str(store_file),
+            "-d",
+            d2_id,
+            "-p",
+            "pkg_cli_02",
+        ],
+    )
+    assert res_rep_d2.exit_code == 0
+    assert json.loads(res_rep_d2.output)["stage"] == "represented"
+
+    # 8. chargeback-resolve: invalid outcome / missing / not found / valid
+    res_res_bad_outcome = runner.invoke(
+        app,
+        [
+            "chargeback-resolve",
+            "-s",
+            str(store_file),
+            "-d",
+            d1_id,
+            "-o",
+            "invalid_stage",
+        ],
+    )
+    assert res_res_bad_outcome.exit_code == 2
+    assert "Invalid outcome" in res_res_bad_outcome.output
+
+    res_res_missing = runner.invoke(
+        app,
+        [
+            "chargeback-resolve",
+            "-s",
+            str(tmp_path / "none.json"),
+            "-d",
+            d1_id,
+            "-o",
+            "resolved_won",
+        ],
+    )
+    assert res_res_missing.exit_code == 2
+
+    res_res_not_found = runner.invoke(
+        app,
+        [
+            "chargeback-resolve",
+            "-s",
+            str(store_file),
+            "-d",
+            "dsp_nonexistent",
+            "-o",
+            "resolved_won",
+        ],
+    )
+    assert res_res_not_found.exit_code == 2
+
+    # Resolve d1 as resolved_won
+    res_res_won = runner.invoke(
+        app,
+        [
+            "chargeback-resolve",
+            "-s",
+            str(store_file),
+            "-d",
+            d1_id,
+            "-o",
+            "resolved_won",
+            "--actor",
+            "scheme_gateway",
+            "-n",
+            "Merchant victory",
+            "-f",
+            "table",
+        ],
+    )
+    assert res_res_won.exit_code == 0
+    assert "Stage:       resolved_won" in res_res_won.output
+    assert "Terminal:    True" in res_res_won.output
+
+    # Cannot represent an already resolved dispute
+    res_rep_resolved = runner.invoke(
+        app,
+        [
+            "chargeback-represent",
+            "-s",
+            str(store_file),
+            "-d",
+            d1_id,
+        ],
+    )
+    assert res_rep_resolved.exit_code == 2
+    assert "Failed to represent dispute" in res_rep_resolved.output
+
+    # Resolve d2 as resolved_lost
+    res_res_lost = runner.invoke(
+        app,
+        [
+            "chargeback-resolve",
+            "-s",
+            str(store_file),
+            "-d",
+            d2_id,
+            "-o",
+            "resolved_lost",
+        ],
+    )
+    assert res_res_lost.exit_code == 0
+    d2_resolved = json.loads(res_res_lost.output)
+    assert d2_resolved["stage"] == "resolved_lost"
+    assert d2_resolved["is_terminal"] is True
+
+    # 9. chargeback-ingest when store_file already has non-list content (line 9517)
+    non_list_file = tmp_path / "cb_non_list.json"
+    non_list_file.write_text('{"not": "a list"}', encoding="utf-8")
+    res_ingest_nl = runner.invoke(
+        app,
+        [
+            "chargeback-ingest",
+            "-x",
+            "tx_nl_01",
+            "--scheme",
+            "visa",
+            "-r",
+            "10.4",
+            "-s",
+            str(non_list_file),
+        ],
+    )
+    assert res_ingest_nl.exit_code == 0
+    nl_content = json.loads(non_list_file.read_text(encoding="utf-8"))
+    assert isinstance(nl_content, list)
+    assert len(nl_content) == 1
+
+    # 10. Corrupt / non-list store handling in inspect, represent, and resolve
+    assert (
+        runner.invoke(app, ["chargeback-inspect", "-s", str(corrupt_store), "-d", d1_id]).exit_code
+        == 2
+    )
+    assert (
+        runner.invoke(app, ["chargeback-inspect", "-s", str(non_list_store), "-d", d1_id]).exit_code
+        == 2
+    )
+    assert (
+        runner.invoke(
+            app, ["chargeback-represent", "-s", str(corrupt_store), "-d", d1_id]
+        ).exit_code
+        == 2
+    )
+    assert (
+        runner.invoke(
+            app, ["chargeback-represent", "-s", str(non_list_store), "-d", d1_id]
+        ).exit_code
+        == 2
+    )
+    assert (
+        runner.invoke(
+            app,
+            ["chargeback-resolve", "-s", str(corrupt_store), "-d", d1_id, "-o", "resolved_won"],
+        ).exit_code
+        == 2
+    )
+    assert (
+        runner.invoke(
+            app,
+            ["chargeback-resolve", "-s", str(non_list_store), "-d", d1_id, "-o", "resolved_won"],
+        ).exit_code
+        == 2
+    )
+
+    # 11. chargeback-list with non-dict records in store (line 9608) and stage mismatch (line 9614)
+    mixed_store = tmp_path / "mixed.json"
+    mixed_store.write_text(json.dumps(["string_item", 42, stored_records[0]]), encoding="utf-8")
+    res_l_mixed = runner.invoke(app, ["chargeback-list", "-s", str(mixed_store)])
+    assert res_l_mixed.exit_code == 0
+    assert json.loads(res_l_mixed.output)["total_count"] == 1
+
+    res_l_stage_mismatch = runner.invoke(
+        app, ["chargeback-list", "-s", str(mixed_store), "--stage", "arbitration"]
+    )
+    assert res_l_stage_mismatch.exit_code == 0
+    assert json.loads(res_l_stage_mismatch.output)["total_count"] == 0
+
+
+def test_cli_ato_workflow_and_edge_cases(tmp_path: Path) -> None:
+    """Validate ato-* CLI commands: login, eval, mutation, inspect, quarantine, release."""
+    store_file = tmp_path / "ato_store.json"
+
+    # 1. ato-login with table output (no store file)
+    res_lgn_tbl = runner.invoke(
+        app,
+        ["ato-login", "-u", "usr_cli_1", "-i", "192.0.2.1", "-f", "table"],
+    )
+    assert res_lgn_tbl.exit_code == 0
+    assert "Assessment ID:" in res_lgn_tbl.output
+    assert "User ID:       usr_cli_1" in res_lgn_tbl.output
+
+    # 2. ato-login with json output and persistence
+    res_lgn_json = runner.invoke(
+        app,
+        [
+            "ato-login",
+            "-u",
+            "usr_cli_1",
+            "-i",
+            "192.0.2.1",
+            "-d",
+            "dev_cli_laptop",
+            "--latitude",
+            "40.7128",
+            "--longitude",
+            "-74.0060",
+            "-s",
+            str(store_file),
+            "-f",
+            "json",
+        ],
+    )
+    assert res_lgn_json.exit_code == 0
+    lgn_data = json.loads(res_lgn_json.output)
+    assert lgn_data["user_id"] == "usr_cli_1"
+    assert lgn_data["recommended_action"] == "allow"
+    assert store_file.exists()
+
+    # 3. ato-mutation
+    res_mut = runner.invoke(
+        app,
+        [
+            "ato-mutation",
+            "-u",
+            "usr_cli_1",
+            "-m",
+            "password_change",
+            "-c",
+            "web",
+            "-s",
+            str(store_file),
+            "-f",
+            "table",
+        ],
+    )
+    assert res_mut.exit_code == 0
+    assert "Mutation ID:" in res_mut.output
+    assert "Type:        password_change" in res_mut.output
+
+    # 4. ato-inspect (table & json)
+    res_insp_tbl = runner.invoke(
+        app,
+        ["ato-inspect", "-u", "usr_cli_1", "-s", str(store_file), "-f", "table"],
+    )
+    assert res_insp_tbl.exit_code == 0
+    assert "User ID:        usr_cli_1" in res_insp_tbl.output
+    assert "dev_cli_laptop" in res_insp_tbl.output
+
+    res_insp_json = runner.invoke(
+        app,
+        ["ato-inspect", "-u", "usr_cli_1", "-s", str(store_file), "-f", "json"],
+    )
+    assert res_insp_json.exit_code == 0
+    prof = json.loads(res_insp_json.output)
+    assert prof["user_id"] == "usr_cli_1"
+    assert "dev_cli_laptop" in prof["known_devices"]
+    assert len(prof["mutations"]) == 1
+
+    # 5. ato-eval
+    res_eval = runner.invoke(
+        app,
+        [
+            "ato-eval",
+            "-u",
+            "usr_cli_1",
+            "-a",
+            "checkout",
+            "--amount",
+            "150.0",
+            "-s",
+            str(store_file),
+            "-f",
+            "json",
+        ],
+    )
+    assert res_eval.exit_code == 0
+    eval_res = json.loads(res_eval.output)
+    assert eval_res["user_id"] == "usr_cli_1"
+
+    # ato-eval with table output
+    res_eval_tbl = runner.invoke(
+        app,
+        ["ato-eval", "-u", "usr_cli_1", "-f", "table"],
+    )
+    assert res_eval_tbl.exit_code == 0
+    assert "Assessment ID:" in res_eval_tbl.output
+
+    # 6. ato-quarantine (table & json)
+    res_q_tbl = runner.invoke(
+        app,
+        [
+            "ato-quarantine",
+            "-u",
+            "usr_cli_1",
+            "-r",
+            "Security incident 404",
+            "-s",
+            str(store_file),
+            "-f",
+            "table",
+        ],
+    )
+    assert res_q_tbl.exit_code == 0
+    assert "Status:      QUARANTINED" in res_q_tbl.output
+
+    res_q_json = runner.invoke(
+        app,
+        [
+            "ato-quarantine",
+            "-u",
+            "usr_cli_1",
+            "-r",
+            "Suspicious API usage",
+            "-s",
+            str(store_file),
+            "-f",
+            "json",
+        ],
+    )
+    assert res_q_json.exit_code == 0
+    assert json.loads(res_q_json.output)["status"] == "quarantined"
+
+    # Verify quarantine state in inspection
+    res_insp_q = runner.invoke(
+        app,
+        ["ato-inspect", "-u", "usr_cli_1", "-s", str(store_file), "-f", "table"],
+    )
+    assert res_insp_q.exit_code == 0
+    assert "Quarantined:    True" in res_insp_q.output
+
+    # 7. ato-release (table & json)
+    res_rel_tbl = runner.invoke(
+        app,
+        [
+            "ato-release",
+            "-u",
+            "usr_cli_1",
+            "-r",
+            "Identity verified by tier 2",
+            "-s",
+            str(store_file),
+            "-f",
+            "table",
+        ],
+    )
+    assert res_rel_tbl.exit_code == 0
+    assert "Status:      RELEASED" in res_rel_tbl.output
+
+    res_rel_json = runner.invoke(
+        app,
+        [
+            "ato-release",
+            "-u",
+            "usr_cli_1",
+            "-r",
+            "Verified via MFA challenge",
+            "-s",
+            str(store_file),
+            "-f",
+            "json",
+        ],
+    )
+    assert res_rel_json.exit_code == 0
+    assert json.loads(res_rel_json.output)["status"] == "released"
+
+    # 8. ato-mutation with json output
+    res_mut_json = runner.invoke(
+        app,
+        [
+            "ato-mutation",
+            "-u",
+            "usr_cli_1",
+            "-m",
+            "email_change",
+            "-s",
+            str(store_file),
+            "-f",
+            "json",
+        ],
+    )
+    assert res_mut_json.exit_code == 0
+    assert json.loads(res_mut_json.output)["mutation_type"] == "email_change"
+
+    # 9. Error edge cases
+    # Invalid outcome -> exit code 2
+    res_err_outcome = runner.invoke(
+        app,
+        ["ato-login", "-u", "u1", "-o", "invalid_outcome"],
+    )
+    assert res_err_outcome.exit_code == 2
+
+    # Invalid mutation type -> exit code 2
+    res_err_mut = runner.invoke(
+        app,
+        ["ato-mutation", "-u", "u1", "-m", "invalid_mutation", "-s", str(store_file)],
+    )
+    assert res_err_mut.exit_code == 2
+
+    # Corrupt store file -> exit code 2
+    corrupt_file = tmp_path / "corrupt_ato.json"
+    corrupt_file.write_text("{not valid json", encoding="utf-8")
+    assert runner.invoke(app, ["ato-inspect", "-u", "u1", "-s", str(corrupt_file)]).exit_code == 2
+
+    # Non-dict store file -> exit code 2
+    non_dict_file = tmp_path / "non_dict_ato.json"
+    non_dict_file.write_text(json.dumps(["just", "a", "list"]), encoding="utf-8")
+    assert runner.invoke(app, ["ato-inspect", "-u", "u1", "-s", str(non_dict_file)]).exit_code == 2
+
+
+def test_aml_cli_workflows(tmp_path: Path) -> None:
+    """Validate aml-* CLI commands: screen, monitor, alerts, sar-generate, sar-list, sar-status."""
+    runner = CliRunner()
+    store_file = tmp_path / "aml_store.json"
+
+    # 1. aml-screen against default watchlists (table & json)
+    res_scr_tbl = runner.invoke(
+        app,
+        ["aml-screen", "-n", "Sergei Ivanov", "-t", "0.80", "-f", "table"],
+    )
+    assert res_scr_tbl.exit_code == 0
+    assert "Screening Query: Sergei Ivanov" in res_scr_tbl.stdout
+    assert "Matches Found:" in res_scr_tbl.stdout
+
+    res_scr_json = runner.invoke(
+        app,
+        ["aml-screen", "-n", "Vladimir Putin", "-t", "0.85", "-f", "json"],
+    )
+    assert res_scr_json.exit_code == 0
+    matches_data = json.loads(res_scr_json.stdout)
+    assert isinstance(matches_data, list)
+    assert len(matches_data) > 0
+    assert matches_data[0]["matched_entry"]["watchlist_type"] == "ofac_sdn"
+
+    # aml-screen with custom watchlist file
+    custom_wl_file = tmp_path / "custom_wl.json"
+    custom_wl_file.write_text(
+        json.dumps(
+            [
+                {
+                    "entity_id": "wl_custom_001",
+                    "name": "Tony Montana",
+                    "aliases": ["Scarface"],
+                    "watchlist_type": "pep",
+                    "country": "CU",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    res_custom_scr = runner.invoke(
+        app,
+        ["aml-screen", "-n", "Tony Montana", "-w", str(custom_wl_file), "-f", "table"],
+    )
+    assert res_custom_scr.exit_code == 0
+    assert "Matches Found:   1" in res_custom_scr.stdout
+
+    # 2. aml-monitor: low-risk transaction with table output (default aml_store.json fallback)
+    res_mon_low = runner.invoke(
+        app,
+        [
+            "aml-monitor",
+            "-u",
+            "usr_aml_1",
+            "-a",
+            "150.0",
+            "-c",
+            "merch_groceries",
+            "--country",
+            "US",
+            "-d",
+            "outbound",
+            "-s",
+            str(store_file),
+            "-f",
+            "table",
+        ],
+    )
+    assert res_mon_low.exit_code == 0
+    assert "User ID:        usr_aml_1" in res_mon_low.stdout
+    assert "Policy Action:  pass" in res_mon_low.stdout
+
+    # 3. aml-monitor: high-risk sanction entity with json output and persistence
+    res_mon_sanction = runner.invoke(
+        app,
+        [
+            "aml-monitor",
+            "-u",
+            "usr_aml_bad",
+            "-a",
+            "75000.0",
+            "-c",
+            "entity_suspicious",
+            "-n",
+            "Sergei Ivanov",
+            "--country",
+            "RU",
+            "-d",
+            "outbound",
+            "-s",
+            str(store_file),
+            "-f",
+            "json",
+        ],
+    )
+    assert res_mon_sanction.exit_code == 0
+    assess_data = json.loads(res_mon_sanction.stdout)
+    assert assess_data["risk_level"] in ("high", "critical")
+    assert assess_data["recommended_action"] == "file_sar_block"
+    assert "sanction_pep_match" in assess_data["score_breakdown"]
+    assert assess_data["alert"] is not None
+    sanction_alert_id = assess_data["alert"]["alert_id"]
+
+    # 4. aml-monitor: structuring pattern (3 sub-threshold transactions)
+    for _ in range(3):
+        runner.invoke(
+            app,
+            [
+                "aml-monitor",
+                "-u",
+                "usr_aml_structurer",
+                "-a",
+                "9500.0",
+                "-s",
+                str(store_file),
+            ],
+        )
+
+    # 5. aml-alerts (table and json output with filtering)
+    res_alerts_tbl = runner.invoke(
+        app,
+        ["aml-alerts", "-s", str(store_file), "-f", "table"],
+    )
+    assert res_alerts_tbl.exit_code == 0
+    assert "Alerts (" in res_alerts_tbl.stdout
+
+    res_alerts_json = runner.invoke(
+        app,
+        [
+            "aml-alerts",
+            "-u",
+            "usr_aml_bad",
+            "-t",
+            "sanction_pep_match",
+            "-s",
+            str(store_file),
+            "-f",
+            "json",
+        ],
+    )
+    assert res_alerts_json.exit_code == 0
+    filtered_alerts = json.loads(res_alerts_json.stdout)
+    assert len(filtered_alerts) > 0
+    assert filtered_alerts[0]["alert_id"] == sanction_alert_id
+
+    # 6. aml-sar-generate: compile SAR dossier from sanction alert
+    res_sar_gen = runner.invoke(
+        app,
+        [
+            "aml-sar-generate",
+            "-u",
+            "usr_aml_bad",
+            "-a",
+            sanction_alert_id,
+            "-n",
+            "Sergei Ivanov",
+            "--narrative",
+            "High confidence OFAC sanctions match on international wire transfer.",
+            "-s",
+            str(store_file),
+            "-f",
+            "table",
+        ],
+    )
+    assert res_sar_gen.exit_code == 0
+    assert "SAR ID:" in res_sar_gen.stdout
+    assert "Filing Status: draft" in res_sar_gen.stdout
+
+    # aml-sar-generate with json output
+    res_sar_gen_json = runner.invoke(
+        app,
+        [
+            "aml-sar-generate",
+            "-u",
+            "usr_aml_bad",
+            "-a",
+            sanction_alert_id,
+            "-s",
+            str(store_file),
+            "-f",
+            "json",
+        ],
+    )
+    assert res_sar_gen_json.exit_code == 0
+    sar_data = json.loads(res_sar_gen_json.stdout)
+    sar_id = sar_data["sar_id"]
+    assert sar_data["status"] == "draft"
+
+    # 7. aml-sar-list (table & json)
+    res_sar_list_tbl = runner.invoke(
+        app,
+        ["aml-sar-list", "-s", str(store_file), "-f", "table"],
+    )
+    assert res_sar_list_tbl.exit_code == 0
+    assert "SAR Dossiers (" in res_sar_list_tbl.stdout
+
+    res_sar_list_json = runner.invoke(
+        app,
+        ["aml-sar-list", "--status", "draft", "-s", str(store_file), "-f", "json"],
+    )
+    assert res_sar_list_json.exit_code == 0
+    sars_list = json.loads(res_sar_list_json.stdout)
+    assert len(sars_list) >= 2
+
+    # 8. aml-sar-status: transition draft -> pending_review -> approved -> filed
+    res_st1 = runner.invoke(
+        app,
+        [
+            "aml-sar-status",
+            "--sar-id",
+            sar_id,
+            "--status",
+            "pending_review",
+            "-r",
+            "officer_alice",
+            "-c",
+            "Escalated for senior compliance officer review.",
+            "-s",
+            str(store_file),
+            "-f",
+            "table",
+        ],
+    )
+    assert res_st1.exit_code == 0
+    assert "New Status:    pending_review" in res_st1.stdout
+
+    res_st2 = runner.invoke(
+        app,
+        [
+            "aml-sar-status",
+            "--sar-id",
+            sar_id,
+            "--status",
+            "approved",
+            "-r",
+            "officer_bob",
+            "-c",
+            "Approved for regulatory submission to FinCEN.",
+            "-s",
+            str(store_file),
+        ],
+    )
+    assert res_st2.exit_code == 0
+    assert "New Status:    approved" in res_st2.stdout
+
+    res_st3 = runner.invoke(
+        app,
+        [
+            "aml-sar-status",
+            "--sar-id",
+            sar_id,
+            "--status",
+            "filed",
+            "-r",
+            "officer_bob",
+            "-c",
+            "Submitted via FinCEN BSA Direct.",
+            "-s",
+            str(store_file),
+            "-f",
+            "json",
+        ],
+    )
+    assert res_st3.exit_code == 0
+    filed_data = json.loads(res_st3.stdout)
+    assert filed_data["status"] == "filed"
+    assert filed_data["filing_date"] != ""
+
+
+def test_aml_cli_error_branches(tmp_path: Path) -> None:
+    """Validate error branches and exit code 2 handling in aml-* CLI commands."""
+    runner = CliRunner()
+    store_file = tmp_path / "aml_store.json"
+
+    # Invalid direction
+    res_dir = runner.invoke(
+        app,
+        ["aml-monitor", "-u", "u1", "-a", "100.0", "-d", "invalid_dir"],
+    )
+    assert res_dir.exit_code == 2
+    assert "Invalid transaction direction" in res_dir.stderr
+
+    # Non-existent watchlist file
+    res_missing_wl = runner.invoke(
+        app,
+        ["aml-screen", "-n", "Target", "-w", str(tmp_path / "missing.json")],
+    )
+    assert res_missing_wl.exit_code == 2
+    assert "Watchlist file not found" in res_missing_wl.stderr
+
+    # Corrupt watchlist file
+    corrupt_wl = tmp_path / "corrupt_wl.json"
+    corrupt_wl.write_text("{invalid json", encoding="utf-8")
+    res_corrupt_wl = runner.invoke(
+        app,
+        ["aml-screen", "-n", "Target", "-w", str(corrupt_wl)],
+    )
+    assert res_corrupt_wl.exit_code == 2
+
+    # Invalid typology in aml-alerts
+    res_bad_typ = runner.invoke(
+        app,
+        ["aml-alerts", "-t", "unknown_typology", "-s", str(store_file)],
+    )
+    assert res_bad_typ.exit_code == 2
+
+    # Invalid risk level in aml-alerts
+    res_bad_rl = runner.invoke(
+        app,
+        ["aml-alerts", "-r", "ultra_extreme", "-s", str(store_file)],
+    )
+    assert res_bad_rl.exit_code == 2
+
+    # Corrupt store file
+    corrupt_store = tmp_path / "corrupt_store.json"
+    corrupt_store.write_text("{bad json", encoding="utf-8")
+    assert runner.invoke(app, ["aml-alerts", "-s", str(corrupt_store)]).exit_code == 2
+
+    # Non-dict store file
+    non_dict = tmp_path / "non_dict.json"
+    non_dict.write_text("[1, 2, 3]", encoding="utf-8")
+    assert runner.invoke(app, ["aml-alerts", "-s", str(non_dict)]).exit_code == 2
+
+    # aml-sar-generate with empty alert IDs
+    res_empty_alerts = runner.invoke(
+        app,
+        ["aml-sar-generate", "-u", "u1", "-a", " , ", "-s", str(store_file)],
+    )
+    assert res_empty_alerts.exit_code == 2
+
+    # aml-sar-status with non-existent SAR ID
+    res_no_sar = runner.invoke(
+        app,
+        [
+            "aml-sar-status",
+            "--sar-id",
+            "non_existent_sar",
+            "--status",
+            "pending_review",
+            "-s",
+            str(store_file),
+        ],
+    )
+    assert res_no_sar.exit_code == 2
+    assert "not found" in res_no_sar.stderr
+
+    # aml-sar-status with invalid status string
+    res_bad_st = runner.invoke(
+        app,
+        [
+            "aml-sar-status",
+            "--sar-id",
+            "sar_123",
+            "--status",
+            "invalid_status",
+            "-s",
+            str(store_file),
+        ],
+    )
+    assert res_bad_st.exit_code == 2
+
+    # aml-sar-list with invalid status string
+    res_bad_list_st = runner.invoke(
+        app,
+        ["aml-sar-list", "--status", "invalid_status", "-s", str(store_file)],
+    )
+    assert res_bad_list_st.exit_code == 2
+
+
+def test_sif_cli_workflows(tmp_path: Path) -> None:
+    """Validate sif-check-ssn, sif-eval, sif-inspect, and sif-summary CLI workflows."""
+    runner = CliRunner()
+    store_file = tmp_path / "sif_state.json"
+
+    # 1. sif-check-ssn (table)
+    res_ssn_tbl = runner.invoke(
+        app,
+        ["sif-check-ssn", "--ssn", "050-12-3456", "--dob", "1980-01-01"],
+    )
+    assert res_ssn_tbl.exit_code == 0
+    assert "SSN Valid:        True" in res_ssn_tbl.stdout
+    assert "New York" in res_ssn_tbl.stdout
+
+    # 2. sif-check-ssn (json) for deceased SSN
+    res_ssn_json = runner.invoke(
+        app,
+        ["sif-check-ssn", "--ssn", "042-12-9999", "--format", "json"],
+    )
+    assert res_ssn_json.exit_code == 0
+    data_ssn = json.loads(res_ssn_json.stdout)
+    assert data_ssn["is_valid"] is False
+    assert data_ssn["is_deceased"] is True
+
+    # 3. sif-eval (legitimate, table)
+    res_eval_tbl = runner.invoke(
+        app,
+        [
+            "sif-eval",
+            "--ssn",
+            "050-12-3456",
+            "--first-name",
+            "Tony",
+            "--last-name",
+            "Stark",
+            "--dob",
+            "1970-05-29",
+            "--address",
+            "10880 Malibu Point, Malibu, CA",
+            "--phone",
+            "+13105554321",
+            "--email",
+            "tony@starkindustries.com",
+            "--applicant-id",
+            "app_stark",
+            "--credit-line",
+            "100000.0",
+            "-s",
+            str(store_file),
+        ],
+    )
+    assert res_eval_tbl.exit_code == 0
+    assert "Applicant ID:     app_stark" in res_eval_tbl.stdout
+    assert "Policy Action:    approve" in res_eval_tbl.stdout
+    assert store_file.exists()
+
+    # 4. sif-eval (deceased, json)
+    res_eval_dec = runner.invoke(
+        app,
+        [
+            "sif-eval",
+            "--ssn",
+            "042-12-9999",
+            "--first-name",
+            "Arthur",
+            "--last-name",
+            "Pendelton",
+            "--dob",
+            "1950-01-01",
+            "--address",
+            "10 Ghost St, Hartford, CT",
+            "--phone",
+            "+12035551212",
+            "--email",
+            "arthur@example.com",
+            "--applicant-id",
+            "app_dec",
+            "-s",
+            str(store_file),
+            "--format",
+            "json",
+        ],
+    )
+    assert res_eval_dec.exit_code == 0
+    data_dec = json.loads(res_eval_dec.stdout)
+    assert data_dec["action"] == "decline_block"
+    assert data_dec["risk_score"] == 1.0
+    ass_id_dec = data_dec["assessment_id"]
+
+    # 5. sif-inspect by applicant-id (table)
+    res_insp_app = runner.invoke(
+        app,
+        ["sif-inspect", "-a", "app_stark", "-s", str(store_file)],
+    )
+    assert res_insp_app.exit_code == 0
+    assert "Applicant ID:     app_stark" in res_insp_app.stdout
+    assert "Tony Stark" in res_insp_app.stdout
+
+    # 6. sif-inspect by assessment-id (json)
+    res_insp_ass = runner.invoke(
+        app,
+        ["sif-inspect", "-i", ass_id_dec, "-s", str(store_file), "--format", "json"],
+    )
+    assert res_insp_ass.exit_code == 0
+    data_insp_ass = json.loads(res_insp_ass.stdout)
+    assert data_insp_ass["assessment_id"] == ass_id_dec
+
+    # 7. sif-summary (table)
+    res_sum_tbl = runner.invoke(
+        app,
+        ["sif-summary", "-s", str(store_file)],
+    )
+    assert res_sum_tbl.exit_code == 0
+    assert "Total Profiles:     2" in res_sum_tbl.stdout
+    assert "Total Assessments:  2" in res_sum_tbl.stdout
+
+    # 8. sif-summary (json)
+    res_sum_json = runner.invoke(
+        app,
+        ["sif-summary", "-s", str(store_file), "--format", "json"],
+    )
+    assert res_sum_json.exit_code == 0
+    data_sum = json.loads(res_sum_json.stdout)
+    assert data_sum["total_profiles"] == 2
+    assert data_sum["total_assessments"] == 2
+
+
+def test_sif_cli_error_branches(tmp_path: Path) -> None:
+    """Validate error branches and exit code 2 in sif-* CLI commands."""
+    runner = CliRunner()
+    store_file = tmp_path / "sif_state.json"
+
+    # sif-inspect without any ID
+    res_no_id = runner.invoke(app, ["sif-inspect", "-s", str(store_file)])
+    assert res_no_id.exit_code == 2
+    assert "Must provide either --applicant-id or --assessment-id" in res_no_id.stderr
+
+    # sif-inspect with non-existent applicant
+    res_no_app = runner.invoke(app, ["sif-inspect", "-a", "unknown_app", "-s", str(store_file)])
+    assert res_no_app.exit_code == 2
+    assert "not found in store" in res_no_app.stderr
+
+    # sif-inspect with non-existent assessment
+    res_no_ass = runner.invoke(app, ["sif-inspect", "-i", "unknown_ass", "-s", str(store_file)])
+    assert res_no_ass.exit_code == 2
+    assert "not found in store" in res_no_ass.stderr
+
+    # Corrupt store file
+    corrupt_store = tmp_path / "corrupt.json"
+    corrupt_store.write_text("{bad json", encoding="utf-8")
+    res_corrupt = runner.invoke(app, ["sif-inspect", "-a", "app1", "-s", str(corrupt_store)])
+    assert res_corrupt.exit_code == 2
+
+    # Non-dict store file
+    nondict_store = tmp_path / "nondict.json"
+    nondict_store.write_text("[]", encoding="utf-8")
+    res_nondict = runner.invoke(app, ["sif-inspect", "-a", "app1", "-s", str(nondict_store)])
+    assert res_nondict.exit_code == 2
