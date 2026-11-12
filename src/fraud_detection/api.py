@@ -199,6 +199,14 @@ from fraud_detection.routing import (
     TrafficSplitStrategy,
 )
 from fraud_detection.rules import RulePrecedence, RuleSet
+from fraud_detection.synthetic_identity import (
+    AuthorizedUserRecord,
+    IdentityProfile,
+    SifAction,
+    SifAssessment,
+    SifRiskLevel,
+    SyntheticIdentityEngine,
+)
 from fraud_detection.telemetry import (
     DEFAULT_OTLP_TIMEOUT_SECONDS,
     DEFAULT_SERVICE_NAME,
@@ -333,6 +341,9 @@ OPERATIONAL_PATHS = frozenset(
         "/v1/aml/watchlist/screen",
         "/v1/aml/alerts",
         "/v1/aml/sar",
+        "/v1/sif/evaluate",
+        "/v1/sif/assessments",
+        "/v1/sif/profiles",
     }
 )
 UNMATCHED_ROUTE_LABEL = "unmatched"
@@ -2180,6 +2191,100 @@ def _aml_sar_to_response(sar: SarDossier) -> AmlSarResponse:
     return AmlSarResponse(**d)
 
 
+class SifEvaluateRequest(BaseModel):
+    """Payload to evaluate an identity profile for synthetic fraud."""
+
+    applicant_id: str = Field(default_factory=lambda: f"app_{uuid4().hex[:12]}")
+    ssn: str
+    first_name: str
+    last_name: str
+    dob: str
+    address: str
+    phone: str
+    email: str
+    credit_line_requested: float = 5000.0
+    authorized_users: list[dict[str, Any]] = Field(default_factory=list)
+    tenant_id: str = "default"
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class SifProfileRequest(BaseModel):
+    """Payload to create or store an applicant identity profile."""
+
+    applicant_id: str = Field(default_factory=lambda: f"app_{uuid4().hex[:12]}")
+    ssn: str
+    first_name: str
+    last_name: str
+    dob: str
+    address: str
+    phone: str
+    email: str
+    credit_line_requested: float = 5000.0
+    authorized_users: list[dict[str, Any]] = Field(default_factory=list)
+    tenant_id: str = "default"
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class SifAssessmentResponse(BaseModel):
+    """Synthetic identity assessment report response."""
+
+    assessment_id: str
+    applicant_id: str
+    tenant_id: str
+    risk_score: float
+    risk_level: str
+    action: str
+    triggered_anomalies: list[str]
+    anomaly_breakdown: dict[str, float]
+    identity_fragmentation_score: float
+    ssn_validation: dict[str, Any] | None = None
+    evaluated_at: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class SifProfileResponse(BaseModel):
+    """Applicant identity profile response."""
+
+    applicant_id: str
+    ssn: str
+    ssn_hash: str
+    first_name: str
+    last_name: str
+    dob: str
+    address: str
+    phone: str
+    email: str
+    credit_line_requested: float
+    authorized_users: list[dict[str, Any]]
+    tenant_id: str
+    created_at: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class SifAssessmentListResponse(BaseModel):
+    """List of synthetic identity assessments."""
+
+    total_count: int
+    assessments: list[SifAssessmentResponse]
+
+
+class SifProfileListResponse(BaseModel):
+    """List of identity profiles."""
+
+    total_count: int
+    profiles: list[SifProfileResponse]
+
+
+def _sif_assessment_to_response(assessment: SifAssessment) -> SifAssessmentResponse:
+    d = assessment.to_dict()
+    return SifAssessmentResponse(**d)
+
+
+def _sif_profile_to_response(profile: IdentityProfile) -> SifProfileResponse:
+    d = profile.to_dict()
+    return SifProfileResponse(**d)
+
+
 def create_app(
     *,
     model: FraudModel | None = None,
@@ -2266,6 +2371,7 @@ def create_app(
     ato_engine: AtoEngine | None = None,
     aml_engine: AmlEngine | None = None,
     sar_manager: SarManager | None = None,
+    sif_engine: SyntheticIdentityEngine | None = None,
 ) -> FastAPI:
     """Create an application using an injected model or a trusted artifact path.
 
@@ -2750,6 +2856,30 @@ def create_app(
     aml_sars_filed_counter = Counter(
         "fraud_aml_sars_filed_total",
         "Total SAR dossiers transitioned to FILED status.",
+        ["tenant_id"],
+        registry=metrics_registry,
+    )
+    sif_evaluations_counter = Counter(
+        "fraud_sif_evaluations_total",
+        "Total synthetic identity fraud evaluations performed.",
+        ["tenant_id", "action", "risk_level"],
+        registry=metrics_registry,
+    )
+    sif_anomalies_counter = Counter(
+        "fraud_sif_anomalies_total",
+        "Total synthetic identity fraud anomalies detected.",
+        ["tenant_id", "anomaly_type"],
+        registry=metrics_registry,
+    )
+    sif_high_risk_counter = Counter(
+        "fraud_sif_high_risk_total",
+        "Total synthetic identity evaluations flagged as HIGH or CRITICAL risk.",
+        ["tenant_id"],
+        registry=metrics_registry,
+    )
+    sif_blocks_counter = Counter(
+        "fraud_sif_blocks_total",
+        "Total applications blocked due to synthetic identity fraud.",
         ["tenant_id"],
         registry=metrics_registry,
     )
@@ -3325,6 +3455,16 @@ def create_app(
         application.state.aml_sanction_hits_counter = aml_sanction_hits_counter
         application.state.aml_sars_created_counter = aml_sars_created_counter
         application.state.aml_sars_filed_counter = aml_sars_filed_counter
+        resolved_sif_engine = sif_engine or SyntheticIdentityEngine(
+            case_manager=application.state.case_manager,
+            challenge_manager=application.state.challenge_manager,
+            event_bus=resolved_event_bus,
+        )
+        application.state.sif_engine = resolved_sif_engine
+        application.state.sif_evaluations_counter = sif_evaluations_counter
+        application.state.sif_anomalies_counter = sif_anomalies_counter
+        application.state.sif_high_risk_counter = sif_high_risk_counter
+        application.state.sif_blocks_counter = sif_blocks_counter
         application.state.audit_sink = resolved_audit_sink
         application.state.explanation_provider = explanation_provider
         application.state.fallback_mode = resolved_fallback_mode
@@ -7523,6 +7663,239 @@ def create_app(
                 counter.labels(tenant_id=updated.tenant_id).inc()
 
         return _aml_sar_to_response(updated)
+
+    @application.post(
+        "/v1/sif/evaluate",
+        response_model=SifAssessmentResponse,
+        responses={
+            500: {"description": "SyntheticIdentityEngine not initialized."},
+        },
+        tags=["synthetic_identity"],
+    )
+    async def sif_evaluate_endpoint(
+        payload: SifEvaluateRequest,
+        request: Request,
+    ) -> SifAssessmentResponse | JSONResponse:
+        """Evaluate an applicant credit profile for synthetic identity fraud."""
+        engine: SyntheticIdentityEngine | None = getattr(request.app.state, "sif_engine", None)
+        if engine is None:
+            return JSONResponse(
+                status_code=500, content={"detail": "SyntheticIdentityEngine not initialized"}
+            )
+
+        auth_users = [
+            AuthorizedUserRecord.from_dict(u) if isinstance(u, dict) else u
+            for u in payload.authorized_users
+        ]
+        profile = IdentityProfile(
+            applicant_id=payload.applicant_id,
+            ssn=payload.ssn,
+            first_name=payload.first_name,
+            last_name=payload.last_name,
+            dob=payload.dob,
+            address=payload.address,
+            phone=payload.phone,
+            email=payload.email,
+            credit_line_requested=payload.credit_line_requested,
+            authorized_users=auth_users,
+            tenant_id=payload.tenant_id,
+            metadata=payload.metadata,
+        )
+
+        assessment = engine.evaluate(profile)
+
+        # Update Prometheus metrics
+        eval_counter = getattr(request.app.state, "sif_evaluations_counter", None)
+        if eval_counter is not None:
+            eval_counter.labels(
+                tenant_id=assessment.tenant_id,
+                action=assessment.action.value,
+                risk_level=assessment.risk_level.value,
+            ).inc()
+
+        anom_counter = getattr(request.app.state, "sif_anomalies_counter", None)
+        if anom_counter is not None:
+            for anom in assessment.triggered_anomalies:
+                anom_counter.labels(
+                    tenant_id=assessment.tenant_id,
+                    anomaly_type=anom.value,
+                ).inc()
+
+        if assessment.risk_level in (SifRiskLevel.HIGH, SifRiskLevel.CRITICAL):
+            high_risk_counter = getattr(request.app.state, "sif_high_risk_counter", None)
+            if high_risk_counter is not None:
+                high_risk_counter.labels(tenant_id=assessment.tenant_id).inc()
+
+        if assessment.action == SifAction.DECLINE_BLOCK:
+            block_counter = getattr(request.app.state, "sif_blocks_counter", None)
+            if block_counter is not None:
+                block_counter.labels(tenant_id=assessment.tenant_id).inc()
+
+        return _sif_assessment_to_response(assessment)
+
+    @application.get(
+        "/v1/sif/assessments/{assessment_id}",
+        response_model=SifAssessmentResponse,
+        responses={
+            404: {"description": "Assessment not found."},
+            500: {"description": "SyntheticIdentityEngine not initialized."},
+        },
+        tags=["synthetic_identity"],
+    )
+    async def sif_get_assessment_endpoint(
+        assessment_id: str,
+        request: Request,
+    ) -> SifAssessmentResponse | JSONResponse:
+        """Fetch synthetic identity risk assessment by ID."""
+        engine: SyntheticIdentityEngine | None = getattr(request.app.state, "sif_engine", None)
+        if engine is None:
+            return JSONResponse(
+                status_code=500, content={"detail": "SyntheticIdentityEngine not initialized"}
+            )
+
+        assessment = engine.store.get_assessment(assessment_id)
+        if assessment is None:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": f"Assessment '{assessment_id}' not found"},
+            )
+        return _sif_assessment_to_response(assessment)
+
+    @application.get(
+        "/v1/sif/assessments",
+        response_model=SifAssessmentListResponse,
+        responses={
+            500: {"description": "SyntheticIdentityEngine not initialized."},
+        },
+        tags=["synthetic_identity"],
+    )
+    async def sif_list_assessments_endpoint(
+        request: Request,
+        tenant_id: str | None = None,
+        limit: int = 100,
+    ) -> SifAssessmentListResponse | JSONResponse:
+        """Query synthetic identity assessments with optional tenant filter."""
+        engine: SyntheticIdentityEngine | None = getattr(request.app.state, "sif_engine", None)
+        if engine is None:
+            return JSONResponse(
+                status_code=500, content={"detail": "SyntheticIdentityEngine not initialized"}
+            )
+
+        assessments = engine.store.list_assessments(tenant_id=tenant_id, limit=limit)
+        return SifAssessmentListResponse(
+            total_count=len(assessments),
+            assessments=[_sif_assessment_to_response(a) for a in assessments],
+        )
+
+    @application.post(
+        "/v1/sif/profiles",
+        response_model=SifProfileResponse,
+        responses={
+            500: {"description": "SyntheticIdentityEngine not initialized."},
+        },
+        tags=["synthetic_identity"],
+    )
+    async def sif_create_profile_endpoint(
+        payload: SifProfileRequest,
+        request: Request,
+    ) -> SifProfileResponse | JSONResponse:
+        """Store an applicant profile in the synthetic identity store."""
+        engine: SyntheticIdentityEngine | None = getattr(request.app.state, "sif_engine", None)
+        if engine is None:
+            return JSONResponse(
+                status_code=500, content={"detail": "SyntheticIdentityEngine not initialized"}
+            )
+
+        auth_users = [
+            AuthorizedUserRecord.from_dict(u) if isinstance(u, dict) else u
+            for u in payload.authorized_users
+        ]
+        profile = IdentityProfile(
+            applicant_id=payload.applicant_id,
+            ssn=payload.ssn,
+            first_name=payload.first_name,
+            last_name=payload.last_name,
+            dob=payload.dob,
+            address=payload.address,
+            phone=payload.phone,
+            email=payload.email,
+            credit_line_requested=payload.credit_line_requested,
+            authorized_users=auth_users,
+            tenant_id=payload.tenant_id,
+            metadata=payload.metadata,
+        )
+        engine.store.add_profile(profile)
+        return _sif_profile_to_response(profile)
+
+    @application.get(
+        "/v1/sif/applicants/{applicant_id}",
+        response_model=SifProfileResponse,
+        responses={
+            404: {"description": "Applicant profile not found."},
+            500: {"description": "SyntheticIdentityEngine not initialized."},
+        },
+        tags=["synthetic_identity"],
+    )
+    async def sif_get_profile_endpoint(
+        applicant_id: str,
+        request: Request,
+    ) -> SifProfileResponse | JSONResponse:
+        """Fetch an applicant profile by applicant_id."""
+        engine: SyntheticIdentityEngine | None = getattr(request.app.state, "sif_engine", None)
+        if engine is None:
+            return JSONResponse(
+                status_code=500, content={"detail": "SyntheticIdentityEngine not initialized"}
+            )
+
+        profile = engine.store.get_profile(applicant_id)
+        if profile is None:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": f"Applicant '{applicant_id}' not found"},
+            )
+        return _sif_profile_to_response(profile)
+
+    @application.get(
+        "/v1/sif/profiles",
+        response_model=SifProfileListResponse,
+        responses={
+            500: {"description": "SyntheticIdentityEngine not initialized."},
+        },
+        tags=["synthetic_identity"],
+    )
+    async def sif_list_profiles_endpoint(
+        request: Request,
+        tenant_id: str | None = None,
+        limit: int = 100,
+    ) -> SifProfileListResponse | JSONResponse:
+        """Query applicant profiles with optional tenant filter."""
+        engine: SyntheticIdentityEngine | None = getattr(request.app.state, "sif_engine", None)
+        if engine is None:
+            return JSONResponse(
+                status_code=500, content={"detail": "SyntheticIdentityEngine not initialized"}
+            )
+
+        profiles = engine.store.list_profiles(tenant_id=tenant_id, limit=limit)
+        return SifProfileListResponse(
+            total_count=len(profiles),
+            profiles=[_sif_profile_to_response(p) for p in profiles],
+        )
+
+    @application.get(
+        "/v1/sif/metrics",
+        response_model=dict[str, Any],
+        tags=["synthetic_identity"],
+    )
+    async def sif_metrics_endpoint(request: Request) -> dict[str, Any]:
+        """Summary metrics of synthetic identity evaluations and storage."""
+        engine: SyntheticIdentityEngine | None = getattr(request.app.state, "sif_engine", None)
+        total_profiles = engine.store.profile_count if engine else 0
+        total_assessments = engine.store.assessment_count if engine else 0
+        return {
+            "total_profiles_tracked": total_profiles,
+            "total_assessments_recorded": total_assessments,
+            "status": "operational" if engine else "uninitialized",
+        }
 
     @application.get(
         "/v1/routing/status",

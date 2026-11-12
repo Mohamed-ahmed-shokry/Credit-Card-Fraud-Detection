@@ -10425,3 +10425,163 @@ def test_aml_cli_error_branches(tmp_path: Path) -> None:
         ["aml-sar-list", "--status", "invalid_status", "-s", str(store_file)],
     )
     assert res_bad_list_st.exit_code == 2
+
+
+def test_sif_cli_workflows(tmp_path: Path) -> None:
+    """Validate sif-check-ssn, sif-eval, sif-inspect, and sif-summary CLI workflows."""
+    runner = CliRunner()
+    store_file = tmp_path / "sif_state.json"
+
+    # 1. sif-check-ssn (table)
+    res_ssn_tbl = runner.invoke(
+        app,
+        ["sif-check-ssn", "--ssn", "050-12-3456", "--dob", "1980-01-01"],
+    )
+    assert res_ssn_tbl.exit_code == 0
+    assert "SSN Valid:        True" in res_ssn_tbl.stdout
+    assert "New York" in res_ssn_tbl.stdout
+
+    # 2. sif-check-ssn (json) for deceased SSN
+    res_ssn_json = runner.invoke(
+        app,
+        ["sif-check-ssn", "--ssn", "042-12-9999", "--format", "json"],
+    )
+    assert res_ssn_json.exit_code == 0
+    data_ssn = json.loads(res_ssn_json.stdout)
+    assert data_ssn["is_valid"] is False
+    assert data_ssn["is_deceased"] is True
+
+    # 3. sif-eval (legitimate, table)
+    res_eval_tbl = runner.invoke(
+        app,
+        [
+            "sif-eval",
+            "--ssn",
+            "050-12-3456",
+            "--first-name",
+            "Tony",
+            "--last-name",
+            "Stark",
+            "--dob",
+            "1970-05-29",
+            "--address",
+            "10880 Malibu Point, Malibu, CA",
+            "--phone",
+            "+13105554321",
+            "--email",
+            "tony@starkindustries.com",
+            "--applicant-id",
+            "app_stark",
+            "--credit-line",
+            "100000.0",
+            "-s",
+            str(store_file),
+        ],
+    )
+    assert res_eval_tbl.exit_code == 0
+    assert "Applicant ID:     app_stark" in res_eval_tbl.stdout
+    assert "Policy Action:    approve" in res_eval_tbl.stdout
+    assert store_file.exists()
+
+    # 4. sif-eval (deceased, json)
+    res_eval_dec = runner.invoke(
+        app,
+        [
+            "sif-eval",
+            "--ssn",
+            "042-12-9999",
+            "--first-name",
+            "Arthur",
+            "--last-name",
+            "Pendelton",
+            "--dob",
+            "1950-01-01",
+            "--address",
+            "10 Ghost St, Hartford, CT",
+            "--phone",
+            "+12035551212",
+            "--email",
+            "arthur@example.com",
+            "--applicant-id",
+            "app_dec",
+            "-s",
+            str(store_file),
+            "--format",
+            "json",
+        ],
+    )
+    assert res_eval_dec.exit_code == 0
+    data_dec = json.loads(res_eval_dec.stdout)
+    assert data_dec["action"] == "decline_block"
+    assert data_dec["risk_score"] == 1.0
+    ass_id_dec = data_dec["assessment_id"]
+
+    # 5. sif-inspect by applicant-id (table)
+    res_insp_app = runner.invoke(
+        app,
+        ["sif-inspect", "-a", "app_stark", "-s", str(store_file)],
+    )
+    assert res_insp_app.exit_code == 0
+    assert "Applicant ID:     app_stark" in res_insp_app.stdout
+    assert "Tony Stark" in res_insp_app.stdout
+
+    # 6. sif-inspect by assessment-id (json)
+    res_insp_ass = runner.invoke(
+        app,
+        ["sif-inspect", "-i", ass_id_dec, "-s", str(store_file), "--format", "json"],
+    )
+    assert res_insp_ass.exit_code == 0
+    data_insp_ass = json.loads(res_insp_ass.stdout)
+    assert data_insp_ass["assessment_id"] == ass_id_dec
+
+    # 7. sif-summary (table)
+    res_sum_tbl = runner.invoke(
+        app,
+        ["sif-summary", "-s", str(store_file)],
+    )
+    assert res_sum_tbl.exit_code == 0
+    assert "Total Profiles:     2" in res_sum_tbl.stdout
+    assert "Total Assessments:  2" in res_sum_tbl.stdout
+
+    # 8. sif-summary (json)
+    res_sum_json = runner.invoke(
+        app,
+        ["sif-summary", "-s", str(store_file), "--format", "json"],
+    )
+    assert res_sum_json.exit_code == 0
+    data_sum = json.loads(res_sum_json.stdout)
+    assert data_sum["total_profiles"] == 2
+    assert data_sum["total_assessments"] == 2
+
+
+def test_sif_cli_error_branches(tmp_path: Path) -> None:
+    """Validate error branches and exit code 2 in sif-* CLI commands."""
+    runner = CliRunner()
+    store_file = tmp_path / "sif_state.json"
+
+    # sif-inspect without any ID
+    res_no_id = runner.invoke(app, ["sif-inspect", "-s", str(store_file)])
+    assert res_no_id.exit_code == 2
+    assert "Must provide either --applicant-id or --assessment-id" in res_no_id.stderr
+
+    # sif-inspect with non-existent applicant
+    res_no_app = runner.invoke(app, ["sif-inspect", "-a", "unknown_app", "-s", str(store_file)])
+    assert res_no_app.exit_code == 2
+    assert "not found in store" in res_no_app.stderr
+
+    # sif-inspect with non-existent assessment
+    res_no_ass = runner.invoke(app, ["sif-inspect", "-i", "unknown_ass", "-s", str(store_file)])
+    assert res_no_ass.exit_code == 2
+    assert "not found in store" in res_no_ass.stderr
+
+    # Corrupt store file
+    corrupt_store = tmp_path / "corrupt.json"
+    corrupt_store.write_text("{bad json", encoding="utf-8")
+    res_corrupt = runner.invoke(app, ["sif-inspect", "-a", "app1", "-s", str(corrupt_store)])
+    assert res_corrupt.exit_code == 2
+
+    # Non-dict store file
+    nondict_store = tmp_path / "nondict.json"
+    nondict_store.write_text("[]", encoding="utf-8")
+    res_nondict = runner.invoke(app, ["sif-inspect", "-a", "app1", "-s", str(nondict_store)])
+    assert res_nondict.exit_code == 2

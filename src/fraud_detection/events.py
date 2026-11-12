@@ -109,6 +109,10 @@ class EventType(StrEnum):
     AML_SANCTION_MATCH_DETECTED = "fraud.aml.sanction_match_detected"
     AML_SAR_CREATED = "fraud.aml.sar_created"
     AML_SAR_STATUS_UPDATED = "fraud.aml.sar_status_updated"
+    SIF_APPLICATION_EVALUATED = "fraud.sif.application_evaluated"
+    SIF_ANOMALY_DETECTED = "fraud.sif.anomaly_detected"
+    SIF_IDENTITY_CONFIRMED = "fraud.sif.identity_confirmed"
+    SIF_APPLICATION_DECLINED = "fraud.sif.application_declined"
 
 
 class EventDeliveryStatus(StrEnum):

@@ -9,6 +9,7 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
+from collections import defaultdict
 from pathlib import Path
 from typing import Annotated, Any, NoReturn, cast
 from uuid import uuid4
@@ -231,6 +232,13 @@ from fraud_detection.signing import (
     load_public_key,
     verify_attestation_signature,
     write_keypair,
+)
+from fraud_detection.synthetic_identity import (
+    IdentityProfile,
+    SifAssessment,
+    SsnValidator,
+    SyntheticIdentityEngine,
+    SyntheticIdentityStore,
 )
 from fraud_detection.tenant import (
     RuleInheritanceMode,
@@ -10721,6 +10729,228 @@ def aml_sar_status(
             typer.echo(f"Filing Date:   {updated.filing_date}")
     else:
         typer.echo(json.dumps(updated.to_dict(), indent=2))
+
+
+def _load_sif_state(
+    store_file: Path | None,
+) -> tuple[SyntheticIdentityEngine, SyntheticIdentityStore]:
+    """Load persistent identity profiles and assessments from store file."""
+    store = SyntheticIdentityStore()
+    engine = SyntheticIdentityEngine(store=store)
+    if store_file is None or not store_file.exists():
+        return engine, store
+
+    try:
+        raw = store_file.read_text(encoding="utf-8")
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            _abort("Invalid SIF store file format: expected JSON object.")
+    except (OSError, json.JSONDecodeError) as exc:
+        _abort(f"Could not read SIF store file: {exc}")
+
+    for p_data in data.get("profiles", []):
+        if isinstance(p_data, dict):
+            store.add_profile(IdentityProfile.from_dict(p_data))
+
+    for a_data in data.get("assessments", []):
+        if isinstance(a_data, dict):
+            store.add_assessment(SifAssessment.from_dict(a_data))
+
+    return engine, store
+
+
+def _save_sif_state(
+    store_file: Path | None,
+    store: SyntheticIdentityStore,
+) -> None:
+    """Save persistent identity profiles and assessments to store file."""
+    if store_file is None:
+        return
+    data = {
+        "profiles": [p.to_dict() for p in store.list_profiles(limit=5000)],
+        "assessments": [a.to_dict() for a in store.list_assessments(limit=5000)],
+    }
+    _atomic_write_text(json.dumps(data, indent=2), store_file)
+
+
+@app.command("sif-eval")
+def sif_eval(
+    ssn: Annotated[str, typer.Option("--ssn", help="Applicant Social Security Number.")],
+    first_name: Annotated[str, typer.Option("--first-name", help="Applicant first name.")],
+    last_name: Annotated[str, typer.Option("--last-name", help="Applicant last name.")],
+    dob: Annotated[str, typer.Option("--dob", help="Date of birth in YYYY-MM-DD format.")],
+    address: Annotated[str, typer.Option("--address", help="Residential street address.")],
+    phone: Annotated[str, typer.Option("--phone", help="Contact phone number.")],
+    email: Annotated[str, typer.Option("--email", help="Contact email address.")],
+    applicant_id: Annotated[
+        str, typer.Option("--applicant-id", help="Optional applicant ID.")
+    ] = "",
+    credit_line: Annotated[
+        float, typer.Option("--credit-line", help="Requested credit line.")
+    ] = 5000.0,
+    tenant_id: Annotated[str, typer.Option("--tenant-id", help="Tenant identifier.")] = "default",
+    store_file: Annotated[
+        Path,
+        typer.Option("--store-file", "-s", help="Path to SIF state JSON file."),
+    ] = Path("sif_store.json"),
+    output_format: Annotated[
+        str, typer.Option("--format", "-f", help="Output format (table or json).")
+    ] = "table",
+) -> None:
+    """Evaluate an applicant credit profile for synthetic identity fraud."""
+    engine, store = _load_sif_state(store_file)
+    aid = applicant_id or f"app_{uuid4().hex[:12]}"
+    profile = IdentityProfile(
+        applicant_id=aid,
+        ssn=ssn,
+        first_name=first_name,
+        last_name=last_name,
+        dob=dob,
+        address=address,
+        phone=phone,
+        email=email,
+        credit_line_requested=credit_line,
+        tenant_id=tenant_id,
+    )
+    assessment = engine.evaluate(profile)
+    _save_sif_state(store_file, store)
+
+    if output_format.lower() == "table":
+        typer.echo(f"Assessment ID:    {assessment.assessment_id}")
+        typer.echo(f"Applicant ID:     {assessment.applicant_id}")
+        typer.echo(f"Risk Score:       {assessment.risk_score:.4f}")
+        typer.echo(f"Risk Level:       {assessment.risk_level.value}")
+        typer.echo(f"Policy Action:    {assessment.action.value}")
+        anoms = ", ".join(a.value for a in assessment.triggered_anomalies) or "none"
+        typer.echo(f"Anomalies:        {anoms}")
+        if assessment.ssn_validation:
+            typer.echo(f"SSN Status:       {assessment.ssn_validation.status.value}")
+            typer.echo(f"State Issued:     {assessment.ssn_validation.state_issued}")
+    else:
+        typer.echo(json.dumps(assessment.to_dict(), indent=2))
+
+
+@app.command("sif-check-ssn")
+def sif_check_ssn(
+    ssn: Annotated[str, typer.Option("--ssn", help="Social Security Number to audit.")],
+    dob: Annotated[str, typer.Option("--dob", help="Optional date of birth (YYYY-MM-DD).")] = "",
+    output_format: Annotated[
+        str, typer.Option("--format", "-f", help="Output format (table or json).")
+    ] = "table",
+) -> None:
+    """Validate SSN against SSA allocation tables, deceased registries, and birth year."""
+    validator = SsnValidator()
+    result = validator.validate(ssn, dob=dob or None)
+
+    if output_format.lower() == "table":
+        typer.echo(f"SSN Valid:        {result.is_valid}")
+        typer.echo(f"Status:           {result.status.value}")
+        typer.echo(f"Area Number:      {result.area_number:03d}")
+        typer.echo(f"Group Number:     {result.group_number:02d}")
+        typer.echo(f"State Issued:     {result.state_issued}")
+        if result.estimated_issuance_year_range:
+            y_start, y_end = result.estimated_issuance_year_range
+            typer.echo(f"Issuance Window:  {y_start}-{y_end}")
+        typer.echo(f"Is Deceased:      {result.is_deceased}")
+        typer.echo(f"Details:          {result.details}")
+    else:
+        typer.echo(json.dumps(result.to_dict(), indent=2))
+
+
+@app.command("sif-inspect")
+def sif_inspect(
+    applicant_id: Annotated[
+        str, typer.Option("--applicant-id", "-a", help="Applicant ID to inspect.")
+    ] = "",
+    assessment_id: Annotated[
+        str, typer.Option("--assessment-id", "-i", help="Assessment ID to inspect.")
+    ] = "",
+    store_file: Annotated[
+        Path,
+        typer.Option("--store-file", "-s", help="Path to SIF state JSON file."),
+    ] = Path("sif_store.json"),
+    output_format: Annotated[
+        str, typer.Option("--format", "-f", help="Output format (table or json).")
+    ] = "table",
+) -> None:
+    """Inspect stored applicant profile or synthetic identity assessment."""
+    if not applicant_id and not assessment_id:
+        _abort("Must provide either --applicant-id or --assessment-id to inspect.")
+
+    _, store = _load_sif_state(store_file)
+
+    if assessment_id:
+        assessment = store.get_assessment(assessment_id)
+        if assessment is None:
+            _abort(f"Assessment '{assessment_id}' not found in store.")
+        if output_format.lower() == "table":
+            typer.echo(f"Assessment ID:    {assessment.assessment_id}")
+            typer.echo(f"Applicant ID:     {assessment.applicant_id}")
+            typer.echo(f"Risk Score:       {assessment.risk_score:.4f}")
+            typer.echo(f"Risk Level:       {assessment.risk_level.value}")
+            typer.echo(f"Action:           {assessment.action.value}")
+            anoms = ", ".join(a.value for a in assessment.triggered_anomalies) or "none"
+            typer.echo(f"Anomalies:        {anoms}")
+        else:
+            typer.echo(json.dumps(assessment.to_dict(), indent=2))
+        return
+
+    profile = store.get_profile(applicant_id)
+    if profile is None:
+        _abort(f"Applicant profile '{applicant_id}' not found in store.")
+    if output_format.lower() == "table":
+        typer.echo(f"Applicant ID:     {profile.applicant_id}")
+        typer.echo(f"Name:             {profile.first_name} {profile.last_name}")
+        typer.echo(f"SSN (Masked):     {profile.ssn_masked()}")
+        typer.echo(f"DOB:              {profile.dob}")
+        typer.echo(f"Address:          {profile.address}")
+        typer.echo(f"Phone:            {profile.phone}")
+        typer.echo(f"Email:            {profile.email}")
+        typer.echo(f"Credit Line:      ${profile.credit_line_requested:,.2f}")
+    else:
+        typer.echo(json.dumps(profile.to_dict(), indent=2))
+
+
+@app.command("sif-summary")
+def sif_summary(
+    store_file: Annotated[
+        Path,
+        typer.Option("--store-file", "-s", help="Path to SIF state JSON file."),
+    ] = Path("sif_store.json"),
+    output_format: Annotated[
+        str, typer.Option("--format", "-f", help="Output format (table or json).")
+    ] = "table",
+) -> None:
+    """Display summary metrics of tracked applicant profiles and synthetic fraud assessments."""
+    _, store = _load_sif_state(store_file)
+    assessments = store.list_assessments(limit=50000)
+    profiles = store.list_profiles(limit=50000)
+
+    actions: dict[str, int] = defaultdict(int)
+    risk_levels: dict[str, int] = defaultdict(int)
+    for a in assessments:
+        actions[a.action.value] += 1
+        risk_levels[a.risk_level.value] += 1
+
+    summary_data = {
+        "total_profiles": len(profiles),
+        "total_assessments": len(assessments),
+        "actions": dict(actions),
+        "risk_levels": dict(risk_levels),
+    }
+
+    if output_format.lower() == "table":
+        typer.echo("Synthetic Identity Fraud Store Summary:")
+        typer.echo(f"  Total Profiles:     {summary_data['total_profiles']}")
+        typer.echo(f"  Total Assessments:  {summary_data['total_assessments']}")
+        typer.echo("  Actions:")
+        for act, cnt in actions.items():
+            typer.echo(f"    {act:25s}: {cnt}")
+        typer.echo("  Risk Levels:")
+        for rk, cnt in risk_levels.items():
+            typer.echo(f"    {rk:25s}: {cnt}")
+    else:
+        typer.echo(json.dumps(summary_data, indent=2))
 
 
 def _abort(message: str) -> NoReturn:

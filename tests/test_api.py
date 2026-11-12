@@ -6832,3 +6832,145 @@ def test_aml_api_error_branches_and_edge_cases(api_context: tuple[Path, Any, Pat
         assert (
             client.post("/v1/aml/sar/s_1/status", json={"new_status": "draft"}).status_code == 500
         )
+
+
+def test_sif_api_endpoints_and_lifecycle(api_context: tuple[Path, Any, Path]) -> None:
+    """Validate /v1/sif/* endpoints, evaluation lifecycle, and Prometheus metrics."""
+    from fraud_detection.synthetic_identity import SyntheticIdentityEngine
+
+    _, model, _ = api_context
+    sif_engine = SyntheticIdentityEngine()
+    app = create_app(model=model, sif_engine=sif_engine)
+
+    with TestClient(app) as client:
+        # 1. Evaluate clean applicant -> APPROVE
+        res_legit = client.post(
+            "/v1/sif/evaluate",
+            json={
+                "applicant_id": "app_api_1",
+                "ssn": "050-12-3456",
+                "first_name": "Bruce",
+                "last_name": "Wayne",
+                "dob": "1980-02-19",
+                "address": "1007 Mountain Drive, Gotham, NY",
+                "phone": "+12125550001",
+                "email": "bruce@wayneenterprises.com",
+                "credit_line_requested": 50000.0,
+                "tenant_id": "tenant_wayne",
+            },
+        )
+        assert res_legit.status_code == 200
+        body_legit = res_legit.json()
+        assert body_legit["applicant_id"] == "app_api_1"
+        assert body_legit["action"] == "approve"
+        assert body_legit["risk_level"] == "low"
+        ass_id = body_legit["assessment_id"]
+
+        # 2. Evaluate deceased applicant -> DECLINE_BLOCK
+        res_dec = client.post(
+            "/v1/sif/evaluate",
+            json={
+                "applicant_id": "app_api_2",
+                "ssn": "042-12-9999",  # Arthur Pendelton
+                "first_name": "Arthur",
+                "last_name": "Pendelton",
+                "dob": "1950-01-01",
+                "address": "10 Cemetery Rd, Hartford, CT",
+                "phone": "+12035551212",
+                "email": "arthur@example.com",
+                "tenant_id": "tenant_wayne",
+            },
+        )
+        assert res_dec.status_code == 200
+        body_dec = res_dec.json()
+        assert body_dec["action"] == "decline_block"
+        assert body_dec["risk_level"] == "critical"
+        assert body_dec["risk_score"] == 1.0
+
+        # 3. Query assessment by ID
+        res_get_ass = client.get(f"/v1/sif/assessments/{ass_id}")
+        assert res_get_ass.status_code == 200
+        assert res_get_ass.json()["assessment_id"] == ass_id
+
+        # 4. List assessments with tenant filter
+        res_list_ass = client.get("/v1/sif/assessments?tenant_id=tenant_wayne")
+        assert res_list_ass.status_code == 200
+        assert res_list_ass.json()["total_count"] == 2
+
+        # 5. Create profile endpoint
+        res_prof = client.post(
+            "/v1/sif/profiles",
+            json={
+                "applicant_id": "app_api_3",
+                "ssn": "111-22-3333",
+                "first_name": "Clark",
+                "last_name": "Kent",
+                "dob": "1982-06-18",
+                "address": "344 Clinton St, Metropolis, NY",
+                "phone": "+12125553333",
+                "email": "clark.kent@dailyplanet.com",
+                "authorized_users": [
+                    {"user_id": "u_lois", "name": "Lois Lane", "relationship": "spouse"}
+                ],
+                "tenant_id": "tenant_wayne",
+            },
+        )
+        assert res_prof.status_code == 200
+        body_prof = res_prof.json()
+        assert body_prof["ssn"] == "XXX-XX-3333"
+        assert len(body_prof["authorized_users"]) == 1
+
+        # 6. Get profile by applicant_id
+        res_get_prof = client.get("/v1/sif/applicants/app_api_3")
+        assert res_get_prof.status_code == 200
+        assert res_get_prof.json()["first_name"] == "Clark"
+
+        # 7. List profiles
+        res_list_prof = client.get("/v1/sif/profiles?tenant_id=tenant_wayne")
+        assert res_list_prof.status_code == 200
+        assert res_list_prof.json()["total_count"] >= 3
+
+        # 8. SIF Summary metrics
+        res_metrics = client.get("/v1/sif/metrics")
+        assert res_metrics.status_code == 200
+        assert res_metrics.json()["status"] == "operational"
+        assert res_metrics.json()["total_assessments_recorded"] >= 2
+
+        # 9. Prometheus metrics endpoint check
+        metrics_resp = client.get("/metrics")
+        assert metrics_resp.status_code == 200
+        assert "fraud_sif_evaluations_total" in metrics_resp.text
+        assert "fraud_sif_blocks_total" in metrics_resp.text
+
+
+def test_sif_api_error_branches_and_edge_cases(api_context: tuple[Path, Any, Path]) -> None:
+    """Validate 404 and 500 error branches on /v1/sif/* endpoints."""
+    from fraud_detection.synthetic_identity import SyntheticIdentityEngine
+
+    _, model, _ = api_context
+    sif_engine = SyntheticIdentityEngine()
+    app = create_app(model=model, sif_engine=sif_engine)
+
+    with TestClient(app) as client:
+        # 404 assessment
+        assert client.get("/v1/sif/assessments/sif_nonexistent").status_code == 404
+        # 404 applicant profile
+        assert client.get("/v1/sif/applicants/app_nonexistent").status_code == 404
+
+        # Null out sif_engine on app.state -> 500
+        app.state.sif_engine = None
+        eval_payload = {
+            "ssn": "050-12-3456",
+            "first_name": "F",
+            "last_name": "L",
+            "dob": "1990-01-01",
+            "address": "1 A St",
+            "phone": "+12125551212",
+            "email": "test@example.com",
+        }
+        assert client.post("/v1/sif/evaluate", json=eval_payload).status_code == 500
+        assert client.get("/v1/sif/assessments/sif_1").status_code == 500
+        assert client.get("/v1/sif/assessments").status_code == 500
+        assert client.post("/v1/sif/profiles", json=eval_payload).status_code == 500
+        assert client.get("/v1/sif/applicants/app_1").status_code == 500
+        assert client.get("/v1/sif/profiles").status_code == 500

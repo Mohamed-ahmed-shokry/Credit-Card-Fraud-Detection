@@ -54,7 +54,9 @@ velocity speed-of-travel calculations, and in-process IP geocoding (Phase 39), a
 device and browser fingerprinting with anomaly clustering (Phase 40), real-time merchant
 and MCC risk profiling, chargeback surveillance, and bust-out anomaly detection (Phase 41),
 and multi-tenant policy partitioning, dynamic rule federation, and account isolation (Phase 42),
-and account takeover (ATO) detection, credential stuffing defense, and identity session anomaly scoring (Phase 47).
+and account takeover (ATO) detection, credential stuffing defense, and identity session anomaly scoring (Phase 47),
+anti-money laundering transaction monitoring, structuring/smurfing detection, and regulatory SAR engine (Phase 48),
+and synthetic identity fraud (SIF) detection, PII inconsistency, and identity verification engine (Phase 49).
 
 ## Phase 1 — Distribution
 
@@ -2649,6 +2651,108 @@ Does not connect to external live FinCEN BSA E-Filing REST APIs or real-time pai
 - `32149c3`: docs(progress): mark Task 8 and AC-8 complete in PROGRESS.md
 - `39ec6ba`: docs(architecture): document Phase 48 AML engine, typology detectors, and SAR management
 - `cd1ada8`: docs(readme): add Phase 48 AML CLI commands and REST API documentation
+
+
+## Phase 49 — Synthetic Identity Fraud (SIF) Detection, PII Inconsistency & Identity Verification Engine (Done)
+
+Phase 49 implements an in-process, zero-external-dependency Synthetic Identity Fraud (SIF) detection, PII inconsistency, and identity verification engine (`synthetic_identity.py`). It detects synthetic identities fabricated by splicing authentic PII (e.g. dormant or minor SSNs) with synthetic personal details, flags SSN-DOB issuance anomalies against historical SSA issuance tables, detects Death Master File (DMF) deceased identifier matches, identifies rapid PII fragmentation and synthetic velocity clusters across applications, flags credit piggybacking and authorized user exploitation, scores composite SIF risk, and orchestrates identity proofing challenges (`challenge.py`) and compliance case investigations (`cases.py`).
+
+### Objective
+
+Provide deterministic, high-throughput Synthetic Identity Fraud detection, SSN/PII anomaly verification, credit bust-out defense, and policy routing with zero external services.
+
+### Scope
+
+1. **SIF Domain Models & Taxonomies (`synthetic_identity.py`)**:
+   - `SifRiskLevel`: `LOW`, `MEDIUM`, `HIGH`, `CRITICAL`.
+   - `SifAction`: `APPROVE`, `STEP_UP_IDENTITY_PROOFING`, `MANUAL_REVIEW`, `DECLINE_BLOCK`.
+   - `SifAnomalyType`: `SSN_DOB_MISMATCH`, `DECEASED_SSN_MATCH`, `SYNTHETIC_VELOCITY_BURST`, `PII_ELEMENT_FRAGMENTATION`, `AUTHORIZED_USER_ABUSE`, `HIGH_RISK_ADDRESS_DROP`, `BURNER_PHONE_DETECTED`.
+   - `IdentityProfile`: Applicant profile with `applicant_id`, `ssn` (masked/hashed), `first_name`, `last_name`, `dob`, `address`, `phone`, `email`, `authorized_users`, `credit_line_requested`, `metadata`.
+   - `SifAssessment`: Comprehensive assessment with `assessment_id`, `applicant_id`, `risk_score` ($[0.0, 1.0]$), `risk_level`, `action`, `triggered_anomalies`, `anomaly_breakdown`, `identity_fragmentation_score`, `ssn_verification_result`, `timestamp`, `metadata`.
+   - `SsnIssuanceRecord`: Pre-2011 SSA geographical area/group allocation rules and simulated deceased registry.
+2. **SSN & PII Inconsistency Engine (`SsnValidator`, `PiiInconsistencyEngine` in `synthetic_identity.py`)**:
+   - SSA High Group table validation and issuance year vs. applicant birth year consistency checking (detecting impossible SSNs issued before applicant was born or issued after 2011 randomization).
+   - Death Master File (DMF) deceased identifier verification.
+   - PII element fragmentation and pairwise similarity distance (Levenshtein/Jaro-Winkler) across multiple applicant records.
+3. **Synthetic Velocity & Link Cluster Tracker (`SyntheticIdentityTracker` in `synthetic_identity.py`)**:
+   - Sliding-window tracking of PII attributes (SSN, phone, address, email) across applications.
+   - Authorized user abuse ("piggybacking") detection: excessive disparate authorized users on new accounts.
+   - High-risk address drop (commercial mail receiving agencies, PO Boxes) and disposable/burner phone detection.
+4. **Synthetic Identity Scoring Engine & Policy Decisioning (`SyntheticIdentityEngine` in `synthetic_identity.py`)**:
+   - Calibrated multi-factor composite risk scoring in $[0.0, 1.0]$ with explainable contribution breakdown.
+   - Deterministic policy routing: `APPROVE`, `STEP_UP_IDENTITY_PROOFING`, `MANUAL_REVIEW`, `DECLINE_BLOCK`.
+   - Automated case escalation to `CaseManager` (`cases.py`) and step-up challenge to `ChallengeManager` (`challenge.py`).
+5. **Thread-Safe Store & EventBus Streaming (`SyntheticIdentityStore` in `synthetic_identity.py`)**:
+   - Concurrently indexed storage with thread locks, secondary indexes (`applicant_id`, `ssn_hash`, `phone`, `email`), and capacity eviction.
+   - EventBus domain events (`events.py`): `SIF_APPLICATION_EVALUATED`, `SIF_ANOMALY_DETECTED`, `SIF_IDENTITY_CONFIRMED`, `SIF_APPLICATION_DECLINED`.
+6. **FastAPI Endpoints & Prometheus Observability (`api.py`)**:
+   - `/v1/sif/evaluate`, `/v1/sif/assessments/{assessment_id}`, `/v1/sif/applicants/{applicant_id}`, `/v1/sif/profiles`, `/v1/sif/metrics`.
+   - Prometheus metrics: `fraud_sif_evaluations_total`, `fraud_sif_anomalies_total`, `fraud_sif_high_risk_total`, `fraud_sif_blocks_total`.
+7. **Typer CLI Workflows (`cli.py`)**:
+   - `fraud-detect sif-eval`, `fraud-detect sif-inspect`, `fraud-detect sif-check-ssn`, `fraud-detect sif-summary`.
+
+### Acceptance Criteria
+
+1. **AC-1 (Domain Models & Taxonomies)**: `SifRiskLevel`, `SifAction`, `SifAnomalyType`, `IdentityProfile`, and `SifAssessment` validate schemas and serialize/deserialize cleanly with roundtrip fidelity.
+2. **AC-2 (SSN Validation & DMF Screening)**: `SsnValidator` accurately validates SSA area/group rules, flags birth-year vs issuance-year impossibilities, and matches deceased registries.
+3. **AC-3 (PII Inconsistency & Fragmentation)**: `PiiInconsistencyEngine` detects fragmented identities, cross-matched PII elements, and subtle typographical variations across multiple applications.
+4. **AC-4 (Synthetic Velocity & Abuse Tracking)**: `SyntheticIdentityTracker` tracks sliding-window velocity bursts, detects burner phones and address drops, and flags authorized user piggybacking.
+5. **AC-5 (SIF Scoring Engine & Policy Routing)**: `SyntheticIdentityEngine` computes calibrated composite risk scores and routes decisions to `APPROVE`, `STEP_UP_IDENTITY_PROOFING`, `MANUAL_REVIEW`, and `DECLINE_BLOCK` with automated `cases.py` and `challenge.py` escalation.
+6. **AC-6 (Thread-Safe Store & EventBus Streaming)**: `SyntheticIdentityStore` provides concurrent multi-index lookups with capacity eviction, and lifecycle transitions emit events over `EventBus`.
+7. **AC-7 (REST API & Observability)**: FastAPI exposes `/v1/sif/*` endpoints with Prometheus metrics and rate limits.
+8. **AC-8 (CLI Workflows)**: Typer CLI exposes `sif-*` commands supporting table and JSON formats with standard exit codes.
+9. **AC-9 (Quality Standards & 100% Green CI)**: All local CI-parity checks and remote CI workflow runs pass 100%, branch coverage >= 97.0%, strict mypy 0 issues, Ruff clean, and build/twine valid.
+
+### Validation & CI Plan
+
+- Local CI-parity commands:
+  - `python -m ruff format --check src tests`
+  - `python -m ruff check src tests`
+  - `python -m mypy src`
+  - `python -m pytest --cov=fraud_detection --cov-report=term-missing`
+  - `python -m build` & `python -m twine check dist/*`
+- Remote CI workflow runs monitored via `gh run list` and `gh pr checks`.
+
+### Exclusions
+
+Does not query live paid credit bureau APIs (Experian, TransUnion, Equifax) or federal e-Verify APIs requiring live government credentials; provides an in-process, zero-external-dependency algorithmic engine, SSA issuance tables, and simulated DMF database with deterministic verification.
+
+### Micro-Task Breakdown
+
+- [x] Task 1: Create `src/fraud_detection/synthetic_identity.py` with domain data models, enums, serialization, and unit tests in `tests/test_synthetic_identity.py`.
+- [x] Task 2: Implement `SsnValidator` (SSA issuance table, DOB mismatch, Death Master File checking) in `src/fraud_detection/synthetic_identity.py` with unit tests.
+- [x] Task 3: Implement `PiiInconsistencyEngine` (PII element fragmentation, cross-element similarity) in `src/fraud_detection/synthetic_identity.py` with unit tests.
+- [x] Task 4: Implement `SyntheticIdentityTracker` (sliding-window velocity, burner phone/drop address detection, authorized user piggybacking) in `src/fraud_detection/synthetic_identity.py` with unit tests.
+- [x] Task 5: Implement `SyntheticIdentityEngine` (composite scoring, policy routing, case/challenge escalation) and thread-safe `SyntheticIdentityStore` in `src/fraud_detection/synthetic_identity.py` with unit tests.
+- [x] Task 6: Integrate SIF Engine with `events.py` (domain events) with unit and integration tests.
+- [x] Task 7: Implement `/v1/sif/*` REST endpoints and Prometheus metrics in `src/fraud_detection/api.py` with integration tests in `tests/test_api.py`.
+- [x] Task 8: Implement CLI commands `sif-eval`, `sif-inspect`, `sif-check-ssn`, and `sif-summary` in `src/fraud_detection/cli.py` with tests in `tests/test_cli.py`.
+- [x] Task 9: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate with 100% Green CI.
+
+### Delivery Record
+
+- `a3b67fc`: docs(roadmap): define Phase 49 synthetic identity fraud detection scope
+- `e79ff9b`: docs(progress): initialize Phase 49 living progress record and decision log
+- `c213ac3`: feat(sif): add core domain enums for synthetic identity detection
+- `07a9fa1`: feat(sif): add domain models and serialization for profiles, assessments, and ssn results
+- `6846548`: docs(progress): mark Task 1 and AC-1 complete in PROGRESS.md
+- `17884aa`: feat(sif): implement SsnValidator with SSA allocation history and death registries
+- `62c1d39`: docs(progress): mark Task 2 and AC-2 complete in PROGRESS.md
+- `f12c6fb`: feat(sif): implement PiiInconsistencyEngine for element fragmentation and cross-profile similarity
+- `ab44ee7`: docs(progress): mark Task 3 and AC-3 complete in PROGRESS.md
+- `4293932`: feat(sif): implement SyntheticIdentityTracker for velocity bursts, drop addresses, and piggybacking
+- `4f5ad86`: docs(progress): mark Task 4 and AC-4 complete in PROGRESS.md
+- `84419d5`: feat(sif): implement SyntheticIdentityStore and SyntheticIdentityEngine with policy routing
+- `b38c1cf`: docs(progress): mark Task 5 and AC-5 complete in PROGRESS.md
+- `467a2d8`: feat(sif): integrate synthetic identity engine with EventBus and register domain events
+- `a4e14a6`: docs(progress): mark Task 6 and AC-6 complete in PROGRESS.md
+- `c8aad10`: feat(api): implement /v1/sif/* REST endpoints and Prometheus metrics
+- `62576e0`: docs(progress): mark Task 7 and AC-7 complete in PROGRESS.md
+- `2c62ed0`: feat(cli): add sif-eval, sif-check-ssn, sif-inspect, and sif-summary commands
+- `e053a3c`: docs(progress): mark Task 8 and AC-8 complete in PROGRESS.md
+- `15030be`: docs: document Phase 49 synthetic identity engine architecture and CLI/API workflows
+- `e489a58`: docs(roadmap): mark Phase 49 completed and record micro-commits
+- `c392ca4`: test(sif): expand branch coverage for edge cases, store eviction, and drop addresses
 
 
 ## Contributing to the roadmap
