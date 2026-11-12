@@ -2756,7 +2756,7 @@ Does not query live paid credit bureau APIs (Experian, TransUnion, Equifax) or f
 - `c392ca4`: test(sif): expand branch coverage for edge cases, store eviction, and drop addresses
 
 
-## Phase 50 — Mule Account & Rapid Fund Exfiltration Detection Engine (`In progress`)
+## Phase 50 — Mule Account & Rapid Fund Exfiltration Detection Engine (Done)
 
 Phase 50 implements an in-process, zero-external-dependency Money Mule & Rapid Fund Exfiltration Detection Engine (`mule_detection.py`). It detects accounts acting as pass-through conduits or money-mule hubs for stolen cards and fraudulent transfers by analyzing inflow-to-outflow pass-through ratios, dwell-time compression, fan-in/fan-out counterparty topology, dormancy-to-burst behavioral shifts, and high-risk cash-out off-ramps (crypto exchanges, P2P wallets, international wires, prepaid loads, ATM cash-outs).
 
@@ -2819,6 +2819,9 @@ Provide deterministic, real-time mule account detection, fund exfiltration scori
 - Task 7: Add `/v1/mule/*` REST endpoints and Prometheus metrics in `api.py` + tests.
 - Task 8: Add `mule-*` CLI commands in `cli.py` + tests.
 - Task 9: Update `ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md` and verify 100% green local & remote CI.
+
+### Micro-Commits
+- `1818507`..`ded7e8a`: Implemented `mule_detection.py` (`PassThroughAnalyzer`, `MuleNetworkAnalyzer`, `DormancyBurstDetector`, `MuleAccountStore`, `MuleDetectionEngine`), registered `MULE_*` events in `events.py`, added `/v1/mule/*` endpoints and Prometheus metrics in `api.py`, added `mule-*` CLI commands in `cli.py`, added full unit/integration tests, and documented architecture and usage.
 
 
 ## Contributing to the roadmap
