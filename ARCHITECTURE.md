@@ -840,6 +840,37 @@ flowchart TD
 - **REST API, CLI & Observability**: Exposes FastAPI endpoints (`/v1/sif/evaluate`, `/v1/sif/assessments/{id}`, `/v1/sif/assessments`, `/v1/sif/profiles`, `/v1/sif/applicants/{id}`, `/v1/sif/metrics`), Typer CLI subcommands (`sif-eval`, `sif-check-ssn`, `sif-inspect`, `sif-summary`), and Prometheus metrics (`fraud_sif_evaluations_total`, `fraud_sif_anomalies_total`, `fraud_sif_high_risk_total`, `fraud_sif_blocks_total`).
 
 
+## Phase 50 — Mule Account & Rapid Fund Exfiltration Detection Engine
+
+Phase 50 delivers an in-process, zero-external-dependency Money Mule & Rapid Fund Exfiltration Detection Engine (`mule_detection.py`) that identifies pass-through conduit accounts, dwell-time compression, fan-in/fan-out counterparty hubs, dormancy-to-burst transitions, and high-risk cash-out off-ramps.
+
+```mermaid
+flowchart TD
+    subgraph Ingestion
+        XferIn["Transfer Event\nPOST /v1/mule/transfers / CLI"] --> Engine["MuleDetectionEngine"]
+    end
+
+    subgraph Analyzers
+        Engine --> PT["PassThroughAnalyzer\n(Inflow/Outflow Ratio & Dwell Time)"]
+        Engine --> Net["MuleNetworkAnalyzer\n(Fan-In / Fan-Out & New Counterparties)"]
+        Engine --> Dorm["DormancyBurstDetector\n(Dormancy Wake-Up Spikes)"]
+    end
+
+    subgraph Policy & Escalation
+        PT & Net & Dorm --> Score["Composite Mule Risk Score"]
+        Score -->|"< 0.35"| Allow["ALLOW"]
+        Score -->|"0.35 - 0.59"| StepUp["STEP_UP_VERIFICATION"]
+        Score -->|"0.60 - 0.79"| Hold["HOLD_FUNDS\n(Event: MULE_FUNDS_HELD)"]
+        Score -->|"0.80 - 0.89"| Freeze["FREEZE_ACCOUNT\n(CaseManager + MULE_ACCOUNT_FLAGGED)"]
+        Score -->|">= 0.90"| SAR["ESCALATE_AML_SAR\n(CaseManager + MULE_ACCOUNT_FLAGGED)"]
+    end
+```
+
+- **Pass-Through & Off-Ramp Analysis (`PassThroughAnalyzer`)**: Tracks inbound vs. outbound volume, pass-through ratio (`min(outbound, inbound) / inbound`), median dwell time between funding and liquidation, and high-risk off-ramp channels (`crypto_exchange`, `wire_international`, `prepaid_load`, `atm_cash_out`).
+- **Network Topology & Dormancy (`MuleNetworkAnalyzer`, `DormancyBurstDetector`)**: Flags fan-in collection, fan-out dispersion, 24h new-counterparty floods, and dormant accounts waking up into sudden high-volume transfer bursts.
+- **Store, EventBus, API & CLI**: `MuleAccountStore` provides thread-safe secondary indexing (`tenant_id`, `counterparty_id`) with capacity eviction; `MuleDetectionEngine` emits `MULE_ACTIVITY_EVALUATED`, `MULE_FUNDS_HELD`, `MULE_ACCOUNT_FLAGGED`, and `MULE_NETWORK_DETECTED`; FastAPI exposes `/v1/mule/*` endpoints and Prometheus counters (`fraud_mule_evaluations_total`, `fraud_mule_anomalies_total`, `fraud_mule_flagged_total`); Typer CLI exposes `mule-ingest`, `mule-eval`, `mule-inspect`, and `mule-summary`.
+
+
 ## Extension guidance
 
 
