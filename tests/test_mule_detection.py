@@ -295,3 +295,69 @@ def test_mule_detection_engine_scoring_and_case_escalation() -> None:
     assert MuleAnomalyType.HIGH_PASS_THROUGH_RATIO in final_ass.triggered_anomalies
     assert MuleAnomalyType.DORMANCY_BURST in final_ass.triggered_anomalies
     assert len(case_mgr.store.list_cases()) >= 1
+
+
+def test_mule_engine_event_bus_publishing() -> None:
+    from fraud_detection.events import EventBus, EventType, FraudDomainEvent
+
+    bus = EventBus()
+    received: list[FraudDomainEvent] = []
+    bus.subscribe(lambda ev: received.append(ev))
+    engine = MuleDetectionEngine(event_bus=bus)
+
+    t0 = datetime(2026, 11, 12, 10, 0, 0, tzinfo=UTC)
+    # 1. HOLD_FUNDS path (rapid pass-through + dwell compression without fan-in/dormancy)
+    engine.ingest_and_evaluate(
+        MuleTransferRecord(
+            transfer_id="e_in_1",
+            account_id="acct_hold",
+            counterparty_id="cp_1",
+            direction=TransferDirection.INBOUND,
+            amount=1000.0,
+            timestamp=t0,
+        )
+    )
+    ass_hold = engine.ingest_and_evaluate(
+        MuleTransferRecord(
+            transfer_id="e_out_1",
+            account_id="acct_hold",
+            counterparty_id="cp_2",
+            direction=TransferDirection.OUTBOUND,
+            amount=950.0,
+            channel=ExfiltrationChannel.ACH,
+            timestamp=t0 + timedelta(minutes=20),
+        )
+    )
+    assert ass_hold.action == MuleAction.HOLD_FUNDS
+    types_1 = [e.event_type for e in received]
+    assert EventType.MULE_ACTIVITY_EVALUATED in types_1
+    assert EventType.MULE_FUNDS_HELD in types_1
+
+    # 2. FREEZE/ESCALATE + MULE_NETWORK_DETECTED path
+    for i in range(4):
+        engine.ingest_and_evaluate(
+            MuleTransferRecord(
+                transfer_id=f"net_in_{i}",
+                account_id="acct_net",
+                counterparty_id=f"src_{i}",
+                direction=TransferDirection.INBOUND,
+                amount=1000.0,
+                timestamp=t0 + timedelta(minutes=i * 5),
+            )
+        )
+    ass_net = engine.ingest_and_evaluate(
+        MuleTransferRecord(
+            transfer_id="net_out_1",
+            account_id="acct_net",
+            counterparty_id="crypto_1",
+            direction=TransferDirection.OUTBOUND,
+            amount=3900.0,
+            channel=ExfiltrationChannel.CRYPTO_EXCHANGE,
+            timestamp=t0 + timedelta(minutes=30),
+        )
+    )
+    assert ass_net.action in (MuleAction.FREEZE_ACCOUNT, MuleAction.ESCALATE_AML_SAR)
+    types_2 = [e.event_type for e in received]
+    assert EventType.MULE_ACCOUNT_FLAGGED in types_2
+    assert EventType.MULE_NETWORK_DETECTED in types_2
+    bus.close()
