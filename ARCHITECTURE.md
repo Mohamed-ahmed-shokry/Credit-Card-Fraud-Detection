@@ -792,6 +792,54 @@ flowchart TD
 - **REST API, CLI & Observability**: Exposes FastAPI endpoints (`/v1/aml/monitor`, `/v1/aml/watchlist/screen`, `/v1/aml/alerts`, `/v1/aml/sar`, `/v1/aml/sar/{id}/xml`, `/v1/aml/sar/{id}/status`), Typer CLI subcommands (`aml-monitor`, `aml-screen`, `aml-alerts`, `aml-sar-generate`, `aml-sar-list`, `aml-sar-status`), and Prometheus metrics (`fraud_aml_transactions_monitored_total`, `fraud_aml_alerts_total`, `fraud_aml_sanction_hits_total`, `fraud_aml_sars_created_total`, `fraud_aml_sars_filed_total`).
 
 
+## Phase 49 — Synthetic Identity Fraud (SIF) Detection, PII Inconsistency & Identity Verification Engine
+
+Phase 49 delivers an in-process, zero-external-dependency Synthetic Identity Fraud (SIF) Detection, PII Inconsistency, and Identity Verification Engine (`synthetic_identity.py`). It protects credit card originations and account lifecycle against synthetic identities fabricated by splicing authentic PII (e.g., dormant/minor SSNs) with fabricated personal details, burner phones, and drop addresses.
+
+```mermaid
+flowchart TD
+    subgraph Ingestion
+        AppIn["Credit Applicant Profile\nPOST /v1/sif/evaluate / CLI"] --> SIF["SyntheticIdentityEngine"]
+    end
+
+    subgraph Verification Modules
+        SIF --> SSN["SsnValidator\n(SSA Area Allocations, Group Progression,\nDOB Consistency, Death Master File)"]
+        SIF --> PII["PiiInconsistencyEngine\n(Cross-Profile PII Fragmentation,\nPairwise Fuzzy Similarity)"]
+        SIF --> Trk["SyntheticIdentityTracker\n(Drop Address, Burner Phone, Piggybacking,\nSliding-Window Application Velocity)"]
+        SSN --> Scorer["Calibrated Composite Risk Scorer\n[0.0, 1.0]"]
+        PII --> Scorer
+        Trk --> Scorer
+    end
+
+    subgraph Policy Routing & Ecosystem Integration
+        Scorer --> Policy{"SIF Policy Decision"}
+        Policy -->|< 0.35| Appr["APPROVE (Low Risk)"]
+        Policy -->|0.35 - 0.64| StepUp["STEP_UP_IDENTITY_PROOFING\n(Medium Risk)"]
+        Policy -->|0.65 - 0.84| Review["MANUAL_REVIEW\n(High Risk)"]
+        Policy -->|>= 0.85 or Deceased| Block["DECLINE_BLOCK\n(Critical Risk)"]
+        StepUp --> Challenge["ChallengeManager\n(Issue OTP Challenge)"]
+        Review --> CaseEscalation["CaseManager\n(Create Investigation Case)"]
+    end
+
+    subgraph Store & Observability
+        SIF --> Store[("SyntheticIdentityStore\n(Thread-Safe Multi-Index)")]
+        SIF -->|SIF Domain Events| Bus["EventBus"]
+        Store --> API["FastAPI /v1/sif/*\n4x Prometheus SIF Metrics"]
+        Store --> CLI["Typer CLI: sif-eval, sif-check-ssn,\nsif-inspect, sif-summary"]
+    end
+```
+
+### Key Components
+
+- **SIF Taxonomies & Domain Models (`synthetic_identity.py`)**: `SifRiskLevel` (`LOW`, `MEDIUM`, `HIGH`, `CRITICAL`), `SifAction` (`APPROVE`, `STEP_UP_IDENTITY_PROOFING`, `MANUAL_REVIEW`, `DECLINE_BLOCK`), `SifAnomalyType` (`SSN_DOB_MISMATCH`, `DECEASED_SSN_MATCH`, `INVALID_SSN_STRUCTURE`, `UNISSUED_SSN_AREA`, `SYNTHETIC_VELOCITY_BURST`, `PII_ELEMENT_FRAGMENTATION`, `AUTHORIZED_USER_ABUSE`, `HIGH_RISK_ADDRESS_DROP`, `BURNER_PHONE_DETECTED`), `IdentityProfile`, and `SifAssessment`.
+- **SSA Historical Allocation & Death Master File (`SsnValidator`)**: Implements pre-June 25, 2011 SSA geographical area allocations (001-728), group number issuance progression sequences, Railroad Retirement board cessation (1963) verification, post-2011 randomization checks, and simulated Death Master File (DMF) matching.
+- **PII Element Fragmentation & Fuzzy Inconsistency (`PiiInconsistencyEngine`)**: Evaluates cross-application PII element fragmentation (e.g., stolen SSN paired with conflicting names/DOBs, identical name/DOB paired with differing SSNs, shared contact info across disparate identities) using Jaro-Winkler and Levenshtein similarity distance algorithms.
+- **Velocity, Burner Phone & Piggybacking Surveillance (`SyntheticIdentityTracker`)**: Detects commercial mail drops and PO Boxes, disposable burner and toll-free numbers, authorized user abuse ("credit piggybacking" with multiple unrelated tradelines), and multi-application velocity bursts in sliding time windows.
+- **Synthetic Identity Engine & Policy Decisioning (`SyntheticIdentityEngine`)**: Computes calibrated multi-factor composite risk scores, maps policies to actions, auto-escalates `MANUAL_REVIEW` alerts to `CaseManager`, and routes `STEP_UP_IDENTITY_PROOFING` to `ChallengeManager`.
+- **Thread-Safe Store (`SyntheticIdentityStore`)**: Multi-index storage with capacity eviction supporting lookups by `applicant_id`, `ssn_hash`, `phone`, `email`, and `tenant_id`.
+- **REST API, CLI & Observability**: Exposes FastAPI endpoints (`/v1/sif/evaluate`, `/v1/sif/assessments/{id}`, `/v1/sif/assessments`, `/v1/sif/profiles`, `/v1/sif/applicants/{id}`, `/v1/sif/metrics`), Typer CLI subcommands (`sif-eval`, `sif-check-ssn`, `sif-inspect`, `sif-summary`), and Prometheus metrics (`fraud_sif_evaluations_total`, `fraud_sif_anomalies_total`, `fraud_sif_high_risk_total`, `fraud_sif_blocks_total`).
+
+
 ## Extension guidance
 
 

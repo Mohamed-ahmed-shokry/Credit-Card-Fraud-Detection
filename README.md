@@ -2113,6 +2113,52 @@ FastAPI Anti-Money Laundering REST endpoints:
 - `POST /v1/aml/sar/{sar_id}/status`: Execute validated SAR state transition (`draft` -> `pending_review` -> `approved` -> `filed` / `rejected`).
 - Prometheus metrics: `fraud_aml_transactions_monitored_total`, `fraud_aml_alerts_total`, `fraud_aml_sanction_hits_total`, `fraud_aml_sars_created_total`, `fraud_aml_sars_filed_total`.
 
+### Synthetic Identity Fraud (SIF) Detection & Identity Verification Engine
+
+Phase 49 introduces autonomous Synthetic Identity Fraud (SIF) detection, SSA historical allocation verification, Death Master File screening, PII element fragmentation analysis, drop address and burner phone detection, and credit piggybacking defense:
+
+```bash
+# Audit an SSN against SSA allocation tables, deceased registries, and birth year
+fraud-detect sif-check-ssn \
+  --ssn 050-12-3456 \
+  --dob 1980-01-01 \
+  --format table
+
+# Evaluate an applicant credit profile for synthetic identity risk
+fraud-detect sif-eval \
+  --ssn 050-12-3456 \
+  --first-name "Tony" \
+  --last-name "Stark" \
+  --dob 1970-05-29 \
+  --address "10880 Malibu Point, Malibu, CA" \
+  --phone "+13105554321" \
+  --email "tony@starkindustries.com" \
+  --credit-line 50000.0 \
+  --store-file data/sif_store.json \
+  --format table
+
+# Inspect stored applicant profiles or risk assessments
+fraud-detect sif-inspect \
+  --applicant-id app_stark \
+  --store-file data/sif_store.json \
+  --format table
+
+# View summary of tracked identities, assessments, and policy actions
+fraud-detect sif-summary \
+  --store-file data/sif_store.json \
+  --format table
+```
+
+FastAPI Synthetic Identity REST endpoints:
+- `POST /v1/sif/evaluate`: Evaluate credit applicant profile against SSN issuance history, DMF registry, PII fragmentation, and synthetic velocity.
+- `GET /v1/sif/assessments/{assessment_id}`: Fetch detailed synthetic identity risk assessment report.
+- `GET /v1/sif/assessments`: Query and filter assessments with optional tenant filter.
+- `POST /v1/sif/profiles`: Store applicant identity profile in thread-safe registry.
+- `GET /v1/sif/applicants/{applicant_id}`: Retrieve stored applicant profile by ID.
+- `GET /v1/sif/profiles`: Query applicant profiles.
+- `GET /v1/sif/metrics`: Summary of tracked profiles and recorded assessments.
+- Prometheus metrics: `fraud_sif_evaluations_total`, `fraud_sif_anomalies_total`, `fraud_sif_high_risk_total`, `fraud_sif_blocks_total`.
+
 ## Reference label-delay analysis
 
 
