@@ -2751,6 +2751,8 @@ Does not query live paid credit bureau APIs (Experian, TransUnion, Equifax) or f
 - `2c62ed0`: feat(cli): add sif-eval, sif-check-ssn, sif-inspect, and sif-summary commands
 - `e053a3c`: docs(progress): mark Task 8 and AC-8 complete in PROGRESS.md
 - `15030be`: docs: document Phase 49 synthetic identity engine architecture and CLI/API workflows
+- `e489a58`: docs(roadmap): mark Phase 49 completed and record micro-commits
+- `c392ca4`: test(sif): expand branch coverage for edge cases, store eviction, and drop addresses
 
 
 ## Contributing to the roadmap
