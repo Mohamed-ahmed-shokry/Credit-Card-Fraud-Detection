@@ -439,3 +439,60 @@ class MuleNetworkAnalyzer:
             anomalies=anomalies,
             risk_score=min(1.0, score),
         )
+
+
+class DormancyBurstDetector:
+    """Detects dormant accounts waking up into sudden high-volume transfer bursts."""
+
+    def __init__(
+        self,
+        dormancy_days: int = 30,
+        burst_window: timedelta = timedelta(hours=24),
+        burst_min_transfers: int = 3,
+        burst_min_volume: float = 2000.0,
+    ) -> None:
+        self.dormancy_days = dormancy_days
+        self.burst_window = burst_window
+        self.burst_min_transfers = burst_min_transfers
+        self.burst_min_volume = burst_min_volume
+
+    def evaluate(
+        self,
+        profile: MuleAccountProfile,
+        now: datetime | None = None,
+    ) -> tuple[bool, float, str]:
+        """Return (is_burst, risk_score, reason) if dormancy-to-burst is detected."""
+        transfers = profile.transfers
+        if not transfers:
+            return (False, 0.0, "")
+
+        ref_time = now if now is not None else max(t.timestamp for t in transfers)
+        burst_cutoff = ref_time - self.burst_window
+        dormancy_delta = timedelta(days=self.dormancy_days)
+
+        burst_xfers = [t for t in transfers if t.timestamp >= burst_cutoff]
+        prior_xfers = [t for t in transfers if t.timestamp < burst_cutoff]
+
+        if len(burst_xfers) < self.burst_min_transfers:
+            return (False, 0.0, "")
+
+        burst_volume = sum(t.amount for t in burst_xfers)
+        if burst_volume < self.burst_min_volume:
+            return (False, 0.0, "")
+
+        earliest_burst = min(t.timestamp for t in burst_xfers)
+        if prior_xfers:
+            last_prior = max(t.timestamp for t in prior_xfers)
+            dormant_gap = earliest_burst - last_prior
+        else:
+            dormant_gap = earliest_burst - profile.account_opened_at
+
+        if dormant_gap >= dormancy_delta:
+            days = int(dormant_gap.total_seconds() // 86400)
+            reason = (
+                f"Account dormant for {days} days followed by {len(burst_xfers)} "
+                f"transfers totaling {burst_volume:.2f}"
+            )
+            return (True, 0.45, reason)
+
+        return (False, 0.0, "")
