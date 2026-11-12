@@ -193,6 +193,13 @@ from fraud_detection.model import (
     validate_artifact,
     verify_attestation,
 )
+from fraud_detection.mule_detection import (
+    ExfiltrationChannel,
+    MuleAccountStore,
+    MuleDetectionEngine,
+    MuleTransferRecord,
+    TransferDirection,
+)
 from fraud_detection.pipeline import (
     DecisionGraphExecutor,
     StageFaultSpec,
@@ -10949,6 +10956,202 @@ def sif_summary(
         typer.echo("  Risk Levels:")
         for rk, cnt in risk_levels.items():
             typer.echo(f"    {rk:25s}: {cnt}")
+    else:
+        typer.echo(json.dumps(summary_data, indent=2))
+
+
+def _load_mule_state(
+    store_file: Path | None,
+) -> tuple[MuleDetectionEngine, MuleAccountStore]:
+    """Load persistent mule account profiles and assessments from a JSON store file."""
+    if store_file is None or not store_file.exists():
+        store = MuleAccountStore()
+        return MuleDetectionEngine(store=store), store
+
+    try:
+        data = json.loads(store_file.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            _abort("Invalid mule store file format: expected JSON object.")
+    except (OSError, json.JSONDecodeError) as exc:
+        _abort(f"Could not read mule store file: {exc}")
+
+    store = MuleAccountStore.from_dict(data)
+    return MuleDetectionEngine(store=store), store
+
+
+def _save_mule_state(store: MuleAccountStore, store_file: Path | None) -> None:
+    """Persist mule account profiles and assessments atomically."""
+    if store_file is None:
+        return
+    _atomic_write_text(json.dumps(store.to_dict(), indent=2) + "\n", store_file)
+
+
+@app.command("mule-ingest")
+def mule_ingest(
+    account_id: Annotated[str, typer.Option("--account-id", "-a", help="Monitored account ID.")],
+    counterparty_id: Annotated[
+        str, typer.Option("--counterparty-id", "-c", help="Counterparty ID.")
+    ],
+    direction: Annotated[
+        str, typer.Option("--direction", "-d", help="Transfer direction (inbound or outbound).")
+    ],
+    amount: Annotated[float, typer.Option("--amount", "-m", help="Transfer amount in USD.")],
+    channel: Annotated[
+        str,
+        typer.Option(
+            "--channel",
+            help=(
+                "Channel (ach, card, p2p_wallet, crypto_exchange, "
+                "wire_international, prepaid_load, atm_cash_out)."
+            ),
+        ),
+    ] = "ach",
+    timestamp: Annotated[
+        str, typer.Option("--timestamp", "-t", help="Optional ISO-8601 timestamp.")
+    ] = "",
+    tenant_id: Annotated[str, typer.Option("--tenant-id", help="Tenant identifier.")] = "default",
+    store_file: Annotated[
+        Path,
+        typer.Option("--store-file", "-s", help="Path to mule state JSON file."),
+    ] = Path("mule_store.json"),
+    output_format: Annotated[
+        str, typer.Option("--format", "-f", help="Output format (table or json).")
+    ] = "table",
+) -> None:
+    """Ingest a transfer and evaluate the account for money mule risk."""
+    try:
+        dir_enum = TransferDirection(direction.lower())
+        chan_enum = ExfiltrationChannel(channel.lower())
+    except ValueError as exc:
+        _abort(f"Invalid transfer direction or channel: {exc}")
+
+    engine, store = _load_mule_state(store_file)
+    xfer = MuleTransferRecord.from_dict(
+        {
+            "account_id": account_id,
+            "counterparty_id": counterparty_id,
+            "direction": dir_enum.value,
+            "amount": amount,
+            "channel": chan_enum.value,
+            "timestamp": timestamp or None,
+            "tenant_id": tenant_id,
+        }
+    )
+    assessment = engine.ingest_and_evaluate(xfer)
+    _save_mule_state(store, store_file)
+
+    if output_format.lower() == "table":
+        typer.echo(f"Assessment ID:    {assessment.assessment_id}")
+        typer.echo(f"Account ID:       {assessment.account_id}")
+        typer.echo(f"Risk Score:       {assessment.risk_score:.4f}")
+        typer.echo(f"Risk Level:       {assessment.risk_level.value}")
+        typer.echo(f"Action:           {assessment.action.value}")
+        typer.echo(f"Pass-Through:     {assessment.pass_through_ratio:.2%}")
+        anoms = ", ".join(a.value for a in assessment.triggered_anomalies) or "none"
+        typer.echo(f"Anomalies:        {anoms}")
+    else:
+        typer.echo(json.dumps(assessment.to_dict(), indent=2))
+
+
+@app.command("mule-eval")
+def mule_eval(
+    account_id: Annotated[str, typer.Option("--account-id", "-a", help="Account ID to evaluate.")],
+    store_file: Annotated[
+        Path,
+        typer.Option("--store-file", "-s", help="Path to mule state JSON file."),
+    ] = Path("mule_store.json"),
+    output_format: Annotated[
+        str, typer.Option("--format", "-f", help="Output format (table or json).")
+    ] = "table",
+) -> None:
+    """Evaluate a stored account's money mule risk profile."""
+    engine, store = _load_mule_state(store_file)
+    assessment = engine.evaluate_account(account_id)
+    _save_mule_state(store, store_file)
+
+    if output_format.lower() == "table":
+        typer.echo(f"Assessment ID:    {assessment.assessment_id}")
+        typer.echo(f"Account ID:       {assessment.account_id}")
+        typer.echo(f"Risk Score:       {assessment.risk_score:.4f}")
+        typer.echo(f"Risk Level:       {assessment.risk_level.value}")
+        typer.echo(f"Action:           {assessment.action.value}")
+    else:
+        typer.echo(json.dumps(assessment.to_dict(), indent=2))
+
+
+@app.command("mule-inspect")
+def mule_inspect(
+    account_id: Annotated[
+        str, typer.Option("--account-id", "-a", help="Account ID to inspect.")
+    ] = "",
+    assessment_id: Annotated[
+        str, typer.Option("--assessment-id", "-i", help="Assessment ID to inspect.")
+    ] = "",
+    store_file: Annotated[
+        Path,
+        typer.Option("--store-file", "-s", help="Path to mule state JSON file."),
+    ] = Path("mule_store.json"),
+    output_format: Annotated[
+        str, typer.Option("--format", "-f", help="Output format (table or json).")
+    ] = "table",
+) -> None:
+    """Inspect a monitored mule account profile or assessment."""
+    if not account_id and not assessment_id:
+        _abort("Must provide either --account-id or --assessment-id to inspect.")
+
+    _, store = _load_mule_state(store_file)
+    if assessment_id:
+        assessment = store.get_assessment(assessment_id)
+        if assessment is None:
+            _abort(f"Assessment '{assessment_id}' not found in mule store.")
+        if output_format.lower() == "table":
+            typer.echo(f"Assessment ID:    {assessment.assessment_id}")
+            typer.echo(f"Account ID:       {assessment.account_id}")
+            typer.echo(f"Risk Score:       {assessment.risk_score:.4f}")
+            typer.echo(f"Action:           {assessment.action.value}")
+        else:
+            typer.echo(json.dumps(assessment.to_dict(), indent=2))
+        return
+
+    profile = store.get_profile(account_id)
+    if profile is None:
+        _abort(f"Account profile '{account_id}' not found in mule store.")
+    if output_format.lower() == "table":
+        typer.echo(f"Account ID:       {profile.account_id}")
+        typer.echo(f"Tenant ID:        {profile.tenant_id}")
+        typer.echo(f"Transfers:        {len(profile.transfers)}")
+    else:
+        typer.echo(json.dumps(profile.to_dict(), indent=2))
+
+
+@app.command("mule-summary")
+def mule_summary(
+    store_file: Annotated[
+        Path,
+        typer.Option("--store-file", "-s", help="Path to mule state JSON file."),
+    ] = Path("mule_store.json"),
+    output_format: Annotated[
+        str, typer.Option("--format", "-f", help="Output format (table or json).")
+    ] = "table",
+) -> None:
+    """Display summary metrics of monitored mule accounts and assessments."""
+    _, store = _load_mule_state(store_file)
+    assessments = store.list_assessments(limit=50000)
+    profiles = store.list_profiles(limit=50000)
+    actions: dict[str, int] = defaultdict(int)
+    for a in assessments:
+        actions[a.action.value] += 1
+    summary_data = {
+        "total_accounts": len(profiles),
+        "total_assessments": len(assessments),
+        "actions": dict(actions),
+    }
+    if output_format.lower() == "table":
+        typer.echo("Money Mule Detection Store Summary:")
+        typer.echo(f"  Total Accounts:     {summary_data['total_accounts']}")
+        typer.echo(f"  Total Assessments:  {summary_data['total_assessments']}")
+        for act, cnt in actions.items():
+            typer.echo(f"    {act:25s}: {cnt}")
     else:
         typer.echo(json.dumps(summary_data, indent=2))
 
