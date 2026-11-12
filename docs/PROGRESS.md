@@ -14,7 +14,7 @@
 - [x] Task 5: Implement `MuleAccountStore` & `MuleDetectionEngine` + unit tests.
 - [x] Task 6: Register `MULE_*` events in `src/fraud_detection/events.py` and wire `EventBus` into `MuleDetectionEngine` + tests.
 - [x] Task 7: Add `/v1/mule/*` REST endpoints and Prometheus metrics in `src/fraud_detection/api.py` + tests in `tests/test_api.py`.
-- [ ] Task 8: Add `mule-ingest`, `mule-eval`, `mule-inspect`, and `mule-summary` CLI commands in `src/fraud_detection/cli.py` + tests in `tests/test_cli.py`.
+- [x] Task 8: Add `mule-ingest`, `mule-eval`, `mule-inspect`, and `mule-summary` CLI commands in `src/fraud_detection/cli.py` + tests in `tests/test_cli.py`.
 - [ ] Task 9: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate with 100% Green CI.
 
 ## Acceptance Criteria Status
@@ -26,7 +26,7 @@
 | AC-4 (Mule Engine, Store & Escalation) | PASSED | `MuleDetectionEngine` and `MuleAccountStore` verified on scoring, policy routing, capacity eviction, and `CaseManager` escalation in `tests/test_mule_detection.py` |
 | AC-5 (EventBus Streaming) | PASSED | `MULE_ACTIVITY_EVALUATED`, `MULE_ACCOUNT_FLAGGED`, `MULE_FUNDS_HELD`, `MULE_NETWORK_DETECTED` registered in `events.py` and verified in `tests/test_mule_detection.py` |
 | AC-6 (REST API & Metrics) | PASSED | `/v1/mule/*` endpoints and Prometheus counters (`fraud_mule_evaluations_total`, `fraud_mule_anomalies_total`, `fraud_mule_flagged_total`) verified in `tests/test_api.py` |
-| AC-7 (CLI Workflows) | PENDING | Pending Task 8 |
+| AC-7 (CLI Workflows) | PASSED | `mule-ingest`, `mule-eval`, `mule-inspect`, and `mule-summary` verified in `tests/test_cli.py` |
 | AC-8 (Quality Standards & 100% Green CI) | PENDING | Pending Task 9 |
 
 ## Decision Log
