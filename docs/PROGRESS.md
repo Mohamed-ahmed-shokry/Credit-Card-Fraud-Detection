@@ -9,7 +9,7 @@
 ## Task Status
 - [x] Task 1: Define Phase 50 roadmap & initialize `docs/PROGRESS.md`.
 - [x] Task 2: Create `src/fraud_detection/mule_detection.py` domain enums and data models + unit tests in `tests/test_mule_detection.py`.
-- [ ] Task 3: Implement `PassThroughAnalyzer` + unit tests.
+- [x] Task 3: Implement `PassThroughAnalyzer` + unit tests.
 - [ ] Task 4: Implement `MuleNetworkAnalyzer` & `DormancyBurstDetector` + unit tests.
 - [ ] Task 5: Implement `MuleAccountStore` & `MuleDetectionEngine` + unit tests.
 - [ ] Task 6: Register `MULE_*` events in `src/fraud_detection/events.py` and wire `EventBus` into `MuleDetectionEngine` + tests.
@@ -21,7 +21,7 @@
 | Criterion | Status | Evidence |
 |-----------|--------|----------|
 | AC-1 (Domain Models & Taxonomies) | PASSED | `MuleRiskLevel`, `MuleAction`, `MuleAnomalyType`, `TransferDirection`, `ExfiltrationChannel`, `MuleTransferRecord`, `MuleAccountProfile`, `MuleAssessment` verified in `tests/test_mule_detection.py` |
-| AC-2 (Pass-Through & Dwell Compression) | PENDING | Pending Task 3 |
+| AC-2 (Pass-Through & Dwell Compression) | PASSED | `PassThroughAnalyzer` verified on rapid cash-out sequences, dwell compression, and off-ramps in `tests/test_mule_detection.py` |
 | AC-3 (Network Topology & Dormancy Burst) | PENDING | Pending Task 4 |
 | AC-4 (Mule Engine, Store & Escalation) | PENDING | Pending Task 5 |
 | AC-5 (EventBus Streaming) | PENDING | Pending Task 6 |
