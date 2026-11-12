@@ -4,14 +4,17 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
+from fraud_detection.cases import CaseManager
 from fraud_detection.mule_detection import (
     HIGH_RISK_OFF_RAMP_CHANNELS,
     DormancyBurstDetector,
     ExfiltrationChannel,
     MuleAccountProfile,
+    MuleAccountStore,
     MuleAction,
     MuleAnomalyType,
     MuleAssessment,
+    MuleDetectionEngine,
     MuleNetworkAnalyzer,
     MuleRiskLevel,
     MuleTransferRecord,
@@ -196,3 +199,99 @@ def test_dormancy_burst_detector() -> None:
     assert is_burst is True
     assert score == 0.45
     assert "dormant" in reason.lower()
+
+
+def test_mule_store_eviction_indexing_and_serialization() -> None:
+    store = MuleAccountStore(max_records=2)
+    t0 = datetime(2026, 11, 12, 10, 0, 0, tzinfo=UTC)
+    store.record_transfer(
+        MuleTransferRecord(
+            transfer_id="t1",
+            account_id="a1",
+            counterparty_id="cp_shared",
+            direction=TransferDirection.INBOUND,
+            amount=100.0,
+            timestamp=t0,
+            tenant_id="t_alpha",
+        )
+    )
+    store.record_transfer(
+        MuleTransferRecord(
+            transfer_id="t2",
+            account_id="a2",
+            counterparty_id="cp_shared",
+            direction=TransferDirection.OUTBOUND,
+            amount=100.0,
+            timestamp=t0,
+            tenant_id="t_beta",
+        )
+    )
+    assert store.profile_count == 2
+    assert len(store.find_accounts_by_counterparty("cp_shared")) == 2
+    assert len(store.list_profiles(tenant_id="t_alpha")) == 1
+
+    store.record_transfer(
+        MuleTransferRecord(
+            transfer_id="t3",
+            account_id="a3",
+            counterparty_id="cp_other",
+            direction=TransferDirection.INBOUND,
+            amount=200.0,
+            timestamp=t0,
+        )
+    )
+    assert store.profile_count == 2
+    assert store.get_profile("a1") is None
+    store.remove_profile("nonexistent")
+
+    rt_store = MuleAccountStore.from_dict(store.to_dict())
+    assert rt_store.profile_count == 2
+    rt_store.clear()
+    assert rt_store.profile_count == 0
+
+
+def test_mule_detection_engine_scoring_and_case_escalation() -> None:
+    case_mgr = CaseManager()
+    engine = MuleDetectionEngine(case_manager=case_mgr)
+
+    t0 = datetime(2026, 1, 1, 0, 0, 0, tzinfo=UTC)
+    t_burst = datetime(2026, 11, 12, 10, 0, 0, tzinfo=UTC)
+
+    # 1. Clean evaluation for new empty account
+    clean_ass = engine.evaluate_account("acct_clean", now=t_burst)
+    assert clean_ass.action == MuleAction.ALLOW
+    assert clean_ass.risk_level == MuleRiskLevel.LOW
+
+    # 2. High-severity mule account: dormant wake-up + fan-in + rapid crypto off-ramp
+    engine.store.upsert_profile(
+        MuleAccountProfile(account_id="acct_high_mule", account_opened_at=t0)
+    )
+    for i in range(4):
+        engine.ingest_and_evaluate(
+            MuleTransferRecord(
+                transfer_id=f"m_in_{i}",
+                account_id="acct_high_mule",
+                counterparty_id=f"victim_{i}",
+                direction=TransferDirection.INBOUND,
+                amount=1500.0,
+                channel=ExfiltrationChannel.P2P_WALLET,
+                timestamp=t_burst + timedelta(minutes=i * 5),
+            )
+        )
+    final_ass = engine.ingest_and_evaluate(
+        MuleTransferRecord(
+            transfer_id="m_out_1",
+            account_id="acct_high_mule",
+            counterparty_id="crypto_offramp",
+            direction=TransferDirection.OUTBOUND,
+            amount=5900.0,
+            channel=ExfiltrationChannel.CRYPTO_EXCHANGE,
+            timestamp=t_burst + timedelta(minutes=30),
+        )
+    )
+    assert final_ass.risk_score >= 0.90
+    assert final_ass.risk_level == MuleRiskLevel.CRITICAL
+    assert final_ass.action == MuleAction.ESCALATE_AML_SAR
+    assert MuleAnomalyType.HIGH_PASS_THROUGH_RATIO in final_ass.triggered_anomalies
+    assert MuleAnomalyType.DORMANCY_BURST in final_ass.triggered_anomalies
+    assert len(case_mgr.store.list_cases()) >= 1
