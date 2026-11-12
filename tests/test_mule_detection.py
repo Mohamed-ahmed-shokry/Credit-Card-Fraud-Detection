@@ -367,7 +367,7 @@ def test_mule_edge_cases_and_policy_tiers() -> None:
     from fraud_detection.mule_detection import _parse_dt
 
     # _parse_dt naive and fallback
-    naive = datetime(2026, 11, 12, 10, 0, 0)
+    naive = datetime(2026, 11, 12, 10, 0, 0)  # noqa: DTZ001
     assert _parse_dt(naive).tzinfo == UTC
     assert _parse_dt("2026-11-12T10:00:00").tzinfo == UTC
     assert _parse_dt(None, default=naive.replace(tzinfo=UTC)).year == 2026
