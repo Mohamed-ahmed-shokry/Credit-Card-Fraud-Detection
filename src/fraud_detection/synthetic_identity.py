@@ -15,6 +15,97 @@ from enum import StrEnum
 from typing import Any
 from uuid import uuid4
 
+# SSA Area to State mapping (pre-2011 historical allocation)
+SSA_AREA_ALLOCATION: list[tuple[int, int, str, int, int]] = [
+    (1, 3, "New Hampshire", 1936, 2011),
+    (4, 7, "Maine", 1936, 2011),
+    (8, 9, "Vermont", 1936, 2011),
+    (10, 34, "Massachusetts", 1936, 2011),
+    (35, 39, "Rhode Island", 1936, 2011),
+    (40, 49, "Connecticut", 1936, 2011),
+    (50, 134, "New York", 1936, 2011),
+    (135, 158, "New Jersey", 1936, 2011),
+    (159, 211, "Pennsylvania", 1936, 2011),
+    (212, 220, "Maryland", 1936, 2011),
+    (221, 222, "Delaware", 1936, 2011),
+    (223, 231, "Virginia", 1936, 2011),
+    (232, 232, "North Carolina", 1936, 2011),
+    (233, 236, "West Virginia", 1936, 2011),
+    (237, 246, "North Carolina", 1936, 2011),
+    (247, 251, "South Carolina", 1936, 2011),
+    (252, 260, "Georgia", 1936, 2011),
+    (261, 267, "Florida", 1936, 2011),
+    (268, 302, "Ohio", 1936, 2011),
+    (303, 317, "Indiana", 1936, 2011),
+    (318, 361, "Illinois", 1936, 2011),
+    (362, 386, "Michigan", 1936, 2011),
+    (387, 399, "Wisconsin", 1936, 2011),
+    (400, 415, "Kentucky", 1936, 2011),
+    (416, 424, "Tennessee", 1936, 2011),
+    (425, 428, "Mississippi", 1936, 2011),
+    (429, 432, "Arkansas", 1936, 2011),
+    (433, 439, "Louisiana", 1936, 2011),
+    (440, 448, "Oklahoma", 1936, 2011),
+    (449, 467, "Texas", 1936, 2011),
+    (468, 477, "Minnesota", 1936, 2011),
+    (478, 485, "Iowa", 1936, 2011),
+    (486, 500, "Missouri", 1936, 2011),
+    (501, 502, "North Dakota", 1936, 2011),
+    (503, 504, "South Dakota", 1936, 2011),
+    (505, 508, "Nebraska", 1936, 2011),
+    (509, 515, "Kansas", 1936, 2011),
+    (516, 517, "Montana", 1936, 2011),
+    (518, 519, "Idaho", 1936, 2011),
+    (520, 520, "Wyoming", 1936, 2011),
+    (521, 524, "Colorado", 1936, 2011),
+    (525, 525, "New Mexico", 1936, 2011),
+    (526, 527, "Arizona", 1936, 2011),
+    (528, 529, "Utah", 1936, 2011),
+    (530, 530, "Nevada", 1936, 2011),
+    (531, 539, "Washington", 1936, 2011),
+    (540, 544, "Oregon", 1936, 2011),
+    (545, 573, "California", 1936, 2011),
+    (574, 574, "Alaska", 1957, 2011),
+    (575, 576, "Hawaii", 1936, 2011),
+    (577, 579, "District of Columbia", 1936, 2011),
+    (580, 580, "Virgin Islands", 1936, 2011),
+    (581, 584, "Puerto Rico", 1936, 2011),
+    (586, 586, "Pacific Islands", 1951, 2011),
+    (700, 728, "Railroad Retirement", 1936, 1963),
+]
+
+# Unissued area numbers prior to June 25, 2011 randomization
+PRE_2011_UNISSUED_AREAS: set[int] = (
+    {0, 666}
+    | set(range(587, 600))
+    | set(range(640, 650))
+    | set(range(667, 700))
+    | set(range(729, 900))
+)
+
+# Simulated Death Master File (DMF) records for high-risk validation
+DEFAULT_DECEASED_RECORDS: dict[str, dict[str, str]] = {
+    # 9-digit cleaned SSN -> metadata
+    "042129999": {"name": "Arthur Pendelton", "dod": "2018-04-12", "state": "CT"},
+    "111223333": {"name": "Eleanor Vance", "dod": "2015-11-03", "state": "NY"},
+    "318445555": {"name": "Walter White", "dod": "2020-09-07", "state": "IL"},
+    "449998888": {"name": "Henry Higgins", "dod": "2012-01-20", "state": "TX"},
+    "545001122": {"name": "Clara Bow", "dod": "2016-08-14", "state": "CA"},
+}
+
+
+def get_group_order(group: int) -> int:
+    """Return the SSA group issuance progression order (1 to 99)."""
+    if 1 <= group <= 9 and group % 2 == 1:
+        return (group + 1) // 2  # 1, 3, 5, 7, 9 -> 1, 2, 3, 4, 5
+    if 10 <= group <= 98 and group % 2 == 0:
+        return 5 + (group - 8) // 2  # 10, 12, ... 98 -> 6, 7, ... 50
+    if 2 <= group <= 8 and group % 2 == 0:
+        return 50 + group // 2  # 02, 04, 06, 08 -> 51, 52, 53, 54
+    if 11 <= group <= 99 and group % 2 == 1:
+        return 54 + (group - 9) // 2  # 11, 13, ... 99 -> 55, 56, ... 99
+    return 0
+
 
 class SifRiskLevel(StrEnum):
     """Categorical risk tiers for synthetic identity assessments."""
@@ -227,6 +318,166 @@ class SsnValidationResult:
             estimated_issuance_year_range=parsed_range,
             is_deceased=bool(data.get("is_deceased", False)),
             details=str(data.get("details", "")),
+        )
+
+
+class SsnValidator:
+    """Validates US Social Security Numbers against SSA allocation history and death registries."""
+
+    def __init__(
+        self,
+        deceased_records: dict[str, dict[str, str]] | None = None,
+        unissued_areas: set[int] | None = None,
+    ) -> None:
+        self._deceased_records: dict[str, dict[str, str]] = dict(
+            DEFAULT_DECEASED_RECORDS if deceased_records is None else deceased_records
+        )
+        self._unissued_areas: set[int] = set(
+            PRE_2011_UNISSUED_AREAS if unissued_areas is None else unissued_areas
+        )
+
+    def add_deceased_record(self, ssn: str, name: str, dod: str, state: str = "US") -> None:
+        clean = re.sub(r"\D", "", ssn)
+        if len(clean) == 9:
+            self._deceased_records[clean] = {"name": name, "dod": dod, "state": state}
+
+    def is_deceased(self, ssn: str) -> tuple[bool, dict[str, str] | None]:
+        clean = re.sub(r"\D", "", ssn)
+        record = self._deceased_records.get(clean)
+        return (record is not None, record)
+
+    def lookup_area(self, area: int) -> tuple[str, int, int] | None:
+        for start, end, state, from_yr, to_yr in SSA_AREA_ALLOCATION:
+            if start <= area <= end:
+                return (state, from_yr, to_yr)
+        return None
+
+    def validate(self, ssn: str, dob: str | None = None) -> SsnValidationResult:
+        clean = re.sub(r"\D", "", ssn)
+        if len(clean) != 9:
+            return SsnValidationResult(
+                is_valid=False,
+                status=SsnValidationStatus.INVALID_FORMAT,
+                area_number=0,
+                group_number=0,
+                serial_number=0,
+                state_issued="Unknown",
+                details="SSN must contain exactly 9 numeric digits",
+            )
+
+        area = int(clean[:3])
+        group = int(clean[3:5])
+        serial = int(clean[5:9])
+
+        if group == 0 or serial == 0:
+            return SsnValidationResult(
+                is_valid=False,
+                status=SsnValidationStatus.RESERVED_OR_SPECIAL,
+                area_number=area,
+                group_number=group,
+                serial_number=serial,
+                state_issued="Unknown",
+                details="Group number 00 and serial number 0000 are invalid and reserved",
+            )
+
+        if area == 0 or area == 666 or area >= 900:
+            return SsnValidationResult(
+                is_valid=False,
+                status=SsnValidationStatus.RESERVED_OR_SPECIAL,
+                area_number=area,
+                group_number=group,
+                serial_number=serial,
+                state_issued="Unknown",
+                details=f"Area number {area:03d} is reserved or prohibited",
+            )
+
+        deceased_match, dec_info = self.is_deceased(clean)
+        if deceased_match and dec_info:
+            d_name = dec_info.get("name", "Unknown")
+            d_dod = dec_info.get("dod", "Unknown")
+            return SsnValidationResult(
+                is_valid=False,
+                status=SsnValidationStatus.DECEASED,
+                area_number=area,
+                group_number=group,
+                serial_number=serial,
+                state_issued=dec_info.get("state", "Unknown"),
+                is_deceased=True,
+                details=f"SSN matched Death Master File: {d_name} (DOD: {d_dod})",
+            )
+
+        birth_year: int | None = None
+        if dob:
+            try:
+                birth_year = int(dob.split("-")[0])
+            except (ValueError, IndexError):
+                birth_year = None
+
+        area_info = self.lookup_area(area)
+        if area_info is None:
+            if area in self._unissued_areas:
+                if birth_year is not None and birth_year < 2011:
+                    detail_msg = (
+                        f"Area {area:03d} was unissued prior to 2011 randomization, "
+                        f"but applicant birth year is {birth_year}"
+                    )
+                    return SsnValidationResult(
+                        is_valid=False,
+                        status=SsnValidationStatus.UNISSUED_AREA,
+                        area_number=area,
+                        group_number=group,
+                        serial_number=serial,
+                        state_issued="Unissued Pre-2011",
+                        details=detail_msg,
+                    )
+                return SsnValidationResult(
+                    is_valid=True,
+                    status=SsnValidationStatus.ISSUED_POST_RANDOMIZATION,
+                    area_number=area,
+                    group_number=group,
+                    serial_number=serial,
+                    state_issued="Randomized Post-2011",
+                    estimated_issuance_year_range=(2011, 2026),
+                    details="SSN area issued under SSA post-June 25, 2011 randomization",
+                )
+            return SsnValidationResult(
+                is_valid=True,
+                status=SsnValidationStatus.VALID,
+                area_number=area,
+                group_number=group,
+                serial_number=serial,
+                state_issued="Unknown (Unmapped)",
+                details="Area number outside standard historical tables",
+            )
+
+        state, from_yr, to_yr = area_info
+
+        # Check special retired series like Railroad Retirement (1936-1963)
+        if state == "Railroad Retirement" and birth_year is not None and birth_year > 1963:
+            rr_detail = (
+                "SSN area belonged to Railroad Retirement board discontinued in 1963, "
+                f"but applicant born in {birth_year}"
+            )
+            return SsnValidationResult(
+                is_valid=False,
+                status=SsnValidationStatus.DOB_INCONSISTENT,
+                area_number=area,
+                group_number=group,
+                serial_number=serial,
+                state_issued=state,
+                estimated_issuance_year_range=(from_yr, to_yr),
+                details=rr_detail,
+            )
+
+        return SsnValidationResult(
+            is_valid=True,
+            status=SsnValidationStatus.VALID,
+            area_number=area,
+            group_number=group,
+            serial_number=serial,
+            state_issued=state,
+            estimated_issuance_year_range=(from_yr, to_yr),
+            details=f"Valid pre-randomization SSN issued in {state}",
         )
 
 
