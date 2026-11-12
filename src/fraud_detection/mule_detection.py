@@ -351,3 +351,91 @@ class PassThroughAnalyzer:
             anomalies=anomalies,
             risk_score=min(1.0, score),
         )
+
+
+@dataclass(frozen=True)
+class MuleNetworkMetrics:
+    """Counterparty fan-in, fan-out, and new-counterparty concentration metrics."""
+
+    unique_inbound_counterparties: int
+    unique_outbound_counterparties: int
+    new_counterparties_24h: int
+    anomalies: list[MuleAnomalyType]
+    risk_score: float
+
+
+class MuleNetworkAnalyzer:
+    """Detects fan-in collection, fan-out dispersion, and rapid counterparty floods."""
+
+    def __init__(
+        self,
+        window: timedelta = timedelta(hours=72),
+        fan_in_threshold: int = 4,
+        fan_out_threshold: int = 4,
+        new_counterparty_threshold: int = 5,
+    ) -> None:
+        self.window = window
+        self.fan_in_threshold = fan_in_threshold
+        self.fan_out_threshold = fan_out_threshold
+        self.new_counterparty_threshold = new_counterparty_threshold
+
+    def analyze(
+        self,
+        transfers: list[MuleTransferRecord],
+        now: datetime | None = None,
+    ) -> MuleNetworkMetrics:
+        """Evaluate counterparty fan-in/fan-out topology over the sliding window."""
+        if not transfers:
+            return MuleNetworkMetrics(
+                unique_inbound_counterparties=0,
+                unique_outbound_counterparties=0,
+                new_counterparties_24h=0,
+                anomalies=[],
+                risk_score=0.0,
+            )
+
+        ref_time = now if now is not None else max(t.timestamp for t in transfers)
+        cutoff = ref_time - self.window
+        recent_24h = ref_time - timedelta(hours=24)
+
+        prior_cps = {t.counterparty_id for t in transfers if t.timestamp < recent_24h}
+        recent_xfers = [t for t in transfers if t.timestamp >= cutoff]
+
+        inbound_cps = {
+            t.counterparty_id
+            for t in recent_xfers
+            if t.direction == TransferDirection.INBOUND and t.counterparty_id
+        }
+        outbound_cps = {
+            t.counterparty_id
+            for t in recent_xfers
+            if t.direction == TransferDirection.OUTBOUND and t.counterparty_id
+        }
+        new_24h_cps = {
+            t.counterparty_id
+            for t in recent_xfers
+            if t.timestamp >= recent_24h
+            and t.counterparty_id
+            and t.counterparty_id not in prior_cps
+        }
+
+        anomalies: list[MuleAnomalyType] = []
+        score = 0.0
+
+        if len(inbound_cps) >= self.fan_in_threshold:
+            anomalies.append(MuleAnomalyType.FAN_IN_COLLECTION)
+            score += 0.40
+        if len(outbound_cps) >= self.fan_out_threshold:
+            anomalies.append(MuleAnomalyType.FAN_OUT_DISPERSION)
+            score += 0.35
+        if len(new_24h_cps) >= self.new_counterparty_threshold:
+            anomalies.append(MuleAnomalyType.NEW_COUNTERPARTY_FLOOD)
+            score += 0.30
+
+        return MuleNetworkMetrics(
+            unique_inbound_counterparties=len(inbound_cps),
+            unique_outbound_counterparties=len(outbound_cps),
+            new_counterparties_24h=len(new_24h_cps),
+            anomalies=anomalies,
+            risk_score=min(1.0, score),
+        )
