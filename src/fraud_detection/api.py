@@ -11,7 +11,7 @@ import re
 import secrets
 import time
 from collections.abc import AsyncIterator, Callable, Collection
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from threading import RLock
@@ -38,6 +38,28 @@ from starlette.middleware.base import RequestResponseEndpoint
 from starlette.responses import Response
 
 from fraud_detection import __version__
+from fraud_detection.aml import (
+    AmlAssessment,
+    AmlEngine,
+    AmlRiskLevel,
+    AmlTransactionEvent,
+    AmlTypology,
+    SarDossier,
+    SarManager,
+    SarStatus,
+    TransactionDirection,
+    WatchlistEntry,
+    WatchlistType,
+)
+from fraud_detection.ato import (
+    AccountMutationRecord,
+    AccountMutationType,
+    AccountProfile,
+    AtoEngine,
+    AtoRiskAssessment,
+    LoginEvent,
+    LoginOutcome,
+)
 from fraud_detection.audit import (
     AuditSink,
     JsonlAuditSink,
@@ -53,6 +75,40 @@ from fraud_detection.audit import (
     build_retraining_trigger_audit_event,
     build_scoring_audit_event,
     build_shadow_scoring_audit_event,
+)
+from fraud_detection.cases import (
+    CaseAssignmentError,
+    CaseDisposition,
+    CaseManager,
+    CaseNotFoundError,
+    CasePriority,
+    CaseStatus,
+    CaseValidationError,
+    DisputeEvidencePackage,
+    EvidencePackagingError,
+    FraudCase,
+    InvalidCaseStateTransitionError,
+)
+from fraud_detection.challenge import (
+    ChallengeError,
+    ChallengeExpiredError,
+    ChallengeLockedOutError,
+    ChallengeManager,
+    ChallengeMaxAttemptsExceededError,
+    ChallengeMethod,
+    ChallengeSessionNotFoundError,
+    InvalidChallengeTokenError,
+    RateLimitExceededError,
+)
+from fraud_detection.chargeback import (
+    CardScheme,
+    ChargebackCategory,
+    ChargebackDispute,
+    ChargebackManager,
+    ChargebackStage,
+    DisputeNotFoundError,
+    DisputeValidationError,
+    InvalidDisputeStateTransitionError,
 )
 from fraud_detection.device import (
     DeviceFeatureExtractor,
@@ -143,6 +199,14 @@ from fraud_detection.routing import (
     TrafficSplitStrategy,
 )
 from fraud_detection.rules import RulePrecedence, RuleSet
+from fraud_detection.synthetic_identity import (
+    AuthorizedUserRecord,
+    IdentityProfile,
+    SifAction,
+    SifAssessment,
+    SifRiskLevel,
+    SyntheticIdentityEngine,
+)
 from fraud_detection.telemetry import (
     DEFAULT_OTLP_TIMEOUT_SECONDS,
     DEFAULT_SERVICE_NAME,
@@ -261,6 +325,25 @@ OPERATIONAL_PATHS = frozenset(
         "/v1/webhooks/",
         "/v1/webhooks/dlq",
         "/v1/webhooks/dlq/replay",
+        "/v1/challenges",
+        "/v1/challenges/",
+        "/v1/cases",
+        "/v1/cases/",
+        "/v1/cases/summary",
+        "/v1/chargebacks",
+        "/v1/chargebacks/",
+        "/v1/chargebacks/summary",
+        "/v1/chargebacks/webhook",
+        "/v1/ato/login",
+        "/v1/ato/evaluate",
+        "/v1/ato/assessments",
+        "/v1/aml/transactions/monitor",
+        "/v1/aml/watchlist/screen",
+        "/v1/aml/alerts",
+        "/v1/aml/sar",
+        "/v1/sif/evaluate",
+        "/v1/sif/assessments",
+        "/v1/sif/profiles",
     }
 )
 UNMATCHED_ROUTE_LABEL = "unmatched"
@@ -608,17 +691,16 @@ class CircuitBreaker:
                 logger.warning(
                     "CircuitBreaker probe failed (%s); transitioned back to open.", reason
                 )
-            elif self.state == "closed":
-                if self.consecutive_failures >= self.failure_threshold:
-                    self.state = "open"
-                    self.last_state_change = now
-                    if self.on_trip is not None:
-                        self.on_trip()
-                    logger.warning(
-                        "CircuitBreaker tripped to open after %d consecutive failures (%s).",
-                        self.consecutive_failures,
-                        reason,
-                    )
+            elif self.state == "closed" and self.consecutive_failures >= self.failure_threshold:
+                self.state = "open"
+                self.last_state_change = now
+                if self.on_trip is not None:
+                    self.on_trip()
+                logger.warning(
+                    "CircuitBreaker tripped to open after %d consecutive failures (%s).",
+                    self.consecutive_failures,
+                    reason,
+                )
 
     def trip(self) -> None:
         """Force the circuit breaker to OPEN state."""
@@ -1539,6 +1621,670 @@ class DeadLetterReplayResponse(BaseModel):
     success_count: int
 
 
+class ChallengeCreateRequest(BaseModel):
+    """Payload to create an SCA step-up challenge session."""
+
+    transaction_id: str
+    user_id: str
+    tenant_id: str = "default"
+    destination: str
+    method: str = "sms_otp"
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ChallengeVerifyRequest(BaseModel):
+    """Payload to verify an entered challenge token."""
+
+    token: str
+
+
+class ChallengeResendRequest(BaseModel):
+    """Payload to request an OTP resend."""
+
+    destination: str | None = None
+
+
+class ChallengeSessionResponse(BaseModel):
+    """Serialized step-up challenge session response."""
+
+    challenge_id: str
+    transaction_id: str
+    user_id: str
+    tenant_id: str
+    method: str
+    target_masked: str
+    attempts_count: int
+    max_attempts: int
+    status: str
+    created_at: str
+    expires_at: str
+    verified_at: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ChallengeListResponse(BaseModel):
+    """List of active and historical challenge sessions."""
+
+    total_count: int
+    challenges: list[ChallengeSessionResponse]
+
+
+class CaseCreateRequest(BaseModel):
+    """Payload to create an investigation case."""
+
+    transaction_id: str
+    fraud_score: float = 0.0
+    amount: float = 0.0
+    currency: str = "USD"
+    tenant_id: str = "default"
+    priority: str | None = None
+    sla_deadline_hours: float = 24.0
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    auto_assign: str | None = None
+
+
+class CaseUpdateRequest(BaseModel):
+    """Payload to update an existing case's status or assignment."""
+
+    assigned_analyst: str | None = None
+    status: str | None = None
+    priority: str | None = None
+    reason: str = ""
+    actor: str = "system"
+
+
+class CaseNoteRequest(BaseModel):
+    """Payload to append an analyst investigation note."""
+
+    author: str
+    text: str
+
+
+class CaseResolveRequest(BaseModel):
+    """Payload to finalize and resolve a fraud case."""
+
+    disposition: str
+    actor: str
+    notes: str = ""
+
+
+class CaseEvidenceRequest(BaseModel):
+    """Payload to compile and fingerprint a dispute evidence package."""
+
+    transaction_data: dict[str, Any] = Field(default_factory=dict)
+    device_data: dict[str, Any] | None = None
+    geo_data: dict[str, Any] | None = None
+    challenge_data: dict[str, Any] | None = None
+    merchant_data: dict[str, Any] | None = None
+    additional_evidence: dict[str, Any] | None = None
+    actor: str = "system"
+
+
+class CaseNoteResponse(BaseModel):
+    """Serialized analyst case note."""
+
+    note_id: str
+    author: str
+    text: str
+    timestamp: str
+
+
+class FraudCaseResponse(BaseModel):
+    """Serialized fraud case representation."""
+
+    case_id: str
+    transaction_id: str
+    tenant_id: str
+    assigned_analyst: str | None = None
+    status: str
+    priority: str
+    fraud_score: float
+    amount: float
+    currency: str
+    disposition: str
+    notes: list[CaseNoteResponse]
+    audit_trail: list[dict[str, Any]]
+    created_at: str
+    updated_at: str
+    sla_deadline_hours: float
+    sla_expires_at: str
+    is_sla_breached: bool
+    resolved_at: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class CaseListResponse(BaseModel):
+    """List of queried fraud cases."""
+
+    total_count: int
+    cases: list[FraudCaseResponse]
+
+
+class CaseSummaryResponse(BaseModel):
+    """Aggregate statistics for fraud cases."""
+
+    total_cases: int
+    by_status: dict[str, int]
+    by_priority: dict[str, int]
+    sla_breached_count: int
+
+
+class DisputeEvidenceResponse(BaseModel):
+    """Serialized dispute evidence package."""
+
+    package_id: str
+    case_id: str
+    transaction_id: str
+    tenant_id: str
+    created_at: str
+    evidence_items: dict[str, Any]
+    device_fingerprint: dict[str, Any] | None = None
+    geolocation_data: dict[str, Any] | None = None
+    challenge_verification: dict[str, Any] | None = None
+    merchant_profile: dict[str, Any] | None = None
+    sha256_fingerprint: str
+
+
+class ChargebackIngestRequest(BaseModel):
+    """Payload for manual or automated scheme chargeback ingestion."""
+
+    transaction_id: str
+    scheme: str
+    reason_code: str
+    disputed_amount: float
+    currency: str = "USD"
+    tenant_id: str = "default"
+    scheme_dispute_id: str | None = None
+    filing_date: str | None = None
+    response_deadline: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    auto_evaluate: bool = True
+    transaction_context: dict[str, Any] | None = None
+    challenge_session: dict[str, Any] | None = None
+    prior_customer_transactions: list[dict[str, Any]] | None = None
+    evidence_package: dict[str, Any] | None = None
+
+
+class ChargebackWebhookRequest(BaseModel):
+    """Inbound webhook payload from card schemes or payment gateways."""
+
+    event_type: str = "chargeback.created"
+    scheme: str
+    scheme_dispute_id: str
+    transaction_id: str
+    reason_code: str
+    amount: float
+    currency: str = "USD"
+    filing_date: str | None = None
+    response_deadline: str | None = None
+    tenant_id: str = "default"
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ChargebackRepresentRequest(BaseModel):
+    """Payload for submitting dispute representment with defense evidence."""
+
+    package_id: str | None = None
+    evidence_fingerprint: str | None = None
+    notes: str = ""
+    actor: str = "analyst"
+
+
+class ChargebackResolveRequest(BaseModel):
+    """Payload for finalizing dispute outcome."""
+
+    outcome: str
+    actor: str = "analyst"
+    notes: str = ""
+
+
+class ChargebackDisputeResponse(BaseModel):
+    """Serialized representation of a card scheme dispute."""
+
+    dispute_id: str
+    transaction_id: str
+    tenant_id: str
+    scheme: str
+    reason_code: str
+    category: str
+    stage: str
+    disputed_amount: float
+    currency: str
+    filing_date: str
+    response_deadline: str
+    is_expired: bool
+    is_terminal: bool
+    liability_shift_proven: bool
+    winnability_score: float
+    recommended_action: str
+    representment_package_id: str | None = None
+    evidence_fingerprint: str | None = None
+    represented_at: str | None = None
+    resolved_at: str | None = None
+    audit_trail: list[dict[str, Any]] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    created_at: str
+    updated_at: str
+
+
+class ChargebackListResponse(BaseModel):
+    """Collection response for multi-criteria dispute queries."""
+
+    total_count: int
+    disputes: list[ChargebackDisputeResponse]
+
+
+class ChargebackSummaryResponse(BaseModel):
+    """Aggregated portfolio statistics across all scheme disputes."""
+
+    total_disputes: int
+    total_disputed_amount: float
+    by_stage: dict[str, int]
+    by_scheme: dict[str, int]
+    by_category: dict[str, int]
+    expired_count: int
+    liability_shift_proven_count: int
+    high_winnability_count: int
+
+
+def _dispute_to_response(dispute: ChargebackDispute) -> ChargebackDisputeResponse:
+    """Helper to convert ChargebackDispute dataclass to ChargebackDisputeResponse Pydantic model."""
+    return ChargebackDisputeResponse(
+        dispute_id=dispute.dispute_id,
+        transaction_id=dispute.transaction_id,
+        tenant_id=dispute.tenant_id,
+        scheme=dispute.scheme.value,
+        reason_code=dispute.reason_code,
+        category=dispute.category.value,
+        stage=dispute.stage.value,
+        disputed_amount=dispute.disputed_amount,
+        currency=dispute.currency,
+        filing_date=dispute.filing_date,
+        response_deadline=dispute.response_deadline,
+        is_expired=dispute.is_expired,
+        is_terminal=dispute.is_terminal,
+        liability_shift_proven=dispute.liability_shift_proven,
+        winnability_score=dispute.winnability_score,
+        recommended_action=dispute.recommended_action.value,
+        representment_package_id=dispute.representment_package_id,
+        evidence_fingerprint=dispute.evidence_fingerprint,
+        represented_at=dispute.represented_at,
+        resolved_at=dispute.resolved_at,
+        audit_trail=dispute.audit_trail,
+        metadata=dispute.metadata,
+        created_at=dispute.created_at,
+        updated_at=dispute.updated_at,
+    )
+
+
+class AtoLoginRequest(BaseModel):
+    """Payload for authentication attempt ingestion and ATO evaluation."""
+
+    user_id: str
+    tenant_id: str = "default"
+    ip_address: str = "127.0.0.1"
+    outcome: str = "success"
+    device_fingerprint: str | None = None
+    latitude: float | None = None
+    longitude: float | None = None
+    user_agent: str | None = None
+
+
+class AtoEvaluateRequest(BaseModel):
+    """Payload for evaluating an account transaction or action for takeover risk."""
+
+    user_id: str
+    tenant_id: str = "default"
+    action_type: str = "transaction"
+    ip_address: str = "127.0.0.1"
+    device_fingerprint: str | None = None
+    latitude: float | None = None
+    longitude: float | None = None
+    transaction_amount: float | None = None
+
+
+class AtoMutationRequest(BaseModel):
+    """Payload for recording a sensitive account profile mutation."""
+
+    mutation_type: str
+    channel: str = "web"
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class AtoQuarantineRequest(BaseModel):
+    """Payload for administrative account quarantine."""
+
+    reason: str
+    tenant_id: str = "default"
+
+
+class AtoReleaseRequest(BaseModel):
+    """Payload for administrative release from quarantine."""
+
+    reason: str
+    tenant_id: str = "default"
+
+
+class AtoMutationResponse(BaseModel):
+    """Response confirming sensitive mutation recorded."""
+
+    status: str
+    user_id: str
+    mutation_id: str
+
+
+class AtoActionStatusResponse(BaseModel):
+    """Response confirming administrative action (quarantine/release)."""
+
+    status: str
+    user_id: str
+    reason: str
+
+
+class AtoAssessmentResponse(BaseModel):
+    """Serialized response of an ATO risk assessment."""
+
+    assessment_id: str
+    user_id: str
+    tenant_id: str
+    risk_score: float
+    recommended_action: str
+    factors_triggered: list[str]
+    score_breakdown: dict[str, float]
+    impossible_travel_kmh: float | None = None
+    is_new_device: bool
+    hours_since_last_mutation: float | None = None
+    quarantined: bool
+    timestamp: str
+    details: dict[str, Any] = Field(default_factory=dict)
+
+
+class AtoAssessmentListResponse(BaseModel):
+    """Collection response for ATO risk assessments."""
+
+    total_count: int
+    assessments: list[AtoAssessmentResponse]
+
+
+class AtoProfileResponse(BaseModel):
+    """Serialized representation of a user's account baseline and security profile."""
+
+    user_id: str
+    tenant_id: str
+    known_devices: list[str]
+    known_locations: list[list[float]]
+    last_known_ip: str | None = None
+    last_known_location: list[float] | None = None
+    last_active_at: str | None = None
+    created_at: str
+    is_quarantined: bool
+    quarantine_reason: str | None = None
+    quarantined_at: str | None = None
+    released_at: str | None = None
+    mutations: list[dict[str, Any]] = Field(default_factory=list)
+
+
+def _assessment_to_response(assessment: AtoRiskAssessment) -> AtoAssessmentResponse:
+    """Helper to convert AtoRiskAssessment dataclass to AtoAssessmentResponse."""
+    data = assessment.to_dict()
+    return AtoAssessmentResponse(**data)
+
+
+def _profile_to_response(profile: AccountProfile) -> AtoProfileResponse:
+    """Helper to convert AccountProfile dataclass to AtoProfileResponse."""
+    data = profile.to_dict()
+    return AtoProfileResponse(**data)
+
+
+class AmlMonitorRequest(BaseModel):
+    """Payload to evaluate a financial transaction for AML typologies."""
+
+    transaction_id: str = Field(default_factory=lambda: f"tx_{uuid4().hex[:12]}")
+    user_id: str
+    amount: float = Field(gt=0.0)
+    currency: str = "USD"
+    direction: str = "outflow"
+    counterparty_id: str = ""
+    country: str = "US"
+    payment_method: str = "card"
+    entity_name: str | None = None
+    tenant_id: str = "default"
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class AmlAssessmentResponse(BaseModel):
+    """Evaluation response from the AML scoring and policy decisioning engine."""
+
+    transaction_id: str
+    user_id: str
+    risk_score: float
+    risk_level: str
+    recommended_action: str
+    triggered_typologies: list[str]
+    score_breakdown: dict[str, float]
+    screening_matches: list[dict[str, Any]]
+    alert_id: str | None = None
+    case_id: str | None = None
+    tenant_id: str = "default"
+    evaluated_at: str
+
+
+class AmlWatchlistScreenRequest(BaseModel):
+    """Request to screen an entity name against sanctions and PEP watchlists."""
+
+    name: str
+    threshold: float | None = None
+    country: str | None = None
+
+
+class AmlWatchlistEntryRequest(BaseModel):
+    """Request to add or update an entry in the watchlist."""
+
+    name: str
+    watchlist_type: str
+    country: str = ""
+    aliases: list[str] = Field(default_factory=list)
+    notes: str = ""
+
+
+class AmlWatchlistMatchResponse(BaseModel):
+    """Screening match record."""
+
+    match_id: str
+    entity_name: str
+    matched_entry: dict[str, Any]
+    similarity_score: float
+    match_algorithm: str
+    risk_level: str
+    screened_at: str
+
+
+class AmlAlertResponse(BaseModel):
+    """Serialized AML alert."""
+
+    alert_id: str
+    user_id: str
+    typology: str
+    risk_level: str
+    recommended_action: str
+    risk_score: float
+    trigger_details: dict[str, Any]
+    transaction_ids: list[str]
+    tenant_id: str
+    created_at: str
+
+
+class AmlAlertListResponse(BaseModel):
+    """List of AML alerts."""
+
+    total_count: int
+    alerts: list[AmlAlertResponse]
+
+
+class AmlSarGenerateRequest(BaseModel):
+    """Request to compile a regulatory SAR filing dossier."""
+
+    user_id: str
+    alert_ids: list[str]
+    suspect_name: str = ""
+    suspect_details: dict[str, Any] = Field(default_factory=dict)
+    transactions: list[dict[str, Any]] = Field(default_factory=list)
+    tenant_id: str = "default"
+
+
+class AmlSarStatusUpdateRequest(BaseModel):
+    """Request to transition the status of a SAR filing dossier."""
+
+    new_status: str
+    notes: str = ""
+    actor: str = "compliance_officer"
+
+
+class AmlSarResponse(BaseModel):
+    """Serialized SAR regulatory filing dossier."""
+
+    sar_id: str
+    user_id: str
+    alert_ids: list[str]
+    status: str
+    narrative: str
+    suspect_details: dict[str, Any]
+    summary_financials: dict[str, Any]
+    jurisdictions: list[str]
+    filing_date: str
+    tenant_id: str
+    created_at: str
+    updated_at: str
+    audit_trail: list[dict[str, Any]]
+
+
+class AmlSarListResponse(BaseModel):
+    """List of SAR dossiers."""
+
+    total_count: int
+    sars: list[AmlSarResponse]
+
+
+def _aml_assessment_to_response(assessment: AmlAssessment) -> AmlAssessmentResponse:
+    """Helper to convert AmlAssessment dataclass to AmlAssessmentResponse."""
+    d = assessment.to_dict()
+    alert_id = d["alert"]["alert_id"] if d.get("alert") else None
+    return AmlAssessmentResponse(
+        transaction_id=d["transaction_id"],
+        user_id=d["user_id"],
+        risk_score=d["risk_score"],
+        risk_level=d["risk_level"],
+        recommended_action=d["recommended_action"],
+        triggered_typologies=d["triggered_typologies"],
+        score_breakdown=d["score_breakdown"],
+        screening_matches=d["screening_matches"],
+        alert_id=alert_id,
+        case_id=d.get("case_id"),
+        tenant_id=d.get("tenant_id", "default"),
+        evaluated_at=d["evaluated_at"],
+    )
+
+
+def _aml_sar_to_response(sar: SarDossier) -> AmlSarResponse:
+    """Helper to convert SarDossier dataclass to AmlSarResponse."""
+    d = sar.to_dict()
+    return AmlSarResponse(**d)
+
+
+class SifEvaluateRequest(BaseModel):
+    """Payload to evaluate an identity profile for synthetic fraud."""
+
+    applicant_id: str = Field(default_factory=lambda: f"app_{uuid4().hex[:12]}")
+    ssn: str
+    first_name: str
+    last_name: str
+    dob: str
+    address: str
+    phone: str
+    email: str
+    credit_line_requested: float = 5000.0
+    authorized_users: list[dict[str, Any]] = Field(default_factory=list)
+    tenant_id: str = "default"
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class SifProfileRequest(BaseModel):
+    """Payload to create or store an applicant identity profile."""
+
+    applicant_id: str = Field(default_factory=lambda: f"app_{uuid4().hex[:12]}")
+    ssn: str
+    first_name: str
+    last_name: str
+    dob: str
+    address: str
+    phone: str
+    email: str
+    credit_line_requested: float = 5000.0
+    authorized_users: list[dict[str, Any]] = Field(default_factory=list)
+    tenant_id: str = "default"
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class SifAssessmentResponse(BaseModel):
+    """Synthetic identity assessment report response."""
+
+    assessment_id: str
+    applicant_id: str
+    tenant_id: str
+    risk_score: float
+    risk_level: str
+    action: str
+    triggered_anomalies: list[str]
+    anomaly_breakdown: dict[str, float]
+    identity_fragmentation_score: float
+    ssn_validation: dict[str, Any] | None = None
+    evaluated_at: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class SifProfileResponse(BaseModel):
+    """Applicant identity profile response."""
+
+    applicant_id: str
+    ssn: str
+    ssn_hash: str
+    first_name: str
+    last_name: str
+    dob: str
+    address: str
+    phone: str
+    email: str
+    credit_line_requested: float
+    authorized_users: list[dict[str, Any]]
+    tenant_id: str
+    created_at: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class SifAssessmentListResponse(BaseModel):
+    """List of synthetic identity assessments."""
+
+    total_count: int
+    assessments: list[SifAssessmentResponse]
+
+
+class SifProfileListResponse(BaseModel):
+    """List of identity profiles."""
+
+    total_count: int
+    profiles: list[SifProfileResponse]
+
+
+def _sif_assessment_to_response(assessment: SifAssessment) -> SifAssessmentResponse:
+    d = assessment.to_dict()
+    return SifAssessmentResponse(**d)
+
+
+def _sif_profile_to_response(profile: IdentityProfile) -> SifProfileResponse:
+    d = profile.to_dict()
+    return SifProfileResponse(**d)
+
+
 def create_app(
     *,
     model: FraudModel | None = None,
@@ -1619,6 +2365,13 @@ def create_app(
     merchant_chargeback_rate_threshold: float = 0.015,
     tenant_registry: TenantRegistry | None = None,
     event_bus: EventBus | None = None,
+    challenge_manager: ChallengeManager | None = None,
+    case_manager: CaseManager | None = None,
+    chargeback_manager: ChargebackManager | None = None,
+    ato_engine: AtoEngine | None = None,
+    aml_engine: AmlEngine | None = None,
+    sar_manager: SarManager | None = None,
+    sif_engine: SyntheticIdentityEngine | None = None,
 ) -> FastAPI:
     """Create an application using an injected model or a trusted artifact path.
 
@@ -1989,6 +2742,144 @@ def create_app(
     webhook_dlq_size_gauge = Gauge(
         "fraud_webhook_dlq_size",
         "Current number of failed webhook events retained in the dead-letter queue.",
+        ["tenant_id"],
+        registry=metrics_registry,
+    )
+    challenges_issued_counter = Counter(
+        "fraud_challenges_issued_total",
+        "Total step-up challenge sessions created.",
+        ["tenant_id", "method"],
+        registry=metrics_registry,
+    )
+    challenges_verified_counter = Counter(
+        "fraud_challenges_verified_total",
+        "Total step-up challenge sessions successfully verified.",
+        ["tenant_id", "method"],
+        registry=metrics_registry,
+    )
+    challenges_failed_counter = Counter(
+        "fraud_challenges_failed_total",
+        "Total step-up challenge verification failures by reason.",
+        ["tenant_id", "method", "reason"],
+        registry=metrics_registry,
+    )
+    cases_created_counter = Counter(
+        "fraud_cases_total",
+        "Total fraud cases created by priority.",
+        ["tenant_id", "priority"],
+        registry=metrics_registry,
+    )
+    cases_resolved_counter = Counter(
+        "fraud_cases_resolved_total",
+        "Total fraud cases resolved by disposition.",
+        ["tenant_id", "disposition"],
+        registry=metrics_registry,
+    )
+    evidence_packages_counter = Counter(
+        "fraud_evidence_packages_total",
+        "Total dispute evidence packages compiled.",
+        ["tenant_id"],
+        registry=metrics_registry,
+    )
+    chargebacks_received_counter = Counter(
+        "fraud_chargebacks_received_total",
+        "Total card scheme chargebacks received by scheme and category.",
+        ["tenant_id", "scheme", "category"],
+        registry=metrics_registry,
+    )
+    chargebacks_represented_counter = Counter(
+        "fraud_chargebacks_represented_total",
+        "Total card scheme disputes represented with evidence packages.",
+        ["tenant_id", "scheme"],
+        registry=metrics_registry,
+    )
+    chargebacks_won_counter = Counter(
+        "fraud_chargebacks_won_total",
+        "Total card scheme disputes successfully won in representment.",
+        ["tenant_id", "scheme"],
+        registry=metrics_registry,
+    )
+    chargebacks_lost_counter = Counter(
+        "fraud_chargebacks_lost_total",
+        "Total card scheme disputes resolved as lost or accepted liability.",
+        ["tenant_id", "scheme"],
+        registry=metrics_registry,
+    )
+    chargeback_exposure_gauge = Gauge(
+        "fraud_chargeback_financial_exposure_amount",
+        "Total disputed exposure amount across active chargeback disputes.",
+        ["tenant_id"],
+        registry=metrics_registry,
+    )
+    ato_login_attempts_counter = Counter(
+        "fraud_ato_login_attempts_total",
+        "Total authentication attempts evaluated by ATO engine.",
+        ["tenant_id", "outcome", "action"],
+        registry=metrics_registry,
+    )
+    ato_evaluations_counter = Counter(
+        "fraud_ato_risk_assessments_total",
+        "Total ATO risk evaluations executed.",
+        ["tenant_id", "action"],
+        registry=metrics_registry,
+    )
+    ato_quarantines_counter = Counter(
+        "fraud_ato_quarantines_total",
+        "Total user accounts quarantined for ATO security breach.",
+        ["tenant_id"],
+        registry=metrics_registry,
+    )
+    aml_transactions_counter = Counter(
+        "fraud_aml_transactions_monitored_total",
+        "Total transactions evaluated by AML engine.",
+        ["tenant_id", "action", "risk_level"],
+        registry=metrics_registry,
+    )
+    aml_alerts_counter = Counter(
+        "fraud_aml_alerts_total",
+        "Total AML alerts triggered.",
+        ["tenant_id", "typology", "risk_level"],
+        registry=metrics_registry,
+    )
+    aml_sanction_hits_counter = Counter(
+        "fraud_aml_sanction_hits_total",
+        "Total sanctions and PEP watchlist matches detected.",
+        ["tenant_id"],
+        registry=metrics_registry,
+    )
+    aml_sars_created_counter = Counter(
+        "fraud_aml_sars_created_total",
+        "Total SAR dossiers compiled.",
+        ["tenant_id"],
+        registry=metrics_registry,
+    )
+    aml_sars_filed_counter = Counter(
+        "fraud_aml_sars_filed_total",
+        "Total SAR dossiers transitioned to FILED status.",
+        ["tenant_id"],
+        registry=metrics_registry,
+    )
+    sif_evaluations_counter = Counter(
+        "fraud_sif_evaluations_total",
+        "Total synthetic identity fraud evaluations performed.",
+        ["tenant_id", "action", "risk_level"],
+        registry=metrics_registry,
+    )
+    sif_anomalies_counter = Counter(
+        "fraud_sif_anomalies_total",
+        "Total synthetic identity fraud anomalies detected.",
+        ["tenant_id", "anomaly_type"],
+        registry=metrics_registry,
+    )
+    sif_high_risk_counter = Counter(
+        "fraud_sif_high_risk_total",
+        "Total synthetic identity evaluations flagged as HIGH or CRITICAL risk.",
+        ["tenant_id"],
+        registry=metrics_registry,
+    )
+    sif_blocks_counter = Counter(
+        "fraud_sif_blocks_total",
+        "Total applications blocked due to synthetic identity fraud.",
         ["tenant_id"],
         registry=metrics_registry,
     )
@@ -2525,6 +3416,55 @@ def create_app(
         application.state.event_bus_published_counter = event_bus_published_counter
         application.state.webhook_dispatches_counter = webhook_dispatches_counter
         application.state.webhook_dlq_size_gauge = webhook_dlq_size_gauge
+        resolved_challenge_manager = challenge_manager or ChallengeManager()
+        application.state.challenge_manager = resolved_challenge_manager
+        application.state.challenges_issued_counter = challenges_issued_counter
+        application.state.challenges_verified_counter = challenges_verified_counter
+        application.state.challenges_failed_counter = challenges_failed_counter
+        resolved_case_manager = case_manager or CaseManager()
+        application.state.case_manager = resolved_case_manager
+        application.state.cases_created_counter = cases_created_counter
+        application.state.cases_resolved_counter = cases_resolved_counter
+        application.state.evidence_packages_counter = evidence_packages_counter
+        resolved_chargeback_manager = chargeback_manager or ChargebackManager(
+            event_bus=resolved_event_bus
+        )
+        application.state.chargeback_manager = resolved_chargeback_manager
+        application.state.chargebacks_received_counter = chargebacks_received_counter
+        application.state.chargebacks_represented_counter = chargebacks_represented_counter
+        application.state.chargebacks_won_counter = chargebacks_won_counter
+        application.state.chargebacks_lost_counter = chargebacks_lost_counter
+        application.state.chargeback_exposure_gauge = chargeback_exposure_gauge
+        resolved_ato_engine = ato_engine or AtoEngine(event_bus=resolved_event_bus)
+        application.state.ato_engine = resolved_ato_engine
+        application.state.ato_login_attempts_counter = ato_login_attempts_counter
+        application.state.ato_evaluations_counter = ato_evaluations_counter
+        application.state.ato_quarantines_counter = ato_quarantines_counter
+        resolved_aml_engine = aml_engine or AmlEngine(
+            case_manager=application.state.case_manager,
+            event_bus=resolved_event_bus,
+        )
+        resolved_sar_manager = sar_manager or SarManager(
+            store=resolved_aml_engine.store,
+            event_bus=resolved_event_bus,
+        )
+        application.state.aml_engine = resolved_aml_engine
+        application.state.sar_manager = resolved_sar_manager
+        application.state.aml_transactions_counter = aml_transactions_counter
+        application.state.aml_alerts_counter = aml_alerts_counter
+        application.state.aml_sanction_hits_counter = aml_sanction_hits_counter
+        application.state.aml_sars_created_counter = aml_sars_created_counter
+        application.state.aml_sars_filed_counter = aml_sars_filed_counter
+        resolved_sif_engine = sif_engine or SyntheticIdentityEngine(
+            case_manager=application.state.case_manager,
+            challenge_manager=application.state.challenge_manager,
+            event_bus=resolved_event_bus,
+        )
+        application.state.sif_engine = resolved_sif_engine
+        application.state.sif_evaluations_counter = sif_evaluations_counter
+        application.state.sif_anomalies_counter = sif_anomalies_counter
+        application.state.sif_high_risk_counter = sif_high_risk_counter
+        application.state.sif_blocks_counter = sif_blocks_counter
         application.state.audit_sink = resolved_audit_sink
         application.state.explanation_provider = explanation_provider
         application.state.fallback_mode = resolved_fallback_mode
@@ -2630,6 +3570,9 @@ def create_app(
                 "/v1/merchant/profile/",
                 "/v1/tenants/",
                 "/v1/webhooks/",
+                "/v1/challenges/",
+                "/v1/cases/",
+                "/v1/chargebacks/",
             )
         )
         if (
@@ -2657,6 +3600,9 @@ def create_app(
                 "/v1/merchant/profile/",
                 "/v1/tenants/",
                 "/v1/webhooks/",
+                "/v1/challenges/",
+                "/v1/cases/",
+                "/v1/chargebacks/",
             )
         )
         if rate_limiter is None or is_operational:
@@ -5029,6 +5975,1927 @@ def create_app(
             attempt_count=delivery_res.attempt_count,
             duration_seconds=delivery_res.duration_seconds,
         )
+
+    @application.get(
+        "/v1/challenges",
+        response_model=ChallengeListResponse,
+        tags=["challenges"],
+    )
+    async def list_challenges(
+        request: Request,
+        tenant_id: str | None = None,
+        limit: int = 100,
+    ) -> ChallengeListResponse:
+        """List active and historical step-up challenge sessions."""
+        mgr: ChallengeManager | None = getattr(request.app.state, "challenge_manager", None)
+        if mgr is None:
+            return ChallengeListResponse(total_count=0, challenges=[])
+        sessions = mgr.store.list_sessions(tenant_id=tenant_id, limit=limit)
+        return ChallengeListResponse(
+            total_count=len(sessions),
+            challenges=[
+                ChallengeSessionResponse(
+                    challenge_id=s.challenge_id,
+                    transaction_id=s.transaction_id,
+                    user_id=s.user_id,
+                    tenant_id=s.tenant_id,
+                    method=s.method.value,
+                    target_masked=s.target_masked,
+                    attempts_count=s.attempts_count,
+                    max_attempts=s.max_attempts,
+                    status=s.status.value,
+                    created_at=s.created_at,
+                    expires_at=s.expires_at,
+                    verified_at=s.verified_at,
+                    metadata=s.metadata,
+                )
+                for s in sessions
+            ],
+        )
+
+    @application.post(
+        "/v1/challenges",
+        response_model=ChallengeSessionResponse,
+        status_code=201,
+        responses={
+            400: {"description": "Invalid challenge parameters."},
+            429: {"description": "User is locked out."},
+        },
+        tags=["challenges"],
+    )
+    async def create_challenge_endpoint(
+        payload: ChallengeCreateRequest,
+        request: Request,
+    ) -> ChallengeSessionResponse | JSONResponse:
+        """Create a new step-up friction challenge session."""
+        mgr: ChallengeManager | None = getattr(request.app.state, "challenge_manager", None)
+        if mgr is None:
+            return JSONResponse(
+                status_code=500, content={"detail": "ChallengeManager not initialized"}
+            )
+
+        try:
+            method_enum = ChallengeMethod(payload.method)
+        except ValueError:
+            return JSONResponse(
+                status_code=400,
+                content={"detail": f"Unsupported challenge method '{payload.method}'"},
+            )
+
+        try:
+            session, _ = mgr.create_challenge(
+                transaction_id=payload.transaction_id,
+                user_id=payload.user_id,
+                tenant_id=payload.tenant_id,
+                destination=payload.destination,
+                method=method_enum,
+                metadata=payload.metadata,
+            )
+        except ChallengeLockedOutError as exc:
+            return JSONResponse(status_code=429, content={"detail": str(exc)})
+        except ValueError as exc:
+            return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+        issued_counter: Counter | None = getattr(
+            request.app.state, "challenges_issued_counter", None
+        )
+        if issued_counter is not None:
+            issued_counter.labels(tenant_id=session.tenant_id, method=session.method.value).inc()
+
+        return ChallengeSessionResponse(
+            challenge_id=session.challenge_id,
+            transaction_id=session.transaction_id,
+            user_id=session.user_id,
+            tenant_id=session.tenant_id,
+            method=session.method.value,
+            target_masked=session.target_masked,
+            attempts_count=session.attempts_count,
+            max_attempts=session.max_attempts,
+            status=session.status.value,
+            created_at=session.created_at,
+            expires_at=session.expires_at,
+            verified_at=session.verified_at,
+            metadata=session.metadata,
+        )
+
+    @application.get(
+        "/v1/challenges/{challenge_id}",
+        response_model=ChallengeSessionResponse,
+        responses={
+            404: {"description": "Challenge session not found."},
+        },
+        tags=["challenges"],
+    )
+    async def get_challenge_endpoint(
+        challenge_id: str,
+        request: Request,
+    ) -> ChallengeSessionResponse | JSONResponse:
+        """Retrieve the status and masked destination of a challenge session."""
+        mgr: ChallengeManager | None = getattr(request.app.state, "challenge_manager", None)
+        if mgr is None:
+            return JSONResponse(
+                status_code=500, content={"detail": "ChallengeManager not initialized"}
+            )
+        session = mgr.get_session(challenge_id)
+        if session is None:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": f"Challenge session '{challenge_id}' not found"},
+            )
+
+        return ChallengeSessionResponse(
+            challenge_id=session.challenge_id,
+            transaction_id=session.transaction_id,
+            user_id=session.user_id,
+            tenant_id=session.tenant_id,
+            method=session.method.value,
+            target_masked=session.target_masked,
+            attempts_count=session.attempts_count,
+            max_attempts=session.max_attempts,
+            status=session.status.value,
+            created_at=session.created_at,
+            expires_at=session.expires_at,
+            verified_at=session.verified_at,
+            metadata=session.metadata,
+        )
+
+    @application.post(
+        "/v1/challenges/{challenge_id}/verify",
+        response_model=ChallengeSessionResponse,
+        responses={
+            400: {"description": "Invalid token or inactive session."},
+            404: {"description": "Challenge session not found."},
+            410: {"description": "Challenge has expired."},
+            429: {"description": "Max attempts exceeded or user locked out."},
+        },
+        tags=["challenges"],
+    )
+    async def verify_challenge_endpoint(
+        challenge_id: str,
+        payload: ChallengeVerifyRequest,
+        request: Request,
+    ) -> ChallengeSessionResponse | JSONResponse:
+        """Verify candidate OTP token for an active challenge session."""
+        mgr: ChallengeManager | None = getattr(request.app.state, "challenge_manager", None)
+        if mgr is None:
+            return JSONResponse(
+                status_code=500, content={"detail": "ChallengeManager not initialized"}
+            )
+
+        failed_counter: Counter | None = getattr(
+            request.app.state, "challenges_failed_counter", None
+        )
+        verified_counter: Counter | None = getattr(
+            request.app.state, "challenges_verified_counter", None
+        )
+
+        try:
+            session = mgr.verify_challenge(challenge_id, payload.token)
+            if verified_counter is not None:
+                verified_counter.labels(
+                    tenant_id=session.tenant_id, method=session.method.value
+                ).inc()
+            return ChallengeSessionResponse(
+                challenge_id=session.challenge_id,
+                transaction_id=session.transaction_id,
+                user_id=session.user_id,
+                tenant_id=session.tenant_id,
+                method=session.method.value,
+                target_masked=session.target_masked,
+                attempts_count=session.attempts_count,
+                max_attempts=session.max_attempts,
+                status=session.status.value,
+                created_at=session.created_at,
+                expires_at=session.expires_at,
+                verified_at=session.verified_at,
+                metadata=session.metadata,
+            )
+        except ChallengeSessionNotFoundError:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": f"Challenge session '{challenge_id}' not found"},
+            )
+        except ChallengeExpiredError as exc:
+            if failed_counter is not None:
+                failed_counter.labels(tenant_id="unknown", method="unknown", reason="expired").inc()
+            return JSONResponse(status_code=410, content={"detail": str(exc)})
+        except (ChallengeMaxAttemptsExceededError, ChallengeLockedOutError) as exc:
+            if failed_counter is not None:
+                failed_counter.labels(
+                    tenant_id="unknown", method="unknown", reason="locked_out"
+                ).inc()
+            return JSONResponse(status_code=429, content={"detail": str(exc)})
+        except InvalidChallengeTokenError as exc:
+            if failed_counter is not None:
+                failed_counter.labels(
+                    tenant_id="unknown", method="unknown", reason="invalid_token"
+                ).inc()
+            return JSONResponse(status_code=400, content={"detail": str(exc)})
+        except ChallengeError as exc:
+            return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+    @application.post(
+        "/v1/challenges/{challenge_id}/resend",
+        response_model=ChallengeSessionResponse,
+        responses={
+            400: {"description": "Cannot resend challenge."},
+            404: {"description": "Challenge session not found."},
+            429: {"description": "Cooldown rate limit active."},
+        },
+        tags=["challenges"],
+    )
+    async def resend_challenge_endpoint(
+        challenge_id: str,
+        payload: ChallengeResendRequest,
+        request: Request,
+    ) -> ChallengeSessionResponse | JSONResponse:
+        """Request a fresh OTP token subject to cooldown rate-limiting."""
+        mgr: ChallengeManager | None = getattr(request.app.state, "challenge_manager", None)
+        if mgr is None:
+            return JSONResponse(
+                status_code=500, content={"detail": "ChallengeManager not initialized"}
+            )
+
+        try:
+            session, _ = mgr.resend_challenge(challenge_id, destination=payload.destination)
+            return ChallengeSessionResponse(
+                challenge_id=session.challenge_id,
+                transaction_id=session.transaction_id,
+                user_id=session.user_id,
+                tenant_id=session.tenant_id,
+                method=session.method.value,
+                target_masked=session.target_masked,
+                attempts_count=session.attempts_count,
+                max_attempts=session.max_attempts,
+                status=session.status.value,
+                created_at=session.created_at,
+                expires_at=session.expires_at,
+                verified_at=session.verified_at,
+                metadata=session.metadata,
+            )
+        except ChallengeSessionNotFoundError:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": f"Challenge session '{challenge_id}' not found"},
+            )
+        except RateLimitExceededError as exc:
+            return JSONResponse(status_code=429, content={"detail": str(exc)})
+        except ChallengeError as exc:
+            return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+    @application.delete(
+        "/v1/challenges/{challenge_id}",
+        responses={
+            404: {"description": "Challenge session not found."},
+        },
+        tags=["challenges"],
+    )
+    async def cancel_challenge_endpoint(
+        challenge_id: str,
+        request: Request,
+    ) -> JSONResponse:
+        """Cancel a pending challenge session."""
+        mgr: ChallengeManager | None = getattr(request.app.state, "challenge_manager", None)
+        if mgr is None:
+            return JSONResponse(
+                status_code=500, content={"detail": "ChallengeManager not initialized"}
+            )
+        try:
+            mgr.cancel_challenge(challenge_id, reason="Cancelled via API")
+            return JSONResponse(
+                status_code=200,
+                content={"detail": f"Challenge '{challenge_id}' cancelled"},
+            )
+        except ChallengeSessionNotFoundError:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": f"Challenge session '{challenge_id}' not found"},
+            )
+
+    def _case_to_response(case: FraudCase) -> FraudCaseResponse:
+        return FraudCaseResponse(
+            case_id=case.case_id,
+            transaction_id=case.transaction_id,
+            tenant_id=case.tenant_id,
+            assigned_analyst=case.assigned_analyst,
+            status=case.status.value,
+            priority=case.priority.value,
+            fraud_score=case.fraud_score,
+            amount=case.amount,
+            currency=case.currency,
+            disposition=case.disposition.value,
+            notes=[
+                CaseNoteResponse(
+                    note_id=n.note_id,
+                    author=n.author,
+                    text=n.text,
+                    timestamp=n.timestamp,
+                )
+                for n in case.notes
+            ],
+            audit_trail=list(case.audit_trail),
+            created_at=case.created_at,
+            updated_at=case.updated_at,
+            sla_deadline_hours=case.sla_deadline_hours,
+            sla_expires_at=case.sla_expires_at,
+            is_sla_breached=case.is_sla_breached,
+            resolved_at=case.resolved_at,
+            metadata=dict(case.metadata),
+        )
+
+    def _evidence_to_response(pkg: DisputeEvidencePackage) -> DisputeEvidenceResponse:
+        return DisputeEvidenceResponse(
+            package_id=pkg.package_id,
+            case_id=pkg.case_id,
+            transaction_id=pkg.transaction_id,
+            tenant_id=pkg.tenant_id,
+            created_at=pkg.created_at,
+            evidence_items=dict(pkg.evidence_items),
+            device_fingerprint=pkg.device_fingerprint,
+            geolocation_data=pkg.geolocation_data,
+            challenge_verification=pkg.challenge_verification,
+            merchant_profile=pkg.merchant_profile,
+            sha256_fingerprint=pkg.sha256_fingerprint,
+        )
+
+    @application.get(
+        "/v1/cases/summary",
+        response_model=CaseSummaryResponse,
+        tags=["cases"],
+    )
+    async def case_summary_endpoint(
+        request: Request,
+        tenant_id: str | None = None,
+    ) -> CaseSummaryResponse | JSONResponse:
+        """Retrieve aggregated statistics across all investigation cases."""
+        mgr: CaseManager | None = getattr(request.app.state, "case_manager", None)
+        if mgr is None:
+            return JSONResponse(status_code=500, content={"detail": "CaseManager not initialized"})
+        summary = mgr.get_summary(tenant_id=tenant_id)
+        return CaseSummaryResponse(
+            total_cases=summary["total_cases"],
+            by_status=summary["by_status"],
+            by_priority=summary["by_priority"],
+            sla_breached_count=summary["sla_breached_count"],
+        )
+
+    @application.get(
+        "/v1/cases",
+        response_model=CaseListResponse,
+        tags=["cases"],
+    )
+    async def list_cases_endpoint(
+        request: Request,
+        tenant_id: str | None = None,
+        status: str | None = None,
+        priority: str | None = None,
+        assigned_analyst: str | None = None,
+        sla_breached_only: bool = False,
+        limit: int = 100,
+    ) -> CaseListResponse | JSONResponse:
+        """Query and filter fraud cases with multi-criteria search."""
+        mgr: CaseManager | None = getattr(request.app.state, "case_manager", None)
+        if mgr is None:
+            return CaseListResponse(total_count=0, cases=[])
+
+        status_enum = None
+        if status:
+            try:
+                status_enum = CaseStatus(status)
+            except ValueError:
+                return JSONResponse(
+                    status_code=400,
+                    content={"detail": f"Invalid case status '{status}'"},
+                )
+
+        prio_enum = None
+        if priority:
+            try:
+                prio_enum = CasePriority(priority)
+            except ValueError:
+                return JSONResponse(
+                    status_code=400,
+                    content={"detail": f"Invalid case priority '{priority}'"},
+                )
+
+        cases = mgr.store.list_cases(
+            tenant_id=tenant_id,
+            status=status_enum,
+            priority=prio_enum,
+            assigned_analyst=assigned_analyst,
+            sla_breached_only=sla_breached_only,
+            limit=limit,
+        )
+        return CaseListResponse(
+            total_count=len(cases),
+            cases=[_case_to_response(c) for c in cases],
+        )
+
+    @application.post(
+        "/v1/cases",
+        response_model=FraudCaseResponse,
+        status_code=201,
+        responses={
+            400: {"description": "Invalid case parameters."},
+        },
+        tags=["cases"],
+    )
+    async def create_case_endpoint(
+        payload: CaseCreateRequest,
+        request: Request,
+    ) -> FraudCaseResponse | JSONResponse:
+        """Create a new manual or automated fraud investigation case."""
+        mgr: CaseManager | None = getattr(request.app.state, "case_manager", None)
+        if mgr is None:
+            return JSONResponse(status_code=500, content={"detail": "CaseManager not initialized"})
+
+        prio_enum = None
+        if payload.priority:
+            try:
+                prio_enum = CasePriority(payload.priority)
+            except ValueError:
+                return JSONResponse(
+                    status_code=400,
+                    content={"detail": f"Invalid case priority '{payload.priority}'"},
+                )
+
+        try:
+            case = mgr.create_case(
+                transaction_id=payload.transaction_id,
+                fraud_score=payload.fraud_score,
+                amount=payload.amount,
+                currency=payload.currency,
+                tenant_id=payload.tenant_id,
+                priority=prio_enum,
+                sla_deadline_hours=payload.sla_deadline_hours,
+                metadata=payload.metadata,
+                auto_assign=payload.auto_assign,
+            )
+        except CaseValidationError as exc:
+            return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+        cases_counter: Counter | None = getattr(request.app.state, "cases_created_counter", None)
+        if cases_counter is not None:
+            cases_counter.labels(tenant_id=case.tenant_id, priority=case.priority.value).inc()
+
+        return _case_to_response(case)
+
+    @application.get(
+        "/v1/cases/{case_id}",
+        response_model=FraudCaseResponse,
+        responses={
+            404: {"description": "Case not found."},
+        },
+        tags=["cases"],
+    )
+    async def get_case_endpoint(
+        case_id: str,
+        request: Request,
+    ) -> FraudCaseResponse | JSONResponse:
+        """Retrieve full details, notes, and audit trail of a fraud case."""
+        mgr: CaseManager | None = getattr(request.app.state, "case_manager", None)
+        if mgr is None:
+            return JSONResponse(status_code=500, content={"detail": "CaseManager not initialized"})
+
+        try:
+            case = mgr.get_case(case_id)
+            return _case_to_response(case)
+        except CaseNotFoundError as exc:
+            return JSONResponse(status_code=404, content={"detail": str(exc)})
+
+    @application.patch(
+        "/v1/cases/{case_id}",
+        response_model=FraudCaseResponse,
+        responses={
+            400: {"description": "Invalid transition or assignment."},
+            404: {"description": "Case not found."},
+        },
+        tags=["cases"],
+    )
+    async def update_case_endpoint(
+        case_id: str,
+        payload: CaseUpdateRequest,
+        request: Request,
+    ) -> FraudCaseResponse | JSONResponse:
+        """Update case assignment, status, or priority."""
+        mgr: CaseManager | None = getattr(request.app.state, "case_manager", None)
+        if mgr is None:
+            return JSONResponse(status_code=500, content={"detail": "CaseManager not initialized"})
+
+        try:
+            case = mgr.get_case(case_id)
+            if payload.assigned_analyst is not None:
+                case = mgr.assign_case(case_id, payload.assigned_analyst, actor=payload.actor)
+            if payload.status is not None:
+                try:
+                    new_st = CaseStatus(payload.status)
+                    case = mgr.update_status(
+                        case_id, new_st, actor=payload.actor, reason=payload.reason
+                    )
+                except ValueError:
+                    return JSONResponse(
+                        status_code=400,
+                        content={"detail": f"Invalid status '{payload.status}'"},
+                    )
+            if payload.priority is not None:
+                try:
+                    case.priority = CasePriority(payload.priority)
+                    case.add_audit_entry(
+                        action="priority_changed",
+                        actor=payload.actor,
+                        details={"new_priority": case.priority.value, "reason": payload.reason},
+                    )
+                    mgr.store.put(case)
+                except ValueError:
+                    return JSONResponse(
+                        status_code=400,
+                        content={"detail": f"Invalid priority '{payload.priority}'"},
+                    )
+            return _case_to_response(case)
+        except CaseNotFoundError as exc:
+            return JSONResponse(status_code=404, content={"detail": str(exc)})
+        except (InvalidCaseStateTransitionError, CaseAssignmentError, CaseValidationError) as exc:
+            return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+    @application.post(
+        "/v1/cases/{case_id}/notes",
+        response_model=CaseNoteResponse,
+        status_code=201,
+        responses={
+            400: {"description": "Invalid note content."},
+            404: {"description": "Case not found."},
+        },
+        tags=["cases"],
+    )
+    async def add_case_note_endpoint(
+        case_id: str,
+        payload: CaseNoteRequest,
+        request: Request,
+    ) -> CaseNoteResponse | JSONResponse:
+        """Append an investigation finding note to a fraud case."""
+        mgr: CaseManager | None = getattr(request.app.state, "case_manager", None)
+        if mgr is None:
+            return JSONResponse(status_code=500, content={"detail": "CaseManager not initialized"})
+
+        try:
+            note = mgr.add_note(case_id, author=payload.author, text=payload.text)
+            return CaseNoteResponse(
+                note_id=note.note_id,
+                author=note.author,
+                text=note.text,
+                timestamp=note.timestamp,
+            )
+        except CaseNotFoundError as exc:
+            return JSONResponse(status_code=404, content={"detail": str(exc)})
+        except CaseValidationError as exc:
+            return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+    @application.post(
+        "/v1/cases/{case_id}/resolve",
+        response_model=FraudCaseResponse,
+        responses={
+            400: {"description": "Invalid disposition."},
+            404: {"description": "Case not found."},
+        },
+        tags=["cases"],
+    )
+    async def resolve_case_endpoint(
+        case_id: str,
+        payload: CaseResolveRequest,
+        request: Request,
+    ) -> FraudCaseResponse | JSONResponse:
+        """Resolve a fraud case with a final disposition and conclusion notes."""
+        mgr: CaseManager | None = getattr(request.app.state, "case_manager", None)
+        if mgr is None:
+            return JSONResponse(status_code=500, content={"detail": "CaseManager not initialized"})
+
+        try:
+            disp_enum = CaseDisposition(payload.disposition)
+        except ValueError:
+            return JSONResponse(
+                status_code=400,
+                content={"detail": f"Invalid disposition '{payload.disposition}'"},
+            )
+
+        try:
+            case = mgr.resolve_case(
+                case_id,
+                disposition=disp_enum,
+                actor=payload.actor,
+                notes=payload.notes,
+            )
+            resolved_counter: Counter | None = getattr(
+                request.app.state, "cases_resolved_counter", None
+            )
+            if resolved_counter is not None:
+                resolved_counter.labels(
+                    tenant_id=case.tenant_id, disposition=case.disposition.value
+                ).inc()
+
+            return _case_to_response(case)
+        except CaseNotFoundError as exc:
+            return JSONResponse(status_code=404, content={"detail": str(exc)})
+        except (CaseValidationError, InvalidCaseStateTransitionError) as exc:
+            return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+    @application.post(
+        "/v1/cases/{case_id}/evidence",
+        response_model=DisputeEvidenceResponse,
+        status_code=201,
+        responses={
+            400: {"description": "Evidence packaging failed."},
+            404: {"description": "Case not found."},
+        },
+        tags=["cases"],
+    )
+    async def generate_evidence_endpoint(
+        case_id: str,
+        payload: CaseEvidenceRequest,
+        request: Request,
+    ) -> DisputeEvidenceResponse | JSONResponse:
+        """Generate and fingerprint a tamper-evident dispute evidence dossier."""
+        mgr: CaseManager | None = getattr(request.app.state, "case_manager", None)
+        if mgr is None:
+            return JSONResponse(status_code=500, content={"detail": "CaseManager not initialized"})
+
+        try:
+            pkg = mgr.generate_evidence_package(
+                case_id=case_id,
+                transaction_data=payload.transaction_data,
+                device_data=payload.device_data,
+                geo_data=payload.geo_data,
+                challenge_data=payload.challenge_data,
+                merchant_data=payload.merchant_data,
+                additional_evidence=payload.additional_evidence,
+                actor=payload.actor,
+            )
+            ev_counter: Counter | None = getattr(
+                request.app.state, "evidence_packages_counter", None
+            )
+            if ev_counter is not None:
+                ev_counter.labels(tenant_id=pkg.tenant_id).inc()
+
+            return _evidence_to_response(pkg)
+        except CaseNotFoundError as exc:
+            return JSONResponse(status_code=404, content={"detail": str(exc)})
+        except EvidencePackagingError as exc:
+            return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+    @application.get(
+        "/v1/cases/{case_id}/evidence",
+        response_model=list[DisputeEvidenceResponse],
+        responses={
+            404: {"description": "Case not found."},
+        },
+        tags=["cases"],
+    )
+    async def list_evidence_endpoint(
+        case_id: str,
+        request: Request,
+    ) -> list[DisputeEvidenceResponse] | JSONResponse:
+        """List all compiled dispute evidence packages for a case."""
+        mgr: CaseManager | None = getattr(request.app.state, "case_manager", None)
+        if mgr is None:
+            return JSONResponse(status_code=500, content={"detail": "CaseManager not initialized"})
+
+        try:
+            mgr.get_case(case_id)
+            packages = mgr.store.list_evidence_packages(case_id)
+            return [_evidence_to_response(p) for p in packages]
+        except CaseNotFoundError as exc:
+            return JSONResponse(status_code=404, content={"detail": str(exc)})
+
+    @application.get(
+        "/v1/chargebacks/summary",
+        response_model=ChargebackSummaryResponse,
+        tags=["chargebacks"],
+    )
+    async def chargeback_summary_endpoint(
+        request: Request,
+        tenant_id: str | None = None,
+    ) -> ChargebackSummaryResponse | JSONResponse:
+        """Retrieve aggregated portfolio statistics across all scheme disputes."""
+        mgr: ChargebackManager | None = getattr(request.app.state, "chargeback_manager", None)
+        if mgr is None:
+            return JSONResponse(
+                status_code=500, content={"detail": "ChargebackManager not initialized"}
+            )
+        summary = mgr.get_summary(tenant_id=tenant_id)
+        return ChargebackSummaryResponse(
+            total_disputes=summary["total_disputes"],
+            total_disputed_amount=summary["total_disputed_amount"],
+            by_stage=summary["by_stage"],
+            by_scheme=summary["by_scheme"],
+            by_category=summary["by_category"],
+            expired_count=summary["expired_count"],
+            liability_shift_proven_count=summary["liability_shift_proven_count"],
+            high_winnability_count=summary["high_winnability_count"],
+        )
+
+    @application.get(
+        "/v1/chargebacks",
+        response_model=ChargebackListResponse,
+        tags=["chargebacks"],
+    )
+    async def list_chargebacks_endpoint(
+        request: Request,
+        tenant_id: str | None = None,
+        scheme: str | None = None,
+        stage: str | None = None,
+        category: str | None = None,
+        expired_only: bool = False,
+        limit: int = 100,
+    ) -> ChargebackListResponse | JSONResponse:
+        """Query and filter card scheme chargebacks with multi-criteria search."""
+        mgr: ChargebackManager | None = getattr(request.app.state, "chargeback_manager", None)
+        if mgr is None:
+            return ChargebackListResponse(total_count=0, disputes=[])
+
+        scheme_enum = None
+        if scheme:
+            try:
+                scheme_enum = CardScheme(scheme.lower())
+            except ValueError:
+                return JSONResponse(
+                    status_code=400,
+                    content={"detail": f"Invalid card scheme '{scheme}'"},
+                )
+
+        stage_enum = None
+        if stage:
+            try:
+                stage_enum = ChargebackStage(stage.lower())
+            except ValueError:
+                return JSONResponse(
+                    status_code=400,
+                    content={"detail": f"Invalid chargeback stage '{stage}'"},
+                )
+
+        category_enum = None
+        if category:
+            try:
+                category_enum = ChargebackCategory(category.lower())
+            except ValueError:
+                return JSONResponse(
+                    status_code=400,
+                    content={"detail": f"Invalid chargeback category '{category}'"},
+                )
+
+        disputes = mgr.store.list_disputes(
+            tenant_id=tenant_id,
+            scheme=scheme_enum,
+            stage=stage_enum,
+            category=category_enum,
+            expired_only=expired_only,
+            limit=limit,
+        )
+        return ChargebackListResponse(
+            total_count=len(disputes),
+            disputes=[_dispute_to_response(d) for d in disputes],
+        )
+
+    @application.post(
+        "/v1/chargebacks",
+        response_model=ChargebackDisputeResponse,
+        status_code=201,
+        responses={
+            400: {"description": "Invalid chargeback parameters."},
+            500: {"description": "ChargebackManager not initialized."},
+        },
+        tags=["chargebacks"],
+    )
+    async def ingest_chargeback_endpoint(
+        request: Request,
+        payload: ChargebackIngestRequest,
+    ) -> ChargebackDisputeResponse | JSONResponse:
+        """Ingest, evaluate, and index an incoming scheme chargeback dispute."""
+        mgr: ChargebackManager | None = getattr(request.app.state, "chargeback_manager", None)
+        if mgr is None:
+            return JSONResponse(
+                status_code=500, content={"detail": "ChargebackManager not initialized"}
+            )
+
+        try:
+            scheme_enum = CardScheme(payload.scheme.lower())
+        except ValueError:
+            return JSONResponse(
+                status_code=400,
+                content={"detail": f"Invalid card scheme '{payload.scheme}'"},
+            )
+
+        try:
+            dispute = mgr.ingest_chargeback(
+                transaction_id=payload.transaction_id,
+                scheme=scheme_enum,
+                reason_code=payload.reason_code,
+                disputed_amount=payload.disputed_amount,
+                currency=payload.currency,
+                tenant_id=payload.tenant_id,
+                scheme_dispute_id=payload.scheme_dispute_id,
+                filing_date=payload.filing_date,
+                response_deadline=payload.response_deadline,
+                metadata=payload.metadata,
+                auto_evaluate=payload.auto_evaluate,
+                transaction_context=payload.transaction_context,
+                challenge_session=payload.challenge_session,
+                prior_customer_transactions=payload.prior_customer_transactions,
+                evidence_package=payload.evidence_package,
+            )
+            rcv_counter = getattr(request.app.state, "chargebacks_received_counter", None)
+            if rcv_counter is not None:
+                rcv_counter.labels(
+                    tenant_id=dispute.tenant_id,
+                    scheme=dispute.scheme.value,
+                    category=dispute.category.value,
+                ).inc()
+            exp_gauge = getattr(request.app.state, "chargeback_exposure_gauge", None)
+            if exp_gauge is not None:
+                summary = mgr.get_summary(tenant_id=dispute.tenant_id)
+                exp_gauge.labels(tenant_id=dispute.tenant_id).set(summary["total_disputed_amount"])
+            return _dispute_to_response(dispute)
+        except DisputeValidationError as exc:
+            return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+    @application.post(
+        "/v1/chargebacks/webhook",
+        response_model=ChargebackDisputeResponse,
+        status_code=201,
+        responses={
+            400: {"description": "Invalid webhook payload."},
+            500: {"description": "ChargebackManager not initialized."},
+        },
+        tags=["chargebacks"],
+    )
+    async def chargeback_webhook_endpoint(
+        request: Request,
+        payload: ChargebackWebhookRequest,
+    ) -> ChargebackDisputeResponse | JSONResponse:
+        """Process inbound payment gateway/scheme chargeback webhook event."""
+        mgr: ChargebackManager | None = getattr(request.app.state, "chargeback_manager", None)
+        if mgr is None:
+            return JSONResponse(
+                status_code=500, content={"detail": "ChargebackManager not initialized"}
+            )
+
+        try:
+            scheme_enum = CardScheme(payload.scheme.lower())
+        except ValueError:
+            return JSONResponse(
+                status_code=400,
+                content={"detail": f"Invalid card scheme '{payload.scheme}'"},
+            )
+
+        try:
+            meta = dict(payload.metadata)
+            meta["webhook_event_type"] = payload.event_type
+            dispute = mgr.ingest_chargeback(
+                transaction_id=payload.transaction_id,
+                scheme=scheme_enum,
+                reason_code=payload.reason_code,
+                disputed_amount=payload.amount,
+                currency=payload.currency,
+                tenant_id=payload.tenant_id,
+                scheme_dispute_id=payload.scheme_dispute_id,
+                filing_date=payload.filing_date,
+                response_deadline=payload.response_deadline,
+                metadata=meta,
+                auto_evaluate=True,
+            )
+            rcv_counter = getattr(request.app.state, "chargebacks_received_counter", None)
+            if rcv_counter is not None:
+                rcv_counter.labels(
+                    tenant_id=dispute.tenant_id,
+                    scheme=dispute.scheme.value,
+                    category=dispute.category.value,
+                ).inc()
+            exp_gauge = getattr(request.app.state, "chargeback_exposure_gauge", None)
+            if exp_gauge is not None:
+                summary = mgr.get_summary(tenant_id=dispute.tenant_id)
+                exp_gauge.labels(tenant_id=dispute.tenant_id).set(summary["total_disputed_amount"])
+            return _dispute_to_response(dispute)
+        except DisputeValidationError as exc:
+            return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+    @application.get(
+        "/v1/chargebacks/{dispute_id}",
+        response_model=ChargebackDisputeResponse,
+        responses={
+            404: {"description": "Chargeback dispute not found."},
+            500: {"description": "ChargebackManager not initialized."},
+        },
+        tags=["chargebacks"],
+    )
+    async def get_chargeback_endpoint(
+        dispute_id: str,
+        request: Request,
+    ) -> ChargebackDisputeResponse | JSONResponse:
+        """Retrieve full dispute record including audit trail and representment status."""
+        mgr: ChargebackManager | None = getattr(request.app.state, "chargeback_manager", None)
+        if mgr is None:
+            return JSONResponse(
+                status_code=500, content={"detail": "ChargebackManager not initialized"}
+            )
+
+        try:
+            dispute = mgr.get_dispute(dispute_id)
+            return _dispute_to_response(dispute)
+        except DisputeNotFoundError as exc:
+            return JSONResponse(status_code=404, content={"detail": str(exc)})
+
+    @application.post(
+        "/v1/chargebacks/{dispute_id}/represent",
+        response_model=ChargebackDisputeResponse,
+        responses={
+            400: {"description": "Dispute cannot be represented."},
+            404: {"description": "Chargeback dispute not found."},
+            500: {"description": "ChargebackManager not initialized."},
+        },
+        tags=["chargebacks"],
+    )
+    async def represent_chargeback_endpoint(
+        dispute_id: str,
+        request: Request,
+        payload: ChargebackRepresentRequest,
+    ) -> ChargebackDisputeResponse | JSONResponse:
+        """Submit representment package and defense evidence to card network."""
+        mgr: ChargebackManager | None = getattr(request.app.state, "chargeback_manager", None)
+        if mgr is None:
+            return JSONResponse(
+                status_code=500, content={"detail": "ChargebackManager not initialized"}
+            )
+
+        try:
+            dispute = mgr.represent_dispute(
+                dispute_id=dispute_id,
+                package_id=payload.package_id,
+                evidence_fingerprint=payload.evidence_fingerprint,
+                notes=payload.notes,
+                actor=payload.actor,
+            )
+            rep_counter = getattr(request.app.state, "chargebacks_represented_counter", None)
+            if rep_counter is not None:
+                rep_counter.labels(
+                    tenant_id=dispute.tenant_id,
+                    scheme=dispute.scheme.value,
+                ).inc()
+            return _dispute_to_response(dispute)
+        except DisputeNotFoundError as exc:
+            return JSONResponse(status_code=404, content={"detail": str(exc)})
+        except (InvalidDisputeStateTransitionError, DisputeValidationError) as exc:
+            return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+    @application.post(
+        "/v1/chargebacks/{dispute_id}/resolve",
+        response_model=ChargebackDisputeResponse,
+        responses={
+            400: {"description": "Invalid outcome or illegal resolution transition."},
+            404: {"description": "Chargeback dispute not found."},
+            500: {"description": "ChargebackManager not initialized."},
+        },
+        tags=["chargebacks"],
+    )
+    async def resolve_chargeback_endpoint(
+        dispute_id: str,
+        request: Request,
+        payload: ChargebackResolveRequest,
+    ) -> ChargebackDisputeResponse | JSONResponse:
+        """Finalize dispute with terminal outcome and forward realized label to feedback engine."""
+        mgr: ChargebackManager | None = getattr(request.app.state, "chargeback_manager", None)
+        if mgr is None:
+            return JSONResponse(
+                status_code=500, content={"detail": "ChargebackManager not initialized"}
+            )
+
+        try:
+            outcome_enum = ChargebackStage(payload.outcome.lower())
+        except ValueError:
+            return JSONResponse(
+                status_code=400,
+                content={"detail": f"Invalid resolution outcome '{payload.outcome}'"},
+            )
+
+        try:
+            dispute = mgr.resolve_dispute(
+                dispute_id=dispute_id,
+                outcome=outcome_enum,
+                actor=payload.actor,
+                notes=payload.notes,
+            )
+            if outcome_enum == ChargebackStage.RESOLVED_WON:
+                won_counter = getattr(request.app.state, "chargebacks_won_counter", None)
+                if won_counter is not None:
+                    won_counter.labels(
+                        tenant_id=dispute.tenant_id,
+                        scheme=dispute.scheme.value,
+                    ).inc()
+            else:
+                lost_counter = getattr(request.app.state, "chargebacks_lost_counter", None)
+                if lost_counter is not None:
+                    lost_counter.labels(
+                        tenant_id=dispute.tenant_id,
+                        scheme=dispute.scheme.value,
+                    ).inc()
+
+            label_store = getattr(request.app.state, "label_store", None)
+            if label_store is not None:
+                try:
+                    mgr.publish_feedback_label(dispute.dispute_id, label_store=label_store)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Failed to publish feedback label for dispute %s: %s",
+                        dispute_id,
+                        exc,
+                    )
+
+            exp_gauge = getattr(request.app.state, "chargeback_exposure_gauge", None)
+            if exp_gauge is not None:
+                summary = mgr.get_summary(tenant_id=dispute.tenant_id)
+                exp_gauge.labels(tenant_id=dispute.tenant_id).set(summary["total_disputed_amount"])
+
+            return _dispute_to_response(dispute)
+        except DisputeNotFoundError as exc:
+            return JSONResponse(status_code=404, content={"detail": str(exc)})
+        except (InvalidDisputeStateTransitionError, DisputeValidationError) as exc:
+            return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+    # =========================================================================
+    # Phase 47: Account Takeover (ATO) & Credential Stuffing Defense Endpoints
+    # =========================================================================
+
+    @application.post(
+        "/v1/ato/login",
+        response_model=AtoAssessmentResponse,
+        responses={
+            400: {"description": "Invalid authentication event data."},
+            500: {"description": "AtoEngine not initialized."},
+        },
+        tags=["ato"],
+    )
+    async def ato_login_endpoint(
+        request: Request,
+        payload: AtoLoginRequest,
+    ) -> AtoAssessmentResponse | JSONResponse:
+        """Ingest authentication attempt and evaluate Account Takeover risk."""
+        engine: AtoEngine | None = getattr(request.app.state, "ato_engine", None)
+        if engine is None:
+            return JSONResponse(status_code=500, content={"detail": "AtoEngine not initialized"})
+
+        try:
+            outcome_enum = LoginOutcome(payload.outcome.lower())
+        except ValueError:
+            return JSONResponse(
+                status_code=400,
+                content={"detail": f"Invalid login outcome '{payload.outcome}'"},
+            )
+
+        event = LoginEvent(
+            user_id=payload.user_id,
+            tenant_id=payload.tenant_id,
+            ip_address=payload.ip_address,
+            outcome=outcome_enum,
+            device_fingerprint=payload.device_fingerprint,
+            latitude=payload.latitude,
+            longitude=payload.longitude,
+            user_agent=payload.user_agent,
+        )
+
+        assessment = engine.evaluate_attempt(event, action_type="login")
+
+        counter = getattr(request.app.state, "ato_login_attempts_counter", None)
+        if counter is not None:
+            counter.labels(
+                tenant_id=assessment.tenant_id,
+                outcome=outcome_enum.value,
+                action=assessment.recommended_action.value,
+            ).inc()
+
+        if assessment.quarantined:
+            q_counter = getattr(request.app.state, "ato_quarantines_counter", None)
+            if q_counter is not None:
+                q_counter.labels(tenant_id=assessment.tenant_id).inc()
+
+        return _assessment_to_response(assessment)
+
+    @application.post(
+        "/v1/ato/evaluate",
+        response_model=AtoAssessmentResponse,
+        responses={
+            500: {"description": "AtoEngine not initialized."},
+        },
+        tags=["ato"],
+    )
+    async def ato_evaluate_endpoint(
+        request: Request,
+        payload: AtoEvaluateRequest,
+    ) -> AtoAssessmentResponse | JSONResponse:
+        """Evaluate a transactional action or session context for ATO compromise."""
+        engine: AtoEngine | None = getattr(request.app.state, "ato_engine", None)
+        if engine is None:
+            return JSONResponse(status_code=500, content={"detail": "AtoEngine not initialized"})
+
+        event = LoginEvent(
+            user_id=payload.user_id,
+            tenant_id=payload.tenant_id,
+            ip_address=payload.ip_address,
+            outcome=LoginOutcome.SUCCESS,
+            device_fingerprint=payload.device_fingerprint,
+            latitude=payload.latitude,
+            longitude=payload.longitude,
+        )
+
+        assessment = engine.evaluate_attempt(
+            event,
+            action_type=payload.action_type,
+            transaction_amount=payload.transaction_amount,
+        )
+
+        counter = getattr(request.app.state, "ato_evaluations_counter", None)
+        if counter is not None:
+            counter.labels(
+                tenant_id=assessment.tenant_id,
+                action=assessment.recommended_action.value,
+            ).inc()
+
+        if assessment.quarantined:
+            q_counter = getattr(request.app.state, "ato_quarantines_counter", None)
+            if q_counter is not None:
+                q_counter.labels(tenant_id=assessment.tenant_id).inc()
+
+        return _assessment_to_response(assessment)
+
+    @application.get(
+        "/v1/ato/accounts/{user_id}",
+        response_model=AtoProfileResponse,
+        responses={
+            500: {"description": "AtoEngine not initialized."},
+        },
+        tags=["ato"],
+    )
+    async def ato_get_profile_endpoint(
+        user_id: str,
+        request: Request,
+    ) -> AtoProfileResponse | JSONResponse:
+        """Retrieve user baseline account profile, known devices, and security status."""
+        engine: AtoEngine | None = getattr(request.app.state, "ato_engine", None)
+        if engine is None:
+            return JSONResponse(status_code=500, content={"detail": "AtoEngine not initialized"})
+
+        profile = engine.profile_tracker.get_or_create_profile(user_id)
+        return _profile_to_response(profile)
+
+    @application.post(
+        "/v1/ato/accounts/{user_id}/mutations",
+        response_model=AtoMutationResponse,
+        responses={
+            400: {"description": "Invalid mutation type."},
+            500: {"description": "AtoEngine not initialized."},
+        },
+        tags=["ato"],
+    )
+    async def ato_record_mutation_endpoint(
+        user_id: str,
+        payload: AtoMutationRequest,
+        request: Request,
+    ) -> AtoMutationResponse | JSONResponse:
+        """Record a sensitive profile change (password, email, MFA) for takeover surveillance."""
+        engine: AtoEngine | None = getattr(request.app.state, "ato_engine", None)
+        if engine is None:
+            return JSONResponse(status_code=500, content={"detail": "AtoEngine not initialized"})
+
+        try:
+            m_type = AccountMutationType(payload.mutation_type.lower())
+        except ValueError:
+            return JSONResponse(
+                status_code=400,
+                content={"detail": f"Invalid mutation type '{payload.mutation_type}'"},
+            )
+
+        record = AccountMutationRecord(
+            mutation_type=m_type,
+            channel=payload.channel,
+            metadata=payload.metadata,
+        )
+        engine.profile_tracker.record_mutation(user_id, record)
+        return AtoMutationResponse(
+            status="recorded", user_id=user_id, mutation_id=record.mutation_id
+        )
+
+    @application.post(
+        "/v1/ato/accounts/{user_id}/quarantine",
+        response_model=AtoActionStatusResponse,
+        responses={
+            500: {"description": "AtoEngine not initialized."},
+        },
+        tags=["ato"],
+    )
+    async def ato_quarantine_account_endpoint(
+        user_id: str,
+        payload: AtoQuarantineRequest,
+        request: Request,
+    ) -> AtoActionStatusResponse | JSONResponse:
+        """Administratively place an account under quarantine."""
+        engine: AtoEngine | None = getattr(request.app.state, "ato_engine", None)
+        if engine is None:
+            return JSONResponse(status_code=500, content={"detail": "AtoEngine not initialized"})
+
+        engine.quarantine_account(user_id, reason=payload.reason, tenant_id=payload.tenant_id)
+        q_counter = getattr(request.app.state, "ato_quarantines_counter", None)
+        if q_counter is not None:
+            q_counter.labels(tenant_id=payload.tenant_id).inc()
+
+        return AtoActionStatusResponse(status="quarantined", user_id=user_id, reason=payload.reason)
+
+    @application.post(
+        "/v1/ato/accounts/{user_id}/release",
+        response_model=AtoActionStatusResponse,
+        responses={
+            500: {"description": "AtoEngine not initialized."},
+        },
+        tags=["ato"],
+    )
+    async def ato_release_account_endpoint(
+        user_id: str,
+        payload: AtoReleaseRequest,
+        request: Request,
+    ) -> AtoActionStatusResponse | JSONResponse:
+        """Administratively release an account from quarantine."""
+        engine: AtoEngine | None = getattr(request.app.state, "ato_engine", None)
+        if engine is None:
+            return JSONResponse(status_code=500, content={"detail": "AtoEngine not initialized"})
+
+        engine.release_account(user_id, reason=payload.reason, tenant_id=payload.tenant_id)
+        return AtoActionStatusResponse(status="released", user_id=user_id, reason=payload.reason)
+
+    @application.get(
+        "/v1/ato/assessments",
+        response_model=AtoAssessmentListResponse,
+        responses={
+            500: {"description": "AtoEngine not initialized."},
+        },
+        tags=["ato"],
+    )
+    async def ato_list_assessments_endpoint(
+        request: Request,
+        user_id: str | None = None,
+        tenant_id: str | None = None,
+        limit: int = 100,
+    ) -> AtoAssessmentListResponse | JSONResponse:
+        """Query and list recent ATO risk assessments."""
+        engine: AtoEngine | None = getattr(request.app.state, "ato_engine", None)
+        if engine is None:
+            return JSONResponse(status_code=500, content={"detail": "AtoEngine not initialized"})
+
+        if user_id:
+            assessments = engine.store.get_user_assessments(user_id, limit=limit)
+        else:
+            assessments = engine.store.list_assessments(tenant_id=tenant_id, limit=limit)
+
+        return AtoAssessmentListResponse(
+            total_count=len(assessments),
+            assessments=[_assessment_to_response(a) for a in assessments],
+        )
+
+    @application.get(
+        "/v1/ato/assessments/{assessment_id}",
+        response_model=AtoAssessmentResponse,
+        responses={
+            404: {"description": "Assessment not found."},
+            500: {"description": "AtoEngine not initialized."},
+        },
+        tags=["ato"],
+    )
+    async def ato_get_assessment_endpoint(
+        assessment_id: str,
+        request: Request,
+    ) -> AtoAssessmentResponse | JSONResponse:
+        """Retrieve details of a single ATO assessment by ID."""
+        engine: AtoEngine | None = getattr(request.app.state, "ato_engine", None)
+        if engine is None:
+            return JSONResponse(status_code=500, content={"detail": "AtoEngine not initialized"})
+
+        assessment = engine.store.get_assessment(assessment_id)
+        if assessment is None:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": f"ATO assessment '{assessment_id}' not found"},
+            )
+        return _assessment_to_response(assessment)
+
+    # -------------------------------------------------------------------------
+    # Phase 48: Anti-Money Laundering (AML) & Regulatory SAR Endpoints
+    # -------------------------------------------------------------------------
+
+    @application.post(
+        "/v1/aml/transactions/monitor",
+        response_model=AmlAssessmentResponse,
+        responses={
+            400: {"description": "Invalid transaction direction or parameters."},
+            500: {"description": "AmlEngine not initialized."},
+        },
+        tags=["aml"],
+    )
+    async def aml_monitor_transaction_endpoint(
+        payload: AmlMonitorRequest,
+        request: Request,
+    ) -> AmlAssessmentResponse | JSONResponse:
+        """Monitor financial transaction for AML typologies, structuring, and sanctions hits."""
+        engine: AmlEngine | None = getattr(request.app.state, "aml_engine", None)
+        if engine is None:
+            return JSONResponse(status_code=500, content={"detail": "AmlEngine not initialized"})
+
+        try:
+            direction_enum = TransactionDirection(payload.direction.lower())
+        except ValueError:
+            return JSONResponse(
+                status_code=400,
+                content={"detail": f"Invalid direction '{payload.direction}'"},
+            )
+
+        event = AmlTransactionEvent(
+            transaction_id=payload.transaction_id,
+            user_id=payload.user_id,
+            amount=payload.amount,
+            currency=payload.currency,
+            direction=direction_enum,
+            counterparty_id=payload.counterparty_id,
+            country=payload.country,
+            payment_method=payload.payment_method,
+            tenant_id=payload.tenant_id,
+            metadata=payload.metadata,
+        )
+
+        assessment = engine.evaluate_transaction(event, entity_name=payload.entity_name)
+
+        tx_counter = getattr(request.app.state, "aml_transactions_counter", None)
+        if tx_counter is not None:
+            tx_counter.labels(
+                tenant_id=assessment.tenant_id,
+                action=assessment.recommended_action.value,
+                risk_level=assessment.risk_level.value,
+            ).inc()
+
+        if assessment.alert is not None:
+            alt_counter = getattr(request.app.state, "aml_alerts_counter", None)
+            if alt_counter is not None:
+                alt_counter.labels(
+                    tenant_id=assessment.tenant_id,
+                    typology=assessment.alert.typology.value,
+                    risk_level=assessment.risk_level.value,
+                ).inc()
+
+        if AmlTypology.SANCTION_PEP_MATCH in assessment.triggered_typologies:
+            s_counter = getattr(request.app.state, "aml_sanction_hits_counter", None)
+            if s_counter is not None:
+                s_counter.labels(tenant_id=assessment.tenant_id).inc()
+
+        return _aml_assessment_to_response(assessment)
+
+    @application.post(
+        "/v1/aml/watchlist/screen",
+        response_model=list[AmlWatchlistMatchResponse],
+        responses={
+            500: {"description": "AmlEngine not initialized."},
+        },
+        tags=["aml"],
+    )
+    async def aml_watchlist_screen_endpoint(
+        payload: AmlWatchlistScreenRequest,
+        request: Request,
+    ) -> list[AmlWatchlistMatchResponse] | JSONResponse:
+        """Screen entity name against registered OFAC, PEP, and law enforcement watchlists."""
+        engine: AmlEngine | None = getattr(request.app.state, "aml_engine", None)
+        if engine is None:
+            return JSONResponse(status_code=500, content={"detail": "AmlEngine not initialized"})
+
+        matches = engine.screening_engine.screen_entity(
+            name=payload.name,
+            threshold=payload.threshold,
+            country=payload.country,
+        )
+        return [
+            AmlWatchlistMatchResponse(
+                match_id=m.match_id,
+                entity_name=m.entity_name,
+                matched_entry=m.matched_entry.to_dict(),
+                similarity_score=m.similarity_score,
+                match_algorithm=m.match_algorithm,
+                risk_level=m.risk_level.value,
+                screened_at=m.screened_at.isoformat(),
+            )
+            for m in matches
+        ]
+
+    @application.post(
+        "/v1/aml/watchlist/entries",
+        responses={
+            400: {"description": "Invalid watchlist type."},
+            500: {"description": "AmlEngine not initialized."},
+        },
+        tags=["aml"],
+    )
+    async def aml_add_watchlist_entry_endpoint(
+        payload: AmlWatchlistEntryRequest,
+        request: Request,
+    ) -> JSONResponse:
+        """Register a new sanctions or PEP entity in the fuzzy screening watchlist."""
+        engine: AmlEngine | None = getattr(request.app.state, "aml_engine", None)
+        if engine is None:
+            return JSONResponse(status_code=500, content={"detail": "AmlEngine not initialized"})
+
+        try:
+            wl_type = WatchlistType(payload.watchlist_type.lower())
+        except ValueError:
+            return JSONResponse(
+                status_code=400,
+                content={"detail": f"Invalid watchlist type '{payload.watchlist_type}'"},
+            )
+
+        entry = WatchlistEntry(
+            name=payload.name,
+            watchlist_type=wl_type,
+            country=payload.country,
+            aliases=tuple(payload.aliases),
+            notes=payload.notes,
+        )
+        engine.screening_engine.add_entry(entry)
+        return JSONResponse(
+            status_code=201,
+            content={"status": "created", "entry": entry.to_dict()},
+        )
+
+    @application.get(
+        "/v1/aml/alerts",
+        response_model=AmlAlertListResponse,
+        responses={
+            500: {"description": "AmlEngine not initialized."},
+        },
+        tags=["aml"],
+    )
+    async def aml_list_alerts_endpoint(
+        request: Request,
+        user_id: str | None = None,
+        typology: str | None = None,
+        risk_level: str | None = None,
+        tenant_id: str | None = None,
+        limit: int = 100,
+    ) -> AmlAlertListResponse | JSONResponse:
+        """Query recorded AML surveillance alerts."""
+        engine: AmlEngine | None = getattr(request.app.state, "aml_engine", None)
+        if engine is None:
+            return JSONResponse(status_code=500, content={"detail": "AmlEngine not initialized"})
+
+        typ_enum = None
+        if typology:
+            with suppress(ValueError):
+                typ_enum = AmlTypology(typology.lower())
+
+        risk_enum = None
+        if risk_level:
+            with suppress(ValueError):
+                risk_enum = AmlRiskLevel(risk_level.lower())
+
+        alerts = engine.store.list_alerts(
+            user_id=user_id,
+            typology=typ_enum,
+            risk_level=risk_enum,
+            tenant_id=tenant_id,
+            limit=limit,
+        )
+        return AmlAlertListResponse(
+            total_count=len(alerts),
+            alerts=[AmlAlertResponse(**a.to_dict()) for a in alerts],
+        )
+
+    @application.get(
+        "/v1/aml/alerts/{alert_id}",
+        response_model=AmlAlertResponse,
+        responses={
+            404: {"description": "AML alert not found."},
+            500: {"description": "AmlEngine not initialized."},
+        },
+        tags=["aml"],
+    )
+    async def aml_get_alert_endpoint(
+        alert_id: str,
+        request: Request,
+    ) -> AmlAlertResponse | JSONResponse:
+        """Retrieve details of a single AML alert by ID."""
+        engine: AmlEngine | None = getattr(request.app.state, "aml_engine", None)
+        if engine is None:
+            return JSONResponse(status_code=500, content={"detail": "AmlEngine not initialized"})
+
+        alert = engine.store.get_alert(alert_id)
+        if alert is None:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": f"AML alert '{alert_id}' not found"},
+            )
+        return AmlAlertResponse(**alert.to_dict())
+
+    @application.post(
+        "/v1/aml/sar/generate",
+        response_model=AmlSarResponse,
+        responses={
+            500: {"description": "SarManager not initialized."},
+        },
+        tags=["aml"],
+    )
+    async def aml_generate_sar_endpoint(
+        payload: AmlSarGenerateRequest,
+        request: Request,
+    ) -> AmlSarResponse | JSONResponse:
+        """Compile a Suspicious Activity Report (SAR) regulatory dossier."""
+        sar_mgr: SarManager | None = getattr(request.app.state, "sar_manager", None)
+        if sar_mgr is None:
+            return JSONResponse(status_code=500, content={"detail": "SarManager not initialized"})
+
+        txs = [AmlTransactionEvent.from_dict(t) for t in payload.transactions]
+        dossier = sar_mgr.generate_sar(
+            user_id=payload.user_id,
+            alert_ids=payload.alert_ids,
+            suspect_name=payload.suspect_name,
+            suspect_details=payload.suspect_details,
+            transactions=txs,
+            tenant_id=payload.tenant_id,
+        )
+
+        counter = getattr(request.app.state, "aml_sars_created_counter", None)
+        if counter is not None:
+            counter.labels(tenant_id=dossier.tenant_id).inc()
+
+        return _aml_sar_to_response(dossier)
+
+    @application.get(
+        "/v1/aml/sar",
+        response_model=AmlSarListResponse,
+        responses={
+            500: {"description": "SarManager not initialized."},
+        },
+        tags=["aml"],
+    )
+    async def aml_list_sars_endpoint(
+        request: Request,
+        user_id: str | None = None,
+        status: str | None = None,
+        tenant_id: str | None = None,
+        limit: int = 100,
+    ) -> AmlSarListResponse | JSONResponse:
+        """Query SAR dossiers by user, filing status, or tenant."""
+        sar_mgr: SarManager | None = getattr(request.app.state, "sar_manager", None)
+        if sar_mgr is None:
+            return JSONResponse(status_code=500, content={"detail": "SarManager not initialized"})
+
+        status_enum = None
+        if status:
+            with suppress(ValueError):
+                status_enum = SarStatus(status.lower())
+
+        sars = sar_mgr.store.list_sars(
+            user_id=user_id,
+            status=status_enum,
+            tenant_id=tenant_id,
+            limit=limit,
+        )
+        return AmlSarListResponse(
+            total_count=len(sars),
+            sars=[_aml_sar_to_response(s) for s in sars],
+        )
+
+    @application.get(
+        "/v1/aml/sar/{sar_id}",
+        response_model=AmlSarResponse,
+        responses={
+            404: {"description": "SAR dossier not found."},
+            500: {"description": "SarManager not initialized."},
+        },
+        tags=["aml"],
+    )
+    async def aml_get_sar_endpoint(
+        sar_id: str,
+        request: Request,
+    ) -> AmlSarResponse | JSONResponse:
+        """Retrieve a specific SAR regulatory filing dossier."""
+        sar_mgr: SarManager | None = getattr(request.app.state, "sar_manager", None)
+        if sar_mgr is None:
+            return JSONResponse(status_code=500, content={"detail": "SarManager not initialized"})
+
+        dossier = sar_mgr.store.get_sar(sar_id)
+        if dossier is None:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": f"SAR dossier '{sar_id}' not found"},
+            )
+        return _aml_sar_to_response(dossier)
+
+    @application.get(
+        "/v1/aml/sar/{sar_id}/xml",
+        response_model=None,
+        responses={
+            404: {"description": "SAR dossier not found."},
+            500: {"description": "SarManager not initialized."},
+        },
+        tags=["aml"],
+    )
+    async def aml_get_sar_xml_endpoint(
+        sar_id: str,
+        request: Request,
+    ) -> Response | JSONResponse:
+        """Export SAR regulatory filing dossier in standard FinCEN BSA XML schema."""
+        sar_mgr: SarManager | None = getattr(request.app.state, "sar_manager", None)
+        if sar_mgr is None:
+            return JSONResponse(status_code=500, content={"detail": "SarManager not initialized"})
+
+        try:
+            xml_content = sar_mgr.export_fincen_xml(sar_id)
+        except KeyError:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": f"SAR dossier '{sar_id}' not found"},
+            )
+        return Response(content=xml_content, media_type="application/xml")
+
+    @application.post(
+        "/v1/aml/sar/{sar_id}/status",
+        response_model=AmlSarResponse,
+        responses={
+            400: {"description": "Invalid status transition."},
+            404: {"description": "SAR dossier not found."},
+            500: {"description": "SarManager not initialized."},
+        },
+        tags=["aml"],
+    )
+    async def aml_update_sar_status_endpoint(
+        sar_id: str,
+        payload: AmlSarStatusUpdateRequest,
+        request: Request,
+    ) -> AmlSarResponse | JSONResponse:
+        """Transition the review or regulatory filing status of a SAR dossier."""
+        sar_mgr: SarManager | None = getattr(request.app.state, "sar_manager", None)
+        if sar_mgr is None:
+            return JSONResponse(status_code=500, content={"detail": "SarManager not initialized"})
+
+        try:
+            target_status = SarStatus(payload.new_status.lower())
+        except ValueError:
+            return JSONResponse(
+                status_code=400,
+                content={"detail": f"Invalid SAR status '{payload.new_status}'"},
+            )
+
+        try:
+            updated = sar_mgr.transition_status(
+                sar_id,
+                target_status,
+                notes=payload.notes,
+                actor=payload.actor,
+            )
+        except KeyError:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": f"SAR dossier '{sar_id}' not found"},
+            )
+        except ValueError as exc:
+            return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+        if target_status == SarStatus.FILED:
+            counter = getattr(request.app.state, "aml_sars_filed_counter", None)
+            if counter is not None:
+                counter.labels(tenant_id=updated.tenant_id).inc()
+
+        return _aml_sar_to_response(updated)
+
+    @application.post(
+        "/v1/sif/evaluate",
+        response_model=SifAssessmentResponse,
+        responses={
+            500: {"description": "SyntheticIdentityEngine not initialized."},
+        },
+        tags=["synthetic_identity"],
+    )
+    async def sif_evaluate_endpoint(
+        payload: SifEvaluateRequest,
+        request: Request,
+    ) -> SifAssessmentResponse | JSONResponse:
+        """Evaluate an applicant credit profile for synthetic identity fraud."""
+        engine: SyntheticIdentityEngine | None = getattr(request.app.state, "sif_engine", None)
+        if engine is None:
+            return JSONResponse(
+                status_code=500, content={"detail": "SyntheticIdentityEngine not initialized"}
+            )
+
+        auth_users = [
+            AuthorizedUserRecord.from_dict(u) if isinstance(u, dict) else u
+            for u in payload.authorized_users
+        ]
+        profile = IdentityProfile(
+            applicant_id=payload.applicant_id,
+            ssn=payload.ssn,
+            first_name=payload.first_name,
+            last_name=payload.last_name,
+            dob=payload.dob,
+            address=payload.address,
+            phone=payload.phone,
+            email=payload.email,
+            credit_line_requested=payload.credit_line_requested,
+            authorized_users=auth_users,
+            tenant_id=payload.tenant_id,
+            metadata=payload.metadata,
+        )
+
+        assessment = engine.evaluate(profile)
+
+        # Update Prometheus metrics
+        eval_counter = getattr(request.app.state, "sif_evaluations_counter", None)
+        if eval_counter is not None:
+            eval_counter.labels(
+                tenant_id=assessment.tenant_id,
+                action=assessment.action.value,
+                risk_level=assessment.risk_level.value,
+            ).inc()
+
+        anom_counter = getattr(request.app.state, "sif_anomalies_counter", None)
+        if anom_counter is not None:
+            for anom in assessment.triggered_anomalies:
+                anom_counter.labels(
+                    tenant_id=assessment.tenant_id,
+                    anomaly_type=anom.value,
+                ).inc()
+
+        if assessment.risk_level in (SifRiskLevel.HIGH, SifRiskLevel.CRITICAL):
+            high_risk_counter = getattr(request.app.state, "sif_high_risk_counter", None)
+            if high_risk_counter is not None:
+                high_risk_counter.labels(tenant_id=assessment.tenant_id).inc()
+
+        if assessment.action == SifAction.DECLINE_BLOCK:
+            block_counter = getattr(request.app.state, "sif_blocks_counter", None)
+            if block_counter is not None:
+                block_counter.labels(tenant_id=assessment.tenant_id).inc()
+
+        return _sif_assessment_to_response(assessment)
+
+    @application.get(
+        "/v1/sif/assessments/{assessment_id}",
+        response_model=SifAssessmentResponse,
+        responses={
+            404: {"description": "Assessment not found."},
+            500: {"description": "SyntheticIdentityEngine not initialized."},
+        },
+        tags=["synthetic_identity"],
+    )
+    async def sif_get_assessment_endpoint(
+        assessment_id: str,
+        request: Request,
+    ) -> SifAssessmentResponse | JSONResponse:
+        """Fetch synthetic identity risk assessment by ID."""
+        engine: SyntheticIdentityEngine | None = getattr(request.app.state, "sif_engine", None)
+        if engine is None:
+            return JSONResponse(
+                status_code=500, content={"detail": "SyntheticIdentityEngine not initialized"}
+            )
+
+        assessment = engine.store.get_assessment(assessment_id)
+        if assessment is None:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": f"Assessment '{assessment_id}' not found"},
+            )
+        return _sif_assessment_to_response(assessment)
+
+    @application.get(
+        "/v1/sif/assessments",
+        response_model=SifAssessmentListResponse,
+        responses={
+            500: {"description": "SyntheticIdentityEngine not initialized."},
+        },
+        tags=["synthetic_identity"],
+    )
+    async def sif_list_assessments_endpoint(
+        request: Request,
+        tenant_id: str | None = None,
+        limit: int = 100,
+    ) -> SifAssessmentListResponse | JSONResponse:
+        """Query synthetic identity assessments with optional tenant filter."""
+        engine: SyntheticIdentityEngine | None = getattr(request.app.state, "sif_engine", None)
+        if engine is None:
+            return JSONResponse(
+                status_code=500, content={"detail": "SyntheticIdentityEngine not initialized"}
+            )
+
+        assessments = engine.store.list_assessments(tenant_id=tenant_id, limit=limit)
+        return SifAssessmentListResponse(
+            total_count=len(assessments),
+            assessments=[_sif_assessment_to_response(a) for a in assessments],
+        )
+
+    @application.post(
+        "/v1/sif/profiles",
+        response_model=SifProfileResponse,
+        responses={
+            500: {"description": "SyntheticIdentityEngine not initialized."},
+        },
+        tags=["synthetic_identity"],
+    )
+    async def sif_create_profile_endpoint(
+        payload: SifProfileRequest,
+        request: Request,
+    ) -> SifProfileResponse | JSONResponse:
+        """Store an applicant profile in the synthetic identity store."""
+        engine: SyntheticIdentityEngine | None = getattr(request.app.state, "sif_engine", None)
+        if engine is None:
+            return JSONResponse(
+                status_code=500, content={"detail": "SyntheticIdentityEngine not initialized"}
+            )
+
+        auth_users = [
+            AuthorizedUserRecord.from_dict(u) if isinstance(u, dict) else u
+            for u in payload.authorized_users
+        ]
+        profile = IdentityProfile(
+            applicant_id=payload.applicant_id,
+            ssn=payload.ssn,
+            first_name=payload.first_name,
+            last_name=payload.last_name,
+            dob=payload.dob,
+            address=payload.address,
+            phone=payload.phone,
+            email=payload.email,
+            credit_line_requested=payload.credit_line_requested,
+            authorized_users=auth_users,
+            tenant_id=payload.tenant_id,
+            metadata=payload.metadata,
+        )
+        engine.store.add_profile(profile)
+        return _sif_profile_to_response(profile)
+
+    @application.get(
+        "/v1/sif/applicants/{applicant_id}",
+        response_model=SifProfileResponse,
+        responses={
+            404: {"description": "Applicant profile not found."},
+            500: {"description": "SyntheticIdentityEngine not initialized."},
+        },
+        tags=["synthetic_identity"],
+    )
+    async def sif_get_profile_endpoint(
+        applicant_id: str,
+        request: Request,
+    ) -> SifProfileResponse | JSONResponse:
+        """Fetch an applicant profile by applicant_id."""
+        engine: SyntheticIdentityEngine | None = getattr(request.app.state, "sif_engine", None)
+        if engine is None:
+            return JSONResponse(
+                status_code=500, content={"detail": "SyntheticIdentityEngine not initialized"}
+            )
+
+        profile = engine.store.get_profile(applicant_id)
+        if profile is None:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": f"Applicant '{applicant_id}' not found"},
+            )
+        return _sif_profile_to_response(profile)
+
+    @application.get(
+        "/v1/sif/profiles",
+        response_model=SifProfileListResponse,
+        responses={
+            500: {"description": "SyntheticIdentityEngine not initialized."},
+        },
+        tags=["synthetic_identity"],
+    )
+    async def sif_list_profiles_endpoint(
+        request: Request,
+        tenant_id: str | None = None,
+        limit: int = 100,
+    ) -> SifProfileListResponse | JSONResponse:
+        """Query applicant profiles with optional tenant filter."""
+        engine: SyntheticIdentityEngine | None = getattr(request.app.state, "sif_engine", None)
+        if engine is None:
+            return JSONResponse(
+                status_code=500, content={"detail": "SyntheticIdentityEngine not initialized"}
+            )
+
+        profiles = engine.store.list_profiles(tenant_id=tenant_id, limit=limit)
+        return SifProfileListResponse(
+            total_count=len(profiles),
+            profiles=[_sif_profile_to_response(p) for p in profiles],
+        )
+
+    @application.get(
+        "/v1/sif/metrics",
+        response_model=dict[str, Any],
+        tags=["synthetic_identity"],
+    )
+    async def sif_metrics_endpoint(request: Request) -> dict[str, Any]:
+        """Summary metrics of synthetic identity evaluations and storage."""
+        engine: SyntheticIdentityEngine | None = getattr(request.app.state, "sif_engine", None)
+        total_profiles = engine.store.profile_count if engine else 0
+        total_assessments = engine.store.assessment_count if engine else 0
+        return {
+            "total_profiles_tracked": total_profiles,
+            "total_assessments_recorded": total_assessments,
+            "status": "operational" if engine else "uninitialized",
+        }
 
     @application.get(
         "/v1/routing/status",

@@ -1849,6 +1849,316 @@ FastAPI webhook REST endpoints:
 - `POST /v1/webhooks/dlq/replay`: Replay undelivered dead-letter events through the webhook dispatcher.
 - Prometheus metrics: `fraud_event_bus_published_total`, `fraud_webhook_dispatches_total`, and `fraud_webhook_dlq_size`.
 
+## Step-Up Authentication & Challenge Orchestration (Phase 44)
+
+Orchestrate Strong Customer Authentication (SCA) step-up challenges and 3-D Secure (3DS 2.3) workflows for friction decisions (`challenge.py`):
+
+```bash
+# Issue a step-up challenge session for a high-risk transaction
+fraud-detect challenge-create \
+  --transaction-id tx_88492 \
+  --user-id usr_42 \
+  --destination "+14155552671" \
+  --method sms_otp \
+  --store-file sessions.json \
+  --format table
+
+# Inspect stored challenge sessions
+fraud-detect challenge-inspect --store-file sessions.json --format table
+
+# Verify an entered OTP code
+fraud-detect challenge-verify --store-file sessions.json --challenge-id ch_0c39d3 --token 492018
+```
+
+FastAPI step-up challenge REST endpoints:
+- `POST /v1/challenges`: Create a new step-up friction challenge session with cryptographic OTP generation and destination masking.
+- `GET /v1/challenges`: List active and historical challenge sessions with optional `?tenant_id=` filter.
+- `GET /v1/challenges/{challenge_id}`: Retrieve challenge details, lifecycle status, attempts, and masked destination.
+- `POST /v1/challenges/{challenge_id}/verify`: Verify candidate OTP token with constant-time comparison, updating session status or enforcing brute-force lockouts.
+- `POST /v1/challenges/{challenge_id}/resend`: Request a fresh token subject to rate-limiting cooldown periods.
+- `DELETE /v1/challenges/{challenge_id}`: Cancel a pending challenge session.
+- Prometheus metrics: `fraud_challenges_issued_total`, `fraud_challenges_verified_total`, and `fraud_challenges_failed_total`.
+
+## Fraud Case Management & Dispute Evidence Packaging Engine (Phase 45)
+
+Manage operational investigation queues, analyst notes, SLA timers, and generate tamper-evident dispute evidence dossiers for card network representment (`cases.py`):
+
+```bash
+# Create a new fraud investigation case
+fraud-detect case-create \
+  --transaction-id tx_90412 \
+  --amount 1450.00 \
+  --currency USD \
+  --priority high \
+  --assign analyst_alice \
+  --fraud-score 0.94 \
+  --store-file cases.json \
+  --format table
+
+# List stored cases with multi-criteria filters
+fraud-detect case-list --store-file cases.json --status investigating --priority high --format table
+
+# Inspect full case details, notes, and audit trail
+fraud-detect case-inspect --store-file cases.json --case-id case_83f2a1b9 --format table
+
+# Resolve an investigation case with an analyst conclusion
+fraud-detect case-resolve \
+  --store-file cases.json \
+  --case-id case_83f2a1b9 \
+  --disposition confirmed_fraud \
+  --actor analyst_alice \
+  --notes "Cardholder confirmed stolen credentials." \
+  --format table
+
+# Compile and export a tamper-evident dispute evidence dossier
+fraud-detect case-evidence \
+  --store-file cases.json \
+  --case-id case_83f2a1b9 \
+  --output dispute_evidence.json \
+  --format table
+```
+
+FastAPI Case Management REST endpoints:
+- `POST /v1/cases`: Manually create a new fraud investigation case with SLA timers.
+- `GET /v1/cases`: Query stored cases with multi-criteria filtering (`tenant_id`, `status`, `priority`, `assigned_analyst`, `sla_breached_only`).
+- `GET /v1/cases/summary`: Aggregate metrics breakdown (total, open, resolved, breached counts).
+- `GET /v1/cases/{case_id}`: Retrieve full case record with audit log and analyst notes.
+- `PATCH /v1/cases/{case_id}`: Update case status or assign/reassign to an analyst.
+- `POST /v1/cases/{case_id}/notes`: Append an immutable investigation note to the audit trail.
+- `POST /v1/cases/{case_id}/resolve`: Close a case with a final disposition and conclusion notes.
+- `GET /v1/cases/{case_id}/evidence`: Compile and export a canonicalized SHA-256 fingerprinted dispute evidence dossier (Visa CE3.0 / Mastercard First-Party Trust ready).
+- Prometheus metrics: `fraud_cases_total`, `fraud_cases_resolved_total`, `fraud_case_sla_breaches_total`, `fraud_evidence_packages_generated_total`.
+
+## Card Scheme Chargeback & Automated Representment Gateway (Phase 46)
+
+Ingest inbound card scheme chargebacks, normalize network reason codes (Visa, Mastercard, Amex, Discover), evaluate representment viability (3DS liability shift and CE3.0 / First-Party Trust rules), defend disputes, and forward realized labels to continuous learning (`chargeback.py`):
+
+```bash
+# Ingest an incoming Visa chargeback dispute
+fraud-detect chargeback-ingest \
+  --transaction-id tx_88129 \
+  --scheme visa \
+  --reason-code 10.4 \
+  --amount 350.00 \
+  --currency USD \
+  --tenant-id default \
+  --scheme-dispute-id vrol_9812 \
+  --store-file chargebacks.json \
+  --format table
+
+# List stored disputes with multi-criteria filters
+fraud-detect chargeback-list --store-file chargebacks.json --scheme visa --stage first_chargeback --format table
+
+# Inspect full dispute details, viability score, liability shift, and audit history
+fraud-detect chargeback-inspect --store-file chargebacks.json --dispute-id dsp_38f2a1b9 --format table
+
+# Submit dispute representment with evidence package and cryptographic fingerprint
+fraud-detect chargeback-represent \
+  --store-file chargebacks.json \
+  --dispute-id dsp_38f2a1b9 \
+  --package-id pkg_rep_101 \
+  --fingerprint a4b8c9...64chars \
+  --notes "Visa CE3.0 compelling evidence attached: 2 prior undisputed matching transactions." \
+  --actor senior_analyst \
+  --format table
+
+# Finalize dispute resolution with terminal outcome
+fraud-detect chargeback-resolve \
+  --store-file chargebacks.json \
+  --dispute-id dsp_38f2a1b9 \
+  --outcome resolved_won \
+  --actor scheme_gateway \
+  --notes "Issuer arbitration concluded in merchant favor." \
+  --format table
+```
+
+FastAPI Chargeback Gateway REST endpoints:
+- `POST /v1/chargebacks`: Ingest, validate, and evaluate an incoming dispute with 3DS/CE3.0 viability engine.
+- `POST /v1/chargebacks/webhook`: Automated inbound webhook receiver from card scheme APIs or payment gateways.
+- `GET /v1/chargebacks`: Multi-criteria query interface (`tenant_id`, `scheme`, `stage`, `category`, `expired_only`).
+- `GET /v1/chargebacks/summary`: Portfolio-level aggregation (dispute counts, disputed amounts, stage & category breakdowns).
+- `GET /v1/chargebacks/{dispute_id}`: Retrieve detailed dispute state, deadlines, liability shift status, and audit trail.
+- `POST /v1/chargebacks/{dispute_id}/represent`: Submit representment evidence package and transition to `represented`.
+- `POST /v1/chargebacks/{dispute_id}/resolve`: Terminal dispute finalization (`resolved_won`, `resolved_lost`, `accepted_liability`) with automatic feedback label publication to `feedback.py`.
+- Prometheus metrics: `fraud_chargebacks_received_total`, `fraud_chargebacks_represented_total`, `fraud_chargebacks_won_total`, `fraud_chargebacks_lost_total`, `fraud_chargeback_financial_exposure_amount`.
+
+## Account Takeover (ATO) Detection & Credential Stuffing Defense (Phase 47)
+
+Ingest authentication events, track user behavioral baselines (known devices, locations, dormancy), detect distributed credential stuffing and password spraying attacks, calculate impossible travel velocities, and enforce automated account defense actions (`ato.py`):
+
+```bash
+# Ingest and evaluate an authentication attempt
+fraud-detect ato-login \
+  --user-id usr_9012 \
+  --ip-address 198.51.100.42 \
+  --outcome success \
+  --device dev_trusted_laptop \
+  --latitude 40.7128 \
+  --longitude -74.0060 \
+  --store-file data/ato_store.json \
+  --format table
+
+# Record a sensitive account mutation (password, email, or MFA reset)
+fraud-detect ato-mutation \
+  --user-id usr_9012 \
+  --type password_change \
+  --channel web \
+  --store-file data/ato_store.json \
+  --format table
+
+# Inspect account profile, known devices, locations, and quarantine state
+fraud-detect ato-inspect \
+  --user-id usr_9012 \
+  --store-file data/ato_store.json \
+  --format table
+
+# Evaluate an ongoing transaction or session action
+fraud-detect ato-eval \
+  --user-id usr_9012 \
+  --action-type checkout \
+  --amount 850.00 \
+  --ip-address 203.0.113.15 \
+  --device dev_unrecognized_device \
+  --store-file data/ato_store.json \
+  --format table
+
+# Administratively quarantine a compromised account
+fraud-detect ato-quarantine \
+  --user-id usr_9012 \
+  --reason "SOC flagged credential stuffing burst" \
+  --store-file data/ato_store.json \
+  --format table
+
+# Administratively release a verified account
+fraud-detect ato-release \
+  --user-id usr_9012 \
+  --reason "User identity verified via secondary phone challenge" \
+  --store-file data/ato_store.json \
+  --format table
+```
+
+FastAPI Account Takeover REST endpoints:
+- `POST /v1/ato/login`: Ingest authentication event and evaluate takeover risk.
+- `POST /v1/ato/evaluate`: Evaluate transaction or session action context for takeover indicators.
+- `GET /v1/ato/accounts/{user_id}`: Retrieve account behavioral profile, known devices, and security state.
+- `POST /v1/ato/accounts/{user_id}/mutations`: Log sensitive profile mutations for time-decay surveillance.
+- `POST /v1/ato/accounts/{user_id}/quarantine`: Place an account under security quarantine.
+- `POST /v1/ato/accounts/{user_id}/release`: Release an account from security quarantine.
+- `GET /v1/ato/assessments`: Query and filter historical ATO risk assessments.
+- `GET /v1/ato/assessments/{assessment_id}`: Retrieve detailed risk score breakdown, impossible travel speed, and factor telemetry.
+- Prometheus metrics: `fraud_ato_login_attempts_total`, `fraud_ato_risk_assessments_total`, `fraud_ato_quarantines_total`.
+
+### Anti-Money Laundering (AML) Transaction Monitoring & Regulatory SAR Engine
+
+Phase 48 introduces autonomous AML transaction monitoring, sub-CTR structuring/smurfing detection, rapid layering flow-through analysis, round-trip circular flow detection, phonetic/fuzzy OFAC/PEP watchlist screening, and FinCEN BSA Suspicious Activity Report (SAR) dossier management:
+
+```bash
+# Screen an individual or entity against OFAC SDN and PEP watchlists
+fraud-detect aml-screen \
+  --name "Vladimir Putin" \
+  --threshold 0.85 \
+  --format table
+
+# Monitor a transaction against all AML typologies and high-risk corridors
+fraud-detect aml-monitor \
+  --user-id usr_aml_101 \
+  --amount 9500.00 \
+  --counterparty-id entity_99 \
+  --country US \
+  --direction outbound \
+  --store-file data/aml_store.json \
+  --format table
+
+# List and filter AML alerts by typology or severity
+fraud-detect aml-alerts \
+  --typology structuring_smurfing \
+  --risk-level high \
+  --store-file data/aml_store.json \
+  --format table
+
+# Compile and package a regulatory SAR filing dossier
+fraud-detect aml-sar-generate \
+  --user-id usr_aml_101 \
+  --alert-ids "alt_structuring_01,alt_structuring_02" \
+  --suspect-name "John Doe" \
+  --narrative "Repeated structured withdrawals under currency transaction reporting threshold." \
+  --store-file data/aml_store.json \
+  --format table
+
+# Query regulatory SAR filing dossiers
+fraud-detect aml-sar-list \
+  --status draft \
+  --store-file data/aml_store.json \
+  --format table
+
+# Transition SAR dossier through compliance review lifecycle
+fraud-detect aml-sar-status \
+  --sar-id sar_84920 \
+  --status pending_review \
+  --reviewer "compliance_officer_jane" \
+  --comment "Escalated for principal officer approval." \
+  --store-file data/aml_store.json \
+  --format table
+```
+
+FastAPI Anti-Money Laundering REST endpoints:
+- `POST /v1/aml/monitor`: Ingest financial transaction and evaluate across structuring, layering, circular flows, sanctions, and FATF corridors.
+- `POST /v1/aml/watchlist/screen`: Screen entity names against watchlists using Soundex, Levenshtein, and Jaro-Winkler fuzzy matching.
+- `GET /v1/aml/alerts`: Query and filter AML surveillance alerts by user, typology, or risk level.
+- `GET /v1/aml/alerts/{alert_id}`: Retrieve detailed AML alert telemetry, evidence transactions, and trigger diagnostics.
+- `POST /v1/aml/sar`: Package and compile a formal FinCEN BSA SAR dossier from verified alerts.
+- `GET /v1/aml/sar`: List and filter SAR filing packages by status or subject user.
+- `GET /v1/aml/sar/{sar_id}`: Retrieve complete SAR dossier, narrative, financials, and audit history.
+- `GET /v1/aml/sar/{sar_id}/xml`: Export SAR dossier into standard FinCEN BSA XML compliant schema.
+- `POST /v1/aml/sar/{sar_id}/status`: Execute validated SAR state transition (`draft` -> `pending_review` -> `approved` -> `filed` / `rejected`).
+- Prometheus metrics: `fraud_aml_transactions_monitored_total`, `fraud_aml_alerts_total`, `fraud_aml_sanction_hits_total`, `fraud_aml_sars_created_total`, `fraud_aml_sars_filed_total`.
+
+### Synthetic Identity Fraud (SIF) Detection & Identity Verification Engine
+
+Phase 49 introduces autonomous Synthetic Identity Fraud (SIF) detection, SSA historical allocation verification, Death Master File screening, PII element fragmentation analysis, drop address and burner phone detection, and credit piggybacking defense:
+
+```bash
+# Audit an SSN against SSA allocation tables, deceased registries, and birth year
+fraud-detect sif-check-ssn \
+  --ssn 050-12-3456 \
+  --dob 1980-01-01 \
+  --format table
+
+# Evaluate an applicant credit profile for synthetic identity risk
+fraud-detect sif-eval \
+  --ssn 050-12-3456 \
+  --first-name "Tony" \
+  --last-name "Stark" \
+  --dob 1970-05-29 \
+  --address "10880 Malibu Point, Malibu, CA" \
+  --phone "+13105554321" \
+  --email "tony@starkindustries.com" \
+  --credit-line 50000.0 \
+  --store-file data/sif_store.json \
+  --format table
+
+# Inspect stored applicant profiles or risk assessments
+fraud-detect sif-inspect \
+  --applicant-id app_stark \
+  --store-file data/sif_store.json \
+  --format table
+
+# View summary of tracked identities, assessments, and policy actions
+fraud-detect sif-summary \
+  --store-file data/sif_store.json \
+  --format table
+```
+
+FastAPI Synthetic Identity REST endpoints:
+- `POST /v1/sif/evaluate`: Evaluate credit applicant profile against SSN issuance history, DMF registry, PII fragmentation, and synthetic velocity.
+- `GET /v1/sif/assessments/{assessment_id}`: Fetch detailed synthetic identity risk assessment report.
+- `GET /v1/sif/assessments`: Query and filter assessments with optional tenant filter.
+- `POST /v1/sif/profiles`: Store applicant identity profile in thread-safe registry.
+- `GET /v1/sif/applicants/{applicant_id}`: Retrieve stored applicant profile by ID.
+- `GET /v1/sif/profiles`: Query applicant profiles.
+- `GET /v1/sif/metrics`: Summary of tracked profiles and recorded assessments.
+- Prometheus metrics: `fraud_sif_evaluations_total`, `fraud_sif_anomalies_total`, `fraud_sif_high_risk_total`, `fraud_sif_blocks_total`.
+
 ## Reference label-delay analysis
 
 
@@ -1886,7 +2196,11 @@ Project layout:
 ```text
 src/fraud_detection/
 ├── api.py            # versioned online prediction service, circuit breakers, and traffic shadowing
+├── ato.py            # account takeover detection, credential stuffing defense, and identity session anomalies
 ├── audit.py          # structured JSONL audit logs with Luhn PAN redaction and log replay
+├── cases.py          # fraud case management, SLA tracking, and dispute evidence packaging
+├── chargeback.py     # card scheme dispute ingestion, reason code taxonomy, and automated representment
+├── challenge.py      # step-up authentication, 3DS challenge orchestration, and token verification
 ├── cli.py            # training, comparison, surveillance, profiling, simulation, and serving CLI
 ├── data.py           # ingestion, schema validation, and synthetic data
 ├── device.py         # adaptive browser/device fingerprinting, simhash clustering, and bot detection

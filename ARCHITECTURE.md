@@ -550,6 +550,296 @@ flowchart TD
 - **Dead-Letter Queue (DLQ)**: Undeliverable notifications are preserved in a thread-safe, bounded in-memory buffer (`DeadLetterQueue`) for inspection and on-demand replay via CLI or API.
 
 
+## Risk-Based Step-Up Authentication & Challenge Orchestration (Phase 44)
+
+The platform incorporates an in-process, zero-dependency Strong Customer Authentication (SCA) step-up challenge and 3-D Secure (3DS 2.3) orchestration engine (`challenge.py`). When transaction risk evaluation falls into review/friction thresholds (`RuleAction.CHALLENGE`), step-up authentication sessions are automatically provisioned with cryptographically secure OTP tokens, channel destination masking, constant-time verification, brute-force lockout, and rate-limited resends.
+
+```mermaid
+flowchart TD
+    subgraph Decision Engine
+        DAG["Decision DAG Pipeline"] -->|Evaluate Rules & Model| Action["ActionAggregatorStageProcessor"]
+        Action -->|Action == CHALLENGE| CM["ChallengeManager"]
+    end
+
+    subgraph Challenge Lifecycle
+        CM --> Gen["Cryptographic OTP Generator\n(secrets.SystemRandom)"]
+        Gen --> Hash["HMAC-SHA256 Token Hash + Salt"]
+        Hash --> Mask["PII Masking Filter\n(Email/SMS Phone Masking)"]
+        Mask --> Store[("ChallengeStore\n(Thread-Safe Multi-Index)")]
+        Store --> State{"Session State Machine\n(PENDING / VERIFIED / LOCKED_OUT / EXPIRED)"}
+    end
+
+    subgraph Verification & Protection
+        API["FastAPI /v1/challenges/*\nCLI challenge-*"] -->|Verify Token| Comp["Constant-Time Verification\nhmac.compare_digest"]
+        Comp -->|Match| Verified["Status: VERIFIED\nPrometheus: fraud_challenges_verified_total"]
+        Comp -->|Mismatch| Attempts{"Attempts >= Max?"}
+        Attempts -->|No| Invalid["Status: PENDING\nRemaining Attempts Decremented"]
+        Attempts -->|Yes| Lockout["Status: LOCKED_OUT\nUser Lockout Timer Triggered"]
+    end
+
+    subgraph Event Broadcasting
+        CM -->|Emit CHALLENGE_ISSUED| Bus["EventBus"]
+        Comp -->|Emit CHALLENGE_VERIFIED / FAILED| Bus
+    end
+```
+
+### Key Components
+
+- **Domain Models & Enums (`ChallengeSession`, `ChallengeMethod`, `ChallengeStatus`)**: Immutable records tracking multi-channel challenge methods (`sms_otp`, `email_otp`, `totp`, `biometric_push`, `kba_security_questions`, `out_of_band`) and lifecycle states.
+- **Cryptographic Security & Constant-Time Verification**: Generates cryptographically secure nonces via `secrets.SystemRandom`, salted with high-entropy bytes and hashed using HMAC-SHA256. Verified using `hmac.compare_digest` to prevent side-channel timing attacks.
+- **PII Destination Redaction**: Automatically redacts sensitive phone numbers and emails (e.g., `+1 ***-***-1234` and `a***e@example.com`) to prevent exposure in logs, API responses, and audit records.
+- **Brute-Force Lockout & Cooldown Rate Limiting**: Enforces configurable max attempts per session (default: 3). Failed attempts exceeding thresholds trigger automated user lockouts (`lockout_duration_seconds=900`). Resend operations enforce a cooldown period (`resend_cooldown_seconds=30`) to protect against SMS pumping and denial-of-service.
+- **Pipeline & EventBus Synergy**: Seamlessly wired into the Decision DAG and broadcasts `fraud.challenge.issued`, `fraud.challenge.verified`, `fraud.challenge.failed`, and `fraud.challenge.expired` across the streaming EventBus.
+
+
+## Fraud Case Management, Investigation SLA Tracking & Dispute Evidence Packaging Engine (Phase 45)
+
+The platform incorporates an in-process, zero-dependency Fraud Case Management, Analyst Workflow, SLA Tracking, and Dispute Evidence Packaging Engine (`cases.py`). Suspicious transactions flagged for manual review (`final_action == "REVIEW"` in `pipeline.py`) or charged-back transactions are tracked through a formalized investigation lifecycle with SLA timers, audit trails, and cryptographically fingerprinted dispute dossiers suitable for card network representment.
+
+```mermaid
+flowchart TD
+    subgraph Trigger & Creation
+        DAG["Decision DAG Pipeline\n(Action == REVIEW)"] -->|Auto-Create Case| CM["CaseManager"]
+        Manual["Analyst API / CLI\nPOST /v1/cases"] -->|Create Case| CM
+    end
+
+    subgraph Case Lifecycle & SLA
+        CM --> Store[("CaseStore\n(Thread-Safe Multi-Index)")]
+        Store --> Prioritization["compute_priority\n(Score x Amount Matrix)"]
+        Prioritization --> Lifecycle["Lifecycle State Machine\nOPEN -> INVESTIGATING -> PENDING_CUSTOMER\n-> REPRESENTED -> RESOLVED -> CLOSED"]
+        Lifecycle --> SLATimer["SLA Tracking & Breach Monitor\n(sla_deadline_hours, is_sla_breached)"]
+    end
+
+    subgraph Dispute Evidence Packaging
+        CM --> Compiler["compile_evidence_package\n(DisputeEvidencePackage)"]
+        Compiler --> Modals["Multi-Modal Evidence Aggregation\n- Transaction Context & Amount\n- Risk & Model Decision Score\n- Device Signals (Phase 40)\n- Geolocation Velocities (Phase 39)\n- 3DS Challenge Verification Proof (Phase 44)"]
+        Modals --> Canonical["Deterministic Canonical JSON\n(rfc8785 strict keys & format)"]
+        Canonical --> Fingerprint["SHA-256 Package Fingerprint\n(Visa CE3.0 / Mastercard First-Party Trust)"]
+    end
+
+    subgraph Event Broadcasting & Operations
+        CM -->|Emit CASE_CREATED / ASSIGNED / RESOLVED / EVIDENCE_PACKAGED| Bus["EventBus"]
+        Store --> API["FastAPI /v1/cases/*\nPrometheus Metrics"]
+        Store --> CLI["CLI: case-create, case-list,\ncase-inspect, case-resolve, case-evidence"]
+    end
+```
+
+### Key Components
+
+- **Domain Models & Taxonomy (`cases.py`)**: `FraudCase`, `CasePriority` (`LOW`, `MEDIUM`, `HIGH`, `CRITICAL`), `CaseStatus` (`OPEN`, `INVESTIGATING`, `PENDING_CUSTOMER`, `REPRESENTED`, `RESOLVED`, `CLOSED`), `CaseDisposition` (`CONFIRMED_FRAUD`, `FALSE_POSITIVE`, `MERCHANT_ERROR`, `ACCOUNT_TAKEOVER`, `FRIENDLY_FRAUD`, `UNRESOLVED`), and append-only `CaseNote`.
+- **Dynamic Priority & Invariant Validation**: Automatically calculates priority using an empirical severity matrix combining fraud probability and monetary exposure. Enforces strict lifecycle state machines preventing invalid transitions (e.g. directly closing an uninvestigated case).
+- **Tamper-Evident Dispute Evidence Dossiers**: `DisputeEvidencePackage` compiles multi-modal transaction context, risk scores, device anomalies, geolocation travel velocities, and 3DS step-up verification proofs into a canonicalized JSON payload hashed with SHA-256 for network chargeback representment.
+- **SLA Countdown & Breach Surveillance**: Computes SLA deadlines and dynamically evaluates SLA breach status, supporting priority-based operational queues and automated breach escalation counters.
+- **Thread-Safe Storage & Manager**: `CaseStore` provides multi-index querying (by `case_id`, `transaction_id`, `tenant_id`, `status`, `priority`, `assigned_analyst`, and SLA breach). `CaseManager` coordinates safe concurrent state updates with thread-level re-entrant locks.
+- **API, CLI & Telemetry Integration**: Exposes REST endpoints (`/v1/cases/*`), CLI commands (`case-create`, `case-list`, `case-inspect`, `case-resolve`, `case-evidence`), and Prometheus counters (`fraud_cases_total`, `fraud_cases_resolved_total`, `fraud_case_sla_breaches_total`, `fraud_evidence_packages_generated_total`).
+
+
+## Card Scheme Chargeback Ingestion, Reason Code Taxonomy & Automated Representment Gateway (Phase 46)
+
+The platform incorporates an in-process, zero-dependency Card Scheme Chargeback Ingestion, Reason Code Taxonomy, Representment Viability Engine, and Representment Gateway (`chargeback.py`). Inbound post-authorization dispute notices across major networks (Visa, Mastercard, American Express, Discover) are classified, evaluated for liability shift and network deflection rules (Visa CE3.0 / Mastercard First-Party Trust), defended with cryptographic evidence packages, and forwarded into the continuous learning feedback pipeline.
+
+```mermaid
+flowchart TD
+    subgraph Ingestion & Taxonomy
+        Webhook["Gateway Webhook\nPOST /v1/chargebacks/webhook"] --> CM["ChargebackManager"]
+        Manual["Analyst API / CLI\nPOST /v1/chargebacks"] --> CM
+        CM --> Reg["ReasonCodeRegistry\n(Visa, Mastercard, Amex, Discover)"]
+        Reg --> Cat["Normalized ChargebackCategory\n(Fraud CNP/CP, Friendly Fraud, Consumer, Auth)"]
+    end
+
+    subgraph Representment Viability Engine
+        CM --> Viability["evaluate_representment_viability"]
+        Viability --> ThreeDS["3DS Liability Shift Check\n(ECI 05/02/06 / CAVV Verification)"]
+        Viability --> CE3["CE3.0 / First-Party Trust Rules\n(>=2 Qualifying Undisputed Prior Txns\nDevice / IP / Account Hash Match)"]
+        Viability --> Score["Winnability Score & Action\n(REPRESENT, ACCEPT_LIABILITY, PRE_ARBITRATION)"]
+    end
+
+    subgraph Dispute Lifecycle & Store
+        CM --> Store[("ChargebackStore\n(Thread-Safe Multi-Index)")]
+        Store --> StateMachine["Dispute State Machine\nFIRST_CHARGEBACK -> REPRESENTED\n-> PRE_ARBITRATION -> ARBITRATION\n-> RESOLVED_WON / RESOLVED_LOST / EXPIRED"]
+        Store --> ExpireTimer["Response Deadline Surveillance\n(is_expired, days_remaining)"]
+    end
+
+    subgraph Continuous Learning & Interfaces
+        CM -->|Publish CHARGEBACK_INGESTED / REPRESENTED / RESOLVED| Bus["EventBus"]
+        CM -->|Forward Realized Labels on Resolution| Feedback["Feedback LabelIngestionStore\n(DelayedLabelRecord)"]
+        Store --> API["FastAPI /v1/chargebacks/*\nPrometheus Exposure & Win Metrics"]
+        Store --> CLI["Typer CLI: chargeback-ingest, chargeback-list,\nchargeback-inspect, chargeback-represent, chargeback-resolve"]
+    end
+```
+
+### Key Components
+
+- **Card Scheme Reason Code Taxonomy (`chargeback.py`)**: `ReasonCodeRegistry` provides standard network taxonomies for Visa (e.g., 10.4 Fraud CNP, 13.1 Merchandise Not Received), Mastercard (e.g., 4837 Fraud CNP, 4853 Cardholder Dispute), American Express (e.g., FR2, C08), and Discover (e.g., 4837, 4853). Automatically infers network-specific response windows (e.g. 30 days Visa/MC, 20 days Amex) and maps reasons into normalized categories.
+- **Representment Viability & Liability Shift Engine**: Calculates objective representment winnability scores ($0.0$ to $1.0$) based on protocol verification proofs. Analyzes 3D-Secure Electronic Commerce Indicators (ECI `05` / `02` for fully authenticated liability shift; `06` / `01` for merchant liability protection attempts) and generates representment recommendations.
+- **Visa Compelling Evidence 3.0 (CE3.0) & Mastercard First-Party Trust Qualification**: Defends against first-party/friendly fraud claims by auditing prior transaction history for at least 2 qualifying historical undisputed purchases ($\ge 120$ days prior) matching IP address, device fingerprint, or customer credentials.
+- **Thread-Safe Dispute Store & Lifecycle Gateway**: `ChargebackStore` manages secondary indexes by `dispute_id`, `transaction_id`, `scheme_dispute_id`, and `tenant_id` with bounded capacity eviction. `ChargebackManager` enforces network state transition constraints, deadline tracking, audit logging, and evidence attachment.
+- **Continuous Learning Feedback Loop**: When chargebacks reach terminal resolution (`resolved_won`, `resolved_lost`, `accepted_liability`), `publish_feedback_label` converts outcomes into `DelayedLabelRecord` and submits them to `feedback.py` (`LabelIngestionStore`), updating realized precision/recall surveillance and triggering automated model retraining.
+- **API, CLI & Telemetry Integration**: Exposes REST endpoints (`/v1/chargebacks/*`, `/v1/chargebacks/webhook`), Typer CLI commands (`chargeback-ingest`, `chargeback-list`, `chargeback-inspect`, `chargeback-represent`, `chargeback-resolve`), and Prometheus metrics (`fraud_chargebacks_received_total`, `fraud_chargebacks_represented_total`, `fraud_chargebacks_won_total`, `fraud_chargebacks_lost_total`, `fraud_chargeback_financial_exposure_amount`).
+
+
+## Phase 47 — Account Takeover (ATO) Detection, Credential Stuffing Defense & Identity Session Anomaly Engine
+
+Phase 47 introduces an in-process, zero-external-dependency Account Takeover (ATO) Detection, Credential Stuffing Defense, and Identity Session Anomaly Engine (`ato.py`). It analyzes authentication attempts, sensitive account profile mutations (password, email, phone, and MFA resets), device recognition, and impossible travel velocity to prevent account hijacking before fraudulent card charges occur.
+
+```mermaid
+flowchart TD
+    subgraph Authentication & Telemetry Ingestion
+        LoginReq["Login Event\nPOST /v1/ato/login / CLI"] --> Engine["AtoEngine"]
+        ActionReq["Action / Txn Eval\nPOST /v1/ato/evaluate"] --> Engine
+        MutationReq["Profile Mutation\nPOST /v1/ato/accounts/{id}/mutations"] --> Tracker["AccountProfileTracker"]
+    end
+
+    subgraph Multi-Factor ATO Scoring Engine
+        Engine --> Stuffing["CredentialStuffingDetector\n(Sliding Window IP Spraying\nDistributed Brute Force / Subnet Bursts)"]
+        Engine --> Geo["Impossible Travel Calculation\n(Haversine Distance > 800 km/h)"]
+        Engine --> Device["Device Recognition\n(Known Device Fingerprints)"]
+        Engine --> Mutation["Mutation Risk Decay\n(Password/MFA Reset < 1h: +0.40, < 24h: +0.20)"]
+        Engine --> Dormant["Dormancy Spike Detection\n(Inactive > 90 Days Sudden Active)"]
+        Stuffing --> Score["Composite Calibrated Risk Score\n[0.0, 1.0]"]
+        Geo --> Score
+        Device --> Score
+        Mutation --> Score
+        Dormant --> Score
+    end
+
+    subgraph Enforcement & Store
+        Score --> Policy{"Policy Decision"}
+        Policy -->|< 0.40| Allow["ALLOW\nUpdate Profile Baseline"]
+        Policy -->|0.40 - 0.74| Challenge["CHALLENGE\nStep-Up MFA Trigger"]
+        Policy -->|>= 0.75| Quarantine["QUARANTINE_ACCOUNT / BLOCK\nLock User Account & Audit"]
+        Quarantine --> Store[("AtoStore\n(Thread-Safe Multi-Index)")]
+        Allow --> Store
+        Challenge --> Store
+    end
+
+    subgraph Interfaces & Continuous Surveillance
+        Engine -->|Publish ATO_LOGIN_EVALUATED / QUARANTINED| Bus["EventBus"]
+        Store --> API["FastAPI /v1/ato/*\nPrometheus ATO Counters"]
+        Store --> CLI["Typer CLI: ato-login, ato-eval,\nato-inspect, ato-quarantine, ato-release, ato-mutation"]
+    end
+```
+
+### Key Components
+
+- **ATO Risk Factors & Decision Policies (`ato.py`)**: `AtoRiskFactor` categorizes compromise indicators (`NEW_DEVICE`, `IMPOSSIBLE_TRAVEL`, `RECENT_CREDENTIAL_CHANGE`, `RECENT_MFA_RESET`, `CREDENTIAL_STUFFING_BURST`, `PASSWORD_SPRAYING`, `DORMANT_ACCOUNT_REACTIVE`, `ACCOUNT_QUARANTINED`). `AtoAction` provides deterministic enforcement (`ALLOW`, `CHALLENGE`, `QUARANTINE_ACCOUNT`, `BLOCK`).
+- **Sliding-Window Credential Stuffing & Spraying Detection (`CredentialStuffingDetector`)**: Maintains sliding windows of authentication failures across IPs, user accounts, and `/24` or `/48` subnet prefixes to detect distributed password spraying botnets and multi-IP brute force attacks.
+- **Account Behavioral Baselines & Mutation Decay (`AccountProfileTracker`)**: Maintains known device fingerprints, geolocation centroids, dormancy history, and time-decayed penalties for sensitive mutations (e.g., password change within 1 hour adds a severe risk penalty).
+- **Impossible Travel Velocity**: Calculates spherical Haversine distances between sequential user events and computes implied travel speed ($km/h$). Velocities exceeding commercial aircraft thresholds ($800\text{ km/h}$) automatically trigger `IMPOSSIBLE_TRAVEL`.
+- **Thread-Safe ATO Store & EventBus Streaming**: `AtoStore` provides concurrent, multi-indexed storage with capacity eviction. Lifecycle transitions publish domain events (`ATO_LOGIN_EVALUATED`, `ATO_ACCOUNT_QUARANTINED`, `ATO_ACCOUNT_RELEASED`, `ATO_CREDENTIAL_STUFFING_BURST`) across `EventBus`.
+- **API, CLI & Observability**: Exposes FastAPI endpoints (`/v1/ato/login`, `/v1/ato/evaluate`, `/v1/ato/accounts/{user_id}`, `/v1/ato/accounts/{user_id}/mutations`, `/v1/ato/accounts/{user_id}/quarantine`, `/v1/ato/accounts/{user_id}/release`, `/v1/ato/assessments`), Typer CLI subcommands (`ato-login`, `ato-eval`, `ato-inspect`, `ato-quarantine`, `ato-release`, `ato-mutation`), and Prometheus metrics (`fraud_ato_login_attempts_total`, `fraud_ato_risk_assessments_total`, `fraud_ato_quarantines_total`).
+
+
+## Phase 48 — Anti-Money Laundering (AML) Transaction Monitoring, Structuring/Smurfing Detection & Regulatory SAR Engine
+
+Phase 48 introduces an in-process, zero-external-dependency Anti-Money Laundering (AML) Transaction Monitoring, Structuring/Smurfing Detection, Sanction/PEP Screening, and Regulatory Suspicious Activity Report (SAR) Filing Engine (`aml.py`). It enforces Bank Secrecy Act (BSA), FinCEN, and FATF regulatory compliance across payments, card transactions, and account transfers.
+
+```mermaid
+flowchart TD
+    subgraph Ingestion & Screening
+        TxIn["Financial Transaction Event\nPOST /v1/aml/monitor / CLI"] --> AML["AmlEngine"]
+        ScreenReq["Entity Name / PEP Query\nPOST /v1/aml/watchlist/screen"] --> ScreenEngine["WatchlistScreeningEngine\n(Levenshtein, Jaro-Winkler, Soundex)"]
+        ScreenEngine --> AML
+    end
+
+    subgraph AML Typology Detectors
+        AML --> Struct["StructuringDetector\n(Sub-CTR Smurfing Window\n$8,000-$9,999 Cumulative >= $10,000)"]
+        AML --> Layer["LayeringDetector\n(Rapid Flow-Through Inflow/Outflow\nTurnover Ratio > 80% within 4h)"]
+        AML --> Circ["CircularFlowDetector\n(Round-Trip Counterparty Loops\nA -> B -> A within 48h)"]
+        AML --> Juris["HighRiskJurisdictionDetector\n(FATF Blacklist / Graylist Corridors)"]
+        Struct --> Scoring["Calibrated Risk Scorer & Policy Matrix\n[0.0, 1.0]"]
+        Layer --> Scoring
+        Circ --> Scoring
+        Juris --> Scoring
+        ScreenEngine --> Scoring
+    end
+
+    subgraph Policy Routing & Case Escalation
+        Scoring --> Policy{"AML Policy Decision"}
+        Policy -->|< 0.30| Pass["PASS"]
+        Policy -->|0.30 - 0.69| Mon["MONITOR\nLog Alert"]
+        Policy -->|0.70 - 0.84| EDD["ENHANCED_DUE_DILIGENCE\nEscalate Case"]
+        Policy -->|>= 0.85 or Sanction Match| Block["FILE_SAR_BLOCK\nEscalate Priority P1 Case & Draft SAR"]
+        Block --> CaseEscalation["CaseManager\n(Auto-Escalate Cases)"]
+        EDD --> CaseEscalation
+    end
+
+    subgraph Store & Regulatory SAR Packaging
+        AML --> Store[("AmlStore\n(Thread-Safe Multi-Index)")]
+        Store --> SAR["SarManager\n(FinCEN BSA Narrative Generator\nAudit Trail & Status State Machine)"]
+        SAR --> XML["FinCEN XML Export\nGET /v1/aml/sar/{id}/xml"]
+        SAR --> SARAPI["SAR Lifecycle REST & CLI\n(draft -> pending_review -> approved -> filed)"]
+    end
+
+    subgraph Streaming & Observability
+        AML -->|Publish AML Domain Events| Bus["EventBus"]
+        Store --> API["FastAPI /v1/aml/*\n5x Prometheus AML Metrics"]
+        Store --> CLI["Typer CLI: aml-monitor, aml-screen,\naml-alerts, aml-sar-*"]
+    end
+```
+
+### Key Components
+
+- **AML Typologies & Taxonomy (`aml.py`)**: `AmlTypology` models regulatory financial crime patterns (`STRUCTURING_SMURFING`, `RAPID_MOVEMENT_LAYERING`, `ROUND_TRIP_CIRCULAR`, `HIGH_RISK_JURISDICTION`, `SANCTION_PEP_MATCH`). `AmlAction` provides deterministic compliance actions (`PASS`, `MONITOR`, `ENHANCED_DUE_DILIGENCE`, `FILE_SAR_BLOCK`).
+- **Phonetic & Fuzzy Watchlist Screening (`WatchlistScreeningEngine`)**: Zero-dependency string matching using Soundex phonetic encoding, Levenshtein edit distance, Jaro, and Jaro-Winkler prefix-weighted similarity against OFAC SDN, PEP, and FATF watchlists.
+- **Typology Detectors**:
+  - `StructuringDetector`: Detects intentional sub-threshold structuring (e.g. transactions between \$8,000 and \$9,999 aggregating over the \$10,000 Currency Transaction Report threshold in sliding time windows).
+  - `LayeringDetector`: Detects rapid movement of funds where inbound deposits are promptly disbursed to third parties with high turnover ratios (>80%) within short dwell windows (<4h).
+  - `CircularFlowDetector`: Identifies circular round-trip money movement loops between matching counterparties ($A \to B \to A$) within a 48-hour window.
+  - `HighRiskJurisdictionDetector`: Flags transaction corridors involving FATF High-Risk Jurisdictions subject to a Call for Action (Blacklist) and Increased Monitoring (Graylist).
+- **AML Engine & Autonomous Case Escalation (`AmlEngine`)**: Evaluates transactions against all active typologies, aggregates weighted scores into a calibrated composite risk metric, routes policy actions, and auto-escalates high-risk alerts into `CaseManager` investigations.
+- **Regulatory SAR Packaging & Lifecycle (`SarManager`)**: Formulates comprehensive FinCEN/FATF Suspicious Activity Report narratives, maintains strict audit-trailed state transitions (`DRAFT` $\to$ `PENDING_REVIEW` $\to$ `APPROVED` $\to$ `FILED` / `REJECTED`), and exports compliant FinCEN BSA XML representations.
+- **REST API, CLI & Observability**: Exposes FastAPI endpoints (`/v1/aml/monitor`, `/v1/aml/watchlist/screen`, `/v1/aml/alerts`, `/v1/aml/sar`, `/v1/aml/sar/{id}/xml`, `/v1/aml/sar/{id}/status`), Typer CLI subcommands (`aml-monitor`, `aml-screen`, `aml-alerts`, `aml-sar-generate`, `aml-sar-list`, `aml-sar-status`), and Prometheus metrics (`fraud_aml_transactions_monitored_total`, `fraud_aml_alerts_total`, `fraud_aml_sanction_hits_total`, `fraud_aml_sars_created_total`, `fraud_aml_sars_filed_total`).
+
+
+## Phase 49 — Synthetic Identity Fraud (SIF) Detection, PII Inconsistency & Identity Verification Engine
+
+Phase 49 delivers an in-process, zero-external-dependency Synthetic Identity Fraud (SIF) Detection, PII Inconsistency, and Identity Verification Engine (`synthetic_identity.py`). It protects credit card originations and account lifecycle against synthetic identities fabricated by splicing authentic PII (e.g., dormant/minor SSNs) with fabricated personal details, burner phones, and drop addresses.
+
+```mermaid
+flowchart TD
+    subgraph Ingestion
+        AppIn["Credit Applicant Profile\nPOST /v1/sif/evaluate / CLI"] --> SIF["SyntheticIdentityEngine"]
+    end
+
+    subgraph Verification Modules
+        SIF --> SSN["SsnValidator\n(SSA Area Allocations, Group Progression,\nDOB Consistency, Death Master File)"]
+        SIF --> PII["PiiInconsistencyEngine\n(Cross-Profile PII Fragmentation,\nPairwise Fuzzy Similarity)"]
+        SIF --> Trk["SyntheticIdentityTracker\n(Drop Address, Burner Phone, Piggybacking,\nSliding-Window Application Velocity)"]
+        SSN --> Scorer["Calibrated Composite Risk Scorer\n[0.0, 1.0]"]
+        PII --> Scorer
+        Trk --> Scorer
+    end
+
+    subgraph Policy Routing & Ecosystem Integration
+        Scorer --> Policy{"SIF Policy Decision"}
+        Policy -->|< 0.35| Appr["APPROVE (Low Risk)"]
+        Policy -->|0.35 - 0.64| StepUp["STEP_UP_IDENTITY_PROOFING\n(Medium Risk)"]
+        Policy -->|0.65 - 0.84| Review["MANUAL_REVIEW\n(High Risk)"]
+        Policy -->|>= 0.85 or Deceased| Block["DECLINE_BLOCK\n(Critical Risk)"]
+        StepUp --> Challenge["ChallengeManager\n(Issue OTP Challenge)"]
+        Review --> CaseEscalation["CaseManager\n(Create Investigation Case)"]
+    end
+
+    subgraph Store & Observability
+        SIF --> Store[("SyntheticIdentityStore\n(Thread-Safe Multi-Index)")]
+        SIF -->|SIF Domain Events| Bus["EventBus"]
+        Store --> API["FastAPI /v1/sif/*\n4x Prometheus SIF Metrics"]
+        Store --> CLI["Typer CLI: sif-eval, sif-check-ssn,\nsif-inspect, sif-summary"]
+    end
+```
+
+### Key Components
+
+- **SIF Taxonomies & Domain Models (`synthetic_identity.py`)**: `SifRiskLevel` (`LOW`, `MEDIUM`, `HIGH`, `CRITICAL`), `SifAction` (`APPROVE`, `STEP_UP_IDENTITY_PROOFING`, `MANUAL_REVIEW`, `DECLINE_BLOCK`), `SifAnomalyType` (`SSN_DOB_MISMATCH`, `DECEASED_SSN_MATCH`, `INVALID_SSN_STRUCTURE`, `UNISSUED_SSN_AREA`, `SYNTHETIC_VELOCITY_BURST`, `PII_ELEMENT_FRAGMENTATION`, `AUTHORIZED_USER_ABUSE`, `HIGH_RISK_ADDRESS_DROP`, `BURNER_PHONE_DETECTED`), `IdentityProfile`, and `SifAssessment`.
+- **SSA Historical Allocation & Death Master File (`SsnValidator`)**: Implements pre-June 25, 2011 SSA geographical area allocations (001-728), group number issuance progression sequences, Railroad Retirement board cessation (1963) verification, post-2011 randomization checks, and simulated Death Master File (DMF) matching.
+- **PII Element Fragmentation & Fuzzy Inconsistency (`PiiInconsistencyEngine`)**: Evaluates cross-application PII element fragmentation (e.g., stolen SSN paired with conflicting names/DOBs, identical name/DOB paired with differing SSNs, shared contact info across disparate identities) using Jaro-Winkler and Levenshtein similarity distance algorithms.
+- **Velocity, Burner Phone & Piggybacking Surveillance (`SyntheticIdentityTracker`)**: Detects commercial mail drops and PO Boxes, disposable burner and toll-free numbers, authorized user abuse ("credit piggybacking" with multiple unrelated tradelines), and multi-application velocity bursts in sliding time windows.
+- **Synthetic Identity Engine & Policy Decisioning (`SyntheticIdentityEngine`)**: Computes calibrated multi-factor composite risk scores, maps policies to actions, auto-escalates `MANUAL_REVIEW` alerts to `CaseManager`, and routes `STEP_UP_IDENTITY_PROOFING` to `ChallengeManager`.
+- **Thread-Safe Store (`SyntheticIdentityStore`)**: Multi-index storage with capacity eviction supporting lookups by `applicant_id`, `ssn_hash`, `phone`, `email`, and `tenant_id`.
+- **REST API, CLI & Observability**: Exposes FastAPI endpoints (`/v1/sif/evaluate`, `/v1/sif/assessments/{id}`, `/v1/sif/assessments`, `/v1/sif/profiles`, `/v1/sif/applicants/{id}`, `/v1/sif/metrics`), Typer CLI subcommands (`sif-eval`, `sif-check-ssn`, `sif-inspect`, `sif-summary`), and Prometheus metrics (`fraud_sif_evaluations_total`, `fraud_sif_anomalies_total`, `fraud_sif_high_risk_total`, `fraud_sif_blocks_total`).
+
+
 ## Extension guidance
 
 

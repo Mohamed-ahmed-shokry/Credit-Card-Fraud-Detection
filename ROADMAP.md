@@ -53,7 +53,10 @@ and graph feature aggregation (Phase 38), real-time geographic geolocation anoma
 velocity speed-of-travel calculations, and in-process IP geocoding (Phase 39), adaptive
 device and browser fingerprinting with anomaly clustering (Phase 40), real-time merchant
 and MCC risk profiling, chargeback surveillance, and bust-out anomaly detection (Phase 41),
-and multi-tenant policy partitioning, dynamic rule federation, and account isolation (Phase 42).
+and multi-tenant policy partitioning, dynamic rule federation, and account isolation (Phase 42),
+and account takeover (ATO) detection, credential stuffing defense, and identity session anomaly scoring (Phase 47),
+anti-money laundering transaction monitoring, structuring/smurfing detection, and regulatory SAR engine (Phase 48),
+and synthetic identity fraud (SIF) detection, PII inconsistency, and identity verification engine (Phase 49).
 
 ## Phase 1 — Distribution
 
@@ -2211,6 +2214,545 @@ Does not implement external message brokers (Kafka/RabbitMQ/Redis Streams) as ex
 - **Primary Modules**: `src/fraud_detection/events.py`, `src/fraud_detection/pipeline.py`, `src/fraud_detection/api.py`, `src/fraud_detection/cli.py`
 - **Test Modules**: `tests/test_events.py`, `tests/test_pipeline.py`, `tests/test_api.py`, `tests/test_cli.py`
 - **Verification Gates**: 100% Green local CI parity, $\ge 97.0\%$ branch coverage, 0 mypy issues, Ruff formatted, pip-audit clean, wheel build and twine valid.
+
+
+## Phase 44 — Risk-Based Step-Up Authentication & Challenge Orchestration (Done)
+
+### Objective
+
+Deliver an in-process, zero-dependency strong customer authentication (SCA) step-up challenge and 3-D Secure (3DS 2.3) orchestration engine (`challenge.py`) for fraud mitigation friction. Support risk-based friction triggers, cryptographically secure OTP generation, constant-time verification, multi-channel challenge methods (`SMS_OTP`, `EMAIL_OTP`, `TOTP`, `BIOMETRIC_PUSH`, `KBA_SECURITY_QUESTIONS`, `OUT_OF_BAND`), brute-force lockout, rate-limited resends, Decision DAG challenge stage node, EventBus challenge event emission, REST API management (`/v1/challenges/*`), Prometheus telemetry metrics, and CLI inspection tools (`challenge-create`, `challenge-verify`, `challenge-inspect`).
+
+### Scope
+
+1. **Domain Models, Challenge Methods & Status Taxonomy (`challenge.py`)**:
+   - `ChallengeError` hierarchy (`ChallengeSessionNotFoundError`, `ChallengeExpiredError`, `ChallengeLockedOutError`, `ChallengeMaxAttemptsExceededError`, `InvalidChallengeTokenError`, `RateLimitExceededError`).
+   - `ChallengeMethod` (`SMS_OTP`, `EMAIL_OTP`, `TOTP`, `BIOMETRIC_PUSH`, `KBA_SECURITY_QUESTIONS`, `OUT_OF_BAND`).
+   - `ChallengeStatus` (`PENDING`, `VERIFIED`, `FAILED`, `EXPIRED`, `LOCKED_OUT`, `CANCELLED`).
+   - `ChallengeSession`: Immutable record tracking `challenge_id`, `transaction_id`, `user_id`, `tenant_id`, `method`, `target_masked`, `token_hash`, `token_salt`, `attempts_count`, `max_attempts`, `status`, `expires_at`, `created_at`, `verified_at`, `metadata`.
+2. **Cryptographic OTP Generation & Timing-Attack Proof Verification (`challenge.py`)**:
+   - Cryptographically secure pseudorandom token/OTP generation (`secrets.SystemRandom`).
+   - Constant-time HMAC-SHA256 token hashing and verification protecting against side-channel and timing attacks.
+   - Channel destination redaction/masking (e.g., `+1 ***-***-1234` or `u***@example.com`).
+3. **Challenge Policy & Thread-Safe Challenge Manager (`challenge.py`)**:
+   - `ChallengePolicy`: Configurable per-tenant TTL, max attempts, lockout duration, and resend cooldown.
+   - `ChallengeStore`: Bounded, thread-safe session store with multi-index lookup (by session, transaction, and user).
+   - `ChallengeManager`: Session lifecycle management (`create_challenge`, `verify_challenge`, `resend_challenge`, `cancel_challenge`, `prune_expired`).
+4. **Decision DAG & EventBus Integration (`pipeline.py`, `events.py`)**:
+   - Extended `EventType` with `CHALLENGE_ISSUED`, `CHALLENGE_VERIFIED`, `CHALLENGE_FAILED`, `CHALLENGE_EXPIRED`.
+   - `ActionAggregatorStageProcessor` / `ChallengeOrchestratorStageProcessor` issuing challenges when pipeline decision action is `CHALLENGE` or `STEP_UP`.
+   - Automated event broadcasting over `EventBus`.
+5. **FastAPI Serving & Observability (`api.py`)**:
+   - REST endpoints: `POST /v1/challenges`, `GET /v1/challenges/{challenge_id}`, `POST /v1/challenges/{challenge_id}/verify`, `POST /v1/challenges/{challenge_id}/resend`.
+   - Prometheus metrics: `fraud_challenges_issued_total`, `fraud_challenges_verified_total`, `fraud_challenges_failed_total`, `fraud_challenge_verification_duration_seconds`.
+6. **CLI Workflows (`cli.py`)**:
+   - `fraud-detect challenge-create`, `fraud-detect challenge-verify`, `fraud-detect challenge-inspect`.
+
+### Acceptance Criteria
+
+1. **AC-1 (Domain Models & Taxonomy)**: `ChallengeSession`, `ChallengeMethod`, and `ChallengeStatus` validate invariants, payload schema, and raise descriptive domain exceptions on bounds violations.
+2. **AC-2 (Cryptographic OTP & Constant-Time Verification)**: Token generation is cryptographically secure, target destinations are masked, and token verification utilizes constant-time comparison immune to timing attacks.
+3. **AC-3 (Thread-Safe Challenge Manager & Policy Lifecycle)**: `ChallengeManager` enforces TTL expiration, max attempts thresholding, brute-force lockout, and resend cooldown periods across concurrent requests.
+4. **AC-4 (Decision DAG & EventBus Integration)**: Pipeline DAG triggers challenge session generation on `CHALLENGE` actions, attaching challenge metadata to decisions and broadcasting `CHALLENGE_*` events to `EventBus`.
+5. **AC-5 (REST API Endpoints & Telemetry)**: FastAPI exposes `/v1/challenges/*` endpoints for issuance, inspection, verification, and resend, exporting Prometheus metrics and adhering to tenant isolation.
+6. **AC-6 (CLI Workflows)**: CLI commands `challenge-create`, `challenge-verify`, and `challenge-inspect` provide deterministic ASCII table and JSON formatting with standard exit codes.
+7. **AC-7 (Quality Standards & 100% Green CI)**: All local CI-parity checks and remote CI workflow runs pass 100%, branch coverage $\ge 97.0\%$, strict mypy 0 issues, Ruff clean, and build/twine valid.
+
+### Validation & CI Plan
+
+- Local CI-parity commands:
+  - `python -m ruff format --check src tests`
+  - `python -m ruff check src tests`
+  - `python -m mypy src`
+  - `python -m pip_audit --skip-editable`
+  - `python -m pytest --cov=fraud_detection --cov-report=term-missing`
+  - `python -m build` & `python -m twine check dist/*`
+- Remote CI workflow runs monitored via `gh run list` and `gh pr checks`.
+
+### Exclusions
+
+Does not implement telecom SMS/Email carrier gateways (Twilio, SendGrid, etc.) as hard runtime dependencies; provides an in-process, pluggable notification adapter interface with built-in mock/memory carrier for hermetic testing and deterministic verification.
+
+### Micro-Task Breakdown
+
+- [x] Task 1: Create `src/fraud_detection/challenge.py` with domain data models (`ChallengeError` hierarchy, `ChallengeMethod`, `ChallengeStatus`, `ChallengeSession`) and unit tests in `tests/test_challenge.py`.
+- [x] Task 2: Implement cryptographic token generation, masking, and constant-time verification in `src/fraud_detection/challenge.py` with unit tests.
+- [x] Task 3: Implement `ChallengePolicy`, `ChallengeStore`, and `ChallengeManager` with lifecycle enforcement in `src/fraud_detection/challenge.py` with unit tests.
+- [x] Task 4: Integrate Challenge Orchestration into Decision DAG (`pipeline.py`) and EventBus (`events.py`) with unit/integration tests.
+- [x] Task 5: Implement `/v1/challenges/*` REST endpoints and Prometheus metrics in `src/fraud_detection/api.py` with integration tests in `tests/test_api.py`.
+- [x] Task 6: Implement CLI commands `challenge-create`, `challenge-verify`, and `challenge-inspect` in `src/fraud_detection/cli.py` with tests in `tests/test_cli.py`.
+- [x] Task 7: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate with 100% Green CI.
+
+### Delivery Record
+
+- **Delivered**: 2026-11-01
+- **Branch**: `phase/challenge-orchestrator`
+- **Pull Request**: [#25](https://github.com/Mohamed-ahmed-shokry/Credit-Card-Fraud-Detection/pull/25)
+- **Primary Modules**: `src/fraud_detection/challenge.py`, `src/fraud_detection/pipeline.py`, `src/fraud_detection/events.py`, `src/fraud_detection/api.py`, `src/fraud_detection/cli.py`
+- **Test Modules**: `tests/test_challenge.py`, `tests/test_api.py`, `tests/test_cli.py`
+- **Verification Gates**: 100% Green local CI parity, $\ge 97.0\%$ branch coverage, 0 mypy issues, Ruff formatted, pip-audit clean, wheel build and twine valid.
+
+
+## Phase 45 — Fraud Case Management, Investigation SLA Tracking & Dispute Evidence Packaging Engine (Done)
+
+### Objective
+
+Deliver an in-process, zero-dependency Fraud Case Management, Analyst Workflow, SLA Tracking, and Dispute Evidence Packaging Engine (`cases.py`) for operational investigation of suspicious transactions and chargeback representment. Support automated case creation on `REVIEW` or high-friction decisions, case prioritization and SLA timers, analyst assignment, status workflows, audit notes trail, cryptographic dispute evidence packaging (`DisputeEvidencePackage` with SHA-256 fingerprint), Decision DAG and EventBus integration, REST API endpoints (`/v1/cases/*`), Prometheus metrics, and CLI investigation tools (`case-create`, `case-list`, `case-inspect`, `case-resolve`, `case-evidence`).
+
+### Scope
+
+1. **Domain Models, Case Taxonomy & Invariant Lifecycle (`cases.py`)**:
+   - `CasePriority` (`LOW`, `MEDIUM`, `HIGH`, `CRITICAL`) with automatic severity calculation.
+   - `CaseStatus` (`OPEN`, `INVESTIGATING`, `PENDING_CUSTOMER`, `REPRESENTED`, `RESOLVED_FRAUD`, `RESOLVED_LEGITIMATE`, `AUTO_CLOSED`).
+   - `CaseDisposition` (`CONFIRMED_FRAUD`, `FALSE_POSITIVE`, `MERCHANT_ERROR`, `ACCOUNT_TAKEOVER`, `FRIENDLY_FRAUD`, `UNRESOLVED`).
+   - `CaseNote`: Immutable analyst note with `note_id`, `author`, `text`, `timestamp`.
+   - `FraudCase`: Complete data model with `case_id`, `transaction_id`, `tenant_id`, `assigned_analyst`, `status`, `priority`, `fraud_score`, `disposition`, `notes`, `audit_trail`, `created_at`, `updated_at`, `sla_deadline_hours`, `sla_expires_at`, `is_sla_breached`, `metadata`.
+2. **Dispute Evidence Packaging & Cryptographic Hashing (`cases.py`)**:
+   - `DisputeEvidencePackage`: Structured evidence bundle aggregating transaction context, model score, device fingerprint indicators (from `device.py`), geolocation speed-of-travel metrics (from `geolocation.py`), 3DS challenge session verification proof (from `challenge.py`), and customer history.
+   - Deterministic JSON canonicalization and SHA-256 evidence fingerprint generation ensuring tamper-evident integrity for network dispute submission (Visa CE3.0 / Mastercard First-Party Trust).
+3. **Thread-Safe Case Store & Case Manager (`cases.py`)**:
+   - `CaseStore`: Bounded, thread-safe session store with multi-index lookup (by `case_id`, `transaction_id`, `tenant_id`, `status`, `priority`, `assigned_analyst`, and SLA breach).
+   - `CaseManager`: Lifecycle operations: `create_case`, `assign_case`, `update_status`, `add_note`, `resolve_case`, `generate_evidence_package`, `query_sla_breaches`, `get_case_summary`.
+4. **Decision DAG & EventBus Integration (`pipeline.py`, `events.py`)**:
+   - Extended `EventType` with `CASE_CREATED`, `CASE_ASSIGNED`, `CASE_STATUS_CHANGED`, `CASE_RESOLVED`, `EVIDENCE_PACKAGED`.
+   - `ActionAggregatorStageProcessor` issuing automated fraud cases when pipeline decision action is `REVIEW` or friction is triggered and `case_manager` is configured in context metadata.
+   - Automated event broadcasting over `EventBus`.
+5. **FastAPI Serving & Observability (`api.py`)**:
+   - REST endpoints: `POST /v1/cases`, `GET /v1/cases`, `GET /v1/cases/{case_id}`, `PATCH /v1/cases/{case_id}`, `POST /v1/cases/{case_id}/notes`, `POST /v1/cases/{case_id}/resolve`, `GET /v1/cases/{case_id}/evidence`.
+   - Prometheus metrics: `fraud_cases_total`, `fraud_cases_resolved_total`, `fraud_case_sla_breaches_total`, `fraud_evidence_packages_generated_total`.
+6. **CLI Workflows (`cli.py`)**:
+   - `fraud-detect case-create`, `fraud-detect case-list`, `fraud-detect case-inspect`, `fraud-detect case-resolve`, `fraud-detect case-evidence`.
+
+### Acceptance Criteria
+
+1. **AC-1 (Domain Models & Taxonomy)**: `FraudCase`, `CasePriority`, `CaseStatus`, and `CaseDisposition` enforce strict invariants, SLA deadline timestamps, and JSON serialization.
+2. **AC-2 (Dispute Evidence Packaging & SHA-256 Digest)**: `DisputeEvidencePackage` compiles multi-modal evidence across device, geo, 3DS challenge, and model scores into a canonicalized SHA-256 fingerprinted payload.
+3. **AC-3 (Thread-Safe Case Store & Case Manager)**: `CaseManager` and `CaseStore` safely manage concurrent lifecycle state transitions, analyst assignments, notes, resolution dispositions, and SLA breach querying.
+4. **AC-4 (Decision DAG & EventBus Integration)**: Pipeline DAG triggers case creation on `REVIEW` actions and broadcasts domain events (`CASE_CREATED`, `CASE_RESOLVED`, etc.) across `EventBus`.
+5. **AC-5 (REST API Endpoints & Observability)**: FastAPI exposes `/v1/cases/*` endpoints for listing, inspection, status update, note creation, resolution, and evidence dossier export with Prometheus metrics.
+6. **AC-6 (CLI Workflows)**: CLI commands provide robust ASCII table and JSON formatting with standard exit codes for case operations.
+7. **AC-7 (Quality Standards & 100% Green CI)**: All local CI-parity checks and remote CI workflow runs pass 100%, branch coverage $\ge 97.0\%$, strict mypy 0 issues, Ruff clean, and build/twine valid.
+
+### Validation & CI Plan
+
+- Local CI-parity commands:
+  - `python -m ruff format --check src tests`
+  - `python -m ruff check src tests`
+  - `python -m mypy src`
+  - `python -m pip_audit --skip-editable`
+  - `python -m pytest --cov=fraud_detection --cov-report=term-missing`
+  - `python -m build` & `python -m twine check dist/*`
+- Remote CI workflow runs monitored via `gh run list` and `gh pr checks`.
+
+### Exclusions
+
+Does not implement direct merchant payment processor API webhooks for card network portals (e.g. Visa Resolve Online / VROL or Mastercard MasterCom); provides complete, standards-compliant evidence dossiers ready for ingest and transmission by payment adapters.
+
+### Micro-Task Breakdown
+
+- [x] Task 1: Create `src/fraud_detection/cases.py` with domain data models (`CaseError` hierarchy, `CasePriority`, `CaseStatus`, `CaseDisposition`, `CaseNote`, `FraudCase`) and unit tests in `tests/test_cases.py`.
+- [x] Task 2: Implement `DisputeEvidencePackage` compiler and canonical SHA-256 fingerprint generation in `src/fraud_detection/cases.py` with unit tests.
+- [x] Task 3: Implement `CaseStore` and `CaseManager` with lifecycle enforcement, note auditing, and SLA query in `src/fraud_detection/cases.py` with unit tests.
+- [x] Task 4: Integrate Case Management into Decision DAG (`pipeline.py`) and EventBus (`events.py`) with unit/integration tests.
+- [x] Task 5: Implement `/v1/cases/*` REST endpoints and Prometheus metrics in `src/fraud_detection/api.py` with integration tests in `tests/test_api.py`.
+- [x] Task 6: Implement CLI commands `case-create`, `case-list`, `case-inspect`, `case-resolve`, and `case-evidence` in `src/fraud_detection/cli.py` with tests in `tests/test_cli.py`.
+- [x] Task 7: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate with 100% Green CI.
+
+### Delivery record
+
+- Delivered an in-process, zero-dependency Fraud Case Management, Analyst Workflow, SLA Tracking, and Dispute Evidence Packaging Engine (`cases.py`).
+- Implemented `FraudCase`, `CasePriority` (dynamic severity calculation), `CaseStatus` (invariant state machine), `CaseDisposition`, and append-only `CaseNote` models with audit logging.
+- Implemented `DisputeEvidencePackage` with deterministic RFC 8785 canonical JSON formatting and SHA-256 tamper-evident fingerprinting for card network chargeback representment (Visa CE3.0 / Mastercard First-Party Trust).
+- Implemented thread-safe, bounded, multi-index `CaseStore` and `CaseManager` supporting concurrent lifecycle mutations and SLA breach monitoring.
+- Integrated automated case generation into Decision DAG (`ActionAggregatorStageProcessor` in `pipeline.py`) on `REVIEW` decisions and broadcasted domain events (`CASE_CREATED`, `CASE_ASSIGNED`, `CASE_STATUS_CHANGED`, `CASE_RESOLVED`, `EVIDENCE_PACKAGED`) over `EventBus`.
+- Added FastAPI REST endpoints under `/v1/cases/*` for case CRUD, status/priority patching, note logging, resolution, and evidence dossier export with Prometheus metrics.
+- Added Typer CLI commands: `case-create`, `case-list`, `case-inspect`, `case-resolve`, `case-evidence` supporting both JSON and ASCII table outputs.
+- Comprehensive unit and integration test coverage across `tests/test_cases.py`, `tests/test_api.py`, `tests/test_cli.py`, and `tests/test_pipeline.py`.
+
+
+## Phase 46 — Card Scheme Chargeback Ingestion, Reason Code Taxonomy & Automated Representment Gateway (Done)
+
+### Objective
+
+Deliver an in-process, zero-dependency Card Scheme Chargeback Ingestion, Reason Code Taxonomy, and Automated Representment Gateway (`chargeback.py`). Ingest disputes from major card schemes (Visa, Mastercard, Amex, Discover), map scheme-specific dispute reason codes into unified fraud/operational categories, evaluate dispute winnability and liability shift (ECI indicators, 3DS proofs from `challenge.py`, CE3.0 / First-Party Trust qualification), link directly with `CaseManager` and `DisputeEvidencePackage` (`cases.py`), feed verified fraud outcomes into `feedback.py` for model retraining surveillance, broadcast lifecycle events across `EventBus` (`events.py`), expose REST management and webhook endpoints (`api.py`), and provide CLI dispute operations (`cli.py`).
+
+### Scope
+
+1. **Card Scheme Taxonomy & Standardized Reason Code Mappings (`chargeback.py`)**:
+   - `CardScheme`: `VISA`, `MASTERCARD`, `AMEX`, `DISCOVER`, `JCB`.
+   - `ChargebackCategory`: `FRAUD_CARD_NOT_PRESENT`, `FRAUD_CARD_PRESENT`, `FRIENDLY_FRAUD_FIRST_PARTY`, `UNRECOGNIZED_TRANSACTION`, `AUTHORIZATION_ERROR`, `PROCESSING_ERROR`, `CONSUMER_DISPUTE`.
+   - `ChargebackStage`: `RETRIEVAL_REQUEST`, `FIRST_CHARGEBACK`, `PRE_ARBITRATION`, `ARBITRATION`, `REPRESENTED`, `RESOLVED_WON`, `RESOLVED_LOST`, `ACCEPTED_LIABILITY`, `EXPIRED`.
+   - `ReasonCodeRegistry`: Mappings for Visa (e.g. 10.4, 10.5, 13.1), Mastercard (e.g. 4837, 4863, 4853), Amex (e.g. FR2, F29, C08), and Discover (e.g. 7030, 4755) to canonical categories, default deadlines, and evidence requirements.
+2. **Dispute Domain Models & Financial Exposure Tracking (`chargeback.py`)**:
+   - `ChargebackDispute`: Complete record with `dispute_id`, `transaction_id`, `tenant_id`, `scheme`, `scheme_dispute_id`, `reason_code`, `category`, `disputed_amount`, `currency`, `stage`, `filing_date`, `response_deadline`, `is_expired`, `liability_shift_proven`, `winnability_score`, `representment_package_id`, `evidence_fingerprint`, `audit_trail`, `created_at`, `updated_at`.
+   - Representment Viability Engine (`evaluate_representment_viability`): Evaluates winnability score (0.0 to 1.0) and recommended representment action (`SUBMIT_REPRESENTMENT`, `ACCEPT_LIABILITY`, `REQUEST_MORE_INFO`) by assessing:
+     - 3DS liability shift proofs from `challenge.py` (ECI 05/02 or verified session).
+     - Prior customer history (Visa CE3.0 / Mastercard First-Party Trust qualification: >=2 prior undisputed transactions matching device/IP/customer within 120 days).
+     - Compelling evidence availability from `cases.py` (`DisputeEvidencePackage`).
+3. **Thread-Safe Chargeback Store & Gateway Engine (`chargeback.py`)**:
+   - `ChargebackStore`: Bounded in-memory store with indexing by `dispute_id`, `transaction_id`, `tenant_id`, `scheme`, `category`, `stage`, and response deadline expiration.
+   - `ChargebackManager`: Ingestion (`ingest_chargeback`), liability assessment, automated representment compilation (`represent_dispute`), resolution (`resolve_dispute`), and summary metrics.
+4. **Integration with Feedback Ingestion (`feedback.py`) & EventBus (`events.py`)**:
+   - Automated ground-truth feedback ingestion into `feedback.py` (`FeedbackCollector` / `FeedbackIngestion`) on confirmed fraud disputes (`label=1`) or won disputes (`label=0`), updating realized performance surveillance and triggering retraining when drift thresholds are exceeded.
+   - `EventType` extensions: `CHARGEBACK_RECEIVED`, `CHARGEBACK_REPRESENTED`, `CHARGEBACK_RESOLVED_WON`, `CHARGEBACK_RESOLVED_LOST`, `LIABILITY_SHIFT_PROVEN`.
+5. **FastAPI Endpoints & Prometheus Observability (`api.py`)**:
+   - Endpoints: `POST /v1/chargebacks`, `GET /v1/chargebacks`, `GET /v1/chargebacks/summary`, `GET /v1/chargebacks/{dispute_id}`, `POST /v1/chargebacks/{dispute_id}/represent`, `POST /v1/chargebacks/{dispute_id}/resolve`, `POST /v1/chargebacks/webhook`.
+   - Prometheus metrics: `fraud_chargebacks_received_total`, `fraud_chargebacks_represented_total`, `fraud_chargebacks_won_total`, `fraud_chargebacks_lost_total`, `fraud_chargeback_exposure_gauge`.
+6. **CLI Workflows (`cli.py`)**:
+   - `fraud-detect chargeback-ingest`, `fraud-detect chargeback-list`, `fraud-detect chargeback-inspect`, `fraud-detect chargeback-represent`, `fraud-detect chargeback-resolve`.
+
+### Acceptance Criteria
+
+1. **AC-1 (Scheme Taxonomy & Reason Code Registry)**: `CardScheme`, `ChargebackCategory`, `ChargebackStage`, and `ReasonCodeRegistry` correctly parse network-specific reason codes into unified categories and validation rules.
+2. **AC-2 (Dispute Models & Representment Viability Engine)**: `ChargebackDispute` tracks financial exposure and deadlines; `evaluate_representment_viability` accurately calculates winnability score and liability shift based on 3DS verification and CE3.0/First-Party Trust conditions.
+3. **AC-3 (Thread-Safe Chargeback Store & Gateway)**: `ChargebackStore` and `ChargebackManager` safely manage concurrent ingestion, status transitions, evidence linking, and dispute resolution.
+4. **AC-4 (Feedback Ingestion & EventBus Integration)**: Confirmed fraud chargebacks automatically submit realized ground-truth labels to `feedback.py`, and lifecycle transitions publish domain events across `EventBus`.
+5. **AC-5 (REST API Endpoints & Observability)**: FastAPI exposes `/v1/chargebacks/*` and `/v1/chargebacks/webhook` with Prometheus metrics and rate-limiting bypass.
+6. **AC-6 (CLI Workflows)**: Typer CLI exposes `chargeback-*` commands with JSON and table formats and standard exit codes.
+7. **AC-7 (Quality Standards & 100% Green CI)**: All local CI-parity checks and remote CI workflow runs pass 100%, branch coverage >= 97.0%, strict mypy 0 issues, Ruff clean, and build/twine valid.
+
+### Validation & CI Plan
+
+- Local CI-parity commands:
+  - `python -m ruff format --check src tests`
+  - `python -m ruff check src tests`
+  - `python -m mypy src`
+  - `python -m pip_audit --skip-editable`
+  - `python -m pytest --cov=fraud_detection --cov-report=term-missing`
+  - `python -m build` & `python -m twine check dist/*`
+- Remote CI workflow runs monitored via `gh run list` and `gh pr checks`.
+
+### Exclusions
+
+Does not implement proprietary mTLS VPN connections to Visa VROL or Mastercard MasterCom APIs; implements the scheme-compliant data structures, reason code logic, representment decisioning, and webhook receiver ready for production gateway adapters.
+
+### Micro-Task Breakdown
+
+- [x] Task 1: Create `src/fraud_detection/chargeback.py` with domain data models, scheme reason code registry, and unit tests in `tests/test_chargeback.py`.
+- [x] Task 2: Implement representment viability engine (liability shift and CE3.0 / First-Party Trust evaluation) in `src/fraud_detection/chargeback.py` with unit tests.
+- [x] Task 3: Implement `ChargebackStore` and `ChargebackManager` lifecycle engine in `src/fraud_detection/chargeback.py` with unit tests.
+- [x] Task 4: Integrate Chargeback Engine with `feedback.py` (ground truth ingestion) and `events.py` (domain event publishing) with unit/integration tests.
+- [x] Task 5: Implement `/v1/chargebacks/*` REST endpoints, webhook ingestion, and Prometheus metrics in `src/fraud_detection/api.py` with integration tests in `tests/test_api.py`.
+- [x] Task 6: Implement CLI commands `chargeback-ingest`, `chargeback-list`, `chargeback-inspect`, `chargeback-represent`, and `chargeback-resolve` in `src/fraud_detection/cli.py` with tests in `tests/test_cli.py`.
+- [x] Task 7: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate with 100% Green CI.
+
+### Delivered Summary
+
+- Implemented `CardScheme`, `ChargebackCategory`, `ChargebackStage`, `RepresentmentAction`, `ReasonCodeDefinition`, and `ReasonCodeRegistry` in `src/fraud_detection/chargeback.py` covering Visa, Mastercard, American Express, and Discover taxonomies.
+- Implemented `ChargebackDispute` tracking financial exposures, deadlines, audit trail, and `evaluate_representment_viability` decisioning 3DS liability shift and Visa CE3.0 / First-Party Trust qualification with winnability scoring.
+- Implemented thread-safe `ChargebackStore` (with secondary indexing and capacity eviction) and `ChargebackManager` lifecycle transition and financial exposure aggregation engine.
+- Integrated dispute events (`CHARGEBACK_INGESTED`, `CHARGEBACK_REPRESENTED`, `CHARGEBACK_RESOLVED`) into `EventType` and `EventBus` (`events.py`), and wired terminal dispute resolution outcomes directly into feedback `LabelIngestionStore` (`feedback.py`) as `DelayedLabelRecord`.
+- Implemented FastAPI REST endpoints under `/v1/chargebacks/*` and `/v1/chargebacks/webhook` with rate-limiting bypass and Prometheus telemetry (`fraud_chargebacks_received_total`, `fraud_chargebacks_represented_total`, `fraud_chargebacks_won_total`, `fraud_chargebacks_lost_total`, `fraud_chargeback_financial_exposure_amount`).
+- Implemented Typer CLI commands (`chargeback-ingest`, `chargeback-list`, `chargeback-inspect`, `chargeback-represent`, `chargeback-resolve`) with JSON and ASCII table outputs, persistent store support, and standard error handling.
+- Comprehensive test coverage across `tests/test_chargeback.py`, `tests/test_api.py`, and `tests/test_cli.py` with $\ge 97.0\%$ branch coverage.
+
+
+## Phase 47 — Account Takeover (ATO) Detection, Credential Stuffing Defense & Identity Session Anomaly Engine (Done)
+
+### Objective
+
+Deliver an in-process, zero-dependency Account Takeover (ATO) Detection, Credential Stuffing Defense, and Identity Session Anomaly Engine (`ato.py`). Evaluate login attempts, sensitive account profile mutations (password, email, MFA resets), and high-velocity transactional behaviors for compromise indicators. Detect distributed credential stuffing and password spraying attacks across sliding time windows, track account historical baselines (known devices, geolocation centroids, dormancy), enforce automated defense actions (`ALLOW`, `CHALLENGE`, `QUARANTINE_ACCOUNT`, `BLOCK`), integrate with `challenge.py` (step-up MFA orchestration), `cases.py` (automated ATO case investigation), and `events.py` (asynchronous event streaming), expose REST API endpoints with Prometheus metrics (`api.py`), and provide CLI commands (`cli.py`).
+
+### Scope
+
+1. **ATO Domain Models & Risk Factor Taxonomy (`ato.py`)**:
+   - `AtoRiskFactor`: `NEW_DEVICE`, `IMPOSSIBLE_TRAVEL`, `RECENT_CREDENTIAL_CHANGE`, `RECENT_MFA_RESET`, `CREDENTIAL_STUFFING_BURST`, `PASSWORD_SPRAYING`, `DORMANT_ACCOUNT_REACTIVE`, `VELOCITY_SPIKE`.
+   - `AtoAction`: `ALLOW`, `CHALLENGE`, `QUARANTINE_ACCOUNT`, `BLOCK`.
+   - `LoginOutcome`: `SUCCESS`, `FAILED_CREDENTIALS`, `FAILED_MFA`, `BLOCKED`.
+   - `AccountMutationType`: `PASSWORD_CHANGE`, `EMAIL_CHANGE`, `PHONE_CHANGE`, `MFA_RESET`, `SHIPPING_ADDRESS_CHANGE`.
+   - `AccountMutationRecord`: Immutable record of sensitive profile changes with timestamp and channel.
+   - `LoginEvent`: Record of authentication attempts with IP, location, device fingerprint, and outcome.
+   - `AtoRiskAssessment`: Comprehensive evaluation record including calibrated risk score (0.0 to 1.0), recommended action, triggered risk factors, factor breakdown, impossible travel velocity ($km/h$), and quarantine status.
+2. **Credential Stuffing & Password Spraying Detector (`CredentialStuffingDetector` in `ato.py`)**:
+   - Sliding-window tracking of authentication failures across IPs and user accounts.
+   - Distributed spray detection: Single IP failing across $>M$ user accounts within window.
+   - Distributed brute force detection: Single user targeted by $>K$ distinct IPs within window.
+   - Subnet aggregation (`/24` CIDR prefix) for IP rotation botnet defense.
+   - Computes credential stuffing risk contribution ($[0.0, 1.0]$).
+3. **Account Profile & Baseline Tracker (`AccountProfileTracker` in `ato.py`)**:
+   - Maintains user baseline profile: known device fingerprints, historical geo centroids, sensitive mutation history, dormant state, and quarantine lock.
+   - Calculates time-decayed mutation risk (e.g. transaction $<1\text{h}$ after password change $\to$ severe risk penalty).
+   - Manages administrative and automated account quarantine and release lifecycle.
+4. **ATO Scoring Engine & Policy Decisioning (`AtoEngine` in `ato.py`)**:
+   - Synthesizes device recognition (`device.py`), impossible travel speed (`geolocation.py`), mutation decay, dormant reactivation, and stuffing burst indicators.
+   - Deterministic policy routing: low risk $\to$ `ALLOW`, medium risk $\to$ `CHALLENGE`, high risk $\to$ `QUARANTINE_ACCOUNT` / `BLOCK`.
+   - Account quarantine enforcement: immediately blocks transactions from compromised accounts.
+5. **Thread-Safe In-Memory Store & Ecosystem Integration (`AtoStore` in `ato.py`)**:
+   - Thread-safe storage with `threading.RLock()` and secondary indexes by `user_id`, `ip_address`, `tenant_id`, and quarantine status.
+   - EventBus streaming (`events.py`): publishes `ATO_LOGIN_EVALUATED`, `ATO_ACCOUNT_QUARANTINED`, `ATO_ACCOUNT_RELEASED`, `ATO_CREDENTIAL_STUFFING_BURST`.
+   - Case & Challenge triggering: triggers `ChallengeManager` (`challenge.py`) on `CHALLENGE` and `CaseManager` (`cases.py`) on `QUARANTINE_ACCOUNT`.
+6. **FastAPI Endpoints & Prometheus Observability (`api.py`)**:
+   - `POST /v1/ato/login`, `POST /v1/ato/evaluate`, `GET /v1/ato/accounts/{user_id}`, `POST /v1/ato/accounts/{user_id}/quarantine`, `POST /v1/ato/accounts/{user_id}/release`, `POST /v1/ato/accounts/{user_id}/mutations`.
+   - Prometheus metrics: `fraud_ato_login_attempts_total`, `fraud_ato_risk_assessments_total`, `fraud_ato_quarantines_total`, `fraud_ato_stuffing_bursts_total`.
+7. **Typer CLI Workflows (`cli.py`)**:
+   - `fraud-detect ato-login`, `fraud-detect ato-eval`, `fraud-detect ato-inspect`, `fraud-detect ato-quarantine`, `fraud-detect ato-release`, `fraud-detect ato-mutation`.
+
+### Acceptance Criteria
+
+1. **AC-1 (Domain Models & Risk Factor Taxonomy)**: `AtoRiskFactor`, `AtoAction`, `LoginOutcome`, `AccountMutationRecord`, `LoginEvent`, and `AtoRiskAssessment` correctly serialize, validate, and track risk factors.
+2. **AC-2 (Credential Stuffing & Spraying Detection)**: `CredentialStuffingDetector` detects high-frequency distributed spraying across users and brute-force targeting across IPs within configured sliding windows.
+3. **AC-3 (Account Baseline & Mutation Tracking)**: `AccountProfileTracker` tracks known devices, geo centroids, dormant reactivation, and computes time-decayed mutation risk penalties.
+4. **AC-4 (ATO Engine & Policy Decisioning)**: `AtoEngine` calculates calibrated aggregate risk score with explainable breakdown, correctly enforces `ALLOW`, `CHALLENGE`, `QUARANTINE_ACCOUNT`, and `BLOCK` policies, and integrates with `challenge.py` and `cases.py`.
+5. **AC-5 (Thread-Safe Store & EventBus Streaming)**: `AtoStore` provides thread-safe queries and mutations with capacity eviction, and lifecycle transitions publish domain events on `EventBus`.
+6. **AC-6 (REST API & Observability)**: FastAPI exposes `/v1/ato/*` endpoints with Prometheus metrics and rate-limiting enforcement.
+7. **AC-7 (CLI Workflows)**: Typer CLI exposes `ato-*` commands supporting JSON and table formats with standard exit codes.
+8. **AC-8 (Quality Standards & 100% Green CI)**: All local CI-parity checks and remote CI workflow runs pass 100%, branch coverage >= 97.0%, strict mypy 0 issues, Ruff clean, and build/twine valid.
+
+### Validation & CI Plan
+
+- Local CI-parity commands:
+  - `python -m ruff format --check src tests`
+  - `python -m ruff check src tests`
+  - `python -m mypy src`
+  - `python -m pip_audit --skip-editable`
+  - `python -m pytest --cov=fraud_detection --cov-report=term-missing`
+  - `python -m build` & `python -m twine check dist/*`
+- Remote CI workflow runs monitored via `gh run list` and `gh pr checks`.
+
+### Exclusions
+
+Does not implement biometric keystroke dynamics machine learning models; provides deterministic behavioral velocity, impossible travel, device trust scoring, credential stuffing analysis, and profile mutation risk tracking ready for production deployment.
+
+### Micro-Task Breakdown
+
+- [x] Task 1: Create `src/fraud_detection/ato.py` with domain data models, enums, mutation records, and unit tests in `tests/test_ato.py`.
+- [x] Task 2: Implement `CredentialStuffingDetector` (sliding-window IP spraying and distributed brute-force detection) in `src/fraud_detection/ato.py` with unit tests.
+- [x] Task 3: Implement `AccountProfileTracker` (baselines, known devices/locations, mutation decay, quarantine) in `src/fraud_detection/ato.py` with unit tests.
+- [x] Task 4: Implement `AtoEngine` (multi-factor risk scoring, policy evaluation, challenge & case integration) and thread-safe `AtoStore` in `src/fraud_detection/ato.py` with unit tests.
+- [x] Task 5: Integrate ATO Engine with `events.py` (domain events) with unit/integration tests.
+- [x] Task 6: Implement `/v1/ato/*` REST endpoints and Prometheus metrics in `src/fraud_detection/api.py` with integration tests in `tests/test_api.py`.
+- [x] Task 7: Implement CLI commands `ato-login`, `ato-eval`, `ato-inspect`, `ato-quarantine`, `ato-release`, and `ato-mutation` in `src/fraud_detection/cli.py` with tests in `tests/test_cli.py`.
+- [x] Task 8: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate with 100% Green CI.
+
+
+## Phase 48 — Anti-Money Laundering (AML) Transaction Monitoring, Structuring/Smurfing Detection & Regulatory SAR Engine (Done)
+
+Phase 48 implements an in-process, zero-external-dependency Anti-Money Laundering (AML) transaction monitoring and regulatory compliance engine (`aml.py`). It detects money laundering typologies—including structuring/smurfing (amounts just below reporting thresholds), rapid flow-through layering, circular fund movement, and high-risk FATF corridors—screens entities against OFAC/PEP watchlists using phonetic and fuzzy distance algorithms, computes composite AML risk scores, orchestrates compliance case escalation, and automates FinCEN/FATF Suspicious Activity Report (SAR) packaging with audit trails.
+
+### Objective
+
+Provide deterministic, high-throughput AML transaction monitoring, typology detection, sanctions/PEP screening, and automated SAR dossier generation with zero external services.
+
+### Scope
+
+1. **AML Domain Models & Typology Taxonomies (`aml.py`)**:
+   - `AmlTypology`: `STRUCTURING_SMURFING`, `RAPID_MOVEMENT_LAYERING`, `ROUND_TRIP_CIRCULAR`, `SANCTION_PEP_MATCH`, `HIGH_RISK_JURISDICTION`, `HIGH_VELOCITY_BURST`.
+   - `AmlRiskLevel`: `LOW`, `MEDIUM`, `HIGH`, `CRITICAL`.
+   - `AmlAction`: `PASS`, `MONITOR`, `ENHANCED_DUE_DILIGENCE`, `FILE_SAR_BLOCK`.
+   - `SarStatus`: `DRAFT`, `PENDING_REVIEW`, `APPROVED`, `FILED`, `REJECTED`.
+   - `WatchlistType`: `OFAC_SDN`, `PEP`, `FATF_HIGH_RISK`, `LAW_ENFORCEMENT`.
+   - `WatchlistEntry`: In-memory entity with name, aliases, country, and risk tier.
+   - `ScreeningMatch`: Match report with Jaro-Winkler/Levenshtein/Soundex phonetic scores.
+   - `AmlTransactionEvent`: Financial transaction model with direction, counterparty, and currency.
+   - `StructuringAlert`: Sub-threshold aggregation report with sliding window metrics.
+   - `AmlAlert`: Comprehensive detection record with triggered typologies, calibrated risk score, and recommended action.
+   - `SarDossier`: Structured regulatory filing dossier with narrative, suspects, and financial summaries.
+2. **Watchlist & Sanction Screening Engine (`WatchlistScreeningEngine` in `aml.py`)**:
+   - In-memory fuzzy and phonetic matching (Jaro-Winkler, Levenshtein, Soundex) with configurable thresholds.
+   - Support for dynamic addition, removal, and querying of watchlist entities.
+3. **Typology Detection Suite (`StructuringDetector`, `LayeringDetector`, `CircularFlowDetector`, `HighRiskJurisdictionDetector` in `aml.py`)**:
+   - Structuring/Smurfing detector: Sliding window detection of sub-CTR transactions ($8,000–$9,999).
+   - Rapid fund flow / Layering detector: Turnover ratio and dwell-time calculation.
+   - Circular fund flow detector: Direct and intermediary fund loops.
+   - High-risk jurisdiction corridor detector: FATF gray/black list matching.
+4. **AML Scoring Engine & Policy Decisioning (`AmlEngine` in `aml.py`)**:
+   - Calibrated multi-typology composite scoring in $[0.0, 1.0]$.
+   - Deterministic policy routing: `PASS`, `MONITOR`, `ENHANCED_DUE_DILIGENCE`, `FILE_SAR_BLOCK`.
+   - Automatic case escalation with `CaseManager` (`cases.py`).
+5. **SAR Packaging & Compliance Workflow (`SarManager` in `aml.py`)**:
+   - Automated narrative drafting and structured regulatory dossier export.
+   - Compliance review lifecycle state machine (`DRAFT` -> `PENDING_REVIEW` -> `APPROVED` -> `FILED` / `REJECTED`).
+6. **Thread-Safe Store & EventBus Streaming (`AmlStore` in `aml.py`)**:
+   - Concurrently indexed storage with thread locks and bounded capacity eviction.
+   - EventBus domain events: `AML_TRANSACTION_MONITORED`, `AML_ALERT_TRIGGERED`, `AML_SANCTION_MATCH_DETECTED`, `AML_SAR_CREATED`, `AML_SAR_STATUS_UPDATED`.
+7. **FastAPI Endpoints & Prometheus Observability (`api.py`)**:
+   - `/v1/aml/transactions/monitor`, `/v1/aml/watchlist/screen`, `/v1/aml/watchlist/entries`, `/v1/aml/alerts`, `/v1/aml/alerts/{alert_id}`, `/v1/aml/sar/generate`, `/v1/aml/sar`, `/v1/aml/sar/{sar_id}`, `/v1/aml/sar/{sar_id}/status`.
+   - Prometheus metrics: `fraud_aml_transactions_monitored_total`, `fraud_aml_alerts_total`, `fraud_aml_sanction_hits_total`, `fraud_aml_sars_created_total`, `fraud_aml_sars_filed_total`.
+8. **Typer CLI Workflows (`cli.py`)**:
+   - `fraud-detect aml-monitor`, `fraud-detect aml-screen`, `fraud-detect aml-alerts`, `fraud-detect aml-sar-generate`, `fraud-detect aml-sar-list`, `fraud-detect aml-sar-status`.
+
+### Acceptance Criteria
+
+1. **AC-1 (Domain Models & Taxonomies)**: `AmlTypology`, `AmlRiskLevel`, `AmlAction`, `SarStatus`, `WatchlistType`, `WatchlistEntry`, `ScreeningMatch`, `AmlTransactionEvent`, `AmlAlert`, and `SarDossier` serialize and validate cleanly.
+2. **AC-2 (Watchlist & Sanction Fuzzy Screening)**: `WatchlistScreeningEngine` accurately identifies exact, typo, and phonetic matches against OFAC/PEP lists with configurable confidence thresholds.
+3. **AC-3 (Typology Detectors)**: `StructuringDetector`, `LayeringDetector`, `CircularFlowDetector`, and `HighRiskJurisdictionDetector` flag structured sub-threshold bursts, rapid pass-throughs, and looping funds.
+4. **AC-4 (AML Scoring Engine & Case Escalation)**: `AmlEngine` computes calibrated risk scores, enforces action policies, and automatically escalates high-risk alerts to `CaseManager`.
+5. **AC-5 (Regulatory SAR Packaging & Lifecycle)**: `SarManager` compiles narrative dossiers and manages review/filing status transitions with immutable audit history.
+6. **AC-6 (Thread-Safe Store & EventBus Streaming)**: `AmlStore` provides multi-index thread-safe queries, and domain events stream over `EventBus`.
+7. **AC-7 (REST API & Observability)**: FastAPI exposes `/v1/aml/*` endpoints with Prometheus metrics and rate limits.
+8. **AC-8 (CLI Workflows)**: Typer CLI exposes `aml-*` commands supporting table and JSON formats with standard exit codes.
+9. **AC-9 (Quality Standards & 100% Green CI)**: All local CI-parity checks and remote CI workflow runs pass 100%, branch coverage >= 97.0%, strict mypy 0 issues, Ruff clean, and build/twine valid.
+
+### Validation & CI Plan
+
+- Local CI-parity commands:
+  - `python -m ruff format --check src tests`
+  - `python -m ruff check src tests`
+  - `python -m mypy src`
+  - `python -m pytest --cov=fraud_detection --cov-report=term-missing`
+  - `python -m build` & `python -m twine check dist/*`
+- Remote CI workflow runs monitored via `gh run list` and `gh pr checks`.
+
+### Exclusions
+
+Does not connect to external live FinCEN BSA E-Filing REST APIs or real-time paid Swift networks; provides zero-external-dependency self-contained matching algorithms, sliding-window monitoring, and standardized exportable SAR packages.
+
+### Micro-Task Breakdown
+
+- [x] Task 1: Create `src/fraud_detection/aml.py` with domain data models, enums, serialization, and unit tests in `tests/test_aml.py`.
+- [x] Task 2: Implement `WatchlistScreeningEngine` with phonetic (Soundex) and fuzzy distance algorithms (Jaro-Winkler, Levenshtein) in `src/fraud_detection/aml.py` with unit tests.
+- [x] Task 3: Implement AML typology detectors (`StructuringDetector`, `LayeringDetector`, `CircularFlowDetector`, `HighRiskJurisdictionDetector`) in `src/fraud_detection/aml.py` with unit tests.
+- [x] Task 4: Implement `AmlEngine` (scoring, policy routing, case escalation) and thread-safe `AmlStore` in `src/fraud_detection/aml.py` with unit tests.
+- [x] Task 5: Implement `SarManager` (narrative generator, FinCEN/FATF SAR dossier compiler, lifecycle state machine) in `src/fraud_detection/aml.py` with unit tests.
+- [x] Task 6: Integrate AML Engine with `events.py` (domain events) with unit and integration tests.
+- [x] Task 7: Implement `/v1/aml/*` REST endpoints and Prometheus metrics in `src/fraud_detection/api.py` with integration tests in `tests/test_api.py`.
+- [x] Task 8: Implement CLI commands `aml-monitor`, `aml-screen`, `aml-alerts`, `aml-sar-generate`, `aml-sar-list`, and `aml-sar-status` in `src/fraud_detection/cli.py` with tests in `tests/test_cli.py`.
+- [x] Task 9: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate with 100% Green CI.
+
+### Delivery Record
+
+- `6416b3d`: docs(roadmap): define Phase 48 AML transaction monitoring and SAR engine scope
+- `c8bd1c6`: docs(progress): initialize Phase 48 living progress record and decision log
+- `49852b0`: feat(aml): add core AML domain enums and taxonomy models in aml.py
+- `209e9cd`: feat(aml): add domain models and serialization for transactions, alerts, and SAR dossiers
+- `a5fcae2`: test(aml): add unit tests for aml domain models serialization and roundtrips
+- `652735c`: feat(aml): add deserialization methods from_dict for all AML domain models
+- `b277040`: test(aml): add comprehensive roundtrip tests for domain models deserialization
+- `3cf2a56`: feat(aml): implement Soundex phonetic algorithm in aml.py
+- `ab03c08`: feat(aml): implement Levenshtein distance and similarity ratio in aml.py
+- `5646abf`: feat(aml): implement Jaro and Jaro-Winkler string similarity algorithms in aml.py
+- `341146b`: feat(aml): implement thread-safe WatchlistScreeningEngine in aml.py
+- `b912f09`: test(aml): add comprehensive tests for Soundex, Levenshtein, and Jaro-Winkler
+- `9b2d9cf`: test(aml): add unit tests for WatchlistScreeningEngine matching algorithms
+- `44ede43`: feat(aml): implement StructuringDetector for sub-CTR smurfing detection
+- `41d3d31`: feat(aml): implement LayeringDetector for rapid flow-through turnover detection
+- `5065e30`: feat(aml): implement CircularFlowDetector for round-trip counterparty loops
+- `bc83b72`: feat(aml): implement HighRiskJurisdictionDetector for FATF corridors
+- `54d6a16`: test(aml): add unit tests for StructuringDetector, LayeringDetector, CircularFlowDetector, and HighRiskJurisdictionDetector
+- `b820c25`: test(aml): add unit tests for typology alert models serialization and deserialization
+- `d0706cd`: feat(aml): implement thread-safe AmlStore with secondary indexing and capacity eviction
+- `94ab4c9`: feat(events): register AML domain event types in events.py
+- `1f10d8c`: feat(aml): implement AmlEngine composite risk scoring and policy actions
+- `eaad2da`: feat(aml): add automated CaseManager escalation for high-risk AML alerts
+- `477303e`: test(aml): add unit tests for AmlStore, AmlEngine scoring, and case escalation
+- `05391c8`: feat(aml): implement FinCEN/FATF SAR narrative generator in aml.py
+- `62e2863`: feat(aml): implement SarManager lifecycle state machine and FinCEN XML export
+- `f79fc5d`: test(aml): add unit tests for SarManager lifecycle, XML export, and audit trails
+- `bd06625`: test(aml): add unit tests for standalone generate_sar_narrative and transition errors
+- `c8081c1`: test(events): add EventBus integration test for AML domain events
+- `5591793`: docs(progress): mark Task 6 and AC-6 complete in PROGRESS.md
+- `3a5db4c`: feat(api): implement /v1/aml/* REST endpoints and Prometheus metrics
+- `4c7a1e4`: fix(api): specify response_model=None on aml XML endpoint
+- `2af273e`: test(api): add comprehensive integration tests for /v1/aml/* endpoints
+- `73c3267`: docs(progress): mark Task 7 and AC-7 complete in PROGRESS.md
+- `cc0dba9`: feat(cli): add aml-monitor, aml-screen, aml-alerts, aml-sar-* commands
+- `8ecdde3`: feat(aml): add DEFAULT_WATCHLIST_ENTRIES and narrative_summary support in SarManager
+- `1ac7365`: fix(cli): align aml CLI commands with aml domain model attributes and enum values
+- `9b1519c`: test(cli): add comprehensive CLI tests for all aml-* commands and error branches
+- `32149c3`: docs(progress): mark Task 8 and AC-8 complete in PROGRESS.md
+- `39ec6ba`: docs(architecture): document Phase 48 AML engine, typology detectors, and SAR management
+- `cd1ada8`: docs(readme): add Phase 48 AML CLI commands and REST API documentation
+
+
+## Phase 49 — Synthetic Identity Fraud (SIF) Detection, PII Inconsistency & Identity Verification Engine (Done)
+
+Phase 49 implements an in-process, zero-external-dependency Synthetic Identity Fraud (SIF) detection, PII inconsistency, and identity verification engine (`synthetic_identity.py`). It detects synthetic identities fabricated by splicing authentic PII (e.g. dormant or minor SSNs) with synthetic personal details, flags SSN-DOB issuance anomalies against historical SSA issuance tables, detects Death Master File (DMF) deceased identifier matches, identifies rapid PII fragmentation and synthetic velocity clusters across applications, flags credit piggybacking and authorized user exploitation, scores composite SIF risk, and orchestrates identity proofing challenges (`challenge.py`) and compliance case investigations (`cases.py`).
+
+### Objective
+
+Provide deterministic, high-throughput Synthetic Identity Fraud detection, SSN/PII anomaly verification, credit bust-out defense, and policy routing with zero external services.
+
+### Scope
+
+1. **SIF Domain Models & Taxonomies (`synthetic_identity.py`)**:
+   - `SifRiskLevel`: `LOW`, `MEDIUM`, `HIGH`, `CRITICAL`.
+   - `SifAction`: `APPROVE`, `STEP_UP_IDENTITY_PROOFING`, `MANUAL_REVIEW`, `DECLINE_BLOCK`.
+   - `SifAnomalyType`: `SSN_DOB_MISMATCH`, `DECEASED_SSN_MATCH`, `SYNTHETIC_VELOCITY_BURST`, `PII_ELEMENT_FRAGMENTATION`, `AUTHORIZED_USER_ABUSE`, `HIGH_RISK_ADDRESS_DROP`, `BURNER_PHONE_DETECTED`.
+   - `IdentityProfile`: Applicant profile with `applicant_id`, `ssn` (masked/hashed), `first_name`, `last_name`, `dob`, `address`, `phone`, `email`, `authorized_users`, `credit_line_requested`, `metadata`.
+   - `SifAssessment`: Comprehensive assessment with `assessment_id`, `applicant_id`, `risk_score` ($[0.0, 1.0]$), `risk_level`, `action`, `triggered_anomalies`, `anomaly_breakdown`, `identity_fragmentation_score`, `ssn_verification_result`, `timestamp`, `metadata`.
+   - `SsnIssuanceRecord`: Pre-2011 SSA geographical area/group allocation rules and simulated deceased registry.
+2. **SSN & PII Inconsistency Engine (`SsnValidator`, `PiiInconsistencyEngine` in `synthetic_identity.py`)**:
+   - SSA High Group table validation and issuance year vs. applicant birth year consistency checking (detecting impossible SSNs issued before applicant was born or issued after 2011 randomization).
+   - Death Master File (DMF) deceased identifier verification.
+   - PII element fragmentation and pairwise similarity distance (Levenshtein/Jaro-Winkler) across multiple applicant records.
+3. **Synthetic Velocity & Link Cluster Tracker (`SyntheticIdentityTracker` in `synthetic_identity.py`)**:
+   - Sliding-window tracking of PII attributes (SSN, phone, address, email) across applications.
+   - Authorized user abuse ("piggybacking") detection: excessive disparate authorized users on new accounts.
+   - High-risk address drop (commercial mail receiving agencies, PO Boxes) and disposable/burner phone detection.
+4. **Synthetic Identity Scoring Engine & Policy Decisioning (`SyntheticIdentityEngine` in `synthetic_identity.py`)**:
+   - Calibrated multi-factor composite risk scoring in $[0.0, 1.0]$ with explainable contribution breakdown.
+   - Deterministic policy routing: `APPROVE`, `STEP_UP_IDENTITY_PROOFING`, `MANUAL_REVIEW`, `DECLINE_BLOCK`.
+   - Automated case escalation to `CaseManager` (`cases.py`) and step-up challenge to `ChallengeManager` (`challenge.py`).
+5. **Thread-Safe Store & EventBus Streaming (`SyntheticIdentityStore` in `synthetic_identity.py`)**:
+   - Concurrently indexed storage with thread locks, secondary indexes (`applicant_id`, `ssn_hash`, `phone`, `email`), and capacity eviction.
+   - EventBus domain events (`events.py`): `SIF_APPLICATION_EVALUATED`, `SIF_ANOMALY_DETECTED`, `SIF_IDENTITY_CONFIRMED`, `SIF_APPLICATION_DECLINED`.
+6. **FastAPI Endpoints & Prometheus Observability (`api.py`)**:
+   - `/v1/sif/evaluate`, `/v1/sif/assessments/{assessment_id}`, `/v1/sif/applicants/{applicant_id}`, `/v1/sif/profiles`, `/v1/sif/metrics`.
+   - Prometheus metrics: `fraud_sif_evaluations_total`, `fraud_sif_anomalies_total`, `fraud_sif_high_risk_total`, `fraud_sif_blocks_total`.
+7. **Typer CLI Workflows (`cli.py`)**:
+   - `fraud-detect sif-eval`, `fraud-detect sif-inspect`, `fraud-detect sif-check-ssn`, `fraud-detect sif-summary`.
+
+### Acceptance Criteria
+
+1. **AC-1 (Domain Models & Taxonomies)**: `SifRiskLevel`, `SifAction`, `SifAnomalyType`, `IdentityProfile`, and `SifAssessment` validate schemas and serialize/deserialize cleanly with roundtrip fidelity.
+2. **AC-2 (SSN Validation & DMF Screening)**: `SsnValidator` accurately validates SSA area/group rules, flags birth-year vs issuance-year impossibilities, and matches deceased registries.
+3. **AC-3 (PII Inconsistency & Fragmentation)**: `PiiInconsistencyEngine` detects fragmented identities, cross-matched PII elements, and subtle typographical variations across multiple applications.
+4. **AC-4 (Synthetic Velocity & Abuse Tracking)**: `SyntheticIdentityTracker` tracks sliding-window velocity bursts, detects burner phones and address drops, and flags authorized user piggybacking.
+5. **AC-5 (SIF Scoring Engine & Policy Routing)**: `SyntheticIdentityEngine` computes calibrated composite risk scores and routes decisions to `APPROVE`, `STEP_UP_IDENTITY_PROOFING`, `MANUAL_REVIEW`, and `DECLINE_BLOCK` with automated `cases.py` and `challenge.py` escalation.
+6. **AC-6 (Thread-Safe Store & EventBus Streaming)**: `SyntheticIdentityStore` provides concurrent multi-index lookups with capacity eviction, and lifecycle transitions emit events over `EventBus`.
+7. **AC-7 (REST API & Observability)**: FastAPI exposes `/v1/sif/*` endpoints with Prometheus metrics and rate limits.
+8. **AC-8 (CLI Workflows)**: Typer CLI exposes `sif-*` commands supporting table and JSON formats with standard exit codes.
+9. **AC-9 (Quality Standards & 100% Green CI)**: All local CI-parity checks and remote CI workflow runs pass 100%, branch coverage >= 97.0%, strict mypy 0 issues, Ruff clean, and build/twine valid.
+
+### Validation & CI Plan
+
+- Local CI-parity commands:
+  - `python -m ruff format --check src tests`
+  - `python -m ruff check src tests`
+  - `python -m mypy src`
+  - `python -m pytest --cov=fraud_detection --cov-report=term-missing`
+  - `python -m build` & `python -m twine check dist/*`
+- Remote CI workflow runs monitored via `gh run list` and `gh pr checks`.
+
+### Exclusions
+
+Does not query live paid credit bureau APIs (Experian, TransUnion, Equifax) or federal e-Verify APIs requiring live government credentials; provides an in-process, zero-external-dependency algorithmic engine, SSA issuance tables, and simulated DMF database with deterministic verification.
+
+### Micro-Task Breakdown
+
+- [x] Task 1: Create `src/fraud_detection/synthetic_identity.py` with domain data models, enums, serialization, and unit tests in `tests/test_synthetic_identity.py`.
+- [x] Task 2: Implement `SsnValidator` (SSA issuance table, DOB mismatch, Death Master File checking) in `src/fraud_detection/synthetic_identity.py` with unit tests.
+- [x] Task 3: Implement `PiiInconsistencyEngine` (PII element fragmentation, cross-element similarity) in `src/fraud_detection/synthetic_identity.py` with unit tests.
+- [x] Task 4: Implement `SyntheticIdentityTracker` (sliding-window velocity, burner phone/drop address detection, authorized user piggybacking) in `src/fraud_detection/synthetic_identity.py` with unit tests.
+- [x] Task 5: Implement `SyntheticIdentityEngine` (composite scoring, policy routing, case/challenge escalation) and thread-safe `SyntheticIdentityStore` in `src/fraud_detection/synthetic_identity.py` with unit tests.
+- [x] Task 6: Integrate SIF Engine with `events.py` (domain events) with unit and integration tests.
+- [x] Task 7: Implement `/v1/sif/*` REST endpoints and Prometheus metrics in `src/fraud_detection/api.py` with integration tests in `tests/test_api.py`.
+- [x] Task 8: Implement CLI commands `sif-eval`, `sif-inspect`, `sif-check-ssn`, and `sif-summary` in `src/fraud_detection/cli.py` with tests in `tests/test_cli.py`.
+- [x] Task 9: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate with 100% Green CI.
+
+### Delivery Record
+
+- `a3b67fc`: docs(roadmap): define Phase 49 synthetic identity fraud detection scope
+- `e79ff9b`: docs(progress): initialize Phase 49 living progress record and decision log
+- `c213ac3`: feat(sif): add core domain enums for synthetic identity detection
+- `07a9fa1`: feat(sif): add domain models and serialization for profiles, assessments, and ssn results
+- `6846548`: docs(progress): mark Task 1 and AC-1 complete in PROGRESS.md
+- `17884aa`: feat(sif): implement SsnValidator with SSA allocation history and death registries
+- `62c1d39`: docs(progress): mark Task 2 and AC-2 complete in PROGRESS.md
+- `f12c6fb`: feat(sif): implement PiiInconsistencyEngine for element fragmentation and cross-profile similarity
+- `ab44ee7`: docs(progress): mark Task 3 and AC-3 complete in PROGRESS.md
+- `4293932`: feat(sif): implement SyntheticIdentityTracker for velocity bursts, drop addresses, and piggybacking
+- `4f5ad86`: docs(progress): mark Task 4 and AC-4 complete in PROGRESS.md
+- `84419d5`: feat(sif): implement SyntheticIdentityStore and SyntheticIdentityEngine with policy routing
+- `b38c1cf`: docs(progress): mark Task 5 and AC-5 complete in PROGRESS.md
+- `467a2d8`: feat(sif): integrate synthetic identity engine with EventBus and register domain events
+- `a4e14a6`: docs(progress): mark Task 6 and AC-6 complete in PROGRESS.md
+- `c8aad10`: feat(api): implement /v1/sif/* REST endpoints and Prometheus metrics
+- `62576e0`: docs(progress): mark Task 7 and AC-7 complete in PROGRESS.md
+- `2c62ed0`: feat(cli): add sif-eval, sif-check-ssn, sif-inspect, and sif-summary commands
+- `e053a3c`: docs(progress): mark Task 8 and AC-8 complete in PROGRESS.md
+- `15030be`: docs: document Phase 49 synthetic identity engine architecture and CLI/API workflows
+- `e489a58`: docs(roadmap): mark Phase 49 completed and record micro-commits
+- `c392ca4`: test(sif): expand branch coverage for edge cases, store eviction, and drop addresses
 
 
 ## Contributing to the roadmap

@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import statistics
 import subprocess
 import time
 import urllib.error
 import urllib.request
+from collections import defaultdict
 from pathlib import Path
 from typing import Annotated, Any, NoReturn, cast
 from uuid import uuid4
@@ -18,6 +20,32 @@ import typer
 import uvicorn
 
 from fraud_detection import __version__
+from fraud_detection.aml import (
+    DEFAULT_WATCHLIST_ENTRIES,
+    AmlAlert,
+    AmlEngine,
+    AmlRiskLevel,
+    AmlStore,
+    AmlTransactionEvent,
+    AmlTypology,
+    SarDossier,
+    SarManager,
+    SarStatus,
+    TransactionDirection,
+    WatchlistEntry,
+    WatchlistScreeningEngine,
+)
+from fraud_detection.ato import (
+    AccountMutationRecord,
+    AccountMutationType,
+    AccountProfile,
+    AccountProfileTracker,
+    AtoEngine,
+    AtoRiskAssessment,
+    AtoStore,
+    LoginEvent,
+    LoginOutcome,
+)
 from fraud_detection.audit import (
     JsonlAuditSink,
     backtest_audit_policy,
@@ -26,6 +54,30 @@ from fraud_detection.audit import (
     build_promotion_audit_event,
     build_scoring_audit_event,
     replay_audit_log,
+)
+from fraud_detection.cases import (
+    CaseDisposition,
+    CaseError,
+    CaseManager,
+    CasePriority,
+    CaseStore,
+    FraudCase,
+)
+from fraud_detection.challenge import (
+    ChallengeError,
+    ChallengeManager,
+    ChallengeMethod,
+    ChallengePolicy,
+    ChallengeSession,
+    ChallengeStore,
+)
+from fraud_detection.chargeback import (
+    CardScheme,
+    ChargebackDispute,
+    ChargebackError,
+    ChargebackManager,
+    ChargebackStage,
+    ChargebackStore,
 )
 from fraud_detection.data import (
     DEFAULT_TARGET,
@@ -180,6 +232,13 @@ from fraud_detection.signing import (
     load_public_key,
     verify_attestation_signature,
     write_keypair,
+)
+from fraud_detection.synthetic_identity import (
+    IdentityProfile,
+    SifAssessment,
+    SsnValidator,
+    SyntheticIdentityEngine,
+    SyntheticIdentityStore,
 )
 from fraud_detection.tenant import (
     RuleInheritanceMode,
@@ -8574,6 +8633,2324 @@ def webhook_replay_dlq(
         "failed_count": failed,
     }
     typer.echo(json.dumps(summary, indent=2))
+
+
+@app.command("challenge-create")
+def challenge_create(
+    transaction_id: Annotated[
+        str,
+        typer.Option(
+            "--transaction-id",
+            "-x",
+            help="Unique transaction ID requiring step-up challenge.",
+        ),
+    ],
+    user_id: Annotated[
+        str,
+        typer.Option(
+            "--user-id",
+            "-u",
+            help="User identifier associated with the transaction.",
+        ),
+    ],
+    destination: Annotated[
+        str,
+        typer.Option(
+            "--destination",
+            "-d",
+            help="Destination phone number or email address for OTP delivery.",
+        ),
+    ],
+    tenant_id: Annotated[
+        str,
+        typer.Option(
+            "--tenant-id",
+            "-t",
+            help="Tenant identifier.",
+        ),
+    ] = "default",
+    method: Annotated[
+        str,
+        typer.Option(
+            "--method",
+            "-m",
+            help="Challenge method (sms_otp, email_otp, totp, biometric_push).",
+        ),
+    ] = "sms_otp",
+    ttl_seconds: Annotated[
+        int,
+        typer.Option(
+            "--ttl-seconds",
+            help="Challenge session lifetime in seconds.",
+        ),
+    ] = 300,
+    store_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--store-file",
+            "-s",
+            help="Optional path to persistent JSON file to append session record.",
+        ),
+    ] = None,
+    output_format: Annotated[
+        str,
+        typer.Option(
+            "--format",
+            "-f",
+            help="Output format: 'json' or 'table'.",
+        ),
+    ] = "json",
+) -> None:
+    """Issue a new step-up authentication challenge for a friction decision."""
+    try:
+        method_enum = ChallengeMethod(method)
+    except ValueError:
+        valid_opts = [m.value for m in ChallengeMethod]
+        _abort(f"Invalid challenge method '{method}'. Valid options: {valid_opts}")
+
+    policy = ChallengePolicy(default_ttl_seconds=ttl_seconds)
+    manager = ChallengeManager(policy=policy)
+
+    try:
+        session, raw_token = manager.create_challenge(
+            transaction_id=transaction_id,
+            user_id=user_id,
+            tenant_id=tenant_id,
+            destination=destination,
+            method=method_enum,
+        )
+    except (ChallengeError, ValueError) as exc:
+        _abort(f"Failed to create challenge: {exc}")
+
+    if store_file is not None:
+        try:
+            records: list[dict[str, Any]] = []
+            if store_file.is_file():
+                raw = store_file.read_text(encoding="utf-8")
+                records = json.loads(raw) if raw.strip() else []
+                if not isinstance(records, list):
+                    records = []
+            records.append(session.to_dict())
+            _atomic_write_text(json.dumps(records, indent=2), store_file)
+        except (OSError, json.JSONDecodeError) as exc:
+            _abort(f"Failed to persist challenge session to store file: {exc}")
+
+    output_data = {
+        "challenge_id": session.challenge_id,
+        "transaction_id": session.transaction_id,
+        "user_id": session.user_id,
+        "tenant_id": session.tenant_id,
+        "method": session.method.value,
+        "target_masked": session.target_masked,
+        "status": session.status.value,
+        "raw_token": raw_token,
+        "expires_at": session.expires_at,
+        "created_at": session.created_at,
+    }
+
+    if output_format.lower() == "table":
+        typer.echo(f"Challenge ID:    {output_data['challenge_id']}")
+        typer.echo(f"Transaction ID:  {output_data['transaction_id']}")
+        typer.echo(f"User ID:         {output_data['user_id']}")
+        typer.echo(f"Tenant ID:       {output_data['tenant_id']}")
+        typer.echo(f"Method:          {output_data['method']}")
+        typer.echo(f"Target Masked:   {output_data['target_masked']}")
+        typer.echo(f"Status:          {output_data['status']}")
+        typer.echo(f"Issued OTP:      {output_data['raw_token']}")
+        typer.echo(f"Expires At:      {output_data['expires_at']}")
+    else:
+        typer.echo(json.dumps(output_data, indent=2))
+
+
+@app.command("challenge-verify")
+def challenge_verify(
+    store_file: Annotated[
+        Path,
+        typer.Option(
+            "--store-file",
+            "-s",
+            help="Path to JSON file containing challenge session records.",
+        ),
+    ],
+    challenge_id: Annotated[
+        str,
+        typer.Option(
+            "--challenge-id",
+            "-c",
+            help="Challenge ID to verify.",
+        ),
+    ],
+    token: Annotated[
+        str,
+        typer.Option(
+            "--token",
+            help="Candidate token entered by the user.",
+        ),
+    ],
+    output_format: Annotated[
+        str,
+        typer.Option(
+            "--format",
+            "-f",
+            help="Output format: 'json' or 'table'.",
+        ),
+    ] = "json",
+) -> None:
+    """Verify an entered OTP token against a stored challenge session."""
+    if not store_file.is_file():
+        _abort(f"Store file not found: {store_file}")
+
+    try:
+        raw = store_file.read_text(encoding="utf-8")
+        records = json.loads(raw)
+        if not isinstance(records, list):
+            _abort("Invalid store file format: expected a JSON array of session objects.")
+    except (OSError, json.JSONDecodeError) as exc:
+        _abort(f"Could not read store file: {exc}")
+
+    matching_idx = None
+    target_session = None
+    for idx, item in enumerate(records):
+        if isinstance(item, dict) and item.get("challenge_id") == challenge_id:
+            matching_idx = idx
+            target_session = ChallengeSession.from_dict(item)
+            break
+
+    if target_session is None or matching_idx is None:
+        _abort(f"Challenge session '{challenge_id}' not found in store file.")
+
+    store = ChallengeStore()
+    store.put(target_session)
+    manager = ChallengeManager(store=store)
+
+    success = False
+    error_msg = None
+    try:
+        updated_session = manager.verify_challenge(challenge_id, token)
+        success = True
+        records[matching_idx] = updated_session.to_dict()
+        _atomic_write_text(json.dumps(records, indent=2), store_file)
+    except ChallengeError as exc:
+        records[matching_idx] = target_session.to_dict()
+        with contextlib.suppress(OSError):
+            _atomic_write_text(json.dumps(records, indent=2), store_file)
+        error_msg = str(exc)
+
+    summary = {
+        "challenge_id": challenge_id,
+        "verified": success,
+        "status": target_session.status.value,
+        "attempts_count": target_session.attempts_count,
+        "max_attempts": target_session.max_attempts,
+        "error": error_msg,
+    }
+
+    if output_format.lower() == "table":
+        typer.echo(f"Challenge ID:  {summary['challenge_id']}")
+        typer.echo(f"Verified:      {summary['verified']}")
+        typer.echo(f"Status:        {summary['status']}")
+        typer.echo(f"Attempts:      {summary['attempts_count']}/{summary['max_attempts']}")
+        if error_msg:
+            typer.echo(f"Error:         {error_msg}")
+    else:
+        typer.echo(json.dumps(summary, indent=2))
+
+    if not success:
+        raise typer.Exit(code=1)
+
+
+@app.command("challenge-inspect")
+def challenge_inspect(
+    store_file: Annotated[
+        Path,
+        typer.Option(
+            "--store-file",
+            "-s",
+            help="Path to JSON file containing challenge session records.",
+        ),
+    ],
+    challenge_id: Annotated[
+        str | None,
+        typer.Option(
+            "--challenge-id",
+            "-c",
+            help="Specific challenge ID to inspect.",
+        ),
+    ] = None,
+    tenant_id: Annotated[
+        str | None,
+        typer.Option(
+            "--tenant-id",
+            "-t",
+            help="Filter by tenant ID.",
+        ),
+    ] = None,
+    output_format: Annotated[
+        str,
+        typer.Option(
+            "--format",
+            "-f",
+            help="Output format: 'json' or 'table'.",
+        ),
+    ] = "json",
+) -> None:
+    """Inspect stored challenge sessions from a session store file."""
+    if not store_file.is_file():
+        _abort(f"Store file not found: {store_file}")
+
+    try:
+        raw = store_file.read_text(encoding="utf-8")
+        records = json.loads(raw)
+        if not isinstance(records, list):
+            _abort("Invalid store file format: expected a JSON array of session objects.")
+    except (OSError, json.JSONDecodeError) as exc:
+        _abort(f"Could not read store file: {exc}")
+
+    matched: list[dict[str, Any]] = []
+    for item in records:
+        if not isinstance(item, dict):
+            continue
+        if challenge_id and item.get("challenge_id") != challenge_id:
+            continue
+        if tenant_id and item.get("tenant_id") != tenant_id:
+            continue
+        matched.append(item)
+
+    if challenge_id and not matched:
+        _abort(f"Challenge session '{challenge_id}' not found.")
+
+    if output_format.lower() == "table":
+        if not matched:
+            typer.echo("No challenge sessions found.")
+            return
+        header = (
+            f"{'CHALLENGE ID':<36}  {'TENANT':<12}  {'USER':<12}  "
+            f"{'METHOD':<10}  {'STATUS':<10}  {'ATTEMPTS':<8}"
+        )
+        typer.echo(header)
+        typer.echo("-" * len(header))
+        for m in matched:
+            att = f"{m.get('attempts_count', 0)}/{m.get('max_attempts', 3)}"
+            typer.echo(
+                f"{m.get('challenge_id', ''):<36}  {m.get('tenant_id', ''):<12}  "
+                f"{m.get('user_id', ''):<12}  {m.get('method', ''):<10}  "
+                f"{m.get('status', ''):<10}  {att}"
+            )
+    else:
+        typer.echo(json.dumps({"total_count": len(matched), "challenges": matched}, indent=2))
+
+
+@app.command("case-create")
+def case_create(
+    transaction_id: Annotated[
+        str,
+        typer.Option(
+            "--transaction-id",
+            "-x",
+            help="Transaction identifier to investigate.",
+        ),
+    ],
+    amount: Annotated[
+        float,
+        typer.Option(
+            "--amount",
+            "-a",
+            help="Transaction amount.",
+        ),
+    ] = 0.0,
+    currency: Annotated[
+        str,
+        typer.Option(
+            "--currency",
+            "-c",
+            help="Transaction currency (e.g. USD, EUR).",
+        ),
+    ] = "USD",
+    fraud_score: Annotated[
+        float,
+        typer.Option(
+            "--fraud-score",
+            help="Model predicted fraud probability (0.0 to 1.0).",
+        ),
+    ] = 0.0,
+    tenant_id: Annotated[
+        str,
+        typer.Option(
+            "--tenant-id",
+            "-t",
+            help="Tenant identifier.",
+        ),
+    ] = "default",
+    priority: Annotated[
+        str | None,
+        typer.Option(
+            "--priority",
+            "-p",
+            help="Case priority (low, medium, high, critical).",
+        ),
+    ] = None,
+    sla_hours: Annotated[
+        float,
+        typer.Option(
+            "--sla-hours",
+            help="SLA deadline in hours.",
+        ),
+    ] = 24.0,
+    analyst: Annotated[
+        str | None,
+        typer.Option(
+            "--assign",
+            "-u",
+            help="Analyst identifier to assign.",
+        ),
+    ] = None,
+    store_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--store-file",
+            "-s",
+            help="Optional path to persistent JSON file to append case record.",
+        ),
+    ] = None,
+    output_format: Annotated[
+        str,
+        typer.Option(
+            "--format",
+            "-f",
+            help="Output format: 'json' or 'table'.",
+        ),
+    ] = "json",
+) -> None:
+    """Create a new fraud investigation case."""
+    prio_enum = None
+    if priority:
+        try:
+            prio_enum = CasePriority(priority)
+        except ValueError:
+            valid_opts = [p.value for p in CasePriority]
+            _abort(f"Invalid case priority '{priority}'. Valid options: {valid_opts}")
+
+    store = CaseStore()
+    manager = CaseManager(store=store)
+
+    try:
+        case = manager.create_case(
+            transaction_id=transaction_id,
+            fraud_score=fraud_score,
+            amount=amount,
+            currency=currency,
+            tenant_id=tenant_id,
+            priority=prio_enum,
+            sla_deadline_hours=sla_hours,
+            auto_assign=analyst,
+        )
+    except CaseError as exc:
+        _abort(f"Failed to create case: {exc}")
+
+    if store_file is not None:
+        try:
+            records: list[dict[str, Any]] = []
+            if store_file.is_file():
+                raw = store_file.read_text(encoding="utf-8")
+                records = json.loads(raw) if raw.strip() else []
+                if not isinstance(records, list):
+                    records = []
+            records.append(case.to_dict())
+            _atomic_write_text(json.dumps(records, indent=2), store_file)
+        except (OSError, json.JSONDecodeError) as exc:
+            _abort(f"Failed to persist case to store file: {exc}")
+
+    if output_format.lower() == "table":
+        typer.echo(f"Case ID:        {case.case_id}")
+        typer.echo(f"Transaction ID: {case.transaction_id}")
+        typer.echo(f"Tenant ID:      {case.tenant_id}")
+        typer.echo(f"Status:         {case.status.value}")
+        typer.echo(f"Priority:       {case.priority.value}")
+        typer.echo(f"Amount:         {case.amount} {case.currency}")
+        typer.echo(f"Fraud Score:    {case.fraud_score}")
+        typer.echo(f"Assigned To:    {case.assigned_analyst or 'Unassigned'}")
+        typer.echo(f"SLA Deadline:   {case.sla_expires_at}")
+    else:
+        typer.echo(json.dumps(case.to_dict(), indent=2))
+
+
+@app.command("case-list")
+def case_list(
+    store_file: Annotated[
+        Path,
+        typer.Option(
+            "--store-file",
+            "-s",
+            help="Path to JSON file containing case records.",
+        ),
+    ],
+    tenant_id: Annotated[
+        str | None,
+        typer.Option(
+            "--tenant-id",
+            "-t",
+            help="Filter by tenant ID.",
+        ),
+    ] = None,
+    status: Annotated[
+        str | None,
+        typer.Option(
+            "--status",
+            help="Filter by case status.",
+        ),
+    ] = None,
+    priority: Annotated[
+        str | None,
+        typer.Option(
+            "--priority",
+            "-p",
+            help="Filter by case priority.",
+        ),
+    ] = None,
+    analyst: Annotated[
+        str | None,
+        typer.Option(
+            "--analyst",
+            "-u",
+            help="Filter by assigned analyst.",
+        ),
+    ] = None,
+    sla_breached_only: Annotated[
+        bool,
+        typer.Option(
+            "--sla-breached-only",
+            help="Filter to show only SLA breached cases.",
+        ),
+    ] = False,
+    output_format: Annotated[
+        str,
+        typer.Option(
+            "--format",
+            "-f",
+            help="Output format: 'json' or 'table'.",
+        ),
+    ] = "json",
+) -> None:
+    """List stored fraud cases with optional multi-criteria filters."""
+    if not store_file.is_file():
+        _abort(f"Store file not found: {store_file}")
+
+    try:
+        raw = store_file.read_text(encoding="utf-8")
+        records = json.loads(raw)
+        if not isinstance(records, list):
+            _abort("Invalid store file format: expected a JSON array of case objects.")
+    except (OSError, json.JSONDecodeError) as exc:
+        _abort(f"Could not read store file: {exc}")
+
+    matched: list[dict[str, Any]] = []
+    for item in records:
+        if not isinstance(item, dict):
+            continue
+        if tenant_id and item.get("tenant_id") != tenant_id:
+            continue
+        if status and str(item.get("status", "")).upper() != status.upper():
+            continue
+        if priority and str(item.get("priority", "")).upper() != priority.upper():
+            continue
+        if analyst and item.get("assigned_analyst") != analyst:
+            continue
+        if sla_breached_only and not item.get("is_sla_breached"):
+            continue
+        matched.append(item)
+
+    if output_format.lower() == "table":
+        if not matched:
+            typer.echo("No fraud cases found.")
+            return
+        header = (
+            f"{'CASE ID':<18}  {'TENANT':<12}  {'PRIORITY':<10}  "
+            f"{'STATUS':<14}  {'AMOUNT':<10}  {'ANALYST':<14}  {'BREACHED':<8}"
+        )
+        typer.echo(header)
+        typer.echo("-" * len(header))
+        for m in matched:
+            c_id = str(m.get("case_id", ""))
+            t_id = str(m.get("tenant_id", ""))
+            p_val = str(m.get("priority", ""))
+            s_val = str(m.get("status", ""))
+            amt = f"{m.get('amount', 0.0):.2f}"
+            ans = str(m.get("assigned_analyst") or "None")
+            br = "YES" if m.get("is_sla_breached") else "NO"
+            typer.echo(
+                f"{c_id:<18}  {t_id:<12}  {p_val:<10}  {s_val:<14}  {amt:<10}  {ans:<14}  {br:<8}"
+            )
+    else:
+        typer.echo(json.dumps({"total_count": len(matched), "cases": matched}, indent=2))
+
+
+@app.command("case-inspect")
+def case_inspect(
+    store_file: Annotated[
+        Path,
+        typer.Option(
+            "--store-file",
+            "-s",
+            help="Path to JSON file containing case records.",
+        ),
+    ],
+    case_id: Annotated[
+        str,
+        typer.Option(
+            "--case-id",
+            "-c",
+            help="Case ID to inspect.",
+        ),
+    ],
+    output_format: Annotated[
+        str,
+        typer.Option(
+            "--format",
+            "-f",
+            help="Output format: 'json' or 'table'.",
+        ),
+    ] = "json",
+) -> None:
+    """Inspect full details, notes, and audit history of a fraud case."""
+    if not store_file.is_file():
+        _abort(f"Store file not found: {store_file}")
+
+    try:
+        raw = store_file.read_text(encoding="utf-8")
+        records = json.loads(raw)
+        if not isinstance(records, list):
+            _abort("Invalid store file format: expected a JSON array of case objects.")
+    except (OSError, json.JSONDecodeError) as exc:
+        _abort(f"Could not read store file: {exc}")
+
+    target: dict[str, Any] | None = None
+    for item in records:
+        if isinstance(item, dict) and item.get("case_id") == case_id:
+            target = item
+            break
+
+    if target is None:
+        _abort(f"Case '{case_id}' not found in store file.")
+
+    if output_format.lower() == "table":
+        typer.echo(f"Case ID:        {target.get('case_id')}")
+        typer.echo(f"Transaction ID: {target.get('transaction_id')}")
+        typer.echo(f"Tenant ID:      {target.get('tenant_id')}")
+        typer.echo(f"Status:         {target.get('status')}")
+        typer.echo(f"Priority:       {target.get('priority')}")
+        typer.echo(f"Disposition:    {target.get('disposition')}")
+        typer.echo(f"Amount:         {target.get('amount')} {target.get('currency')}")
+        typer.echo(f"Fraud Score:    {target.get('fraud_score')}")
+        typer.echo(f"Assigned To:    {target.get('assigned_analyst') or 'Unassigned'}")
+        typer.echo(f"SLA Breached:   {target.get('is_sla_breached')}")
+        typer.echo(f"Notes Count:    {len(target.get('notes') or [])}")
+        typer.echo(f"Audit Entries:  {len(target.get('audit_trail') or [])}")
+    else:
+        typer.echo(json.dumps(target, indent=2))
+
+
+@app.command("case-resolve")
+def case_resolve(
+    store_file: Annotated[
+        Path,
+        typer.Option(
+            "--store-file",
+            "-s",
+            help="Path to JSON file containing case records.",
+        ),
+    ],
+    case_id: Annotated[
+        str,
+        typer.Option(
+            "--case-id",
+            "-c",
+            help="Case ID to resolve.",
+        ),
+    ],
+    disposition: Annotated[
+        str,
+        typer.Option(
+            "--disposition",
+            "-d",
+            help="Resolution disposition (confirmed_fraud, false_positive, etc.).",
+        ),
+    ],
+    actor: Annotated[
+        str,
+        typer.Option(
+            "--actor",
+            help="Analyst or system resolving the case.",
+        ),
+    ] = "analyst",
+    notes: Annotated[
+        str,
+        typer.Option(
+            "--notes",
+            "-n",
+            help="Resolution explanation notes.",
+        ),
+    ] = "",
+    output_format: Annotated[
+        str,
+        typer.Option(
+            "--format",
+            "-f",
+            help="Output format: 'json' or 'table'.",
+        ),
+    ] = "json",
+) -> None:
+    """Resolve an active fraud case with a final disposition and conclusion notes."""
+    try:
+        disp_enum = CaseDisposition(disposition)
+    except ValueError:
+        valid_opts = [d.value for d in CaseDisposition if d != CaseDisposition.UNRESOLVED]
+        _abort(f"Invalid disposition '{disposition}'. Valid options: {valid_opts}")
+
+    if not store_file.is_file():
+        _abort(f"Store file not found: {store_file}")
+
+    try:
+        raw = store_file.read_text(encoding="utf-8")
+        records = json.loads(raw)
+        if not isinstance(records, list):
+            _abort("Invalid store file format: expected a JSON array of case objects.")
+    except (OSError, json.JSONDecodeError) as exc:
+        _abort(f"Could not read store file: {exc}")
+
+    target_idx: int | None = None
+    target_case: FraudCase | None = None
+    for idx, item in enumerate(records):
+        if isinstance(item, dict) and item.get("case_id") == case_id:
+            target_idx = idx
+            target_case = FraudCase.from_dict(item)
+            break
+
+    if target_case is None or target_idx is None:
+        _abort(f"Case '{case_id}' not found in store file.")
+
+    store = CaseStore()
+    store.put(target_case)
+    manager = CaseManager(store=store)
+
+    try:
+        resolved = manager.resolve_case(
+            case_id,
+            disposition=disp_enum,
+            actor=actor,
+            notes=notes,
+        )
+        records[target_idx] = resolved.to_dict()
+        _atomic_write_text(json.dumps(records, indent=2), store_file)
+    except CaseError as exc:
+        _abort(f"Failed to resolve case: {exc}")
+
+    if output_format.lower() == "table":
+        typer.echo(f"Case ID:     {resolved.case_id}")
+        typer.echo(f"Status:      {resolved.status.value}")
+        typer.echo(f"Disposition: {resolved.disposition.value}")
+        typer.echo(f"Resolved At: {resolved.resolved_at}")
+    else:
+        typer.echo(json.dumps(resolved.to_dict(), indent=2))
+
+
+@app.command("case-evidence")
+def case_evidence(
+    store_file: Annotated[
+        Path,
+        typer.Option(
+            "--store-file",
+            "-s",
+            help="Path to JSON file containing case records.",
+        ),
+    ],
+    case_id: Annotated[
+        str,
+        typer.Option(
+            "--case-id",
+            "-c",
+            help="Case ID to generate evidence for.",
+        ),
+    ],
+    output: Annotated[
+        Path | None,
+        typer.Option(
+            "--output",
+            "-o",
+            help="Optional path to write compiled evidence package JSON.",
+        ),
+    ] = None,
+    output_format: Annotated[
+        str,
+        typer.Option(
+            "--format",
+            "-f",
+            help="Output format: 'json' or 'table'.",
+        ),
+    ] = "json",
+) -> None:
+    """Compile and fingerprint a tamper-evident dispute evidence dossier."""
+    if not store_file.is_file():
+        _abort(f"Store file not found: {store_file}")
+
+    try:
+        raw = store_file.read_text(encoding="utf-8")
+        records = json.loads(raw)
+        if not isinstance(records, list):
+            _abort("Invalid store file format: expected a JSON array of case objects.")
+    except (OSError, json.JSONDecodeError) as exc:
+        _abort(f"Could not read store file: {exc}")
+
+    target_case: FraudCase | None = None
+    for item in records:
+        if isinstance(item, dict) and item.get("case_id") == case_id:
+            target_case = FraudCase.from_dict(item)
+            break
+
+    if target_case is None:
+        _abort(f"Case '{case_id}' not found in store file.")
+
+    store = CaseStore()
+    store.put(target_case)
+    manager = CaseManager(store=store)
+
+    tx_data = {
+        "amount": target_case.amount,
+        "currency": target_case.currency,
+        "transaction_id": target_case.transaction_id,
+    }
+    pkg = manager.generate_evidence_package(
+        case_id=case_id,
+        transaction_data=tx_data,
+        actor="cli",
+    )
+
+    if output is not None:
+        _atomic_write_text(json.dumps(pkg.to_dict(), indent=2), output)
+
+    if output_format.lower() == "table":
+        typer.echo(f"Package ID:   {pkg.package_id}")
+        typer.echo(f"Case ID:      {pkg.case_id}")
+        typer.echo(f"Created At:   {pkg.created_at}")
+        typer.echo(f"Fingerprint:  {pkg.sha256_fingerprint}")
+        typer.echo(f"Integrity:    {pkg.verify_integrity()}")
+    else:
+        typer.echo(json.dumps(pkg.to_dict(), indent=2))
+
+
+@app.command("chargeback-ingest")
+def chargeback_ingest(
+    transaction_id: Annotated[
+        str,
+        typer.Option(
+            "--transaction-id",
+            "-x",
+            help="Transaction identifier subject to chargeback.",
+        ),
+    ],
+    scheme: Annotated[
+        str,
+        typer.Option(
+            "--scheme",
+            help="Card scheme (visa, mastercard, amex, discover).",
+        ),
+    ],
+    reason_code: Annotated[
+        str,
+        typer.Option(
+            "--reason-code",
+            "-r",
+            help="Card network chargeback reason code.",
+        ),
+    ],
+    amount: Annotated[
+        float,
+        typer.Option(
+            "--amount",
+            "-a",
+            help="Disputed transaction amount.",
+        ),
+    ] = 0.0,
+    currency: Annotated[
+        str,
+        typer.Option(
+            "--currency",
+            "-c",
+            help="Transaction currency (e.g. USD, EUR).",
+        ),
+    ] = "USD",
+    tenant_id: Annotated[
+        str,
+        typer.Option(
+            "--tenant-id",
+            "-t",
+            help="Tenant identifier.",
+        ),
+    ] = "default",
+    scheme_dispute_id: Annotated[
+        str | None,
+        typer.Option(
+            "--scheme-dispute-id",
+            help="Scheme or gateway dispute reference.",
+        ),
+    ] = None,
+    deadline: Annotated[
+        str | None,
+        typer.Option(
+            "--deadline",
+            help="ISO timestamp representment deadline.",
+        ),
+    ] = None,
+    store_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--store-file",
+            "-s",
+            help="Optional path to persistent JSON file to append dispute record.",
+        ),
+    ] = None,
+    output_format: Annotated[
+        str,
+        typer.Option(
+            "--format",
+            "-f",
+            help="Output format: 'json' or 'table'.",
+        ),
+    ] = "json",
+) -> None:
+    """Ingest a new card scheme chargeback dispute."""
+    try:
+        scheme_enum = CardScheme(scheme.lower())
+    except ValueError:
+        valid_opts = [s.value for s in CardScheme]
+        _abort(f"Invalid card scheme '{scheme}'. Valid options: {valid_opts}")
+
+    store = ChargebackStore()
+    manager = ChargebackManager(store=store)
+
+    try:
+        dispute = manager.ingest_chargeback(
+            transaction_id=transaction_id,
+            scheme=scheme_enum,
+            reason_code=reason_code,
+            disputed_amount=amount,
+            currency=currency,
+            tenant_id=tenant_id,
+            scheme_dispute_id=scheme_dispute_id,
+            response_deadline=deadline,
+        )
+    except ChargebackError as exc:
+        _abort(f"Failed to ingest chargeback: {exc}")
+
+    if store_file is not None:
+        try:
+            records: list[dict[str, Any]] = []
+            if store_file.is_file():
+                raw = store_file.read_text(encoding="utf-8")
+                records = json.loads(raw) if raw.strip() else []
+                if not isinstance(records, list):
+                    records = []
+            records.append(dispute.to_dict())
+            _atomic_write_text(json.dumps(records, indent=2), store_file)
+        except (OSError, json.JSONDecodeError) as exc:
+            _abort(f"Failed to persist chargeback to store file: {exc}")
+
+    if output_format.lower() == "table":
+        typer.echo(f"Dispute ID:     {dispute.dispute_id}")
+        typer.echo(f"Transaction ID: {dispute.transaction_id}")
+        typer.echo(f"Scheme:         {dispute.scheme.value}")
+        typer.echo(f"Reason Code:    {dispute.reason_code}")
+        typer.echo(f"Category:       {dispute.category.value}")
+        typer.echo(f"Stage:          {dispute.stage.value}")
+        typer.echo(f"Amount:         {dispute.disputed_amount} {dispute.currency}")
+        typer.echo(f"Deadline:       {dispute.response_deadline}")
+        typer.echo(f"Winnability:    {dispute.winnability_score:.2f}")
+        typer.echo(f"Recommendation: {dispute.recommended_action.value}")
+    else:
+        typer.echo(json.dumps(dispute.to_dict(), indent=2))
+
+
+@app.command("chargeback-list")
+def chargeback_list(
+    store_file: Annotated[
+        Path,
+        typer.Option(
+            "--store-file",
+            "-s",
+            help="Path to JSON file containing dispute records.",
+        ),
+    ],
+    tenant_id: Annotated[
+        str | None,
+        typer.Option(
+            "--tenant-id",
+            "-t",
+            help="Filter by tenant ID.",
+        ),
+    ] = None,
+    scheme: Annotated[
+        str | None,
+        typer.Option(
+            "--scheme",
+            help="Filter by card scheme.",
+        ),
+    ] = None,
+    stage: Annotated[
+        str | None,
+        typer.Option(
+            "--stage",
+            help="Filter by chargeback stage.",
+        ),
+    ] = None,
+    category: Annotated[
+        str | None,
+        typer.Option(
+            "--category",
+            help="Filter by normalized chargeback category.",
+        ),
+    ] = None,
+    expired_only: Annotated[
+        bool,
+        typer.Option(
+            "--expired-only",
+            help="Filter to show only deadline-expired disputes.",
+        ),
+    ] = False,
+    output_format: Annotated[
+        str,
+        typer.Option(
+            "--format",
+            "-f",
+            help="Output format: 'json' or 'table'.",
+        ),
+    ] = "json",
+) -> None:
+    """List stored card scheme disputes with optional multi-criteria filters."""
+    if not store_file.is_file():
+        _abort(f"Store file not found: {store_file}")
+
+    try:
+        raw = store_file.read_text(encoding="utf-8")
+        records = json.loads(raw)
+        if not isinstance(records, list):
+            _abort("Invalid store file format: expected a JSON array of dispute objects.")
+    except (OSError, json.JSONDecodeError) as exc:
+        _abort(f"Could not read store file: {exc}")
+
+    matched: list[dict[str, Any]] = []
+    for item in records:
+        if not isinstance(item, dict):
+            continue
+        if tenant_id and item.get("tenant_id") != tenant_id:
+            continue
+        if scheme and str(item.get("scheme", "")).lower() != scheme.lower():
+            continue
+        if stage and str(item.get("stage", "")).lower() != stage.lower():
+            continue
+        if category and str(item.get("category", "")).lower() != category.lower():
+            continue
+        if expired_only and not item.get("is_expired"):
+            continue
+        matched.append(item)
+
+    if output_format.lower() == "table":
+        if not matched:
+            typer.echo("No chargeback disputes found.")
+            return
+        header = (
+            f"{'DISPUTE ID':<18}  {'TX ID':<16}  {'SCHEME':<10}  "
+            f"{'REASON':<8}  {'STAGE':<18}  {'AMOUNT':<10}  {'WINNABILITY':<11}"
+        )
+        typer.echo(header)
+        typer.echo("-" * len(header))
+        for m in matched:
+            d_id = str(m.get("dispute_id", ""))
+            tx_id = str(m.get("transaction_id", ""))
+            sc = str(m.get("scheme", ""))
+            rc = str(m.get("reason_code", ""))
+            st = str(m.get("stage", ""))
+            amt = f"{m.get('disputed_amount', 0.0):.2f}"
+            win = f"{m.get('winnability_score', 0.0):.2f}"
+            typer.echo(
+                f"{d_id:<18}  {tx_id:<16}  {sc:<10}  {rc:<8}  {st:<18}  {amt:<10}  {win:<11}"
+            )
+    else:
+        typer.echo(json.dumps({"total_count": len(matched), "disputes": matched}, indent=2))
+
+
+@app.command("chargeback-inspect")
+def chargeback_inspect(
+    store_file: Annotated[
+        Path,
+        typer.Option(
+            "--store-file",
+            "-s",
+            help="Path to JSON file containing dispute records.",
+        ),
+    ],
+    dispute_id: Annotated[
+        str,
+        typer.Option(
+            "--dispute-id",
+            "-d",
+            help="Dispute ID to inspect.",
+        ),
+    ],
+    output_format: Annotated[
+        str,
+        typer.Option(
+            "--format",
+            "-f",
+            help="Output format: 'json' or 'table'.",
+        ),
+    ] = "json",
+) -> None:
+    """Inspect full details, audit trail, and representment readiness of a dispute."""
+    if not store_file.is_file():
+        _abort(f"Store file not found: {store_file}")
+
+    try:
+        raw = store_file.read_text(encoding="utf-8")
+        records = json.loads(raw)
+        if not isinstance(records, list):
+            _abort("Invalid store file format: expected a JSON array of dispute objects.")
+    except (OSError, json.JSONDecodeError) as exc:
+        _abort(f"Could not read store file: {exc}")
+
+    target: dict[str, Any] | None = None
+    for item in records:
+        if isinstance(item, dict) and item.get("dispute_id") == dispute_id:
+            target = item
+            break
+
+    if target is None:
+        _abort(f"Dispute '{dispute_id}' not found in store file.")
+
+    if output_format.lower() == "table":
+        typer.echo(f"Dispute ID:      {target.get('dispute_id')}")
+        typer.echo(f"Transaction ID:  {target.get('transaction_id')}")
+        typer.echo(f"Tenant ID:       {target.get('tenant_id')}")
+        typer.echo(f"Scheme:          {target.get('scheme')}")
+        typer.echo(f"Reason Code:     {target.get('reason_code')}")
+        typer.echo(f"Category:        {target.get('category')}")
+        typer.echo(f"Stage:           {target.get('stage')}")
+        typer.echo(f"Amount:          {target.get('disputed_amount')} {target.get('currency')}")
+        typer.echo(f"Filing Date:     {target.get('filing_date')}")
+        typer.echo(f"Deadline:        {target.get('response_deadline')}")
+        typer.echo(f"Expired:         {target.get('is_expired')}")
+        typer.echo(f"Terminal:        {target.get('is_terminal')}")
+        typer.echo(f"Liability Shift: {target.get('liability_shift_proven')}")
+        typer.echo(f"Winnability:     {target.get('winnability_score')}")
+        typer.echo(f"Recommendation:  {target.get('recommended_action')}")
+        typer.echo(f"Package ID:      {target.get('representment_package_id') or 'None'}")
+        typer.echo(f"Audit Entries:   {len(target.get('audit_trail') or [])}")
+    else:
+        typer.echo(json.dumps(target, indent=2))
+
+
+@app.command("chargeback-represent")
+def chargeback_represent(
+    store_file: Annotated[
+        Path,
+        typer.Option(
+            "--store-file",
+            "-s",
+            help="Path to JSON file containing dispute records.",
+        ),
+    ],
+    dispute_id: Annotated[
+        str,
+        typer.Option(
+            "--dispute-id",
+            "-d",
+            help="Dispute ID to represent.",
+        ),
+    ],
+    package_id: Annotated[
+        str | None,
+        typer.Option(
+            "--package-id",
+            "-p",
+            help="Evidence package reference ID.",
+        ),
+    ] = None,
+    evidence_fingerprint: Annotated[
+        str | None,
+        typer.Option(
+            "--fingerprint",
+            help="Cryptographic SHA-256 fingerprint of evidence package.",
+        ),
+    ] = None,
+    notes: Annotated[
+        str,
+        typer.Option(
+            "--notes",
+            "-n",
+            help="Representment defense narrative or notes.",
+        ),
+    ] = "",
+    actor: Annotated[
+        str,
+        typer.Option(
+            "--actor",
+            help="Analyst or automated agent submitting representment.",
+        ),
+    ] = "analyst",
+    output_format: Annotated[
+        str,
+        typer.Option(
+            "--format",
+            "-f",
+            help="Output format: 'json' or 'table'.",
+        ),
+    ] = "json",
+) -> None:
+    """Submit dispute representment attaching evidence package and cryptographic digest."""
+    if not store_file.is_file():
+        _abort(f"Store file not found: {store_file}")
+
+    try:
+        raw = store_file.read_text(encoding="utf-8")
+        records = json.loads(raw)
+        if not isinstance(records, list):
+            _abort("Invalid store file format: expected a JSON array of dispute objects.")
+    except (OSError, json.JSONDecodeError) as exc:
+        _abort(f"Could not read store file: {exc}")
+
+    target_idx: int | None = None
+    target_dispute: ChargebackDispute | None = None
+    for idx, item in enumerate(records):
+        if isinstance(item, dict) and item.get("dispute_id") == dispute_id:
+            target_idx = idx
+            target_dispute = ChargebackDispute.from_dict(item)
+            break
+
+    if target_dispute is None or target_idx is None:
+        _abort(f"Dispute '{dispute_id}' not found in store file.")
+
+    store = ChargebackStore()
+    store.put(target_dispute)
+    manager = ChargebackManager(store=store)
+
+    try:
+        updated = manager.represent_dispute(
+            dispute_id=dispute_id,
+            package_id=package_id,
+            evidence_fingerprint=evidence_fingerprint,
+            notes=notes,
+            actor=actor,
+        )
+        records[target_idx] = updated.to_dict()
+        _atomic_write_text(json.dumps(records, indent=2), store_file)
+    except ChargebackError as exc:
+        _abort(f"Failed to represent dispute: {exc}")
+
+    if output_format.lower() == "table":
+        typer.echo(f"Dispute ID:     {updated.dispute_id}")
+        typer.echo(f"Stage:          {updated.stage.value}")
+        typer.echo(f"Package ID:     {updated.representment_package_id}")
+        typer.echo(f"Fingerprint:    {updated.evidence_fingerprint}")
+        typer.echo(f"Represented At: {updated.represented_at}")
+    else:
+        typer.echo(json.dumps(updated.to_dict(), indent=2))
+
+
+@app.command("chargeback-resolve")
+def chargeback_resolve(
+    store_file: Annotated[
+        Path,
+        typer.Option(
+            "--store-file",
+            "-s",
+            help="Path to JSON file containing dispute records.",
+        ),
+    ],
+    dispute_id: Annotated[
+        str,
+        typer.Option(
+            "--dispute-id",
+            "-d",
+            help="Dispute ID to resolve.",
+        ),
+    ],
+    outcome: Annotated[
+        str,
+        typer.Option(
+            "--outcome",
+            "-o",
+            help="Resolution outcome: resolved_won, resolved_lost, or accepted_liability.",
+        ),
+    ],
+    actor: Annotated[
+        str,
+        typer.Option(
+            "--actor",
+            help="Analyst or system resolving the dispute.",
+        ),
+    ] = "system",
+    notes: Annotated[
+        str,
+        typer.Option(
+            "--notes",
+            "-n",
+            help="Resolution explanation notes.",
+        ),
+    ] = "",
+    output_format: Annotated[
+        str,
+        typer.Option(
+            "--format",
+            "-f",
+            help="Output format: 'json' or 'table'.",
+        ),
+    ] = "json",
+) -> None:
+    """Finalize dispute with a terminal resolution outcome."""
+    try:
+        stage_enum = ChargebackStage(outcome.lower())
+    except ValueError:
+        valid_opts = [
+            ChargebackStage.RESOLVED_WON.value,
+            ChargebackStage.RESOLVED_LOST.value,
+            ChargebackStage.ACCEPTED_LIABILITY.value,
+        ]
+        _abort(f"Invalid outcome '{outcome}'. Valid options: {valid_opts}")
+
+    if not store_file.is_file():
+        _abort(f"Store file not found: {store_file}")
+
+    try:
+        raw = store_file.read_text(encoding="utf-8")
+        records = json.loads(raw)
+        if not isinstance(records, list):
+            _abort("Invalid store file format: expected a JSON array of dispute objects.")
+    except (OSError, json.JSONDecodeError) as exc:
+        _abort(f"Could not read store file: {exc}")
+
+    target_idx: int | None = None
+    target_dispute: ChargebackDispute | None = None
+    for idx, item in enumerate(records):
+        if isinstance(item, dict) and item.get("dispute_id") == dispute_id:
+            target_idx = idx
+            target_dispute = ChargebackDispute.from_dict(item)
+            break
+
+    if target_dispute is None or target_idx is None:
+        _abort(f"Dispute '{dispute_id}' not found in store file.")
+
+    store = ChargebackStore()
+    store.put(target_dispute)
+    manager = ChargebackManager(store=store)
+
+    try:
+        resolved = manager.resolve_dispute(
+            dispute_id=dispute_id,
+            outcome=stage_enum,
+            actor=actor,
+            notes=notes,
+        )
+        records[target_idx] = resolved.to_dict()
+        _atomic_write_text(json.dumps(records, indent=2), store_file)
+    except ChargebackError as exc:
+        _abort(f"Failed to resolve dispute: {exc}")
+
+    if output_format.lower() == "table":
+        typer.echo(f"Dispute ID:  {resolved.dispute_id}")
+        typer.echo(f"Stage:       {resolved.stage.value}")
+        typer.echo(f"Resolved At: {resolved.resolved_at}")
+        typer.echo(f"Terminal:    {resolved.is_terminal}")
+    else:
+        typer.echo(json.dumps(resolved.to_dict(), indent=2))
+
+
+# =========================================================================
+# Phase 47: Account Takeover (ATO) & Credential Stuffing CLI Commands
+# =========================================================================
+
+
+def _load_ato_state(
+    store_file: Path | None,
+) -> tuple[AccountProfileTracker, AtoStore]:
+    """Load persistent ATO profiles and assessment history from store file."""
+    tracker = AccountProfileTracker()
+    store = AtoStore()
+    if store_file is None or not store_file.exists():
+        return tracker, store
+
+    try:
+        raw = store_file.read_text(encoding="utf-8")
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            _abort("Invalid ATO store file format: expected JSON object with 'profiles'.")
+    except (OSError, json.JSONDecodeError) as exc:
+        _abort(f"Could not read ATO store file: {exc}")
+
+    profiles_data = data.get("profiles", {})
+    if isinstance(profiles_data, dict):
+        for uid, p_data in profiles_data.items():
+            if isinstance(p_data, dict):
+                p = AccountProfile.from_dict(p_data)
+                tracker._profiles[uid] = p  # noqa: SLF001
+
+    assessments_data = data.get("assessments", [])
+    if isinstance(assessments_data, list):
+        for a_data in assessments_data:
+            if isinstance(a_data, dict):
+                a = AtoRiskAssessment.from_dict(a_data)
+                store.record_assessment(a)
+
+    return tracker, store
+
+
+def _save_ato_state(
+    store_file: Path | None,
+    tracker: AccountProfileTracker,
+    store: AtoStore,
+) -> None:
+    """Save persistent ATO profiles and assessment history to store file."""
+    if store_file is None:
+        return
+    data = {
+        "profiles": {uid: p.to_dict() for uid, p in tracker._profiles.items()},  # noqa: SLF001
+        "assessments": [a.to_dict() for a in store.list_assessments(limit=1000)],
+    }
+    _atomic_write_text(json.dumps(data, indent=2), store_file)
+
+
+def _load_aml_state(
+    store_file: Path | None,
+) -> tuple[AmlEngine, SarManager, list[AmlTransactionEvent]]:
+    """Load persistent AML transactions, alerts, and SAR dossiers from store file."""
+    store = AmlStore()
+    engine = AmlEngine(store=store)
+    for wl_entry in DEFAULT_WATCHLIST_ENTRIES:
+        engine.screening_engine.add_entry(wl_entry)
+    sar_manager = SarManager(store=store)
+    transactions: list[AmlTransactionEvent] = []
+    if store_file is None or not store_file.exists():
+        return engine, sar_manager, transactions
+
+    try:
+        raw = store_file.read_text(encoding="utf-8")
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            _abort("Invalid AML store file format: expected JSON object.")
+    except (OSError, json.JSONDecodeError) as exc:
+        _abort(f"Could not read AML store file: {exc}")
+
+    for tx_data in data.get("transactions", []):
+        if isinstance(tx_data, dict):
+            tx = AmlTransactionEvent.from_dict(tx_data)
+            transactions.append(tx)
+            engine.structuring_detector.record_and_evaluate(tx)
+            engine.layering_detector.record_and_evaluate(tx)
+            engine.circular_detector.record_and_evaluate(tx)
+
+    for alert_data in data.get("alerts", []):
+        if isinstance(alert_data, dict):
+            store.record_alert(AmlAlert.from_dict(alert_data))
+
+    for sar_data in data.get("sars", []):
+        if isinstance(sar_data, dict):
+            store.record_sar(SarDossier.from_dict(sar_data))
+
+    return engine, sar_manager, transactions
+
+
+def _save_aml_state(
+    store_file: Path | None,
+    store: AmlStore,
+    transactions: list[AmlTransactionEvent],
+) -> None:
+    """Save persistent AML transactions, alerts, and SAR dossiers to store file."""
+    if store_file is None:
+        return
+    data = {
+        "transactions": [tx.to_dict() for tx in transactions[-5000:]],
+        "alerts": [alert.to_dict() for alert in store.list_alerts(limit=5000)],
+        "sars": [sar.to_dict() for sar in store.list_sars(limit=5000)],
+    }
+    _atomic_write_text(json.dumps(data, indent=2), store_file)
+
+
+@app.command("ato-login")
+def ato_login(
+    user_id: Annotated[
+        str,
+        typer.Option("--user-id", "-u", help="User identifier."),
+    ],
+    ip_address: Annotated[
+        str,
+        typer.Option("--ip-address", "-i", help="Client IP address."),
+    ] = "127.0.0.1",
+    outcome: Annotated[
+        str,
+        typer.Option(
+            "--outcome", "-o", help="Authentication outcome (success, failed_credentials)."
+        ),
+    ] = "success",
+    device_fingerprint: Annotated[
+        str | None,
+        typer.Option("--device", "-d", help="Client device fingerprint hash."),
+    ] = None,
+    latitude: Annotated[
+        float | None,
+        typer.Option("--latitude", help="Client geolocation latitude."),
+    ] = None,
+    longitude: Annotated[
+        float | None,
+        typer.Option("--longitude", help="Client geolocation longitude."),
+    ] = None,
+    tenant_id: Annotated[
+        str,
+        typer.Option("--tenant-id", help="Tenant organization partition."),
+    ] = "default",
+    store_file: Annotated[
+        Path | None,
+        typer.Option("--store-file", "-s", help="Path to JSON file storing ATO profiles."),
+    ] = None,
+    output_format: Annotated[
+        str,
+        typer.Option("--format", "-f", help="Output format (table or json)."),
+    ] = "table",
+) -> None:
+    """Evaluate an authentication attempt for Account Takeover risk."""
+    try:
+        outcome_enum = LoginOutcome(outcome.lower())
+    except ValueError:
+        _abort(f"Invalid outcome '{outcome}'. Expected: success, failed_credentials, failed_mfa.")
+
+    tracker, store = _load_ato_state(store_file)
+    engine = AtoEngine(profile_tracker=tracker, store=store, auto_quarantine=True)
+
+    event = LoginEvent(
+        user_id=user_id,
+        tenant_id=tenant_id,
+        ip_address=ip_address,
+        outcome=outcome_enum,
+        device_fingerprint=device_fingerprint,
+        latitude=latitude,
+        longitude=longitude,
+    )
+    assessment = engine.evaluate_attempt(event, action_type="login")
+    _save_ato_state(store_file, tracker, store)
+
+    if output_format.lower() == "table":
+        typer.echo(f"Assessment ID: {assessment.assessment_id}")
+        typer.echo(f"User ID:       {assessment.user_id}")
+        typer.echo(f"Risk Score:    {assessment.risk_score:.4f}")
+        typer.echo(f"Action:        {assessment.recommended_action.value.upper()}")
+        typer.echo(
+            f"Factors:       {', '.join(f.value for f in assessment.factors_triggered) or 'none'}"
+        )
+        typer.echo(f"Quarantined:   {assessment.quarantined}")
+    else:
+        typer.echo(json.dumps(assessment.to_dict(), indent=2))
+
+
+@app.command("ato-eval")
+def ato_eval(
+    user_id: Annotated[
+        str,
+        typer.Option("--user-id", "-u", help="User identifier."),
+    ],
+    action_type: Annotated[
+        str,
+        typer.Option(
+            "--action-type", "-a", help="Action type (transaction, transfer, profile_view)."
+        ),
+    ] = "transaction",
+    amount: Annotated[
+        float | None,
+        typer.Option("--amount", help="Transaction amount if applicable."),
+    ] = None,
+    ip_address: Annotated[
+        str,
+        typer.Option("--ip-address", "-i", help="Client IP address."),
+    ] = "127.0.0.1",
+    device_fingerprint: Annotated[
+        str | None,
+        typer.Option("--device", "-d", help="Client device fingerprint hash."),
+    ] = None,
+    latitude: Annotated[
+        float | None,
+        typer.Option("--latitude", help="Client geolocation latitude."),
+    ] = None,
+    longitude: Annotated[
+        float | None,
+        typer.Option("--longitude", help="Client geolocation longitude."),
+    ] = None,
+    tenant_id: Annotated[
+        str,
+        typer.Option("--tenant-id", help="Tenant organization partition."),
+    ] = "default",
+    store_file: Annotated[
+        Path | None,
+        typer.Option("--store-file", "-s", help="Path to JSON file storing ATO profiles."),
+    ] = None,
+    output_format: Annotated[
+        str,
+        typer.Option("--format", "-f", help="Output format (table or json)."),
+    ] = "table",
+) -> None:
+    """Evaluate an ongoing session action or card transaction for ATO compromise."""
+    tracker, store = _load_ato_state(store_file)
+    engine = AtoEngine(profile_tracker=tracker, store=store, auto_quarantine=True)
+
+    event = LoginEvent(
+        user_id=user_id,
+        tenant_id=tenant_id,
+        ip_address=ip_address,
+        outcome=LoginOutcome.SUCCESS,
+        device_fingerprint=device_fingerprint,
+        latitude=latitude,
+        longitude=longitude,
+    )
+    assessment = engine.evaluate_attempt(event, action_type=action_type, transaction_amount=amount)
+    _save_ato_state(store_file, tracker, store)
+
+    if output_format.lower() == "table":
+        typer.echo(f"Assessment ID: {assessment.assessment_id}")
+        typer.echo(f"User ID:       {assessment.user_id}")
+        typer.echo(f"Risk Score:    {assessment.risk_score:.4f}")
+        typer.echo(f"Action:        {assessment.recommended_action.value.upper()}")
+        typer.echo(
+            f"Factors:       {', '.join(f.value for f in assessment.factors_triggered) or 'none'}"
+        )
+        typer.echo(f"Quarantined:   {assessment.quarantined}")
+    else:
+        typer.echo(json.dumps(assessment.to_dict(), indent=2))
+
+
+@app.command("ato-inspect")
+def ato_inspect(
+    user_id: Annotated[
+        str,
+        typer.Option("--user-id", "-u", help="User identifier."),
+    ],
+    store_file: Annotated[
+        Path,
+        typer.Option("--store-file", "-s", help="Path to JSON file storing ATO profiles."),
+    ],
+    output_format: Annotated[
+        str,
+        typer.Option("--format", "-f", help="Output format (table or json)."),
+    ] = "table",
+) -> None:
+    """Inspect user baseline account profile, known devices, and quarantine status."""
+    tracker, _ = _load_ato_state(store_file)
+    profile = tracker.get_or_create_profile(user_id)
+
+    if output_format.lower() == "table":
+        typer.echo(f"User ID:        {profile.user_id}")
+        typer.echo(f"Known Devices:  {', '.join(sorted(profile.known_devices)) or 'none'}")
+        typer.echo(f"Known Locs:     {len(profile.known_locations)} recorded")
+        typer.echo(f"Last Known IP:  {profile.last_known_ip or 'none'}")
+        typer.echo(f"Quarantined:    {profile.is_quarantined}")
+        if profile.is_quarantined:
+            typer.echo(f"Reason:         {profile.quarantine_reason}")
+        typer.echo(f"Mutations:      {len(profile.mutations)} recorded")
+    else:
+        typer.echo(json.dumps(profile.to_dict(), indent=2))
+
+
+@app.command("ato-quarantine")
+def ato_quarantine(
+    user_id: Annotated[
+        str,
+        typer.Option("--user-id", "-u", help="User identifier."),
+    ],
+    reason: Annotated[
+        str,
+        typer.Option("--reason", "-r", help="Reason for placing account in security quarantine."),
+    ],
+    store_file: Annotated[
+        Path,
+        typer.Option("--store-file", "-s", help="Path to JSON file storing ATO profiles."),
+    ],
+    output_format: Annotated[
+        str,
+        typer.Option("--format", "-f", help="Output format (table or json)."),
+    ] = "table",
+) -> None:
+    """Administratively place a user account under security quarantine."""
+    tracker, store = _load_ato_state(store_file)
+    tracker.quarantine_account(user_id, reason=reason)
+    _save_ato_state(store_file, tracker, store)
+
+    if output_format.lower() == "table":
+        typer.echo(f"User ID:     {user_id}")
+        typer.echo("Status:      QUARANTINED")
+        typer.echo(f"Reason:      {reason}")
+    else:
+        typer.echo(
+            json.dumps({"status": "quarantined", "user_id": user_id, "reason": reason}, indent=2)
+        )
+
+
+@app.command("ato-release")
+def ato_release(
+    user_id: Annotated[
+        str,
+        typer.Option("--user-id", "-u", help="User identifier."),
+    ],
+    reason: Annotated[
+        str,
+        typer.Option("--reason", "-r", help="Reason for releasing account from quarantine."),
+    ],
+    store_file: Annotated[
+        Path,
+        typer.Option("--store-file", "-s", help="Path to JSON file storing ATO profiles."),
+    ],
+    output_format: Annotated[
+        str,
+        typer.Option("--format", "-f", help="Output format (table or json)."),
+    ] = "table",
+) -> None:
+    """Administratively release a user account from security quarantine."""
+    tracker, store = _load_ato_state(store_file)
+    tracker.release_account(user_id, reason=reason)
+    _save_ato_state(store_file, tracker, store)
+
+    if output_format.lower() == "table":
+        typer.echo(f"User ID:     {user_id}")
+        typer.echo("Status:      RELEASED")
+        typer.echo(f"Reason:      {reason}")
+    else:
+        typer.echo(
+            json.dumps({"status": "released", "user_id": user_id, "reason": reason}, indent=2)
+        )
+
+
+@app.command("ato-mutation")
+def ato_mutation(
+    user_id: Annotated[
+        str,
+        typer.Option("--user-id", "-u", help="User identifier."),
+    ],
+    mutation_type: Annotated[
+        str,
+        typer.Option(
+            "--type", "-m", help="Mutation type (password_change, email_change, mfa_reset)."
+        ),
+    ],
+    channel: Annotated[
+        str,
+        typer.Option(
+            "--channel", "-c", help="Channel where mutation occurred (web, mobile, support)."
+        ),
+    ] = "web",
+    store_file: Annotated[
+        Path,
+        typer.Option("--store-file", "-s", help="Path to JSON file storing ATO profiles."),
+    ] = Path("ato_store.json"),
+    output_format: Annotated[
+        str,
+        typer.Option("--format", "-f", help="Output format (table or json)."),
+    ] = "table",
+) -> None:
+    """Record a sensitive profile mutation for ATO surveillance."""
+    try:
+        m_type = AccountMutationType(mutation_type.lower())
+    except ValueError:
+        _abort(
+            f"Invalid mutation type '{mutation_type}'. "
+            "Expected: password_change, email_change, mfa_reset."
+        )
+
+    tracker, store = _load_ato_state(store_file)
+    rec = AccountMutationRecord(mutation_type=m_type, channel=channel)
+    tracker.record_mutation(user_id, rec)
+    _save_ato_state(store_file, tracker, store)
+
+    if output_format.lower() == "table":
+        typer.echo(f"Mutation ID: {rec.mutation_id}")
+        typer.echo(f"User ID:     {user_id}")
+        typer.echo(f"Type:        {rec.mutation_type.value}")
+        typer.echo(f"Channel:     {rec.channel}")
+    else:
+        typer.echo(json.dumps(rec.to_dict(), indent=2))
+
+
+@app.command("aml-monitor")
+def aml_monitor(
+    user_id: Annotated[
+        str,
+        typer.Option("--user-id", "-u", help="User or account identifier."),
+    ],
+    amount: Annotated[
+        float,
+        typer.Option("--amount", "-a", help="Transaction amount in currency units."),
+    ],
+    counterparty_id: Annotated[
+        str,
+        typer.Option("--counterparty-id", "-c", help="Counterparty account or entity ID."),
+    ] = "",
+    entity_name: Annotated[
+        str,
+        typer.Option(
+            "--entity-name", "-n", help="Legal name of counterparty/entity for screening."
+        ),
+    ] = "",
+    country: Annotated[
+        str,
+        typer.Option("--country", help="ISO country code (e.g. US, IR, KP, MM)."),
+    ] = "US",
+    direction: Annotated[
+        str,
+        typer.Option("--direction", "-d", help="Transaction direction (inbound or outbound)."),
+    ] = "outbound",
+    currency: Annotated[
+        str,
+        typer.Option("--currency", help="ISO currency code (e.g. USD, EUR)."),
+    ] = "USD",
+    store_file: Annotated[
+        Path,
+        typer.Option("--store-file", "-s", help="Path to AML state JSON file."),
+    ] = Path("aml_store.json"),
+    output_format: Annotated[
+        str,
+        typer.Option("--format", "-f", help="Output format (table or json)."),
+    ] = "table",
+) -> None:
+    """Monitor financial transaction for AML typologies, sanctions hits, and corridor risk."""
+    direction_normalized = direction.lower()
+    if direction_normalized in ("inflow", "inbound", "in"):
+        tx_dir = TransactionDirection.INFLOW
+    elif direction_normalized in ("outflow", "outbound", "out"):
+        tx_dir = TransactionDirection.OUTFLOW
+    else:
+        _abort(f"Invalid transaction direction '{direction}'. Expected 'inflow' or 'outflow'.")
+
+    engine, _, transactions = _load_aml_state(store_file)
+    event = AmlTransactionEvent(
+        transaction_id=str(uuid4()),
+        user_id=user_id,
+        amount=amount,
+        counterparty_id=counterparty_id,
+        country=country.upper(),
+        direction=tx_dir,
+        currency=currency.upper(),
+    )
+    assessment = engine.evaluate_transaction(event, entity_name=entity_name or None)
+    transactions.append(event)
+    _save_aml_state(store_file, engine.store, transactions)
+
+    if output_format.lower() == "table":
+        typer.echo(f"Transaction ID: {assessment.transaction_id}")
+        typer.echo(f"User ID:        {assessment.user_id}")
+        typer.echo(f"Risk Score:     {assessment.risk_score:.4f}")
+        typer.echo(f"Risk Level:     {assessment.risk_level.value}")
+        typer.echo(f"Policy Action:  {assessment.recommended_action.value}")
+        typs = ", ".join(t.value for t in assessment.triggered_typologies) or "none"
+        typer.echo(f"Typologies:     {typs}")
+        if assessment.alert:
+            typer.echo(f"Alert ID:       {assessment.alert.alert_id}")
+    else:
+        typer.echo(json.dumps(assessment.to_dict(), indent=2))
+
+
+@app.command("aml-screen")
+def aml_screen(
+    name: Annotated[
+        str,
+        typer.Option("--name", "-n", help="Entity or individual name to screen."),
+    ],
+    threshold: Annotated[
+        float,
+        typer.Option("--threshold", "-t", help="Fuzzy match similarity threshold [0.0 - 1.0]."),
+    ] = 0.85,
+    watchlist_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--watchlist-file", "-w", help="Optional JSON file with custom watchlist entries."
+        ),
+    ] = None,
+    output_format: Annotated[
+        str,
+        typer.Option("--format", "-f", help="Output format (table or json)."),
+    ] = "table",
+) -> None:
+    """Screen entity name against OFAC/PEP watchlists with fuzzy and phonetic matching."""
+    screening_engine = WatchlistScreeningEngine()
+    if watchlist_file is not None:
+        if not watchlist_file.exists():
+            _abort(f"Watchlist file not found: {watchlist_file}")
+        try:
+            raw = watchlist_file.read_text(encoding="utf-8")
+            entries_data = json.loads(raw)
+            if isinstance(entries_data, list):
+                for ed in entries_data:
+                    if isinstance(ed, dict):
+                        screening_engine.add_entry(WatchlistEntry.from_dict(ed))
+        except (OSError, json.JSONDecodeError) as exc:
+            _abort(f"Could not load watchlist file: {exc}")
+    else:
+        for wl_entry in DEFAULT_WATCHLIST_ENTRIES:
+            screening_engine.add_entry(wl_entry)
+
+    matches = screening_engine.screen_entity(name, threshold=threshold)
+
+    if output_format.lower() == "table":
+        typer.echo(f"Screening Query: {name}")
+        typer.echo(f"Threshold:       {threshold}")
+        typer.echo(f"Matches Found:   {len(matches)}")
+        if matches:
+            typer.echo("-" * 60)
+            for m in matches:
+                typer.echo(
+                    f"[{m.matched_entry.watchlist_type.value.upper()}] {m.matched_entry.name} "
+                    f"| Score: {m.similarity_score:.4f} | Method: {m.match_algorithm}"
+                )
+    else:
+        typer.echo(json.dumps([m.to_dict() for m in matches], indent=2))
+
+
+@app.command("aml-alerts")
+def aml_alerts(
+    user_id: Annotated[
+        str | None,
+        typer.Option("--user-id", "-u", help="Filter by user identifier."),
+    ] = None,
+    typology: Annotated[
+        str | None,
+        typer.Option("--typology", "-t", help="Filter by AML typology."),
+    ] = None,
+    risk_level: Annotated[
+        str | None,
+        typer.Option(
+            "--risk-level", "-r", help="Filter by risk level (low, medium, high, critical)."
+        ),
+    ] = None,
+    limit: Annotated[
+        int,
+        typer.Option("--limit", "-l", help="Maximum alerts to return."),
+    ] = 100,
+    store_file: Annotated[
+        Path,
+        typer.Option("--store-file", "-s", help="Path to AML state JSON file."),
+    ] = Path("aml_store.json"),
+    output_format: Annotated[
+        str,
+        typer.Option("--format", "-f", help="Output format (table or json)."),
+    ] = "table",
+) -> None:
+    """Inspect and filter AML detection alerts from store file."""
+    typology_enum: AmlTypology | None = None
+    if typology:
+        try:
+            typology_enum = AmlTypology(typology.lower())
+        except ValueError:
+            _abort(f"Invalid typology '{typology}'.")
+
+    risk_level_enum: AmlRiskLevel | None = None
+    if risk_level:
+        try:
+            risk_level_enum = AmlRiskLevel(risk_level.lower())
+        except ValueError:
+            _abort(f"Invalid risk level '{risk_level}'.")
+
+    engine, _, _ = _load_aml_state(store_file)
+    alerts = engine.store.list_alerts(
+        user_id=user_id,
+        typology=typology_enum,
+        risk_level=risk_level_enum,
+        limit=limit,
+    )
+
+    if output_format.lower() == "table":
+        typer.echo(f"Alerts ({len(alerts)}):")
+        for a in alerts:
+            typer.echo(
+                f"- ID: {a.alert_id} | User: {a.user_id} | Level: {a.risk_level.value.upper()} "
+                f"| Typology: {a.typology.value} | Action: {a.recommended_action.value} "
+                f"| Score: {a.risk_score:.2f}"
+            )
+    else:
+        typer.echo(json.dumps([a.to_dict() for a in alerts], indent=2))
+
+
+@app.command("aml-sar-generate")
+def aml_sar_generate(
+    user_id: Annotated[
+        str,
+        typer.Option("--user-id", "-u", help="Subject user identifier."),
+    ],
+    alert_ids: Annotated[
+        str,
+        typer.Option("--alert-ids", "-a", help="Comma-separated AML alert IDs."),
+    ],
+    suspect_name: Annotated[
+        str,
+        typer.Option("--suspect-name", "-n", help="Subject suspect legal name."),
+    ] = "",
+    narrative: Annotated[
+        str,
+        typer.Option("--narrative", help="Optional narrative summary or context."),
+    ] = "",
+    store_file: Annotated[
+        Path,
+        typer.Option("--store-file", "-s", help="Path to AML state JSON file."),
+    ] = Path("aml_store.json"),
+    output_format: Annotated[
+        str,
+        typer.Option("--format", "-f", help="Output format (table or json)."),
+    ] = "table",
+) -> None:
+    """Compile and package a regulatory SAR filing dossier from suspicious alerts."""
+    a_ids = [aid.strip() for aid in alert_ids.split(",") if aid.strip()]
+    if not a_ids:
+        _abort("At least one alert ID must be specified.")
+
+    engine, sar_manager, transactions = _load_aml_state(store_file)
+    dossier = sar_manager.generate_sar(
+        user_id=user_id,
+        alert_ids=a_ids,
+        suspect_name=suspect_name,
+        narrative_summary=narrative,
+    )
+    _save_aml_state(store_file, engine.store, transactions)
+
+    if output_format.lower() == "table":
+        typer.echo(f"SAR ID:        {dossier.sar_id}")
+        typer.echo(f"Filing Status: {dossier.status.value}")
+        subj = dossier.suspect_details.get("full_name") or dossier.user_id
+        typer.echo(f"Subject:       {subj}")
+        typer.echo(f"Alerts Count:  {len(dossier.alert_ids)}")
+        typer.echo(f"Narrative:     {dossier.narrative[:120]}...")
+    else:
+        typer.echo(json.dumps(dossier.to_dict(), indent=2))
+
+
+@app.command("aml-sar-list")
+def aml_sar_list(
+    status: Annotated[
+        str | None,
+        typer.Option(
+            "--status",
+            help="Filter by SAR filing status (draft, pending_review, approved, filed, rejected).",
+        ),
+    ] = None,
+    user_id: Annotated[
+        str | None,
+        typer.Option("--user-id", "-u", help="Filter by subject user identifier."),
+    ] = None,
+    limit: Annotated[
+        int,
+        typer.Option("--limit", "-l", help="Maximum SAR dossiers to return."),
+    ] = 100,
+    store_file: Annotated[
+        Path,
+        typer.Option("--store-file", "-s", help="Path to AML state JSON file."),
+    ] = Path("aml_store.json"),
+    output_format: Annotated[
+        str,
+        typer.Option("--format", "-f", help="Output format (table or json)."),
+    ] = "table",
+) -> None:
+    """List regulatory SAR dossiers filtered by filing status or subject user."""
+    status_enum: SarStatus | None = None
+    if status:
+        try:
+            status_enum = SarStatus(status.lower())
+        except ValueError:
+            _abort(f"Invalid SAR status '{status}'.")
+
+    _, sar_manager, _ = _load_aml_state(store_file)
+    sars = sar_manager.list_sars(status=status_enum, user_id=user_id, limit=limit)
+
+    if output_format.lower() == "table":
+        typer.echo(f"SAR Dossiers ({len(sars)}):")
+        for s in sars:
+            subj = s.suspect_details.get("full_name") or s.user_id
+            typer.echo(
+                f"- ID: {s.sar_id} | Status: {s.status.value.upper()} "
+                f"| Subject: {subj} | Alerts: {len(s.alert_ids)}"
+            )
+    else:
+        typer.echo(json.dumps([s.to_dict() for s in sars], indent=2))
+
+
+@app.command("aml-sar-status")
+def aml_sar_status(
+    sar_id: Annotated[
+        str,
+        typer.Option("--sar-id", help="SAR filing dossier ID."),
+    ],
+    status: Annotated[
+        str,
+        typer.Option(
+            "--status",
+            help="New target status (pending_review, approved, filed, rejected).",
+        ),
+    ],
+    reviewer: Annotated[
+        str,
+        typer.Option("--reviewer", "-r", help="Compliance officer / reviewer identifier."),
+    ] = "compliance_officer",
+    comment: Annotated[
+        str,
+        typer.Option("--comment", "-c", help="Status transition review comment."),
+    ] = "",
+    store_file: Annotated[
+        Path,
+        typer.Option("--store-file", "-s", help="Path to AML state JSON file."),
+    ] = Path("aml_store.json"),
+    output_format: Annotated[
+        str,
+        typer.Option("--format", "-f", help="Output format (table or json)."),
+    ] = "table",
+) -> None:
+    """Update regulatory SAR filing status according to strict compliance lifecycle."""
+    try:
+        new_status = SarStatus(status.lower())
+    except ValueError:
+        _abort(f"Invalid SAR status '{status}'.")
+
+    engine, sar_manager, transactions = _load_aml_state(store_file)
+    try:
+        updated = sar_manager.transition_status(
+            sar_id=sar_id,
+            new_status=new_status,
+            actor=reviewer,
+            notes=comment,
+        )
+    except KeyError:
+        _abort(f"SAR dossier '{sar_id}' not found.")
+    except (ValueError, RuntimeError) as exc:
+        _abort(str(exc))
+
+    _save_aml_state(store_file, engine.store, transactions)
+
+    if output_format.lower() == "table":
+        typer.echo(f"SAR ID:        {updated.sar_id}")
+        typer.echo(f"New Status:    {updated.status.value}")
+        typer.echo(f"Reviewer:      {reviewer}")
+        if updated.filing_date:
+            typer.echo(f"Filing Date:   {updated.filing_date}")
+    else:
+        typer.echo(json.dumps(updated.to_dict(), indent=2))
+
+
+def _load_sif_state(
+    store_file: Path | None,
+) -> tuple[SyntheticIdentityEngine, SyntheticIdentityStore]:
+    """Load persistent identity profiles and assessments from store file."""
+    store = SyntheticIdentityStore()
+    engine = SyntheticIdentityEngine(store=store)
+    if store_file is None or not store_file.exists():
+        return engine, store
+
+    try:
+        raw = store_file.read_text(encoding="utf-8")
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            _abort("Invalid SIF store file format: expected JSON object.")
+    except (OSError, json.JSONDecodeError) as exc:
+        _abort(f"Could not read SIF store file: {exc}")
+
+    for p_data in data.get("profiles", []):
+        if isinstance(p_data, dict):
+            store.add_profile(IdentityProfile.from_dict(p_data))
+
+    for a_data in data.get("assessments", []):
+        if isinstance(a_data, dict):
+            store.add_assessment(SifAssessment.from_dict(a_data))
+
+    return engine, store
+
+
+def _save_sif_state(
+    store_file: Path | None,
+    store: SyntheticIdentityStore,
+) -> None:
+    """Save persistent identity profiles and assessments to store file."""
+    if store_file is None:
+        return
+    data = {
+        "profiles": [p.to_dict() for p in store.list_profiles(limit=5000)],
+        "assessments": [a.to_dict() for a in store.list_assessments(limit=5000)],
+    }
+    _atomic_write_text(json.dumps(data, indent=2), store_file)
+
+
+@app.command("sif-eval")
+def sif_eval(
+    ssn: Annotated[str, typer.Option("--ssn", help="Applicant Social Security Number.")],
+    first_name: Annotated[str, typer.Option("--first-name", help="Applicant first name.")],
+    last_name: Annotated[str, typer.Option("--last-name", help="Applicant last name.")],
+    dob: Annotated[str, typer.Option("--dob", help="Date of birth in YYYY-MM-DD format.")],
+    address: Annotated[str, typer.Option("--address", help="Residential street address.")],
+    phone: Annotated[str, typer.Option("--phone", help="Contact phone number.")],
+    email: Annotated[str, typer.Option("--email", help="Contact email address.")],
+    applicant_id: Annotated[
+        str, typer.Option("--applicant-id", help="Optional applicant ID.")
+    ] = "",
+    credit_line: Annotated[
+        float, typer.Option("--credit-line", help="Requested credit line.")
+    ] = 5000.0,
+    tenant_id: Annotated[str, typer.Option("--tenant-id", help="Tenant identifier.")] = "default",
+    store_file: Annotated[
+        Path,
+        typer.Option("--store-file", "-s", help="Path to SIF state JSON file."),
+    ] = Path("sif_store.json"),
+    output_format: Annotated[
+        str, typer.Option("--format", "-f", help="Output format (table or json).")
+    ] = "table",
+) -> None:
+    """Evaluate an applicant credit profile for synthetic identity fraud."""
+    engine, store = _load_sif_state(store_file)
+    aid = applicant_id or f"app_{uuid4().hex[:12]}"
+    profile = IdentityProfile(
+        applicant_id=aid,
+        ssn=ssn,
+        first_name=first_name,
+        last_name=last_name,
+        dob=dob,
+        address=address,
+        phone=phone,
+        email=email,
+        credit_line_requested=credit_line,
+        tenant_id=tenant_id,
+    )
+    assessment = engine.evaluate(profile)
+    _save_sif_state(store_file, store)
+
+    if output_format.lower() == "table":
+        typer.echo(f"Assessment ID:    {assessment.assessment_id}")
+        typer.echo(f"Applicant ID:     {assessment.applicant_id}")
+        typer.echo(f"Risk Score:       {assessment.risk_score:.4f}")
+        typer.echo(f"Risk Level:       {assessment.risk_level.value}")
+        typer.echo(f"Policy Action:    {assessment.action.value}")
+        anoms = ", ".join(a.value for a in assessment.triggered_anomalies) or "none"
+        typer.echo(f"Anomalies:        {anoms}")
+        if assessment.ssn_validation:
+            typer.echo(f"SSN Status:       {assessment.ssn_validation.status.value}")
+            typer.echo(f"State Issued:     {assessment.ssn_validation.state_issued}")
+    else:
+        typer.echo(json.dumps(assessment.to_dict(), indent=2))
+
+
+@app.command("sif-check-ssn")
+def sif_check_ssn(
+    ssn: Annotated[str, typer.Option("--ssn", help="Social Security Number to audit.")],
+    dob: Annotated[str, typer.Option("--dob", help="Optional date of birth (YYYY-MM-DD).")] = "",
+    output_format: Annotated[
+        str, typer.Option("--format", "-f", help="Output format (table or json).")
+    ] = "table",
+) -> None:
+    """Validate SSN against SSA allocation tables, deceased registries, and birth year."""
+    validator = SsnValidator()
+    result = validator.validate(ssn, dob=dob or None)
+
+    if output_format.lower() == "table":
+        typer.echo(f"SSN Valid:        {result.is_valid}")
+        typer.echo(f"Status:           {result.status.value}")
+        typer.echo(f"Area Number:      {result.area_number:03d}")
+        typer.echo(f"Group Number:     {result.group_number:02d}")
+        typer.echo(f"State Issued:     {result.state_issued}")
+        if result.estimated_issuance_year_range:
+            y_start, y_end = result.estimated_issuance_year_range
+            typer.echo(f"Issuance Window:  {y_start}-{y_end}")
+        typer.echo(f"Is Deceased:      {result.is_deceased}")
+        typer.echo(f"Details:          {result.details}")
+    else:
+        typer.echo(json.dumps(result.to_dict(), indent=2))
+
+
+@app.command("sif-inspect")
+def sif_inspect(
+    applicant_id: Annotated[
+        str, typer.Option("--applicant-id", "-a", help="Applicant ID to inspect.")
+    ] = "",
+    assessment_id: Annotated[
+        str, typer.Option("--assessment-id", "-i", help="Assessment ID to inspect.")
+    ] = "",
+    store_file: Annotated[
+        Path,
+        typer.Option("--store-file", "-s", help="Path to SIF state JSON file."),
+    ] = Path("sif_store.json"),
+    output_format: Annotated[
+        str, typer.Option("--format", "-f", help="Output format (table or json).")
+    ] = "table",
+) -> None:
+    """Inspect stored applicant profile or synthetic identity assessment."""
+    if not applicant_id and not assessment_id:
+        _abort("Must provide either --applicant-id or --assessment-id to inspect.")
+
+    _, store = _load_sif_state(store_file)
+
+    if assessment_id:
+        assessment = store.get_assessment(assessment_id)
+        if assessment is None:
+            _abort(f"Assessment '{assessment_id}' not found in store.")
+        if output_format.lower() == "table":
+            typer.echo(f"Assessment ID:    {assessment.assessment_id}")
+            typer.echo(f"Applicant ID:     {assessment.applicant_id}")
+            typer.echo(f"Risk Score:       {assessment.risk_score:.4f}")
+            typer.echo(f"Risk Level:       {assessment.risk_level.value}")
+            typer.echo(f"Action:           {assessment.action.value}")
+            anoms = ", ".join(a.value for a in assessment.triggered_anomalies) or "none"
+            typer.echo(f"Anomalies:        {anoms}")
+        else:
+            typer.echo(json.dumps(assessment.to_dict(), indent=2))
+        return
+
+    profile = store.get_profile(applicant_id)
+    if profile is None:
+        _abort(f"Applicant profile '{applicant_id}' not found in store.")
+    if output_format.lower() == "table":
+        typer.echo(f"Applicant ID:     {profile.applicant_id}")
+        typer.echo(f"Name:             {profile.first_name} {profile.last_name}")
+        typer.echo(f"SSN (Masked):     {profile.ssn_masked()}")
+        typer.echo(f"DOB:              {profile.dob}")
+        typer.echo(f"Address:          {profile.address}")
+        typer.echo(f"Phone:            {profile.phone}")
+        typer.echo(f"Email:            {profile.email}")
+        typer.echo(f"Credit Line:      ${profile.credit_line_requested:,.2f}")
+    else:
+        typer.echo(json.dumps(profile.to_dict(), indent=2))
+
+
+@app.command("sif-summary")
+def sif_summary(
+    store_file: Annotated[
+        Path,
+        typer.Option("--store-file", "-s", help="Path to SIF state JSON file."),
+    ] = Path("sif_store.json"),
+    output_format: Annotated[
+        str, typer.Option("--format", "-f", help="Output format (table or json).")
+    ] = "table",
+) -> None:
+    """Display summary metrics of tracked applicant profiles and synthetic fraud assessments."""
+    _, store = _load_sif_state(store_file)
+    assessments = store.list_assessments(limit=50000)
+    profiles = store.list_profiles(limit=50000)
+
+    actions: dict[str, int] = defaultdict(int)
+    risk_levels: dict[str, int] = defaultdict(int)
+    for a in assessments:
+        actions[a.action.value] += 1
+        risk_levels[a.risk_level.value] += 1
+
+    summary_data = {
+        "total_profiles": len(profiles),
+        "total_assessments": len(assessments),
+        "actions": dict(actions),
+        "risk_levels": dict(risk_levels),
+    }
+
+    if output_format.lower() == "table":
+        typer.echo("Synthetic Identity Fraud Store Summary:")
+        typer.echo(f"  Total Profiles:     {summary_data['total_profiles']}")
+        typer.echo(f"  Total Assessments:  {summary_data['total_assessments']}")
+        typer.echo("  Actions:")
+        for act, cnt in actions.items():
+            typer.echo(f"    {act:25s}: {cnt}")
+        typer.echo("  Risk Levels:")
+        for rk, cnt in risk_levels.items():
+            typer.echo(f"    {rk:25s}: {cnt}")
+    else:
+        typer.echo(json.dumps(summary_data, indent=2))
 
 
 def _abort(message: str) -> NoReturn:

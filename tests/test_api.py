@@ -5526,3 +5526,1451 @@ def test_webhook_api_endpoints_and_telemetry(
             json={"tenant_id": "bad#tenant", "target_url": "ftp://bad-url"},
         )
         assert bad_res.status_code == 400
+
+
+def test_challenge_api_endpoints_and_telemetry(
+    api_context: tuple[TestClient, FraudModel, ValidatedDataset],
+) -> None:
+    """Validate /v1/challenges CRUD, verification, cooldown, and telemetry."""
+    from fraud_detection.challenge import (
+        ChallengeManager,
+        ChallengePolicy,
+        InMemoryNotificationAdapter,
+    )
+
+    _, model, _ = api_context
+    adapter = InMemoryNotificationAdapter()
+    policy = ChallengePolicy(resend_cooldown_seconds=30)
+    manager = ChallengeManager(policy=policy, adapter=adapter)
+
+    with TestClient(create_app(model=model, challenge_manager=manager)) as client:
+        # 1. GET /v1/challenges: initially empty
+        res = client.get("/v1/challenges")
+        assert res.status_code == 200
+        assert res.json()["total_count"] == 0
+
+        # 2. POST /v1/challenges: create challenge session
+        req_payload = {
+            "transaction_id": "tx_api_001",
+            "user_id": "usr_api_42",
+            "tenant_id": "fintech_alpha",
+            "destination": "+14155552671",
+            "method": "sms_otp",
+            "metadata": {"risk_level": "high"},
+        }
+        create_res = client.post("/v1/challenges", json=req_payload)
+        assert create_res.status_code == 201
+        created = create_res.json()
+        ch_id = created["challenge_id"]
+        assert ch_id.startswith("ch_")
+        assert created["status"] == "pending"
+        assert created["method"] == "sms_otp"
+        assert created["target_masked"] == "+1 ***-***-2671"
+        assert len(adapter.dispatches) == 1
+        raw_otp = adapter.dispatches[0]["raw_token"]
+
+        # 3. GET /v1/challenges/{ch_id}: inspect session
+        get_res = client.get(f"/v1/challenges/{ch_id}")
+        assert get_res.status_code == 200
+        assert get_res.json()["challenge_id"] == ch_id
+        assert get_res.json()["attempts_count"] == 0
+
+        # 4. POST /v1/challenges/{ch_id}/verify with invalid code -> 400
+        verify_bad = client.post(
+            f"/v1/challenges/{ch_id}/verify",
+            json={"token": "000000"},
+        )
+        assert verify_bad.status_code == 400
+        assert "Invalid token" in verify_bad.json()["detail"]
+
+        # 5. POST /v1/challenges/{ch_id}/resend immediately -> 429
+        resend_bad = client.post(
+            f"/v1/challenges/{ch_id}/resend",
+            json={},
+        )
+        assert resend_bad.status_code == 429
+        assert "Resend cooldown active" in resend_bad.json()["detail"]
+
+        # 6. POST /v1/challenges/{ch_id}/verify with valid code -> 200
+        verify_good = client.post(
+            f"/v1/challenges/{ch_id}/verify",
+            json={"token": raw_otp},
+        )
+        assert verify_good.status_code == 200
+        assert verify_good.json()["status"] == "verified"
+        assert verify_good.json()["verified_at"] is not None
+
+        # 7. Check Prometheus metrics
+        metrics_res = client.get("/metrics")
+        assert metrics_res.status_code == 200
+        assert "fraud_challenges_issued_total{" in metrics_res.text
+        assert "fraud_challenges_verified_total{" in metrics_res.text
+
+        # 8. GET /v1/challenges: list sessions
+        list_res = client.get("/v1/challenges?tenant_id=fintech_alpha")
+        assert list_res.status_code == 200
+        assert list_res.json()["total_count"] == 1
+
+        # 9. DELETE /v1/challenges/{ch_id}: cancel
+        del_res = client.delete(f"/v1/challenges/{ch_id}")
+        assert del_res.status_code == 200
+
+        # 10. Nonexistent challenge -> 404
+        assert client.get("/v1/challenges/ch_nonexistent").status_code == 404
+        assert (
+            client.post(
+                "/v1/challenges/ch_nonexistent/verify", json={"token": "123456"}
+            ).status_code
+            == 404
+        )
+        assert client.post("/v1/challenges/ch_nonexistent/resend", json={}).status_code == 404
+        assert client.delete("/v1/challenges/ch_nonexistent").status_code == 404
+
+
+def test_challenge_api_error_branches(api_context: tuple[Path, Any, Path]) -> None:
+    """Test challenge API error branches, uninitialized manager, lockout, and expiration."""
+    from datetime import UTC, datetime, timedelta
+
+    from fraud_detection.challenge import (
+        ChallengeManager,
+        ChallengePolicy,
+        InMemoryNotificationAdapter,
+    )
+
+    _, model, _ = api_context
+
+    # 1. Uninitialized manager -> 500 on mutative / query routes, empty on list
+    uninit_app = create_app(model=model)
+    with TestClient(uninit_app) as uninit_client:
+        uninit_client.app.state.challenge_manager = None
+        assert uninit_client.get("/v1/challenges").json() == {"total_count": 0, "challenges": []}
+        r_create = uninit_client.post(
+            "/v1/challenges",
+            json={
+                "transaction_id": "tx1",
+                "user_id": "u1",
+                "tenant_id": "t1",
+                "destination": "+14155551234",
+                "method": "sms_otp",
+            },
+        )
+        assert r_create.status_code == 500
+        assert "ChallengeManager not initialized" in r_create.json()["detail"]
+        assert uninit_client.get("/v1/challenges/ch_123").status_code == 500
+        assert (
+            uninit_client.post("/v1/challenges/ch_123/verify", json={"token": "123456"}).status_code
+            == 500
+        )
+        assert uninit_client.post("/v1/challenges/ch_123/resend", json={}).status_code == 500
+        assert uninit_client.delete("/v1/challenges/ch_123").status_code == 500
+
+    # 2. Initialized manager with edge cases
+    adapter = InMemoryNotificationAdapter()
+    policy = ChallengePolicy(
+        max_attempts=2, lockout_duration_seconds=300, resend_cooldown_seconds=10
+    )
+    manager = ChallengeManager(policy=policy, adapter=adapter)
+
+    with TestClient(create_app(model=model, challenge_manager=manager)) as client:
+        # 2a. Unsupported challenge method -> 400
+        r_invalid_method = client.post(
+            "/v1/challenges",
+            json={
+                "transaction_id": "tx1",
+                "user_id": "u1",
+                "tenant_id": "t1",
+                "destination": "+14155551234",
+                "method": "smoke_signal",
+            },
+        )
+        assert r_invalid_method.status_code == 400
+        assert "Unsupported challenge method" in r_invalid_method.json()["detail"]
+
+        # 2b. ValueError (e.g. empty user_id) -> 400
+        r_val_err = client.post(
+            "/v1/challenges",
+            json={
+                "transaction_id": "tx1",
+                "user_id": "",
+                "tenant_id": "t1",
+                "destination": "+14155551234",
+                "method": "sms_otp",
+            },
+        )
+        assert r_val_err.status_code == 400
+
+        # 2c. Locked out user -> 429
+        manager.store.set_user_lockout(
+            "t1", "usr_locked", datetime.now(UTC) + timedelta(minutes=15)
+        )
+        r_locked = client.post(
+            "/v1/challenges",
+            json={
+                "transaction_id": "tx1",
+                "user_id": "usr_locked",
+                "tenant_id": "t1",
+                "destination": "+14155551234",
+                "method": "sms_otp",
+            },
+        )
+        assert r_locked.status_code == 429
+        assert "locked out" in r_locked.json()["detail"]
+
+        # 2d. Create normal session to test verify expiration & lockout
+        r_ok = client.post(
+            "/v1/challenges",
+            json={
+                "transaction_id": "tx_exp",
+                "user_id": "usr_exp",
+                "tenant_id": "t1",
+                "destination": "user@example.com",
+                "method": "email_otp",
+            },
+        )
+        assert r_ok.status_code == 201
+        ch_id = r_ok.json()["challenge_id"]
+
+        # Simulate expiration
+        sess = manager.get_session(ch_id)
+        assert sess is not None
+        sess.expires_at = datetime.now(UTC) - timedelta(seconds=60)
+        manager.store.put(sess)
+
+        r_exp_verify = client.post(f"/v1/challenges/{ch_id}/verify", json={"token": "123456"})
+        assert r_exp_verify.status_code == 410
+
+        # 2e. Create session and exceed max attempts -> 429 lockout
+        r_attempts = client.post(
+            "/v1/challenges",
+            json={
+                "transaction_id": "tx_att",
+                "user_id": "usr_att",
+                "tenant_id": "t1",
+                "destination": "att@example.com",
+                "method": "email_otp",
+            },
+        )
+        ch_att_id = r_attempts.json()["challenge_id"]
+        # Attempt 1 -> 400
+        assert (
+            client.post(f"/v1/challenges/{ch_att_id}/verify", json={"token": "000000"}).status_code
+            == 400
+        )
+        # Attempt 2 -> 429 (max attempts exceeded / lockout)
+        r_lock_verify = client.post(f"/v1/challenges/{ch_att_id}/verify", json={"token": "000000"})
+        assert r_lock_verify.status_code == 429
+
+        # 2f. Challenge already cancelled -> 400 on verify / resend
+        r_canc = client.post(
+            "/v1/challenges",
+            json={
+                "transaction_id": "tx_canc",
+                "user_id": "usr_canc",
+                "tenant_id": "t1",
+                "destination": "+14155559999",
+                "method": "sms_otp",
+            },
+        )
+        ch_canc_id = r_canc.json()["challenge_id"]
+        assert client.delete(f"/v1/challenges/{ch_canc_id}").status_code == 200
+
+        # Verifying cancelled -> 400
+        assert (
+            client.post(f"/v1/challenges/{ch_canc_id}/verify", json={"token": "123456"}).status_code
+            == 400
+        )
+        # Resending cancelled -> 400
+        assert client.post(f"/v1/challenges/{ch_canc_id}/resend", json={}).status_code == 400
+
+
+def test_case_api_endpoints_and_lifecycle(api_context: tuple[Path, Any, Path]) -> None:
+    """Validate /v1/cases/* REST endpoints: creation, assignment, notes, and resolution."""
+    from fraud_detection.cases import CaseManager
+
+    _, model, _ = api_context
+    case_mgr = CaseManager()
+
+    with TestClient(create_app(model=model, case_manager=case_mgr)) as client:
+        # 1. GET /v1/cases: initially empty
+        res = client.get("/v1/cases")
+        assert res.status_code == 200
+        assert res.json()["total_count"] == 0
+
+        # 2. POST /v1/cases: create case
+        req_payload = {
+            "transaction_id": "tx_api_case_001",
+            "fraud_score": 0.82,
+            "amount": 1400.0,
+            "currency": "USD",
+            "tenant_id": "fintech_gamma",
+            "priority": "high",
+            "sla_deadline_hours": 12.0,
+        }
+        create_res = client.post("/v1/cases", json=req_payload)
+        assert create_res.status_code == 201
+        created = create_res.json()
+        case_id = created["case_id"]
+        assert case_id.startswith("case_")
+        assert created["status"] == "open"
+        assert created["priority"] == "high"
+        assert created["amount"] == 1400.0
+
+        # 3. GET /v1/cases/{case_id}: retrieve case details
+        get_res = client.get(f"/v1/cases/{case_id}")
+        assert get_res.status_code == 200
+        assert get_res.json()["case_id"] == case_id
+
+        # 4. PATCH /v1/cases/{case_id}: assign analyst
+        patch_res = client.patch(
+            f"/v1/cases/{case_id}",
+            json={"assigned_analyst": "analyst_dave", "actor": "manager"},
+        )
+        assert patch_res.status_code == 200
+        assert patch_res.json()["assigned_analyst"] == "analyst_dave"
+        assert patch_res.json()["status"] == "investigating"
+
+        # 5. POST /v1/cases/{case_id}/notes: add analyst note
+        note_res = client.post(
+            f"/v1/cases/{case_id}/notes",
+            json={"author": "analyst_dave", "text": "Customer confirmed device unrecognized."},
+        )
+        assert note_res.status_code == 201
+        assert note_res.json()["author"] == "analyst_dave"
+
+        # 6. POST /v1/cases/{case_id}/evidence: generate evidence package
+        ev_payload = {
+            "transaction_data": {"amount": 1400.0, "currency": "USD"},
+            "device_data": {"device_id": "dev_test_99", "vpn_detected": True},
+            "geo_data": {"country": "DE", "speed_kmh": 1450.0},
+            "challenge_data": {"method": "sms_otp", "status": "failed"},
+            "actor": "analyst_dave",
+        }
+        ev_res = client.post(f"/v1/cases/{case_id}/evidence", json=ev_payload)
+        assert ev_res.status_code == 201
+        pkg_data = ev_res.json()
+        assert pkg_data["package_id"].startswith("evpkg_")
+        assert len(pkg_data["sha256_fingerprint"]) == 64
+
+        # 7. GET /v1/cases/{case_id}/evidence: list evidence packages
+        list_ev_res = client.get(f"/v1/cases/{case_id}/evidence")
+        assert list_ev_res.status_code == 200
+        assert len(list_ev_res.json()) == 1
+
+        # 8. POST /v1/cases/{case_id}/resolve: finalize case
+        resolve_res = client.post(
+            f"/v1/cases/{case_id}/resolve",
+            json={
+                "disposition": "confirmed_fraud",
+                "actor": "analyst_dave",
+                "notes": "Stolen credentials confirmed via travel & failed SMS challenge.",
+            },
+        )
+        assert resolve_res.status_code == 200
+        assert resolve_res.json()["status"] == "resolved"
+        assert resolve_res.json()["disposition"] == "confirmed_fraud"
+
+        # 9. GET /v1/cases/summary: check aggregate metrics
+        sum_res = client.get("/v1/cases/summary?tenant_id=fintech_gamma")
+        assert sum_res.status_code == 200
+        assert sum_res.json()["total_cases"] == 1
+        assert sum_res.json()["by_status"]["resolved"] == 1
+
+        # 10. Check Prometheus metrics
+        metrics_res = client.get("/metrics")
+        assert metrics_res.status_code == 200
+        assert "fraud_cases_total{" in metrics_res.text
+        assert "fraud_cases_resolved_total{" in metrics_res.text
+        assert "fraud_evidence_packages_total{" in metrics_res.text
+
+
+def test_case_api_error_branches(api_context: tuple[Path, Any, Path]) -> None:
+    """Verify error branches, 404s, 400s, and uninitialized manager for /v1/cases/*."""
+    from unittest.mock import patch
+
+    from fraud_detection.cases import CaseManager, EvidencePackagingError
+
+    _, model, _ = api_context
+
+    # 1. Uninitialized manager
+    uninit_app = create_app(model=model)
+    with TestClient(uninit_app) as uninit_client:
+        uninit_client.app.state.case_manager = None
+        assert uninit_client.get("/v1/cases").json() == {"total_count": 0, "cases": []}
+        assert uninit_client.get("/v1/cases/summary").status_code == 500
+        assert (
+            uninit_client.post(
+                "/v1/cases",
+                json={"transaction_id": "tx1"},
+            ).status_code
+            == 500
+        )
+        assert uninit_client.get("/v1/cases/c1").status_code == 500
+        assert uninit_client.patch("/v1/cases/c1", json={}).status_code == 500
+        assert (
+            uninit_client.post("/v1/cases/c1/notes", json={"author": "a", "text": "t"}).status_code
+            == 500
+        )
+        assert (
+            uninit_client.post(
+                "/v1/cases/c1/resolve", json={"disposition": "confirmed_fraud", "actor": "a"}
+            ).status_code
+            == 500
+        )
+        assert uninit_client.post("/v1/cases/c1/evidence", json={}).status_code == 500
+        assert uninit_client.get("/v1/cases/c1/evidence").status_code == 500
+
+    # 2. Initialized manager with invalid inputs & 404s
+    case_mgr = CaseManager()
+    with TestClient(create_app(model=model, case_manager=case_mgr)) as client:
+        # 404 on missing case
+        assert client.get("/v1/cases/case_nonexistent").status_code == 404
+        assert (
+            client.patch("/v1/cases/case_nonexistent", json={"status": "closed"}).status_code == 404
+        )
+        assert (
+            client.post(
+                "/v1/cases/case_nonexistent/notes", json={"author": "a", "text": "t"}
+            ).status_code
+            == 404
+        )
+        assert (
+            client.post(
+                "/v1/cases/case_nonexistent/resolve",
+                json={"disposition": "confirmed_fraud", "actor": "a"},
+            ).status_code
+            == 404
+        )
+        assert client.post("/v1/cases/case_nonexistent/evidence", json={}).status_code == 404
+        assert client.get("/v1/cases/case_nonexistent/evidence").status_code == 404
+
+        # 400 on invalid priority in create
+        res_bad_prio = client.post(
+            "/v1/cases", json={"transaction_id": "tx1", "priority": "ultra_extreme"}
+        )
+        assert res_bad_prio.status_code == 400
+
+        # 400 on validation error in create (e.g. negative amount)
+        res_bad_amt = client.post("/v1/cases", json={"transaction_id": "tx1", "amount": -50.0})
+        assert res_bad_amt.status_code == 400
+
+        # 400 on invalid status or priority query filters
+        assert client.get("/v1/cases?status=invalid_st").status_code == 400
+        assert client.get("/v1/cases?priority=invalid_prio").status_code == 400
+
+        # Create valid case for patch and note error tests
+        c_res = client.post("/v1/cases", json={"transaction_id": "tx_err_test"})
+        c_id = c_res.json()["case_id"]
+
+        # 400 on invalid status in patch
+        assert (
+            client.patch(f"/v1/cases/{c_id}", json={"status": "invalid_status"}).status_code == 400
+        )
+        # 400 on invalid priority in patch
+        assert (
+            client.patch(f"/v1/cases/{c_id}", json={"priority": "invalid_prio"}).status_code == 400
+        )
+        # 400 on illegal transition (OPEN directly to RESOLVED)
+        assert client.patch(f"/v1/cases/{c_id}", json={"status": "resolved"}).status_code == 400
+        # 400 on empty analyst assignment
+        assert client.patch(f"/v1/cases/{c_id}", json={"assigned_analyst": "  "}).status_code == 400
+
+        # 400 on empty note text
+        assert (
+            client.post(f"/v1/cases/{c_id}/notes", json={"author": "a", "text": "  "}).status_code
+            == 400
+        )
+
+        # 400 on invalid disposition in resolve
+        assert (
+            client.post(
+                f"/v1/cases/{c_id}/resolve", json={"disposition": "invalid_disp", "actor": "a"}
+            ).status_code
+            == 400
+        )
+        # 400 on UNRESOLVED disposition in resolve
+        assert (
+            client.post(
+                f"/v1/cases/{c_id}/resolve", json={"disposition": "unresolved", "actor": "a"}
+            ).status_code
+            == 400
+        )
+
+        # Successful patch priority
+        res_patch_prio = client.patch(
+            f"/v1/cases/{c_id}",
+            json={"priority": "critical", "actor": "lead_analyst", "reason": "VIP escalation"},
+        )
+        assert res_patch_prio.status_code == 200
+        assert res_patch_prio.json()["priority"] == "critical"
+
+        # EvidencePackagingError -> 400
+        with patch.object(
+            CaseManager,
+            "generate_evidence_package",
+            side_effect=EvidencePackagingError("Forced packaging failure"),
+        ):
+            res_ev_fail = client.post(
+                f"/v1/cases/{c_id}/evidence",
+                json={"transaction_data": {"amount": 100.0}},
+            )
+            assert res_ev_fail.status_code == 400
+            assert "Forced packaging failure" in res_ev_fail.json()["detail"]
+
+
+def test_chargeback_api_endpoints_and_lifecycle(api_context: tuple[Path, Any, Path]) -> None:
+    """Validate /v1/chargebacks/* REST endpoints: ingest, webhook, represent, resolve."""
+    from fraud_detection.chargeback import ChargebackManager
+
+    _, model, _ = api_context
+    mgr = ChargebackManager()
+
+    with TestClient(create_app(model=model, chargeback_manager=mgr)) as client:
+        # 1. GET /v1/chargebacks/summary: initially empty
+        res = client.get("/v1/chargebacks/summary")
+        assert res.status_code == 200
+        summary = res.json()
+        assert summary["total_disputes"] == 0
+        assert summary["total_disputed_amount"] == 0.0
+
+        # 2. GET /v1/chargebacks: initially empty
+        res_list = client.get("/v1/chargebacks")
+        assert res_list.status_code == 200
+        assert res_list.json()["total_count"] == 0
+
+        # 3. POST /v1/chargebacks: ingest card scheme chargeback
+        ingest_payload = {
+            "transaction_id": "tx_cb_api_001",
+            "scheme": "visa",
+            "reason_code": "10.4",
+            "disputed_amount": 350.0,
+            "currency": "USD",
+            "tenant_id": "tenant_api_beta",
+            "scheme_dispute_id": "vrol_disp_991",
+            "transaction_context": {"eci": "05", "is_3ds_authenticated": True},
+            "evidence_package": {"package_id": "pkg_api_01", "evidence_fingerprint": "a" * 64},
+        }
+        create_res = client.post("/v1/chargebacks", json=ingest_payload)
+        assert create_res.status_code == 201
+        created = create_res.json()
+        dispute_id = created["dispute_id"]
+        assert dispute_id.startswith("dsp_")
+        assert created["scheme"] == "visa"
+        assert created["category"] == "fraud_card_not_present"
+        assert created["stage"] == "first_chargeback"
+        assert created["winnability_score"] >= 0.70
+        assert created["liability_shift_proven"] is True
+
+        # 4. GET /v1/chargebacks/{dispute_id}: retrieve dispute details
+        get_res = client.get(f"/v1/chargebacks/{dispute_id}")
+        assert get_res.status_code == 200
+        assert get_res.json()["dispute_id"] == dispute_id
+
+        # 5. POST /v1/chargebacks/webhook: gateway webhook notification
+        webhook_payload = {
+            "event_type": "chargeback.created",
+            "scheme": "mastercard",
+            "scheme_dispute_id": "mcom_disp_772",
+            "transaction_id": "tx_cb_api_002",
+            "reason_code": "4853",
+            "amount": 125.0,
+            "currency": "USD",
+            "tenant_id": "tenant_api_beta",
+            "metadata": {"source": "webhook"},
+        }
+        webhook_res = client.post("/v1/chargebacks/webhook", json=webhook_payload)
+        assert webhook_res.status_code == 201
+        webhook_data = webhook_res.json()
+        assert webhook_data["scheme"] == "mastercard"
+        assert webhook_data["category"] == "consumer_dispute"
+        dispute_id_mc = webhook_data["dispute_id"]
+
+        # 6. Filter queries on GET /v1/chargebacks
+        list_visa = client.get("/v1/chargebacks?scheme=visa")
+        assert list_visa.status_code == 200
+        assert list_visa.json()["total_count"] == 1
+
+        list_cat = client.get("/v1/chargebacks?category=consumer_dispute")
+        assert list_cat.status_code == 200
+        assert list_cat.json()["total_count"] == 1
+
+        # 7. POST /v1/chargebacks/{dispute_id}/represent: submit representment
+        rep_payload = {
+            "package_id": "pkg_rep_100",
+            "evidence_fingerprint": "f" * 64,
+            "notes": "3DS Liability shift evidence submitted",
+            "actor": "senior_analyst",
+        }
+        rep_res = client.post(f"/v1/chargebacks/{dispute_id}/represent", json=rep_payload)
+        assert rep_res.status_code == 200
+        represented = rep_res.json()
+        assert represented["stage"] == "represented"
+        assert represented["representment_package_id"] == "pkg_rep_100"
+
+        # 8. POST /v1/chargebacks/{dispute_id}/resolve: finalize dispute
+        resolve_payload = {
+            "outcome": "resolved_won",
+            "actor": "scheme_gateway",
+            "notes": "Arbitration concluded in merchant favor",
+        }
+        res_res = client.post(f"/v1/chargebacks/{dispute_id}/resolve", json=resolve_payload)
+        assert res_res.status_code == 200
+        resolved = res_res.json()
+        assert resolved["stage"] == "resolved_won"
+        assert resolved["is_terminal"] is True
+
+        # Represent then resolve the second dispute as resolved_lost
+        client.post(f"/v1/chargebacks/{dispute_id_mc}/represent", json={"notes": "Defended"})
+        resolve_lost_payload = {
+            "outcome": "resolved_lost",
+            "actor": "scheme_gateway",
+            "notes": "Issuer upheld dispute after representment",
+        }
+        res_lost = client.post(
+            f"/v1/chargebacks/{dispute_id_mc}/resolve", json=resolve_lost_payload
+        )
+        assert res_lost.status_code == 200
+        assert res_lost.json()["stage"] == "resolved_lost"
+
+        # 9. GET /v1/chargebacks/summary: verify aggregate counts
+        sum_after = client.get("/v1/chargebacks/summary?tenant_id=tenant_api_beta")
+        assert sum_after.status_code == 200
+        sum_data = sum_after.json()
+        assert sum_data["total_disputes"] == 2
+        assert sum_data["total_disputed_amount"] == 475.0
+        assert sum_data["by_stage"]["resolved_won"] == 1
+        assert sum_data["by_stage"]["resolved_lost"] == 1
+
+        # 10. Check Prometheus metrics
+        metrics_res = client.get("/metrics")
+        assert metrics_res.status_code == 200
+        metrics_text = metrics_res.text
+        assert "fraud_chargebacks_received_total" in metrics_text
+        assert "fraud_chargebacks_represented_total" in metrics_text
+        assert "fraud_chargebacks_won_total" in metrics_text
+        assert "fraud_chargebacks_lost_total" in metrics_text
+        assert "fraud_chargeback_financial_exposure_amount" in metrics_text
+
+
+def test_chargeback_api_error_branches_and_edge_cases(
+    api_context: tuple[Path, Any, Path],
+) -> None:
+    """Verify error branches, 404s, 400s, and uninitialized manager for /v1/chargebacks/*."""
+    from unittest.mock import patch
+
+    from fraud_detection.chargeback import CardScheme, ChargebackManager, DisputeValidationError
+
+    _, model, _ = api_context
+
+    # 1. Uninitialized manager returns 500 (or empty list)
+    with TestClient(create_app(model=model, chargeback_manager=None)) as uninit_client:
+        cast(Any, uninit_client.app).state.chargeback_manager = None
+        assert uninit_client.get("/v1/chargebacks").json() == {"total_count": 0, "disputes": []}
+        assert uninit_client.get("/v1/chargebacks/summary").status_code == 500
+        assert (
+            uninit_client.post(
+                "/v1/chargebacks",
+                json={
+                    "transaction_id": "tx1",
+                    "scheme": "visa",
+                    "reason_code": "10.4",
+                    "disputed_amount": 50.0,
+                },
+            ).status_code
+            == 500
+        )
+        assert (
+            uninit_client.post(
+                "/v1/chargebacks/webhook",
+                json={
+                    "scheme": "visa",
+                    "scheme_dispute_id": "d1",
+                    "transaction_id": "tx1",
+                    "reason_code": "10.4",
+                    "amount": 50.0,
+                },
+            ).status_code
+            == 500
+        )
+        assert uninit_client.get("/v1/chargebacks/disp_none").status_code == 500
+        assert (
+            uninit_client.post(
+                "/v1/chargebacks/disp_none/represent",
+                json={},
+            ).status_code
+            == 500
+        )
+        assert (
+            uninit_client.post(
+                "/v1/chargebacks/disp_none/resolve",
+                json={"outcome": "resolved_won"},
+            ).status_code
+            == 500
+        )
+
+    mgr = ChargebackManager()
+    with TestClient(create_app(model=model, chargeback_manager=mgr)) as client:
+        # 2. 404 for nonexistent dispute
+        assert client.get("/v1/chargebacks/disp_nonexistent").status_code == 404
+        assert client.post("/v1/chargebacks/disp_nonexistent/represent", json={}).status_code == 404
+        assert (
+            client.post(
+                "/v1/chargebacks/disp_nonexistent/resolve",
+                json={"outcome": "resolved_won"},
+            ).status_code
+            == 404
+        )
+
+        # 3. 400 for invalid query parameters
+        assert client.get("/v1/chargebacks?scheme=invalid_scheme").status_code == 400
+        assert client.get("/v1/chargebacks?stage=invalid_stage").status_code == 400
+        assert client.get("/v1/chargebacks?category=invalid_cat").status_code == 400
+
+        # 4. 400 for invalid payload parameters in ingest
+        res_bad_scheme = client.post(
+            "/v1/chargebacks",
+            json={
+                "transaction_id": "tx_bad",
+                "scheme": "unsupported_scheme",
+                "reason_code": "10.4",
+                "disputed_amount": 100.0,
+            },
+        )
+        assert res_bad_scheme.status_code == 400
+
+        res_bad_amt = client.post(
+            "/v1/chargebacks",
+            json={
+                "transaction_id": "tx_bad",
+                "scheme": "visa",
+                "reason_code": "10.4",
+                "disputed_amount": -100.0,
+            },
+        )
+        assert res_bad_amt.status_code == 400
+
+        # 5. 400 for invalid scheme in webhook
+        res_bad_wh = client.post(
+            "/v1/chargebacks/webhook",
+            json={
+                "scheme": "unknown_network",
+                "scheme_dispute_id": "d1",
+                "transaction_id": "tx1",
+                "reason_code": "10.4",
+                "amount": 50.0,
+            },
+        )
+        assert res_bad_wh.status_code == 400
+
+        # 6. Ingest valid dispute and test illegal transitions
+        ingest_res = client.post(
+            "/v1/chargebacks",
+            json={
+                "transaction_id": "tx_err_test",
+                "scheme": "discover",
+                "reason_code": "4837",
+                "disputed_amount": 75.0,
+            },
+        )
+        assert ingest_res.status_code == 201
+        d_id = ingest_res.json()["dispute_id"]
+
+        # Invalid outcome in resolve
+        res_bad_out = client.post(
+            f"/v1/chargebacks/{d_id}/resolve",
+            json={"outcome": "invalid_outcome"},
+        )
+        assert res_bad_out.status_code == 400
+
+        # Resolve to terminal accepted_liability
+        res_term = client.post(
+            f"/v1/chargebacks/{d_id}/resolve",
+            json={"outcome": "accepted_liability"},
+        )
+        assert res_term.status_code == 200
+        assert res_term.json()["stage"] == "accepted_liability"
+
+        # Cannot represent a terminal dispute
+        res_term_rep = client.post(f"/v1/chargebacks/{d_id}/represent", json={})
+        assert res_term_rep.status_code == 400
+
+        # 7. Mock DisputeValidationError in webhook
+        with patch.object(
+            mgr,
+            "ingest_chargeback",
+            side_effect=DisputeValidationError("Forced validation error"),
+        ):
+            res_wh_err = client.post(
+                "/v1/chargebacks/webhook",
+                json={
+                    "scheme": "visa",
+                    "scheme_dispute_id": "d_err",
+                    "transaction_id": "tx_wh_err",
+                    "reason_code": "10.4",
+                    "amount": 50.0,
+                },
+            )
+            assert res_wh_err.status_code == 400
+            assert "Forced validation error" in res_wh_err.json()["detail"]
+
+        # 8. Feedback label publishing error during resolve is handled gracefully
+        d_res_lbl = mgr.ingest_chargeback(
+            transaction_id="tx_lbl_err",
+            scheme=CardScheme.VISA,
+            reason_code="10.4",
+            disputed_amount=80.0,
+        )
+        mgr.represent_dispute(d_res_lbl.dispute_id)
+        with patch.object(
+            mgr,
+            "publish_feedback_label",
+            side_effect=RuntimeError("Label store write failed"),
+        ):
+            res_resolve_lbl_err = client.post(
+                f"/v1/chargebacks/{d_res_lbl.dispute_id}/resolve",
+                json={"outcome": "resolved_won"},
+            )
+            assert res_resolve_lbl_err.status_code == 200
+            assert res_resolve_lbl_err.json()["stage"] == "resolved_won"
+
+        # 9. Illegal resolution transition (resolving already terminal dispute) returns 400
+        res_already_term = client.post(
+            f"/v1/chargebacks/{d_res_lbl.dispute_id}/resolve",
+            json={"outcome": "resolved_lost"},
+        )
+        assert res_already_term.status_code == 400
+
+        # 10. Operations when metrics counters/gauges are None on app.state
+        cast(Any, client.app).state.chargebacks_received_counter = None
+        cast(Any, client.app).state.chargebacks_represented_counter = None
+        cast(Any, client.app).state.chargebacks_won_counter = None
+        cast(Any, client.app).state.chargebacks_lost_counter = None
+        cast(Any, client.app).state.chargeback_exposure_gauge = None
+        cast(Any, client.app).state.label_store = None
+
+        res_no_metric_ingest = client.post(
+            "/v1/chargebacks",
+            json={
+                "transaction_id": "tx_no_metrics",
+                "scheme": "visa",
+                "reason_code": "10.4",
+                "disputed_amount": 90.0,
+            },
+        )
+        assert res_no_metric_ingest.status_code == 201
+        d_no_metric_id = res_no_metric_ingest.json()["dispute_id"]
+
+        res_no_metric_rep = client.post(
+            f"/v1/chargebacks/{d_no_metric_id}/represent",
+            json={"notes": "defended without metrics"},
+        )
+        assert res_no_metric_rep.status_code == 200
+
+        res_no_metric_res = client.post(
+            f"/v1/chargebacks/{d_no_metric_id}/resolve",
+            json={"outcome": "resolved_lost"},
+        )
+        assert res_no_metric_res.status_code == 200
+
+
+def test_ato_api_endpoints_and_lifecycle(api_context: tuple[Path, Any, Path]) -> None:
+    """Validate /v1/ato/* REST endpoints: login, evaluate, profile, quarantine, release."""
+    from fraud_detection.ato import AtoEngine
+
+    _, model, _ = api_context
+    ato_engine = AtoEngine(auto_quarantine=True)
+    app = create_app(model=model, ato_engine=ato_engine)
+
+    with TestClient(app) as client:
+        # 1. Ingest normal login attempt
+        login_res = client.post(
+            "/v1/ato/login",
+            json={
+                "user_id": "usr_api_alice",
+                "tenant_id": "corp_test",
+                "ip_address": "198.51.100.25",
+                "outcome": "success",
+                "device_fingerprint": "dev_laptop_1",
+                "latitude": 40.7128,
+                "longitude": -74.0060,
+            },
+        )
+        assert login_res.status_code == 200
+        data1 = login_res.json()
+        assert data1["assessment_id"].startswith("ato_")
+        assert data1["user_id"] == "usr_api_alice"
+        assert data1["recommended_action"] == "allow"
+        assert not data1["quarantined"]
+        assessment_id = data1["assessment_id"]
+
+        # 2. Record sensitive mutation (password change)
+        mut_res = client.post(
+            "/v1/ato/accounts/usr_api_alice/mutations",
+            json={
+                "mutation_type": "password_change",
+                "channel": "web_portal",
+                "metadata": {"ip": "198.51.100.25"},
+            },
+        )
+        assert mut_res.status_code == 200
+        assert mut_res.json()["status"] == "recorded"
+        assert mut_res.json()["user_id"] == "usr_api_alice"
+
+        # 3. Inspect account profile
+        prof_res = client.get("/v1/ato/accounts/usr_api_alice")
+        assert prof_res.status_code == 200
+        prof_data = prof_res.json()
+        assert prof_data["user_id"] == "usr_api_alice"
+        assert "dev_laptop_1" in prof_data["known_devices"]
+        assert len(prof_data["mutations"]) == 1
+
+        # 4. Evaluate high-risk transaction (impossible travel from Tokyo from new device)
+        eval_res = client.post(
+            "/v1/ato/evaluate",
+            json={
+                "user_id": "usr_api_alice",
+                "tenant_id": "corp_test",
+                "action_type": "high_value_wire",
+                "ip_address": "203.0.113.88",
+                "device_fingerprint": "dev_unknown_mobile",
+                "latitude": 35.6762,
+                "longitude": 139.6503,
+                "transaction_amount": 5000.0,
+            },
+        )
+        assert eval_res.status_code == 200
+        eval_data = eval_res.json()
+        assert eval_data["user_id"] == "usr_api_alice"
+        assert "new_device" in eval_data["factors_triggered"]
+        assert eval_data["risk_score"] > 0.40
+
+        # 5. Administratively quarantine account
+        q_res = client.post(
+            "/v1/ato/accounts/usr_api_alice/quarantine",
+            json={"reason": "Security operations center flag", "tenant_id": "corp_test"},
+        )
+        assert q_res.status_code == 200
+        assert q_res.json()["status"] == "quarantined"
+
+        # 6. Verify subsequent attempt returns BLOCK while quarantined
+        blocked_res = client.post(
+            "/v1/ato/login",
+            json={"user_id": "usr_api_alice", "outcome": "success"},
+        )
+        assert blocked_res.status_code == 200
+        assert blocked_res.json()["recommended_action"] == "block"
+        assert blocked_res.json()["quarantined"] is True
+
+        # 7. Release account
+        rel_res = client.post(
+            "/v1/ato/accounts/usr_api_alice/release",
+            json={"reason": "User identity verified", "tenant_id": "corp_test"},
+        )
+        assert rel_res.status_code == 200
+        assert rel_res.json()["status"] == "released"
+
+        # 8. Query assessments list and inspect single assessment
+        list_res = client.get("/v1/ato/assessments?user_id=usr_api_alice")
+        assert list_res.status_code == 200
+        assert list_res.json()["total_count"] >= 2
+
+        single_res = client.get(f"/v1/ato/assessments/{assessment_id}")
+        assert single_res.status_code == 200
+        assert single_res.json()["assessment_id"] == assessment_id
+
+        # 9. Verify Prometheus metrics
+        metrics_res = client.get("/metrics")
+        assert metrics_res.status_code == 200
+        assert "fraud_ato_login_attempts_total" in metrics_res.text
+        assert "fraud_ato_risk_assessments_total" in metrics_res.text
+        assert "fraud_ato_quarantines_total" in metrics_res.text
+
+
+def test_ato_api_error_branches_and_edge_cases(api_context: tuple[Path, Any, Path]) -> None:
+    """Verify 400, 404, 500 error branches and metrics None handling for /v1/ato/* endpoints."""
+    from fraud_detection.ato import AtoEngine
+
+    _, model, _ = api_context
+    ato_engine = AtoEngine()
+    app = create_app(model=model, ato_engine=ato_engine)
+
+    with TestClient(app) as client:
+        # 1. Invalid login outcome -> 400
+        res_bad_outcome = client.post(
+            "/v1/ato/login",
+            json={"user_id": "usr_err", "outcome": "nonexistent_outcome"},
+        )
+        assert res_bad_outcome.status_code == 400
+        assert "Invalid login outcome" in res_bad_outcome.json()["detail"]
+
+        # 2. Invalid mutation type -> 400
+        res_bad_mut = client.post(
+            "/v1/ato/accounts/usr_err/mutations",
+            json={"mutation_type": "nonexistent_mutation"},
+        )
+        assert res_bad_mut.status_code == 400
+        assert "Invalid mutation type" in res_bad_mut.json()["detail"]
+
+        # 3. Missing assessment -> 404
+        res_missing_assessment = client.get("/v1/ato/assessments/ato_does_not_exist")
+        assert res_missing_assessment.status_code == 404
+        assert "not found" in res_missing_assessment.json()["detail"]
+
+        # 4. List assessments without user_id filter
+        res_list_all = client.get("/v1/ato/assessments")
+        assert res_list_all.status_code == 200
+
+        # 5. When metrics counters are None on app.state
+        cast(Any, client.app).state.ato_login_attempts_counter = None
+        cast(Any, client.app).state.ato_evaluations_counter = None
+        cast(Any, client.app).state.ato_quarantines_counter = None
+
+        res_no_metric_login = client.post(
+            "/v1/ato/login",
+            json={"user_id": "usr_no_metrics", "outcome": "success"},
+        )
+        assert res_no_metric_login.status_code == 200
+
+        res_no_metric_eval = client.post(
+            "/v1/ato/evaluate",
+            json={"user_id": "usr_no_metrics"},
+        )
+        assert res_no_metric_eval.status_code == 200
+
+        res_no_metric_q = client.post(
+            "/v1/ato/accounts/usr_no_metrics/quarantine",
+            json={"reason": "test"},
+        )
+        assert res_no_metric_q.status_code == 200
+
+        # 6. When engine is None on app.state -> 500
+        cast(Any, client.app).state.ato_engine = None
+
+        assert client.post("/v1/ato/login", json={"user_id": "u"}).status_code == 500
+        assert client.post("/v1/ato/evaluate", json={"user_id": "u"}).status_code == 500
+        assert client.get("/v1/ato/accounts/u").status_code == 500
+        assert (
+            client.post(
+                "/v1/ato/accounts/u/mutations", json={"mutation_type": "password_change"}
+            ).status_code
+            == 500
+        )
+        assert client.post("/v1/ato/accounts/u/quarantine", json={"reason": "r"}).status_code == 500
+        assert client.post("/v1/ato/accounts/u/release", json={"reason": "r"}).status_code == 500
+        assert client.get("/v1/ato/assessments").status_code == 500
+        assert client.get("/v1/ato/assessments/ato_123").status_code == 500
+
+
+def test_aml_api_endpoints_and_lifecycle(api_context: tuple[Path, Any, Path]) -> None:
+    """Validate /v1/aml/* REST endpoints for monitoring, screening, alerts, and SARs."""
+    from fraud_detection.aml import AmlEngine, SarManager
+
+    _, model, _ = api_context
+    aml_engine = AmlEngine()
+    sar_manager = SarManager(store=aml_engine.store)
+    app = create_app(model=model, aml_engine=aml_engine, sar_manager=sar_manager)
+
+    with TestClient(app) as client:
+        # 1. Add entry to watchlist
+        res_wl = client.post(
+            "/v1/aml/watchlist/entries",
+            json={
+                "name": "Viktor Bout",
+                "watchlist_type": "ofac_sdn",
+                "country": "RU",
+                "aliases": ["The Merchant", "Boris"],
+                "notes": "Arms trafficking designation",
+            },
+        )
+        assert res_wl.status_code == 201
+        assert res_wl.json()["status"] == "created"
+        assert res_wl.json()["entry"]["name"] == "Viktor Bout"
+
+        # 2. Screen entity name against watchlist
+        res_screen = client.post(
+            "/v1/aml/watchlist/screen",
+            json={"name": "Victor Bout", "threshold": 0.85},
+        )
+        assert res_screen.status_code == 200
+        matches = res_screen.json()
+        assert len(matches) == 1
+        assert matches[0]["matched_entry"]["name"] == "Viktor Bout"
+        assert matches[0]["similarity_score"] >= 0.88
+
+        # 3. Monitor normal transaction -> PASS
+        res_norm = client.post(
+            "/v1/aml/transactions/monitor",
+            json={
+                "transaction_id": "tx-normal-1",
+                "user_id": "usr-aml-1",
+                "amount": 150.0,
+                "direction": "outflow",
+                "country": "US",
+            },
+        )
+        assert res_norm.status_code == 200
+        norm_data = res_norm.json()
+        assert norm_data["recommended_action"] == "pass"
+        assert norm_data["risk_level"] == "low"
+        assert norm_data["alert_id"] is None
+
+        # 4. Monitor structuring transactions (two sub-threshold bursts)
+        res_str1 = client.post(
+            "/v1/aml/transactions/monitor",
+            json={
+                "transaction_id": "tx-str-1",
+                "user_id": "usr-aml-smurf",
+                "amount": 9500.0,
+                "direction": "outflow",
+                "country": "US",
+            },
+        )
+        assert res_str1.status_code == 200
+
+        res_str2 = client.post(
+            "/v1/aml/transactions/monitor",
+            json={
+                "transaction_id": "tx-str-2",
+                "user_id": "usr-aml-smurf",
+                "amount": 9200.0,
+                "direction": "outflow",
+                "country": "US",
+            },
+        )
+        assert res_str2.status_code == 200
+        str2_data = res_str2.json()
+        assert "structuring_smurfing" in str2_data["triggered_typologies"]
+        assert str2_data["alert_id"] is not None
+        saved_alert_id = str2_data["alert_id"]
+
+        # 5. Monitor sanctions hit -> FILE_SAR_BLOCK
+        res_sanc = client.post(
+            "/v1/aml/transactions/monitor",
+            json={
+                "transaction_id": "tx-sanc-1",
+                "user_id": "usr-bad-actor",
+                "amount": 50000.0,
+                "counterparty_id": "Viktor Bout",
+                "direction": "outflow",
+                "country": "US",
+            },
+        )
+        assert res_sanc.status_code == 200
+        sanc_data = res_sanc.json()
+        assert sanc_data["recommended_action"] == "file_sar_block"
+        assert sanc_data["risk_level"] == "critical"
+        sanc_alert_id = sanc_data["alert_id"]
+        assert sanc_alert_id is not None
+
+        # 6. Query alerts
+        res_alerts = client.get("/v1/aml/alerts", params={"user_id": "usr-aml-smurf"})
+        assert res_alerts.status_code == 200
+        alerts_list = res_alerts.json()
+        assert alerts_list["total_count"] >= 1
+        assert alerts_list["alerts"][0]["alert_id"] == saved_alert_id
+
+        # Filter by typology
+        res_typ_alerts = client.get("/v1/aml/alerts", params={"typology": "structuring_smurfing"})
+        assert res_typ_alerts.status_code == 200
+        assert res_typ_alerts.json()["total_count"] >= 1
+
+        # Retrieve single alert
+        res_single_alert = client.get(f"/v1/aml/alerts/{saved_alert_id}")
+        assert res_single_alert.status_code == 200
+        assert res_single_alert.json()["alert_id"] == saved_alert_id
+
+        # 7. Generate SAR dossier
+        res_sar_gen = client.post(
+            "/v1/aml/sar/generate",
+            json={
+                "user_id": "usr-aml-smurf",
+                "alert_ids": [saved_alert_id],
+                "suspect_name": "Smurf Master",
+                "suspect_details": {"occupation": "Currency Courier"},
+                "transactions": [
+                    {"transaction_id": "tx-str-1", "user_id": "usr-aml-smurf", "amount": 9500.0},
+                    {"transaction_id": "tx-str-2", "user_id": "usr-aml-smurf", "amount": 9200.0},
+                ],
+            },
+        )
+        assert res_sar_gen.status_code == 200
+        sar_data = res_sar_gen.json()
+        sar_id = sar_data["sar_id"]
+        assert sar_data["status"] == "draft"
+        assert "Smurf Master" in sar_data["narrative"]
+        assert sar_data["summary_financials"]["total_suspicious_amount"] == 18700.0
+
+        # 8. Query SAR dossiers
+        res_sar_list = client.get("/v1/aml/sar", params={"user_id": "usr-aml-smurf"})
+        assert res_sar_list.status_code == 200
+        assert res_sar_list.json()["total_count"] == 1
+
+        res_single_sar = client.get(f"/v1/aml/sar/{sar_id}")
+        assert res_single_sar.status_code == 200
+        assert res_single_sar.json()["sar_id"] == sar_id
+
+        # 9. Export FinCEN XML
+        res_xml = client.get(f"/v1/aml/sar/{sar_id}/xml")
+        assert res_xml.status_code == 200
+        assert res_xml.headers["content-type"].startswith("application/xml")
+        assert "<FinCEN_BSA_SAR" in res_xml.text
+        assert f"<SAR_ID>{sar_id}</SAR_ID>" in res_xml.text
+
+        # 10. SAR status transition: DRAFT -> PENDING_REVIEW -> APPROVED -> FILED
+        res_review = client.post(
+            f"/v1/aml/sar/{sar_id}/status",
+            json={"new_status": "pending_review", "notes": "Audited by BSA analyst"},
+        )
+        assert res_review.status_code == 200
+        assert res_review.json()["status"] == "pending_review"
+
+        res_appr = client.post(
+            f"/v1/aml/sar/{sar_id}/status",
+            json={"new_status": "approved", "notes": "Signed off by MLRO"},
+        )
+        assert res_appr.status_code == 200
+        assert res_appr.json()["status"] == "approved"
+
+        res_filed = client.post(
+            f"/v1/aml/sar/{sar_id}/status",
+            json={"new_status": "filed", "notes": "FinCEN e-file ack #99231"},
+        )
+        assert res_filed.status_code == 200
+        assert res_filed.json()["status"] == "filed"
+        assert res_filed.json()["filing_date"] != ""
+
+
+def test_aml_api_error_branches_and_edge_cases(api_context: tuple[Path, Any, Path]) -> None:
+    """Validate 400, 404, 500 error branches and edge cases on /v1/aml/* endpoints."""
+    from fraud_detection.aml import AmlEngine, SarManager
+
+    _, model, _ = api_context
+    aml_engine = AmlEngine()
+    sar_manager = SarManager(store=aml_engine.store)
+    app = create_app(model=model, aml_engine=aml_engine, sar_manager=sar_manager)
+
+    with TestClient(app) as client:
+        # 1. Invalid transaction direction -> 400
+        res_bad_dir = client.post(
+            "/v1/aml/transactions/monitor",
+            json={
+                "user_id": "u1",
+                "amount": 100.0,
+                "direction": "diagonal",
+            },
+        )
+        assert res_bad_dir.status_code == 400
+        assert "Invalid direction" in res_bad_dir.json()["detail"]
+
+        # 2. Invalid watchlist type -> 400
+        res_bad_wl = client.post(
+            "/v1/aml/watchlist/entries",
+            json={
+                "name": "Test Entry",
+                "watchlist_type": "invalid_type",
+            },
+        )
+        assert res_bad_wl.status_code == 400
+        assert "Invalid watchlist type" in res_bad_wl.json()["detail"]
+
+        # 3. Alert not found -> 404
+        assert client.get("/v1/aml/alerts/nonexistent-alert").status_code == 404
+
+        # 4. SAR not found -> 404
+        assert client.get("/v1/aml/sar/nonexistent-sar").status_code == 404
+        assert client.get("/v1/aml/sar/nonexistent-sar/xml").status_code == 404
+
+        # 5. Invalid SAR status string -> 400
+        res_bad_stat = client.post(
+            "/v1/aml/sar/some-sar/status",
+            json={"new_status": "in_outer_space"},
+        )
+        assert res_bad_stat.status_code == 400
+        assert "Invalid SAR status" in res_bad_stat.json()["detail"]
+
+        # 6. Status update on non-existent SAR -> 404
+        res_stat_404 = client.post(
+            "/v1/aml/sar/missing-sar/status",
+            json={"new_status": "draft"},
+        )
+        assert res_stat_404.status_code == 404
+
+        # 7. Invalid transition rule on real SAR (e.g. DRAFT -> FILED directly) -> 400
+        sar = sar_manager.generate_sar(user_id="u_err", alert_ids=[])
+        res_invalid_trans = client.post(
+            f"/v1/aml/sar/{sar.sar_id}/status",
+            json={"new_status": "filed"},
+        )
+        assert res_invalid_trans.status_code == 400
+        assert "Invalid SAR status transition" in res_invalid_trans.json()["detail"]
+
+        # 8. Uninitialized engine / manager -> 500
+        cast(Any, client.app).state.aml_engine = None
+        cast(Any, client.app).state.sar_manager = None
+
+        assert (
+            client.post(
+                "/v1/aml/transactions/monitor", json={"user_id": "u", "amount": 10.0}
+            ).status_code
+            == 500
+        )
+        assert client.post("/v1/aml/watchlist/screen", json={"name": "n"}).status_code == 500
+        assert (
+            client.post(
+                "/v1/aml/watchlist/entries", json={"name": "n", "watchlist_type": "pep"}
+            ).status_code
+            == 500
+        )
+        assert client.get("/v1/aml/alerts").status_code == 500
+        assert client.get("/v1/aml/alerts/alt_1").status_code == 500
+        assert (
+            client.post("/v1/aml/sar/generate", json={"user_id": "u", "alert_ids": []}).status_code
+            == 500
+        )
+        assert client.get("/v1/aml/sar").status_code == 500
+        assert client.get("/v1/aml/sar/s_1").status_code == 500
+        assert client.get("/v1/aml/sar/s_1/xml").status_code == 500
+        assert (
+            client.post("/v1/aml/sar/s_1/status", json={"new_status": "draft"}).status_code == 500
+        )
+
+
+def test_sif_api_endpoints_and_lifecycle(api_context: tuple[Path, Any, Path]) -> None:
+    """Validate /v1/sif/* endpoints, evaluation lifecycle, and Prometheus metrics."""
+    from fraud_detection.synthetic_identity import SyntheticIdentityEngine
+
+    _, model, _ = api_context
+    sif_engine = SyntheticIdentityEngine()
+    app = create_app(model=model, sif_engine=sif_engine)
+
+    with TestClient(app) as client:
+        # 1. Evaluate clean applicant -> APPROVE
+        res_legit = client.post(
+            "/v1/sif/evaluate",
+            json={
+                "applicant_id": "app_api_1",
+                "ssn": "050-12-3456",
+                "first_name": "Bruce",
+                "last_name": "Wayne",
+                "dob": "1980-02-19",
+                "address": "1007 Mountain Drive, Gotham, NY",
+                "phone": "+12125550001",
+                "email": "bruce@wayneenterprises.com",
+                "credit_line_requested": 50000.0,
+                "tenant_id": "tenant_wayne",
+            },
+        )
+        assert res_legit.status_code == 200
+        body_legit = res_legit.json()
+        assert body_legit["applicant_id"] == "app_api_1"
+        assert body_legit["action"] == "approve"
+        assert body_legit["risk_level"] == "low"
+        ass_id = body_legit["assessment_id"]
+
+        # 2. Evaluate deceased applicant -> DECLINE_BLOCK
+        res_dec = client.post(
+            "/v1/sif/evaluate",
+            json={
+                "applicant_id": "app_api_2",
+                "ssn": "042-12-9999",  # Arthur Pendelton
+                "first_name": "Arthur",
+                "last_name": "Pendelton",
+                "dob": "1950-01-01",
+                "address": "10 Cemetery Rd, Hartford, CT",
+                "phone": "+12035551212",
+                "email": "arthur@example.com",
+                "tenant_id": "tenant_wayne",
+            },
+        )
+        assert res_dec.status_code == 200
+        body_dec = res_dec.json()
+        assert body_dec["action"] == "decline_block"
+        assert body_dec["risk_level"] == "critical"
+        assert body_dec["risk_score"] == 1.0
+
+        # 3. Query assessment by ID
+        res_get_ass = client.get(f"/v1/sif/assessments/{ass_id}")
+        assert res_get_ass.status_code == 200
+        assert res_get_ass.json()["assessment_id"] == ass_id
+
+        # 4. List assessments with tenant filter
+        res_list_ass = client.get("/v1/sif/assessments?tenant_id=tenant_wayne")
+        assert res_list_ass.status_code == 200
+        assert res_list_ass.json()["total_count"] == 2
+
+        # 5. Create profile endpoint
+        res_prof = client.post(
+            "/v1/sif/profiles",
+            json={
+                "applicant_id": "app_api_3",
+                "ssn": "111-22-3333",
+                "first_name": "Clark",
+                "last_name": "Kent",
+                "dob": "1982-06-18",
+                "address": "344 Clinton St, Metropolis, NY",
+                "phone": "+12125553333",
+                "email": "clark.kent@dailyplanet.com",
+                "authorized_users": [
+                    {"user_id": "u_lois", "name": "Lois Lane", "relationship": "spouse"}
+                ],
+                "tenant_id": "tenant_wayne",
+            },
+        )
+        assert res_prof.status_code == 200
+        body_prof = res_prof.json()
+        assert body_prof["ssn"] == "XXX-XX-3333"
+        assert len(body_prof["authorized_users"]) == 1
+
+        # 6. Get profile by applicant_id
+        res_get_prof = client.get("/v1/sif/applicants/app_api_3")
+        assert res_get_prof.status_code == 200
+        assert res_get_prof.json()["first_name"] == "Clark"
+
+        # 7. List profiles
+        res_list_prof = client.get("/v1/sif/profiles?tenant_id=tenant_wayne")
+        assert res_list_prof.status_code == 200
+        assert res_list_prof.json()["total_count"] >= 3
+
+        # 8. SIF Summary metrics
+        res_metrics = client.get("/v1/sif/metrics")
+        assert res_metrics.status_code == 200
+        assert res_metrics.json()["status"] == "operational"
+        assert res_metrics.json()["total_assessments_recorded"] >= 2
+
+        # 9. Prometheus metrics endpoint check
+        metrics_resp = client.get("/metrics")
+        assert metrics_resp.status_code == 200
+        assert "fraud_sif_evaluations_total" in metrics_resp.text
+        assert "fraud_sif_blocks_total" in metrics_resp.text
+
+
+def test_sif_api_error_branches_and_edge_cases(api_context: tuple[Path, Any, Path]) -> None:
+    """Validate 404 and 500 error branches on /v1/sif/* endpoints."""
+    from fraud_detection.synthetic_identity import SyntheticIdentityEngine
+
+    _, model, _ = api_context
+    sif_engine = SyntheticIdentityEngine()
+    app = create_app(model=model, sif_engine=sif_engine)
+
+    with TestClient(app) as client:
+        # 404 assessment
+        assert client.get("/v1/sif/assessments/sif_nonexistent").status_code == 404
+        # 404 applicant profile
+        assert client.get("/v1/sif/applicants/app_nonexistent").status_code == 404
+
+        # Null out sif_engine on app.state -> 500
+        app.state.sif_engine = None
+        eval_payload = {
+            "ssn": "050-12-3456",
+            "first_name": "F",
+            "last_name": "L",
+            "dob": "1990-01-01",
+            "address": "1 A St",
+            "phone": "+12125551212",
+            "email": "test@example.com",
+        }
+        assert client.post("/v1/sif/evaluate", json=eval_payload).status_code == 500
+        assert client.get("/v1/sif/assessments/sif_1").status_code == 500
+        assert client.get("/v1/sif/assessments").status_code == 500
+        assert client.post("/v1/sif/profiles", json=eval_payload).status_code == 500
+        assert client.get("/v1/sif/applicants/app_1").status_code == 500
+        assert client.get("/v1/sif/profiles").status_code == 500
