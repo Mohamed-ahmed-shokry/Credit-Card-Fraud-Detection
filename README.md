@@ -2159,6 +2159,35 @@ FastAPI Synthetic Identity REST endpoints:
 - `GET /v1/sif/metrics`: Summary of tracked profiles and recorded assessments.
 - Prometheus metrics: `fraud_sif_evaluations_total`, `fraud_sif_anomalies_total`, `fraud_sif_high_risk_total`, `fraud_sif_blocks_total`.
 
+### Money Mule Account & Rapid Exfiltration Detection Engine
+
+Phase 50 introduces real-time Money Mule detection (`mule_detection.py`), identifying pass-through conduit behavior, rapid dwell-time compression, fan-in/fan-out concentration, dormancy wake-up bursts, and high-risk off-ramp cash-outs:
+
+```bash
+# Ingest an inbound/outbound transfer and evaluate mule risk
+fraud-detect mule-ingest \
+  --account-id acct_100 \
+  --counterparty-id crypto_offramp \
+  --direction outbound \
+  --amount 4900 \
+  --channel crypto_exchange \
+  --format json
+
+# Evaluate an existing account, inspect history, or view store summary
+fraud-detect mule-eval --account-id acct_100
+fraud-detect mule-inspect --account-id acct_100
+fraud-detect mule-summary --format table
+```
+
+FastAPI Money Mule REST endpoints:
+- `POST /v1/mule/transfers`: Ingest a transfer and evaluate the account for mule activity.
+- `POST /v1/mule/evaluate`: Evaluate a monitored account's mule risk on demand.
+- `GET /v1/mule/assessments/{assessment_id}`: Fetch a specific mule risk assessment.
+- `GET /v1/mule/assessments`: Query mule assessments with optional tenant filter.
+- `GET /v1/mule/accounts/{account_id}`: Inspect a monitored account's profile and transfers.
+- `GET /v1/mule/metrics`: Summary metrics of monitored accounts and recorded assessments.
+- Prometheus metrics: `fraud_mule_evaluations_total`, `fraud_mule_anomalies_total`, `fraud_mule_flagged_total`.
+
 ## Reference label-delay analysis
 
 
