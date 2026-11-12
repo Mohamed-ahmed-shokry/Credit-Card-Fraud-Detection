@@ -54,7 +54,9 @@ velocity speed-of-travel calculations, and in-process IP geocoding (Phase 39), a
 device and browser fingerprinting with anomaly clustering (Phase 40), real-time merchant
 and MCC risk profiling, chargeback surveillance, and bust-out anomaly detection (Phase 41),
 and multi-tenant policy partitioning, dynamic rule federation, and account isolation (Phase 42),
-and account takeover (ATO) detection, credential stuffing defense, and identity session anomaly scoring (Phase 47).
+and account takeover (ATO) detection, credential stuffing defense, and identity session anomaly scoring (Phase 47),
+anti-money laundering transaction monitoring, structuring/smurfing detection, and regulatory SAR engine (Phase 48),
+and synthetic identity fraud (SIF) detection, PII inconsistency, and identity verification engine (Phase 49).
 
 ## Phase 1 — Distribution
 
@@ -2651,7 +2653,7 @@ Does not connect to external live FinCEN BSA E-Filing REST APIs or real-time pai
 - `cd1ada8`: docs(readme): add Phase 48 AML CLI commands and REST API documentation
 
 
-## Phase 49 — Synthetic Identity Fraud (SIF) Detection, PII Inconsistency & Identity Verification Engine (In progress)
+## Phase 49 — Synthetic Identity Fraud (SIF) Detection, PII Inconsistency & Identity Verification Engine (Done)
 
 Phase 49 implements an in-process, zero-external-dependency Synthetic Identity Fraud (SIF) detection, PII inconsistency, and identity verification engine (`synthetic_identity.py`). It detects synthetic identities fabricated by splicing authentic PII (e.g. dormant or minor SSNs) with synthetic personal details, flags SSN-DOB issuance anomalies against historical SSA issuance tables, detects Death Master File (DMF) deceased identifier matches, identifies rapid PII fragmentation and synthetic velocity clusters across applications, flags credit piggybacking and authorized user exploitation, scores composite SIF risk, and orchestrates identity proofing challenges (`challenge.py`) and compliance case investigations (`cases.py`).
 
@@ -2717,15 +2719,38 @@ Does not query live paid credit bureau APIs (Experian, TransUnion, Equifax) or f
 
 ### Micro-Task Breakdown
 
-- [ ] Task 1: Create `src/fraud_detection/synthetic_identity.py` with domain data models, enums, serialization, and unit tests in `tests/test_synthetic_identity.py`.
-- [ ] Task 2: Implement `SsnValidator` (SSA issuance table, DOB mismatch, Death Master File checking) in `src/fraud_detection/synthetic_identity.py` with unit tests.
-- [ ] Task 3: Implement `PiiInconsistencyEngine` (PII element fragmentation, cross-element similarity) in `src/fraud_detection/synthetic_identity.py` with unit tests.
-- [ ] Task 4: Implement `SyntheticIdentityTracker` (sliding-window velocity, burner phone/drop address detection, authorized user piggybacking) in `src/fraud_detection/synthetic_identity.py` with unit tests.
-- [ ] Task 5: Implement `SyntheticIdentityEngine` (composite scoring, policy routing, case/challenge escalation) and thread-safe `SyntheticIdentityStore` in `src/fraud_detection/synthetic_identity.py` with unit tests.
-- [ ] Task 6: Integrate SIF Engine with `events.py` (domain events) with unit and integration tests.
-- [ ] Task 7: Implement `/v1/sif/*` REST endpoints and Prometheus metrics in `src/fraud_detection/api.py` with integration tests in `tests/test_api.py`.
-- [ ] Task 8: Implement CLI commands `sif-eval`, `sif-inspect`, `sif-check-ssn`, and `sif-summary` in `src/fraud_detection/cli.py` with tests in `tests/test_cli.py`.
-- [ ] Task 9: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate with 100% Green CI.
+- [x] Task 1: Create `src/fraud_detection/synthetic_identity.py` with domain data models, enums, serialization, and unit tests in `tests/test_synthetic_identity.py`.
+- [x] Task 2: Implement `SsnValidator` (SSA issuance table, DOB mismatch, Death Master File checking) in `src/fraud_detection/synthetic_identity.py` with unit tests.
+- [x] Task 3: Implement `PiiInconsistencyEngine` (PII element fragmentation, cross-element similarity) in `src/fraud_detection/synthetic_identity.py` with unit tests.
+- [x] Task 4: Implement `SyntheticIdentityTracker` (sliding-window velocity, burner phone/drop address detection, authorized user piggybacking) in `src/fraud_detection/synthetic_identity.py` with unit tests.
+- [x] Task 5: Implement `SyntheticIdentityEngine` (composite scoring, policy routing, case/challenge escalation) and thread-safe `SyntheticIdentityStore` in `src/fraud_detection/synthetic_identity.py` with unit tests.
+- [x] Task 6: Integrate SIF Engine with `events.py` (domain events) with unit and integration tests.
+- [x] Task 7: Implement `/v1/sif/*` REST endpoints and Prometheus metrics in `src/fraud_detection/api.py` with integration tests in `tests/test_api.py`.
+- [x] Task 8: Implement CLI commands `sif-eval`, `sif-inspect`, `sif-check-ssn`, and `sif-summary` in `src/fraud_detection/cli.py` with tests in `tests/test_cli.py`.
+- [x] Task 9: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate with 100% Green CI.
+
+### Delivery Record
+
+- `a3b67fc`: docs(roadmap): define Phase 49 synthetic identity fraud detection scope
+- `e79ff9b`: docs(progress): initialize Phase 49 living progress record and decision log
+- `c213ac3`: feat(sif): add core domain enums for synthetic identity detection
+- `07a9fa1`: feat(sif): add domain models and serialization for profiles, assessments, and ssn results
+- `6846548`: docs(progress): mark Task 1 and AC-1 complete in PROGRESS.md
+- `17884aa`: feat(sif): implement SsnValidator with SSA allocation history and death registries
+- `62c1d39`: docs(progress): mark Task 2 and AC-2 complete in PROGRESS.md
+- `f12c6fb`: feat(sif): implement PiiInconsistencyEngine for element fragmentation and cross-profile similarity
+- `ab44ee7`: docs(progress): mark Task 3 and AC-3 complete in PROGRESS.md
+- `4293932`: feat(sif): implement SyntheticIdentityTracker for velocity bursts, drop addresses, and piggybacking
+- `4f5ad86`: docs(progress): mark Task 4 and AC-4 complete in PROGRESS.md
+- `84419d5`: feat(sif): implement SyntheticIdentityStore and SyntheticIdentityEngine with policy routing
+- `b38c1cf`: docs(progress): mark Task 5 and AC-5 complete in PROGRESS.md
+- `467a2d8`: feat(sif): integrate synthetic identity engine with EventBus and register domain events
+- `a4e14a6`: docs(progress): mark Task 6 and AC-6 complete in PROGRESS.md
+- `c8aad10`: feat(api): implement /v1/sif/* REST endpoints and Prometheus metrics
+- `62576e0`: docs(progress): mark Task 7 and AC-7 complete in PROGRESS.md
+- `2c62ed0`: feat(cli): add sif-eval, sif-check-ssn, sif-inspect, and sif-summary commands
+- `e053a3c`: docs(progress): mark Task 8 and AC-8 complete in PROGRESS.md
+- `15030be`: docs: document Phase 49 synthetic identity engine architecture and CLI/API workflows
 
 
 ## Contributing to the roadmap
