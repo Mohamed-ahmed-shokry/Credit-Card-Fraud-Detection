@@ -1013,6 +1013,16 @@ class SyntheticIdentityStore:
                 ][:limit]
             return list(reversed(list(self._assessments.values())))[:limit]
 
+    @property
+    def profile_count(self) -> int:
+        with self._lock:
+            return len(self._profiles)
+
+    @property
+    def assessment_count(self) -> int:
+        with self._lock:
+            return len(self._assessments)
+
     def clear(self) -> None:
         with self._lock:
             self._profiles.clear()
