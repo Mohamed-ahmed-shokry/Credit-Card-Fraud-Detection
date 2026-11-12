@@ -8,8 +8,9 @@ and high-risk off-ramp cash-out channels with zero external dependencies.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
+from statistics import median
 from typing import Any
 from uuid import uuid4
 
@@ -231,4 +232,122 @@ class MuleAssessment:
             outbound_volume=float(data.get("outbound_volume", 0.0)),
             evaluated_at=_parse_dt(data.get("evaluated_at")),
             metadata=dict(data.get("metadata", {})),
+        )
+
+
+@dataclass(frozen=True)
+class PassThroughMetrics:
+    """Computed pass-through velocity, dwell-time compression, and off-ramp exposure."""
+
+    inbound_volume: float
+    outbound_volume: float
+    pass_through_ratio: float
+    median_dwell_hours: float | None
+    high_risk_off_ramp_ratio: float
+    anomalies: list[MuleAnomalyType]
+    risk_score: float
+
+
+class PassThroughAnalyzer:
+    """Analyzes inbound-to-outbound fund velocity, dwell compression, and off-ramps."""
+
+    def __init__(
+        self,
+        window: timedelta = timedelta(hours=72),
+        min_inbound_volume: float = 500.0,
+        pass_through_threshold: float = 0.85,
+        rapid_dwell_hours: float = 6.0,
+        high_risk_off_ramp_threshold: float = 0.50,
+    ) -> None:
+        self.window = window
+        self.min_inbound_volume = min_inbound_volume
+        self.pass_through_threshold = pass_through_threshold
+        self.rapid_dwell_hours = rapid_dwell_hours
+        self.high_risk_off_ramp_threshold = high_risk_off_ramp_threshold
+
+    def analyze(
+        self,
+        transfers: list[MuleTransferRecord],
+        now: datetime | None = None,
+    ) -> PassThroughMetrics:
+        """Compute pass-through ratio, dwell time compression, and off-ramp risk."""
+        if not transfers:
+            return PassThroughMetrics(
+                inbound_volume=0.0,
+                outbound_volume=0.0,
+                pass_through_ratio=0.0,
+                median_dwell_hours=None,
+                high_risk_off_ramp_ratio=0.0,
+                anomalies=[],
+                risk_score=0.0,
+            )
+
+        ref_time = now if now is not None else max(t.timestamp for t in transfers)
+        cutoff = ref_time - self.window
+        recent = sorted(
+            (t for t in transfers if t.timestamp >= cutoff),
+            key=lambda t: t.timestamp,
+        )
+
+        inbound_xfers = [t for t in recent if t.direction == TransferDirection.INBOUND]
+        outbound_xfers = [t for t in recent if t.direction == TransferDirection.OUTBOUND]
+
+        inbound_vol = sum(t.amount for t in inbound_xfers)
+        outbound_vol = sum(t.amount for t in outbound_xfers)
+
+        pass_through_ratio = (
+            min(outbound_vol, inbound_vol) / inbound_vol if inbound_vol > 0.0 else 0.0
+        )
+
+        # Pair each outbound transfer with the most recent preceding inbound transfer
+        dwell_hours_list: list[float] = []
+        last_in_ts: datetime | None = None
+        for t in recent:
+            if t.direction == TransferDirection.INBOUND:
+                last_in_ts = t.timestamp
+            elif t.direction == TransferDirection.OUTBOUND and last_in_ts is not None:
+                delta_h = max(0.0, (t.timestamp - last_in_ts).total_seconds() / 3600.0)
+                dwell_hours_list.append(delta_h)
+
+        median_dwell = median(dwell_hours_list) if dwell_hours_list else None
+
+        high_risk_out = sum(
+            t.amount for t in outbound_xfers if t.channel in HIGH_RISK_OFF_RAMP_CHANNELS
+        )
+        off_ramp_ratio = high_risk_out / outbound_vol if outbound_vol > 0.0 else 0.0
+
+        anomalies: list[MuleAnomalyType] = []
+        score = 0.0
+
+        if (
+            inbound_vol >= self.min_inbound_volume
+            and pass_through_ratio >= self.pass_through_threshold
+        ):
+            anomalies.append(MuleAnomalyType.HIGH_PASS_THROUGH_RATIO)
+            score += 0.45
+
+        if (
+            median_dwell is not None
+            and inbound_vol >= self.min_inbound_volume
+            and outbound_vol > 0.0
+            and median_dwell <= self.rapid_dwell_hours
+        ):
+            anomalies.append(MuleAnomalyType.RAPID_DWELL_COMPRESSION)
+            score += 0.35
+
+        if (
+            outbound_vol >= self.min_inbound_volume
+            and off_ramp_ratio >= self.high_risk_off_ramp_threshold
+        ):
+            anomalies.append(MuleAnomalyType.HIGH_RISK_OFF_RAMP)
+            score += 0.30
+
+        return PassThroughMetrics(
+            inbound_volume=inbound_vol,
+            outbound_volume=outbound_vol,
+            pass_through_ratio=pass_through_ratio,
+            median_dwell_hours=median_dwell,
+            high_risk_off_ramp_ratio=off_ramp_ratio,
+            anomalies=anomalies,
+            risk_score=min(1.0, score),
         )
