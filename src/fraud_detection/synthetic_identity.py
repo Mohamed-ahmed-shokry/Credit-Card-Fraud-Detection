@@ -7,6 +7,7 @@ and composite risk decisioning with automated case/challenge escalation.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import re
 import threading
@@ -14,8 +15,13 @@ from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
+
+if TYPE_CHECKING:
+    from fraud_detection.cases import CaseManager
+    from fraud_detection.challenge import ChallengeManager
+    from fraud_detection.events import EventBus
 
 from fraud_detection.aml import jaro_winkler_similarity, levenshtein_similarity
 
@@ -883,3 +889,313 @@ class SifAssessment:
             evaluated_at=evaluated_at,
             metadata=dict(data.get("metadata", {})),
         )
+
+
+class SyntheticIdentityStore:
+    """Thread-safe in-memory store for identity profiles and synthetic fraud assessments."""
+
+    def __init__(self, max_records: int = 50_000) -> None:
+        self.max_records = max_records
+        self._lock = threading.RLock()
+
+        self._profiles: dict[str, IdentityProfile] = {}
+        self._profiles_by_ssn: dict[str, list[str]] = defaultdict(list)
+        self._profiles_by_phone: dict[str, list[str]] = defaultdict(list)
+        self._profiles_by_email: dict[str, list[str]] = defaultdict(list)
+        self._profiles_by_tenant: dict[str, list[str]] = defaultdict(list)
+
+        self._assessments: dict[str, SifAssessment] = {}
+        self._assessments_by_applicant: dict[str, list[str]] = defaultdict(list)
+        self._assessments_by_tenant: dict[str, list[str]] = defaultdict(list)
+
+    def add_profile(self, profile: IdentityProfile) -> None:
+        """Store or update an applicant identity profile with secondary indexing."""
+        with self._lock:
+            app_id = profile.applicant_id
+            if len(self._profiles) >= self.max_records and app_id not in self._profiles:
+                # Evict oldest record
+                oldest_key = next(iter(self._profiles))
+                self.remove_profile(oldest_key)
+
+            self._profiles[app_id] = profile
+
+            ssn_h = profile.ssn_hash()
+            if app_id not in self._profiles_by_ssn[ssn_h]:
+                self._profiles_by_ssn[ssn_h].append(app_id)
+
+            phone_clean = re.sub(r"\D", "", profile.phone)
+            if phone_clean and app_id not in self._profiles_by_phone[phone_clean]:
+                self._profiles_by_phone[phone_clean].append(app_id)
+
+            email_norm = profile.email.strip().lower()
+            if email_norm and app_id not in self._profiles_by_email[email_norm]:
+                self._profiles_by_email[email_norm].append(app_id)
+
+            tenant = profile.tenant_id
+            if app_id not in self._profiles_by_tenant[tenant]:
+                self._profiles_by_tenant[tenant].append(app_id)
+
+    def remove_profile(self, applicant_id: str) -> None:
+        with self._lock:
+            prof = self._profiles.pop(applicant_id, None)
+            if prof:
+                ssn_h = prof.ssn_hash()
+                if applicant_id in self._profiles_by_ssn[ssn_h]:
+                    self._profiles_by_ssn[ssn_h].remove(applicant_id)
+
+                phone_clean = re.sub(r"\D", "", prof.phone)
+                if applicant_id in self._profiles_by_phone[phone_clean]:
+                    self._profiles_by_phone[phone_clean].remove(applicant_id)
+
+                email_norm = prof.email.strip().lower()
+                if applicant_id in self._profiles_by_email[email_norm]:
+                    self._profiles_by_email[email_norm].remove(applicant_id)
+
+                tenant = prof.tenant_id
+                if applicant_id in self._profiles_by_tenant[tenant]:
+                    self._profiles_by_tenant[tenant].remove(applicant_id)
+
+    def get_profile(self, applicant_id: str) -> IdentityProfile | None:
+        with self._lock:
+            return self._profiles.get(applicant_id)
+
+    def find_profiles_by_ssn(self, ssn_hash: str) -> list[IdentityProfile]:
+        with self._lock:
+            app_ids = self._profiles_by_ssn.get(ssn_hash, [])
+            return [self._profiles[aid] for aid in app_ids if aid in self._profiles]
+
+    def find_profiles_by_phone(self, phone: str) -> list[IdentityProfile]:
+        clean = re.sub(r"\D", "", phone)
+        with self._lock:
+            app_ids = self._profiles_by_phone.get(clean, [])
+            return [self._profiles[aid] for aid in app_ids if aid in self._profiles]
+
+    def find_profiles_by_email(self, email: str) -> list[IdentityProfile]:
+        norm = email.strip().lower()
+        with self._lock:
+            app_ids = self._profiles_by_email.get(norm, [])
+            return [self._profiles[aid] for aid in app_ids if aid in self._profiles]
+
+    def list_profiles(
+        self, tenant_id: str | None = None, limit: int = 100
+    ) -> list[IdentityProfile]:
+        with self._lock:
+            if tenant_id:
+                app_ids = self._profiles_by_tenant.get(tenant_id, [])
+                return [self._profiles[aid] for aid in reversed(app_ids) if aid in self._profiles][
+                    :limit
+                ]
+            return list(reversed(list(self._profiles.values())))[:limit]
+
+    def add_assessment(self, assessment: SifAssessment) -> None:
+        with self._lock:
+            aid = assessment.assessment_id
+            if len(self._assessments) >= self.max_records and aid not in self._assessments:
+                oldest_key = next(iter(self._assessments))
+                self._assessments.pop(oldest_key, None)
+
+            self._assessments[aid] = assessment
+            self._assessments_by_applicant[assessment.applicant_id].append(aid)
+            self._assessments_by_tenant[assessment.tenant_id].append(aid)
+
+    def get_assessment(self, assessment_id: str) -> SifAssessment | None:
+        with self._lock:
+            return self._assessments.get(assessment_id)
+
+    def list_assessments(
+        self, tenant_id: str | None = None, limit: int = 100
+    ) -> list[SifAssessment]:
+        with self._lock:
+            if tenant_id:
+                aids = self._assessments_by_tenant.get(tenant_id, [])
+                return [
+                    self._assessments[aid] for aid in reversed(aids) if aid in self._assessments
+                ][:limit]
+            return list(reversed(list(self._assessments.values())))[:limit]
+
+    def clear(self) -> None:
+        with self._lock:
+            self._profiles.clear()
+            self._profiles_by_ssn.clear()
+            self._profiles_by_phone.clear()
+            self._profiles_by_email.clear()
+            self._profiles_by_tenant.clear()
+            self._assessments.clear()
+            self._assessments_by_applicant.clear()
+            self._assessments_by_tenant.clear()
+
+
+class SyntheticIdentityEngine:
+    """Composite scoring and decision engine for Synthetic Identity Fraud detection."""
+
+    def __init__(
+        self,
+        store: SyntheticIdentityStore | None = None,
+        ssn_validator: SsnValidator | None = None,
+        pii_engine: PiiInconsistencyEngine | None = None,
+        tracker: SyntheticIdentityTracker | None = None,
+        case_manager: CaseManager | None = None,
+        challenge_manager: ChallengeManager | None = None,
+        event_bus: EventBus | None = None,
+        step_up_threshold: float = 0.35,
+        manual_review_threshold: float = 0.65,
+        block_threshold: float = 0.85,
+    ) -> None:
+        self.store = store or SyntheticIdentityStore()
+        self.ssn_validator = ssn_validator or SsnValidator()
+        self.pii_engine = pii_engine or PiiInconsistencyEngine()
+        self.tracker = tracker or SyntheticIdentityTracker()
+        self.case_manager = case_manager
+        self.challenge_manager = challenge_manager
+        self.event_bus = event_bus
+
+        self.step_up_threshold = step_up_threshold
+        self.manual_review_threshold = manual_review_threshold
+        self.block_threshold = block_threshold
+
+    def evaluate(
+        self,
+        profile: IdentityProfile,
+        now: datetime | None = None,
+    ) -> SifAssessment:
+        """Execute full synthetic identity evaluation and determine policy routing."""
+        eval_time = now if now is not None else profile.created_at
+        anomalies: list[SifAnomalyType] = []
+        breakdown: dict[str, float] = {}
+
+        # 1. SSN issuance and death registry validation
+        ssn_val = self.ssn_validator.validate(profile.ssn, dob=profile.dob)
+        ssn_penalty = 0.0
+
+        if ssn_val.is_deceased:
+            anomalies.append(SifAnomalyType.DECEASED_SSN_MATCH)
+            ssn_penalty = 1.0
+            breakdown["deceased_ssn"] = 1.0
+        elif not ssn_val.is_valid:
+            if ssn_val.status == SsnValidationStatus.DOB_INCONSISTENT:
+                anomalies.append(SifAnomalyType.SSN_DOB_MISMATCH)
+                ssn_penalty = 0.85
+                breakdown["ssn_dob_mismatch"] = 0.85
+            elif ssn_val.status == SsnValidationStatus.UNISSUED_AREA:
+                anomalies.append(SifAnomalyType.UNISSUED_SSN_AREA)
+                ssn_penalty = 0.80
+                breakdown["unissued_ssn_area"] = 0.80
+            elif ssn_val.status in (
+                SsnValidationStatus.INVALID_FORMAT,
+                SsnValidationStatus.RESERVED_OR_SPECIAL,
+            ):
+                anomalies.append(SifAnomalyType.INVALID_SSN_STRUCTURE)
+                ssn_penalty = 0.75
+                breakdown["invalid_ssn_structure"] = 0.75
+
+        # 2. PII element fragmentation against existing profiles
+        existing_profiles = self.store.list_profiles(tenant_id=profile.tenant_id, limit=500)
+        frag_score, _matches, frag_anomalies = self.pii_engine.evaluate_inconsistency(
+            profile, existing_profiles
+        )
+        for a in frag_anomalies:
+            if a not in anomalies:
+                anomalies.append(a)
+        if frag_score > 0.0:
+            breakdown["pii_fragmentation"] = round(frag_score, 4)
+
+        # 3. Synthetic velocity, drop address, burner phone, authorized user abuse
+        vel_score, vel_anomalies, vel_details = self.tracker.check_and_record(
+            profile, now=eval_time
+        )
+        for a in vel_anomalies:
+            if a not in anomalies:
+                anomalies.append(a)
+        for k, v in vel_details.get("breakdown", {}).items():
+            breakdown[k] = round(float(v), 4)
+
+        # 4. Calibrated Composite Risk Scoring
+        if ssn_val.is_deceased:
+            risk_score = 1.0
+        else:
+            # Weighted aggregation
+            risk_score = min(
+                1.0,
+                max(
+                    0.0,
+                    ssn_penalty * 0.40 + frag_score * 0.45 + vel_score * 0.35,
+                ),
+            )
+            if (
+                SifAnomalyType.PII_ELEMENT_FRAGMENTATION in anomalies
+                or SifAnomalyType.SSN_DOB_MISMATCH in anomalies
+            ):
+                risk_score = max(risk_score, 0.70)
+            elif (
+                SifAnomalyType.BURNER_PHONE_DETECTED in anomalies
+                or SifAnomalyType.HIGH_RISK_ADDRESS_DROP in anomalies
+            ):
+                risk_score = max(risk_score, 0.40)
+            elif SifAnomalyType.AUTHORIZED_USER_ABUSE in anomalies:
+                risk_score = max(risk_score, 0.55)
+
+        # 5. Policy Decision Routing
+        if risk_score >= self.block_threshold or ssn_val.is_deceased:
+            action = SifAction.DECLINE_BLOCK
+            risk_level = SifRiskLevel.CRITICAL
+        elif risk_score >= self.manual_review_threshold:
+            action = SifAction.MANUAL_REVIEW
+            risk_level = SifRiskLevel.HIGH
+        elif risk_score >= self.step_up_threshold:
+            action = SifAction.STEP_UP_IDENTITY_PROOFING
+            risk_level = SifRiskLevel.MEDIUM
+        else:
+            action = SifAction.APPROVE
+            risk_level = SifRiskLevel.LOW
+
+        assessment = SifAssessment(
+            applicant_id=profile.applicant_id,
+            tenant_id=profile.tenant_id,
+            risk_score=round(risk_score, 4),
+            risk_level=risk_level,
+            action=action,
+            triggered_anomalies=anomalies,
+            anomaly_breakdown=breakdown,
+            identity_fragmentation_score=round(frag_score, 4),
+            ssn_validation=ssn_val,
+            evaluated_at=eval_time,
+            metadata={
+                "credit_line_requested": profile.credit_line_requested,
+                "authorized_users_count": len(profile.authorized_users),
+            },
+        )
+
+        # Escalate to CaseManager on MANUAL_REVIEW
+        if action == SifAction.MANUAL_REVIEW and self.case_manager:
+            with contextlib.suppress(Exception):
+                self.case_manager.create_case(
+                    transaction_id=f"sif_{profile.applicant_id}",
+                    tenant_id=profile.tenant_id,
+                    fraud_score=risk_score,
+                    metadata={
+                        "sif_assessment_id": assessment.assessment_id,
+                        "anomalies": [a.value for a in anomalies],
+                    },
+                )
+
+        # Trigger Challenge on STEP_UP_IDENTITY_PROOFING
+        if action == SifAction.STEP_UP_IDENTITY_PROOFING and self.challenge_manager:
+            with contextlib.suppress(Exception):
+                from fraud_detection.challenge import ChallengeMethod
+
+                target = profile.phone or profile.email
+                method = ChallengeMethod.SMS_OTP if profile.phone else ChallengeMethod.EMAIL_OTP
+                self.challenge_manager.create_challenge(
+                    transaction_id=f"sif_{profile.applicant_id}",
+                    user_id=profile.applicant_id,
+                    tenant_id=profile.tenant_id,
+                    destination=target,
+                    method=method,
+                    metadata={"sif_assessment_id": assessment.assessment_id},
+                )
+
+        # Save to store
+        self.store.add_profile(profile)
+        self.store.add_assessment(assessment)
+
+        return assessment

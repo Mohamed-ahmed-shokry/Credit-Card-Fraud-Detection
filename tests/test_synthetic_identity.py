@@ -382,3 +382,164 @@ def test_synthetic_identity_tracker_piggybacking_and_velocity() -> None:
     _, anomalies4, _ = tracker.check_and_record(p4, now=future_time)
     # The old applications should have slid out of the window!
     assert SifAnomalyType.SYNTHETIC_VELOCITY_BURST not in anomalies4
+
+
+def test_synthetic_identity_store_crud_and_indexing() -> None:
+    from fraud_detection.synthetic_identity import (
+        IdentityProfile,
+        SifAssessment,
+        SyntheticIdentityStore,
+    )
+
+    store = SyntheticIdentityStore(max_records=3)
+    p1 = IdentityProfile(
+        applicant_id="app1",
+        ssn="111-22-3333",
+        first_name="First",
+        last_name="Person",
+        dob="1990-01-01",
+        address="10 Main St",
+        phone="+12125551111",
+        email="p1@example.com",
+        tenant_id="t1",
+    )
+    store.add_profile(p1)
+    assert store.get_profile("app1") is not None
+    assert len(store.find_profiles_by_ssn(p1.ssn_hash())) == 1
+    assert len(store.find_profiles_by_phone("12125551111")) == 1
+    assert len(store.find_profiles_by_email("p1@example.com")) == 1
+    assert len(store.list_profiles("t1")) == 1
+
+    # Capacity eviction
+    p2 = IdentityProfile(
+        applicant_id="app2",
+        ssn="222-33-4444",
+        first_name="Second",
+        last_name="Person",
+        dob="1991-01-01",
+        address="20 Main St",
+        phone="+12125552222",
+        email="p2@example.com",
+    )
+    p3 = IdentityProfile(
+        applicant_id="app3",
+        ssn="333-44-5555",
+        first_name="Third",
+        last_name="Person",
+        dob="1992-01-01",
+        address="30 Main St",
+        phone="+12125553333",
+        email="p3@example.com",
+    )
+    p4 = IdentityProfile(
+        applicant_id="app4",
+        ssn="444-55-6666",
+        first_name="Fourth",
+        last_name="Person",
+        dob="1993-01-01",
+        address="40 Main St",
+        phone="+12125554444",
+        email="p4@example.com",
+    )
+    store.add_profile(p2)
+    store.add_profile(p3)
+    store.add_profile(p4)
+    # app1 should have been evicted due to max_records=3
+    assert store.get_profile("app1") is None
+    assert store.get_profile("app4") is not None
+
+    # Assessment indexing
+    ass = SifAssessment(assessment_id="ass_1", applicant_id="app4", tenant_id="t1")
+    store.add_assessment(ass)
+    assert store.get_assessment("ass_1") is not None
+    assert len(store.list_assessments("t1")) == 1
+
+    store.clear()
+    assert store.get_profile("app4") is None
+    assert store.get_assessment("ass_1") is None
+
+
+def test_synthetic_identity_engine_decisions_and_escalations() -> None:
+    from unittest.mock import MagicMock
+
+    from fraud_detection.synthetic_identity import (
+        IdentityProfile,
+        SifAction,
+        SifAnomalyType,
+        SifRiskLevel,
+        SyntheticIdentityEngine,
+    )
+
+    mock_case_mgr = MagicMock()
+    mock_challenge_mgr = MagicMock()
+
+    engine = SyntheticIdentityEngine(
+        case_manager=mock_case_mgr,
+        challenge_manager=mock_challenge_mgr,
+    )
+
+    # 1. Clean, legitimate applicant -> APPROVE
+    legit = IdentityProfile(
+        applicant_id="legit_1",
+        ssn="050-12-3456",  # Valid NY
+        first_name="Sarah",
+        last_name="Connor",
+        dob="1984-05-12",
+        address="100 Cyberdyne Way, New York, NY",
+        phone="+12125557777",
+        email="sarah@resistance.org",
+    )
+    ass_legit = engine.evaluate(legit)
+    assert ass_legit.action == SifAction.APPROVE
+    assert ass_legit.risk_level == SifRiskLevel.LOW
+    assert ass_legit.risk_score < 0.35
+    assert not ass_legit.triggered_anomalies
+
+    # 2. Deceased SSN -> DECLINE_BLOCK
+    deceased = IdentityProfile(
+        applicant_id="dec_1",
+        ssn="042-12-9999",  # Arthur Pendelton
+        first_name="Arthur",
+        last_name="Pendelton",
+        dob="1950-01-01",
+        address="10 Ghost St, Hartford, CT",
+        phone="+12035559999",
+        email="ghost@example.com",
+    )
+    ass_dec = engine.evaluate(deceased)
+    assert ass_dec.action == SifAction.DECLINE_BLOCK
+    assert ass_dec.risk_level == SifRiskLevel.CRITICAL
+    assert ass_dec.risk_score == 1.0
+    assert SifAnomalyType.DECEASED_SSN_MATCH in ass_dec.triggered_anomalies
+
+    # 3. High risk PII fragmentation -> MANUAL_REVIEW + Case Escalation
+    # Stolen SSN from legit_1 with different name
+    stolen = IdentityProfile(
+        applicant_id="stolen_1",
+        ssn="050-12-3456",  # Reusing Sarah's SSN!
+        first_name="Miles",
+        last_name="Dyson",
+        dob="1970-08-25",
+        address="200 Tech Blvd, New York, NY",
+        phone="+12125556666",
+        email="dyson@example.com",
+    )
+    ass_stolen = engine.evaluate(stolen)
+    assert ass_stolen.action in (SifAction.MANUAL_REVIEW, SifAction.DECLINE_BLOCK)
+    assert mock_case_mgr.create_case.called
+
+    # 4. Burner phone step-up challenge -> STEP_UP_IDENTITY_PROOFING + ChallengeManager
+    burner_app = IdentityProfile(
+        applicant_id="burner_1",
+        ssn="060-12-3456",
+        first_name="John",
+        last_name="Doe",
+        dob="1988-03-15",
+        address="500 Pine St, New York, NY",
+        phone="18005551234",  # Burner toll-free
+        email="johndoe1800@example.com",
+    )
+    ass_burner = engine.evaluate(burner_app)
+    assert ass_burner.action == SifAction.STEP_UP_IDENTITY_PROOFING
+    assert ass_burner.risk_level == SifRiskLevel.MEDIUM
+    assert mock_challenge_mgr.create_challenge.called
