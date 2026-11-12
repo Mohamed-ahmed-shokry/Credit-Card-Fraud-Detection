@@ -56,7 +56,8 @@ and MCC risk profiling, chargeback surveillance, and bust-out anomaly detection 
 and multi-tenant policy partitioning, dynamic rule federation, and account isolation (Phase 42),
 and account takeover (ATO) detection, credential stuffing defense, and identity session anomaly scoring (Phase 47),
 anti-money laundering transaction monitoring, structuring/smurfing detection, and regulatory SAR engine (Phase 48),
-and synthetic identity fraud (SIF) detection, PII inconsistency, and identity verification engine (Phase 49).
+and synthetic identity fraud (SIF) detection, PII inconsistency, and identity verification engine (Phase 49),
+and money mule account & rapid fund exfiltration detection engine (Phase 50).
 
 ## Phase 1 — Distribution
 
@@ -2753,6 +2754,71 @@ Does not query live paid credit bureau APIs (Experian, TransUnion, Equifax) or f
 - `15030be`: docs: document Phase 49 synthetic identity engine architecture and CLI/API workflows
 - `e489a58`: docs(roadmap): mark Phase 49 completed and record micro-commits
 - `c392ca4`: test(sif): expand branch coverage for edge cases, store eviction, and drop addresses
+
+
+## Phase 50 — Mule Account & Rapid Fund Exfiltration Detection Engine (`In progress`)
+
+Phase 50 implements an in-process, zero-external-dependency Money Mule & Rapid Fund Exfiltration Detection Engine (`mule_detection.py`). It detects accounts acting as pass-through conduits or money-mule hubs for stolen cards and fraudulent transfers by analyzing inflow-to-outflow pass-through ratios, dwell-time compression, fan-in/fan-out counterparty topology, dormancy-to-burst behavioral shifts, and high-risk cash-out off-ramps (crypto exchanges, P2P wallets, international wires, prepaid loads, ATM cash-outs).
+
+### Objective
+
+Provide deterministic, real-time mule account detection, fund exfiltration scoring, automated hold/freeze policy routing, REST API endpoints, and CLI workflows with zero external services.
+
+### Scope
+
+1. **Domain Models & Taxonomies (`mule_detection.py`)**:
+   - `MuleRiskLevel`: `LOW`, `MEDIUM`, `HIGH`, `CRITICAL`.
+   - `MuleAction`: `ALLOW`, `STEP_UP_VERIFICATION`, `HOLD_FUNDS`, `FREEZE_ACCOUNT`, `ESCALATE_AML_SAR`.
+   - `MuleAnomalyType`: `HIGH_PASS_THROUGH_RATIO`, `RAPID_DWELL_COMPRESSION`, `FAN_IN_COLLECTION`, `FAN_OUT_DISPERSION`, `DORMANCY_BURST`, `HIGH_RISK_OFF_RAMP`, `NEW_COUNTERPARTY_FLOOD`.
+   - `TransferDirection` (`INBOUND`, `OUTBOUND`) and `ExfiltrationChannel` (`ACH`, `CARD`, `P2P_WALLET`, `CRYPTO_EXCHANGE`, `WIRE_INTERNATIONAL`, `PREPAID_LOAD`, `ATM_CASH_OUT`).
+   - `MuleTransferRecord`, `MuleAccountProfile`, `MuleAssessment` with lossless dict/JSON serialization.
+2. **Pass-Through & Dwell-Time Analyzer (`PassThroughAnalyzer`)**:
+   - Computes inbound vs outbound volume, net retention ratio, pass-through ratio (`min(outbound, inbound) / inbound`), and median/minimum dwell time between inbound funding and outbound exfiltration.
+3. **Fan-In / Fan-Out Network Topology & Dormancy Analyzers (`MuleNetworkAnalyzer`, `DormancyBurstDetector`)**:
+   - Detects many-to-one collection (`unique_senders >= threshold`), one-to-many dispersion (`unique_recipients >= threshold`), rapid new-counterparty bursts, and dormant accounts waking up into sudden high-velocity transfer bursts.
+4. **Composite Mule Scoring Engine & Thread-Safe Store (`MuleDetectionEngine`, `MuleAccountStore`)**:
+   - Aggregates pass-through velocity, dwell compression, network concentration, dormancy burst, and high-risk off-ramp channels into calibrated risk scores (`0.0`–`1.0`) and policy actions.
+   - Integrates optionally with `CaseManager` (auto-creating compliance cases on `FREEZE_ACCOUNT` / `ESCALATE_AML_SAR`) and `EventBus` (`MULE_ACTIVITY_EVALUATED`, `MULE_ACCOUNT_FLAGGED`, `MULE_FUNDS_HELD`, `MULE_NETWORK_DETECTED`).
+5. **REST API (`/v1/mule/*`) & Prometheus Metrics (`api.py`)**:
+   - `POST /v1/mule/transfers`, `POST /v1/mule/evaluate`, `GET /v1/mule/assessments`, `GET /v1/mule/assessments/{assessment_id}`, `GET /v1/mule/accounts/{account_id}`, `GET /v1/mule/metrics`.
+6. **CLI Workflows (`cli.py`)**:
+   - `mule-ingest`, `mule-eval`, `mule-inspect`, `mule-summary` with table/JSON formatting and store persistence.
+7. **Documentation**:
+   - `ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`.
+
+### Acceptance Criteria
+
+1. **AC-1 (Domain Models & Taxonomies)**: `MuleRiskLevel`, `MuleAction`, `MuleAnomalyType`, `TransferDirection`, `ExfiltrationChannel`, `MuleTransferRecord`, `MuleAccountProfile`, and `MuleAssessment` serialize/deserialize cleanly with unit tests.
+2. **AC-2 (Pass-Through & Dwell Compression)**: `PassThroughAnalyzer` accurately computes pass-through ratios and dwell-time compression on rapid cash-out sequences.
+3. **AC-3 (Network Topology & Dormancy Burst)**: `MuleNetworkAnalyzer` and `DormancyBurstDetector` flag fan-in collection, fan-out dispersion, and dormancy-to-burst transitions.
+4. **AC-4 (Mule Engine, Store & Escalation)**: `MuleDetectionEngine` and `MuleAccountStore` compute calibrated scores, enforce policy routing, evict cleanly at capacity, and auto-create `CaseManager` cases on high-severity findings.
+5. **AC-5 (EventBus Streaming)**: Lifecycle transitions emit `MULE_ACTIVITY_EVALUATED`, `MULE_ACCOUNT_FLAGGED`, `MULE_FUNDS_HELD`, and `MULE_NETWORK_DETECTED` events.
+6. **AC-6 (REST API & Metrics)**: `/v1/mule/*` endpoints and Prometheus metrics work end to end and are verified in `tests/test_api.py`.
+7. **AC-7 (CLI Workflows)**: `mule-ingest`, `mule-eval`, `mule-inspect`, and `mule-summary` work end to end and are verified in `tests/test_cli.py` and real CLI execution.
+8. **AC-8 (All CI-Parity Checks & Remote CI Green)**: `ruff format --check src tests`, `ruff check src tests`, `mypy src`, `pytest --cov=fraud_detection --cov-report=term-missing`, `python -m build`, `twine check dist/*`, and all remote GitHub Actions CI jobs pass 100%.
+
+### Validation & CI Plan
+
+- Focused unit tests: `python -m pytest tests/test_mule_detection.py -v`
+- API & CLI & Event integration tests: `python -m pytest tests/test_events.py tests/test_api.py tests/test_cli.py -k "mule"`
+- Full local CI parity: `ruff format --check src tests`, `ruff check src tests`, `mypy src`, `pytest --cov=fraud_detection --cov-report=term-missing`, `python -m build`, `twine check dist/*`
+- Remote CI: GitHub Actions `CI` workflow on `phase/mule-account-detection` PR.
+
+### Exclusions
+
+- External bank/SWIFT/FedNow network connectors, external blockchain analytics APIs, and distributed graph database persistence (out of scope for in-process zero-dependency reference engine).
+
+### Micro-Task Breakdown
+
+- Task 1: Define Phase 50 roadmap & initialize `docs/PROGRESS.md`.
+- Task 2: Create `src/fraud_detection/mule_detection.py` domain enums and data models + tests.
+- Task 3: Implement `PassThroughAnalyzer` + tests.
+- Task 4: Implement `MuleNetworkAnalyzer` & `DormancyBurstDetector` + tests.
+- Task 5: Implement `MuleAccountStore` & `MuleDetectionEngine` + tests.
+- Task 6: Register `MULE_*` events in `events.py` and wire `EventBus` into `MuleDetectionEngine` + tests.
+- Task 7: Add `/v1/mule/*` REST endpoints and Prometheus metrics in `api.py` + tests.
+- Task 8: Add `mule-*` CLI commands in `cli.py` + tests.
+- Task 9: Update `ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md` and verify 100% green local & remote CI.
 
 
 ## Contributing to the roadmap
