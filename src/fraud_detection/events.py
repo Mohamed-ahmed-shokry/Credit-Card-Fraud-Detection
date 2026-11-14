@@ -113,6 +113,14 @@ class EventType(StrEnum):
     SIF_ANOMALY_DETECTED = "fraud.sif.anomaly_detected"
     SIF_IDENTITY_CONFIRMED = "fraud.sif.identity_confirmed"
     SIF_APPLICATION_DECLINED = "fraud.sif.application_declined"
+    MULE_ACTIVITY_EVALUATED = "fraud.mule.activity_evaluated"
+    MULE_ACCOUNT_FLAGGED = "fraud.mule.account_flagged"
+    MULE_FUNDS_HELD = "fraud.mule.funds_held"
+    MULE_NETWORK_DETECTED = "fraud.mule.network_detected"
+    FIRST_PARTY_EVALUATED = "fraud.first_party.evaluated"
+    FIRST_PARTY_ABUSE_DETECTED = "fraud.first_party.abuse_detected"
+    REFUND_RESTRICTED = "fraud.first_party.refund_restricted"
+    ACCOUNT_PRIVILEGES_REVOKED = "fraud.first_party.privileges_revoked"
 
 
 class EventDeliveryStatus(StrEnum):

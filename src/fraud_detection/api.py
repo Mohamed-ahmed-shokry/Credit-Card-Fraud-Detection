@@ -142,6 +142,16 @@ from fraud_detection.feedback import (
     match_labels_with_audit_log,
     partition_into_cohorts,
 )
+from fraud_detection.first_party_fraud import (
+    ClaimOutcome,
+    FirstPartyAccountProfile,
+    FirstPartyAction,
+    FirstPartyAssessment,
+    FirstPartyEventRecord,
+    FirstPartyFraudEngine,
+    FirstPartyRiskLevel,
+    OrderClaimType,
+)
 from fraud_detection.geolocation import (
     GeoCoordinates,
     GeoFeatureConfig,
@@ -165,6 +175,14 @@ from fraud_detection.merchant import (
     resolve_mcc_profile,
 )
 from fraud_detection.model import FraudModel, ModelArtifactError, load_model
+from fraud_detection.mule_detection import (
+    ExfiltrationChannel,
+    MuleAccountProfile,
+    MuleAssessment,
+    MuleDetectionEngine,
+    MuleTransferRecord,
+    TransferDirection,
+)
 from fraud_detection.pipeline import (
     DecisionGraph,
     DecisionGraphExecutor,
@@ -344,6 +362,16 @@ OPERATIONAL_PATHS = frozenset(
         "/v1/sif/evaluate",
         "/v1/sif/assessments",
         "/v1/sif/profiles",
+        "/v1/mule/transfers",
+        "/v1/mule/evaluate",
+        "/v1/mule/assessments",
+        "/v1/mule/accounts",
+        "/v1/mule/metrics",
+        "/v1/first-party/events",
+        "/v1/first-party/evaluate",
+        "/v1/first-party/assessments",
+        "/v1/first-party/accounts",
+        "/v1/first-party/metrics",
     }
 )
 UNMATCHED_ROUTE_LABEL = "unmatched"
@@ -2285,6 +2313,160 @@ def _sif_profile_to_response(profile: IdentityProfile) -> SifProfileResponse:
     return SifProfileResponse(**d)
 
 
+class MuleTransferRequest(BaseModel):
+    """Inbound or outbound transfer payload for mule risk evaluation."""
+
+    transfer_id: str | None = None
+    account_id: str
+    counterparty_id: str
+    direction: TransferDirection
+    amount: float = Field(gt=0.0)
+    channel: ExfiltrationChannel = ExfiltrationChannel.ACH
+    timestamp: str | None = None
+    device_id: str | None = None
+    tenant_id: str = "default"
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class MuleEvaluateRequest(BaseModel):
+    """Request to evaluate an existing account for mule activity."""
+
+    account_id: str
+    tenant_id: str = "default"
+
+
+class MuleAssessmentResponse(BaseModel):
+    """Mule account risk assessment response."""
+
+    assessment_id: str
+    account_id: str
+    tenant_id: str
+    risk_score: float
+    risk_level: str
+    action: str
+    triggered_anomalies: list[str]
+    anomaly_breakdown: dict[str, float]
+    pass_through_ratio: float
+    median_dwell_hours: float | None = None
+    unique_inbound_counterparties: int
+    unique_outbound_counterparties: int
+    inbound_volume: float
+    outbound_volume: float
+    evaluated_at: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class MuleAssessmentListResponse(BaseModel):
+    """List of mule assessments."""
+
+    total_count: int
+    assessments: list[MuleAssessmentResponse]
+
+
+class MuleAccountProfileResponse(BaseModel):
+    """Monitored mule account profile response."""
+
+    account_id: str
+    tenant_id: str
+    account_opened_at: str
+    transfers: list[dict[str, Any]]
+    last_assessed_at: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+def _mule_assessment_to_response(assessment: MuleAssessment) -> MuleAssessmentResponse:
+    return MuleAssessmentResponse(**assessment.to_dict())
+
+
+def _mule_profile_to_response(profile: MuleAccountProfile) -> MuleAccountProfileResponse:
+    return MuleAccountProfileResponse(**profile.to_dict())
+
+
+class FirstPartyEventRequest(BaseModel):
+    """Order, refund, INR claim, friendly dispute, or promo event payload."""
+
+    event_id: str
+    account_id: str
+    claim_type: OrderClaimType
+    amount: float = Field(..., ge=0)
+    timestamp: str
+    order_id: str = ""
+    currency: str = "USD"
+    merchant_category: str = "general"
+    outcome: ClaimOutcome = ClaimOutcome.APPROVED
+    promo_code: str = ""
+    shipping_address_hash: str = ""
+    payment_instrument_hash: str = ""
+    device_id: str = ""
+    avs_cvv_matched: bool = False
+    three_ds_authenticated: bool = False
+    delivery_confirmed: bool = False
+    signature_captured: bool = False
+    tenant_id: str = "default"
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class FirstPartyEvaluateRequest(BaseModel):
+    """Request to evaluate an existing account for first-party abuse."""
+
+    account_id: str
+
+
+class FirstPartyAssessmentResponse(BaseModel):
+    """First-party fraud and refund abuse assessment response."""
+
+    assessment_id: str
+    account_id: str
+    tenant_id: str
+    risk_score: float
+    risk_level: str
+    action: str
+    anomalies: list[str]
+    return_ratio: float
+    purchase_volume: float
+    refund_volume: float
+    dispute_count: int
+    inr_claim_count: int
+    promo_redemption_count: int
+    linked_account_count: int
+    case_id: str | None = None
+    reasons: list[str]
+    evaluated_at: str
+
+
+class FirstPartyAssessmentListResponse(BaseModel):
+    """List of first-party fraud assessments."""
+
+    total_count: int
+    assessments: list[FirstPartyAssessmentResponse]
+
+
+class FirstPartyAccountProfileResponse(BaseModel):
+    """Monitored first-party account profile response."""
+
+    account_id: str
+    tenant_id: str
+    created_at: str
+    events: list[dict[str, Any]]
+    linked_accounts: list[str]
+    risk_level: str
+    last_action: str
+    last_assessed_at: str | None = None
+    last_assessment_id: str | None = None
+
+
+def _first_party_assessment_to_response(
+    assessment: FirstPartyAssessment,
+) -> FirstPartyAssessmentResponse:
+    return FirstPartyAssessmentResponse(**assessment.to_dict())
+
+
+def _first_party_profile_to_response(
+    profile: FirstPartyAccountProfile,
+) -> FirstPartyAccountProfileResponse:
+    return FirstPartyAccountProfileResponse(**profile.to_dict())
+
+
 def create_app(
     *,
     model: FraudModel | None = None,
@@ -2372,6 +2554,8 @@ def create_app(
     aml_engine: AmlEngine | None = None,
     sar_manager: SarManager | None = None,
     sif_engine: SyntheticIdentityEngine | None = None,
+    mule_engine: MuleDetectionEngine | None = None,
+    first_party_engine: FirstPartyFraudEngine | None = None,
 ) -> FastAPI:
     """Create an application using an injected model or a trusted artifact path.
 
@@ -2880,6 +3064,42 @@ def create_app(
     sif_blocks_counter = Counter(
         "fraud_sif_blocks_total",
         "Total applications blocked due to synthetic identity fraud.",
+        ["tenant_id"],
+        registry=metrics_registry,
+    )
+    mule_evaluations_counter = Counter(
+        "fraud_mule_evaluations_total",
+        "Total money mule account evaluations performed.",
+        ["tenant_id", "action", "risk_level"],
+        registry=metrics_registry,
+    )
+    mule_anomalies_counter = Counter(
+        "fraud_mule_anomalies_total",
+        "Total money mule anomalies detected.",
+        ["tenant_id", "anomaly_type"],
+        registry=metrics_registry,
+    )
+    mule_flagged_counter = Counter(
+        "fraud_mule_flagged_total",
+        "Total accounts flagged as HIGH or CRITICAL mule risk.",
+        ["tenant_id"],
+        registry=metrics_registry,
+    )
+    first_party_evaluations_counter = Counter(
+        "fraud_first_party_evaluations_total",
+        "Total first-party fraud and refund abuse evaluations performed.",
+        ["tenant_id", "action", "risk_level"],
+        registry=metrics_registry,
+    )
+    first_party_anomalies_counter = Counter(
+        "fraud_first_party_anomalies_total",
+        "Total first-party fraud anomalies detected.",
+        ["tenant_id", "anomaly_type"],
+        registry=metrics_registry,
+    )
+    first_party_restricted_counter = Counter(
+        "fraud_first_party_restricted_total",
+        "Total accounts restricted or blocked for first-party abuse.",
         ["tenant_id"],
         registry=metrics_registry,
     )
@@ -3465,6 +3685,22 @@ def create_app(
         application.state.sif_anomalies_counter = sif_anomalies_counter
         application.state.sif_high_risk_counter = sif_high_risk_counter
         application.state.sif_blocks_counter = sif_blocks_counter
+        resolved_mule_engine = mule_engine or MuleDetectionEngine(
+            case_manager=application.state.case_manager,
+            event_bus=resolved_event_bus,
+        )
+        application.state.mule_engine = resolved_mule_engine
+        application.state.mule_evaluations_counter = mule_evaluations_counter
+        application.state.mule_anomalies_counter = mule_anomalies_counter
+        application.state.mule_flagged_counter = mule_flagged_counter
+        resolved_first_party_engine = first_party_engine or FirstPartyFraudEngine(
+            case_manager=application.state.case_manager,
+            event_bus=resolved_event_bus,
+        )
+        application.state.first_party_engine = resolved_first_party_engine
+        application.state.first_party_evaluations_counter = first_party_evaluations_counter
+        application.state.first_party_anomalies_counter = first_party_anomalies_counter
+        application.state.first_party_restricted_counter = first_party_restricted_counter
         application.state.audit_sink = resolved_audit_sink
         application.state.explanation_provider = explanation_provider
         application.state.fallback_mode = resolved_fallback_mode
@@ -7896,6 +8132,354 @@ def create_app(
             "total_assessments_recorded": total_assessments,
             "status": "operational" if engine else "uninitialized",
         }
+
+    def _record_mule_metrics(request: Request, assessment: MuleAssessment) -> None:
+        eval_c = getattr(request.app.state, "mule_evaluations_counter", None)
+        if eval_c is not None:
+            eval_c.labels(
+                tenant_id=assessment.tenant_id,
+                action=assessment.action.value,
+                risk_level=assessment.risk_level.value,
+            ).inc()
+        anom_c = getattr(request.app.state, "mule_anomalies_counter", None)
+        if anom_c is not None:
+            for anom in assessment.triggered_anomalies:
+                anom_c.labels(
+                    tenant_id=assessment.tenant_id,
+                    anomaly_type=anom.value,
+                ).inc()
+        flag_c = getattr(request.app.state, "mule_flagged_counter", None)
+        if flag_c is not None and assessment.risk_level.value in ("high", "critical"):
+            flag_c.labels(tenant_id=assessment.tenant_id).inc()
+
+    @application.post(
+        "/v1/mule/transfers",
+        response_model=MuleAssessmentResponse,
+        responses={
+            401: {"description": "Missing or invalid API key."},
+            500: {"description": "Mule engine not initialized."},
+        },
+        tags=["mule_detection"],
+    )
+    async def mule_ingest_transfer_endpoint(
+        payload: MuleTransferRequest,
+        request: Request,
+    ) -> MuleAssessmentResponse | JSONResponse:
+        """Ingest a transfer and evaluate the account for money mule activity."""
+        engine: MuleDetectionEngine | None = getattr(request.app.state, "mule_engine", None)
+        if engine is None:
+            return JSONResponse(status_code=500, content={"detail": "Mule engine not initialized."})
+        xfer = MuleTransferRecord.from_dict(payload.model_dump())
+        assessment = engine.ingest_and_evaluate(xfer)
+        _record_mule_metrics(request, assessment)
+        return _mule_assessment_to_response(assessment)
+
+    @application.post(
+        "/v1/mule/evaluate",
+        response_model=MuleAssessmentResponse,
+        responses={
+            401: {"description": "Missing or invalid API key."},
+            500: {"description": "Mule engine not initialized."},
+        },
+        tags=["mule_detection"],
+    )
+    async def mule_evaluate_account_endpoint(
+        payload: MuleEvaluateRequest,
+        request: Request,
+    ) -> MuleAssessmentResponse | JSONResponse:
+        """Evaluate an account's mule risk profile on demand."""
+        engine: MuleDetectionEngine | None = getattr(request.app.state, "mule_engine", None)
+        if engine is None:
+            return JSONResponse(status_code=500, content={"detail": "Mule engine not initialized."})
+        prof = engine.store.get_profile(payload.account_id)
+        if prof is None:
+            engine.store.upsert_profile(
+                MuleAccountProfile(account_id=payload.account_id, tenant_id=payload.tenant_id)
+            )
+        assessment = engine.evaluate_account(payload.account_id)
+        _record_mule_metrics(request, assessment)
+        return _mule_assessment_to_response(assessment)
+
+    @application.get(
+        "/v1/mule/assessments/{assessment_id}",
+        response_model=MuleAssessmentResponse,
+        responses={
+            404: {"description": "Assessment not found."},
+            500: {"description": "Mule engine not initialized."},
+        },
+        tags=["mule_detection"],
+    )
+    async def mule_get_assessment_endpoint(
+        assessment_id: str,
+        request: Request,
+    ) -> MuleAssessmentResponse | JSONResponse:
+        """Retrieve a specific mule risk assessment by ID."""
+        engine: MuleDetectionEngine | None = getattr(request.app.state, "mule_engine", None)
+        if engine is None:
+            return JSONResponse(status_code=500, content={"detail": "Mule engine not initialized."})
+        assessment = engine.store.get_assessment(assessment_id)
+        if assessment is None:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": f"Mule assessment '{assessment_id}' not found."},
+            )
+        return _mule_assessment_to_response(assessment)
+
+    @application.get(
+        "/v1/mule/assessments",
+        response_model=MuleAssessmentListResponse,
+        responses={500: {"description": "Mule engine not initialized."}},
+        tags=["mule_detection"],
+    )
+    async def mule_list_assessments_endpoint(
+        request: Request,
+        tenant_id: str | None = None,
+        limit: int = Query(default=100, ge=1, le=500),
+    ) -> MuleAssessmentListResponse | JSONResponse:
+        """Query mule risk assessments with optional tenant filter."""
+        engine: MuleDetectionEngine | None = getattr(request.app.state, "mule_engine", None)
+        if engine is None:
+            return JSONResponse(status_code=500, content={"detail": "Mule engine not initialized."})
+        assessments = engine.store.list_assessments(tenant_id=tenant_id, limit=limit)
+        return MuleAssessmentListResponse(
+            total_count=len(assessments),
+            assessments=[_mule_assessment_to_response(a) for a in assessments],
+        )
+
+    @application.get(
+        "/v1/mule/accounts/{account_id}",
+        response_model=MuleAccountProfileResponse,
+        responses={
+            404: {"description": "Account not found."},
+            500: {"description": "Mule engine not initialized."},
+        },
+        tags=["mule_detection"],
+    )
+    async def mule_get_account_endpoint(
+        account_id: str,
+        request: Request,
+    ) -> MuleAccountProfileResponse | JSONResponse:
+        """Fetch a monitored mule account profile and its transfer history."""
+        engine: MuleDetectionEngine | None = getattr(request.app.state, "mule_engine", None)
+        if engine is None:
+            return JSONResponse(status_code=500, content={"detail": "Mule engine not initialized."})
+        prof = engine.store.get_profile(account_id)
+        if prof is None:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": f"Mule account '{account_id}' not found."},
+            )
+        return _mule_profile_to_response(prof)
+
+    @application.get(
+        "/v1/mule/metrics",
+        response_model=dict[str, Any],
+        tags=["mule_detection"],
+    )
+    async def mule_metrics_endpoint(request: Request) -> dict[str, Any]:
+        """Summary metrics of money mule detection and storage."""
+        engine: MuleDetectionEngine | None = getattr(request.app.state, "mule_engine", None)
+        return {
+            "total_accounts_monitored": engine.store.profile_count if engine else 0,
+            "total_assessments_recorded": engine.store.assessment_count if engine else 0,
+            "status": "operational" if engine else "uninitialized",
+        }
+
+    def _record_first_party_metrics(
+        request: Request,
+        assessment: FirstPartyAssessment,
+    ) -> None:
+        eval_c = getattr(request.app.state, "first_party_evaluations_counter", None)
+        if eval_c is not None:
+            eval_c.labels(
+                tenant_id=assessment.tenant_id,
+                action=assessment.action.value,
+                risk_level=assessment.risk_level.value,
+            ).inc()
+        anom_c = getattr(request.app.state, "first_party_anomalies_counter", None)
+        if anom_c is not None:
+            for anomaly in assessment.anomalies:
+                anom_c.labels(
+                    tenant_id=assessment.tenant_id,
+                    anomaly_type=anomaly.value,
+                ).inc()
+        rest_c = getattr(request.app.state, "first_party_restricted_counter", None)
+        if rest_c is not None and assessment.action in {
+            FirstPartyAction.RESTRICT_INSTANT_REFUND,
+            FirstPartyAction.DENY_REFUND_MANUAL_REVIEW,
+            FirstPartyAction.REVOKE_PRIVILEGES_AND_BLOCK,
+        }:
+            rest_c.labels(tenant_id=assessment.tenant_id).inc()
+
+    @application.post(
+        "/v1/first-party/events",
+        response_model=FirstPartyAssessmentResponse,
+        responses={
+            422: {"description": "Invalid event payload."},
+            500: {"description": "First-party engine not initialized."},
+        },
+        tags=["first_party_fraud"],
+    )
+    async def first_party_ingest_event_endpoint(
+        payload: FirstPartyEventRequest,
+        request: Request,
+    ) -> FirstPartyAssessmentResponse | JSONResponse:
+        """Ingest an order/refund/dispute/promo event and evaluate first-party risk."""
+        engine: FirstPartyFraudEngine | None = getattr(
+            request.app.state, "first_party_engine", None
+        )
+        if engine is None:
+            return JSONResponse(
+                status_code=500,
+                content={"detail": "First-party engine not initialized."},
+            )
+        record = FirstPartyEventRecord.from_dict(payload.model_dump())
+        assessment = engine.record_and_evaluate(record)
+        _record_first_party_metrics(request, assessment)
+        return _first_party_assessment_to_response(assessment)
+
+    @application.post(
+        "/v1/first-party/evaluate",
+        response_model=FirstPartyAssessmentResponse,
+        responses={
+            404: {"description": "First-party account not found."},
+            500: {"description": "First-party engine not initialized."},
+        },
+        tags=["first_party_fraud"],
+    )
+    async def first_party_evaluate_account_endpoint(
+        payload: FirstPartyEvaluateRequest,
+        request: Request,
+    ) -> FirstPartyAssessmentResponse | JSONResponse:
+        """Evaluate an existing account's first-party abuse risk profile."""
+        engine: FirstPartyFraudEngine | None = getattr(
+            request.app.state, "first_party_engine", None
+        )
+        if engine is None:
+            return JSONResponse(
+                status_code=500,
+                content={"detail": "First-party engine not initialized."},
+            )
+        try:
+            assessment = engine.evaluate_account(payload.account_id)
+        except KeyError:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": f"First-party account '{payload.account_id}' not found."},
+            )
+        _record_first_party_metrics(request, assessment)
+        return _first_party_assessment_to_response(assessment)
+
+    @application.get(
+        "/v1/first-party/assessments/{assessment_id}",
+        response_model=FirstPartyAssessmentResponse,
+        responses={
+            404: {"description": "Assessment not found."},
+            500: {"description": "First-party engine not initialized."},
+        },
+        tags=["first_party_fraud"],
+    )
+    async def first_party_get_assessment_endpoint(
+        assessment_id: str,
+        request: Request,
+    ) -> FirstPartyAssessmentResponse | JSONResponse:
+        """Retrieve a specific first-party fraud assessment by ID."""
+        engine: FirstPartyFraudEngine | None = getattr(
+            request.app.state, "first_party_engine", None
+        )
+        if engine is None:
+            return JSONResponse(
+                status_code=500,
+                content={"detail": "First-party engine not initialized."},
+            )
+        assessment = engine.get_assessment(assessment_id)
+        if assessment is None:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": f"First-party assessment '{assessment_id}' not found."},
+            )
+        return _first_party_assessment_to_response(assessment)
+
+    @application.get(
+        "/v1/first-party/assessments",
+        response_model=FirstPartyAssessmentListResponse,
+        responses={500: {"description": "First-party engine not initialized."}},
+        tags=["first_party_fraud"],
+    )
+    async def first_party_list_assessments_endpoint(
+        request: Request,
+        account_id: str | None = None,
+        risk_level: FirstPartyRiskLevel | None = None,
+        tenant_id: str | None = None,
+        limit: int = Query(default=100, ge=1, le=1000),
+    ) -> FirstPartyAssessmentListResponse | JSONResponse:
+        """Query first-party fraud assessments with optional filters."""
+        engine: FirstPartyFraudEngine | None = getattr(
+            request.app.state, "first_party_engine", None
+        )
+        if engine is None:
+            return JSONResponse(
+                status_code=500,
+                content={"detail": "First-party engine not initialized."},
+            )
+        items = engine.list_assessments(
+            account_id=account_id,
+            risk_level=risk_level,
+            tenant_id=tenant_id,
+            limit=limit,
+        )
+        return FirstPartyAssessmentListResponse(
+            total_count=len(items),
+            assessments=[_first_party_assessment_to_response(a) for a in items],
+        )
+
+    @application.get(
+        "/v1/first-party/accounts/{account_id}",
+        response_model=FirstPartyAccountProfileResponse,
+        responses={
+            404: {"description": "Account not found."},
+            500: {"description": "First-party engine not initialized."},
+        },
+        tags=["first_party_fraud"],
+    )
+    async def first_party_get_account_endpoint(
+        account_id: str,
+        request: Request,
+    ) -> FirstPartyAccountProfileResponse | JSONResponse:
+        """Fetch a monitored first-party account profile and its event history."""
+        engine: FirstPartyFraudEngine | None = getattr(
+            request.app.state, "first_party_engine", None
+        )
+        if engine is None:
+            return JSONResponse(
+                status_code=500,
+                content={"detail": "First-party engine not initialized."},
+            )
+        prof = engine.get_profile(account_id)
+        if prof is None:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": f"First-party account '{account_id}' not found."},
+            )
+        return _first_party_profile_to_response(prof)
+
+    @application.get(
+        "/v1/first-party/metrics",
+        response_model=dict[str, Any],
+        tags=["first_party_fraud"],
+    )
+    async def first_party_metrics_endpoint(request: Request) -> dict[str, Any]:
+        """Summary metrics of first-party fraud detection and storage."""
+        engine: FirstPartyFraudEngine | None = getattr(
+            request.app.state, "first_party_engine", None
+        )
+        if engine is None:
+            return {
+                "total_accounts": 0,
+                "total_assessments": 0,
+                "status": "uninitialized",
+            }
+        return {**engine.summary(), "status": "operational"}
 
     @application.get(
         "/v1/routing/status",
