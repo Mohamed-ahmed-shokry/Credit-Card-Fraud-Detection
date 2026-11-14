@@ -22,6 +22,7 @@ from fraud_detection.bin_attack import (
     _coerce_utc_datetime,
 )
 from fraud_detection.cases import CaseManager
+from fraud_detection.events import EventBus, EventType
 
 
 def test_bin_attack_enums_and_model_round_trip() -> None:
@@ -278,3 +279,123 @@ def test_store_eviction_and_engine_case_escalation() -> None:
     restored.load_state(exported)
     assert restored.summary()["total_bins"] == 2
     assert restored.get_assessment(assessment.assessment_id) is not None
+
+
+def test_event_bus_publishing_and_policy_tiers() -> None:
+    bus = EventBus()
+    received: list[EventType] = []
+    bus.subscribe(lambda event: received.append(event.event_type))
+
+    tiny_store = BinAttackStore(max_attempts_per_bin=3, max_assessments=1)
+    now = datetime(2026, 11, 15, 0, 30, 0, tzinfo=UTC)
+    for idx in range(4):
+        tiny_store.record_attempt(
+            BinAuthAttempt(
+                attempt_id=f"tr-{idx}",
+                bin_prefix="499999",
+                last4=f"000{idx}",
+                amount=10.0,
+                response_code=AuthResponseCode.APPROVED,
+                timestamp=now,
+            )
+        )
+    prof_tr = tiny_store.get_profile("499999")
+    assert prof_tr is not None
+    assert len(prof_tr.attempts) == 3
+
+    store = BinAttackStore(max_assessments=20)
+    engine = BinAttackDefenseEngine(store=store, event_bus=bus)
+    assert engine.get_assessment("missing") is None
+
+    # LOW -> ALLOW
+    low = engine.record_and_evaluate(
+        BinAuthAttempt(
+            attempt_id="low-1",
+            bin_prefix="400001",
+            last4="0001",
+            amount=50.0,
+            response_code=AuthResponseCode.APPROVED,
+            timestamp=now,
+        ),
+        now=now,
+    )
+    assert low.action == BinAttackAction.ALLOW
+    assert EventType.BIN_ATTACK_EVALUATED in received
+
+    # MEDIUM -> CHALLENGE_3DS (sequential run of 4 -> 0.30)
+    received.clear()
+    for idx in range(3):
+        engine.record_attempt(
+            BinAuthAttempt(
+                attempt_id=f"med-{idx}",
+                bin_prefix="400002",
+                last4=f"200{idx}",
+                amount=20.0,
+                response_code=AuthResponseCode.APPROVED,
+                timestamp=now,
+            )
+        )
+    med = engine.record_and_evaluate(
+        BinAuthAttempt(
+            attempt_id="med-3",
+            bin_prefix="400002",
+            last4="2003",
+            amount=20.0,
+            response_code=AuthResponseCode.APPROVED,
+            timestamp=now,
+        ),
+        now=now,
+    )
+    assert med.risk_level == BinAttackRiskLevel.MEDIUM
+    assert med.action == BinAttackAction.CHALLENGE_3DS
+    assert EventType.BIN_ENUMERATION_DETECTED in received
+
+    # HIGH -> RATE_LIMIT_MERCHANT_IP (0.45..0.64): sequential (0.30) + cvv probing (0.20) = 0.50
+    for idx in range(4):
+        engine.record_attempt(
+            BinAuthAttempt(
+                attempt_id=f"rl-{idx}",
+                bin_prefix="400003",
+                last4=f"300{idx}",
+                amount=20.0,
+                response_code=AuthResponseCode.CVV_MISMATCH,
+                timestamp=now,
+                ip_address="10.0.0.1" if idx < 3 else "10.0.0.2",
+            )
+        )
+    # Add 2 approved to keep decline ratio < 0.70 (4/6 = 0.667)
+    for idx in range(2):
+        engine.record_attempt(
+            BinAuthAttempt(
+                attempt_id=f"rl-ok-{idx}",
+                bin_prefix="400003",
+                last4=f"900{idx}",
+                amount=20.0,
+                response_code=AuthResponseCode.APPROVED,
+                timestamp=now,
+            )
+        )
+    rl = engine.evaluate_bin("400003", now=now)
+    assert rl.action == BinAttackAction.RATE_LIMIT_MERCHANT_IP
+
+    # HIGH -> TEMP_BLOCK_BIN_PREFIX (0.65..0.84):
+    # sequential (0.30) + probing (0.20) + high decline (0.15) + 0.05 = 0.70
+    received.clear()
+    for idx in range(4):
+        engine.record_attempt(
+            BinAuthAttempt(
+                attempt_id=f"tb-{idx}",
+                bin_prefix="400004",
+                last4=f"400{idx}",
+                amount=20.0,
+                response_code=AuthResponseCode.CVV_MISMATCH,
+                timestamp=now,
+                ip_address="10.0.1.1" if idx < 3 else "10.0.1.2",
+            )
+        )
+    tb = engine.evaluate_bin("400004", now=now)
+    assert tb.action == BinAttackAction.TEMP_BLOCK_BIN_PREFIX
+    assert EventType.CARD_TESTING_BLOCKED in received
+    assert len(engine.list_assessments(risk_level=BinAttackRiskLevel.HIGH)) >= 2
+    assert engine.get_profile("400004") is not None
+    assert engine.summary()["total_bins"] == 4
