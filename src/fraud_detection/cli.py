@@ -56,6 +56,12 @@ from fraud_detection.audit import (
     build_scoring_audit_event,
     replay_audit_log,
 )
+from fraud_detection.bin_attack import (
+    AuthResponseCode,
+    BinAttackDefenseEngine,
+    BinAttackStore,
+    BinAuthAttempt,
+)
 from fraud_detection.cases import (
     CaseDisposition,
     CaseError,
@@ -11359,6 +11365,197 @@ def first_party_summary(
     if output_format.lower() == "table":
         typer.echo("First-Party Fraud Store Summary:")
         typer.echo(f"  Total Accounts:     {summary_data['total_accounts']}")
+        typer.echo(f"  Total Assessments:  {summary_data['total_assessments']}")
+        for level, cnt in summary_data["risk_distribution"].items():
+            typer.echo(f"    {level:25s}: {cnt}")
+    else:
+        typer.echo(json.dumps(summary_data, indent=2))
+
+
+def _load_bin_attack_state(
+    store_file: Path | None,
+) -> tuple[BinAttackDefenseEngine, BinAttackStore]:
+    """Load persistent BIN attack profiles and assessments from a JSON store file."""
+    store = BinAttackStore()
+    if store_file is None or not store_file.exists():
+        return BinAttackDefenseEngine(store=store), store
+
+    try:
+        data = json.loads(store_file.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            _abort("Invalid BIN attack store file format: expected JSON object.")
+    except (OSError, json.JSONDecodeError) as exc:
+        _abort(f"Could not read BIN attack store file: {exc}")
+
+    store.load_state(data)
+    return BinAttackDefenseEngine(store=store), store
+
+
+def _save_bin_attack_state(store: BinAttackStore, store_file: Path) -> None:
+    """Persist BIN attack store atomically to disk."""
+    _atomic_write_text(json.dumps(store.export_state(), indent=2), store_file)
+
+
+@app.command("bin-attack-ingest")
+def bin_attack_ingest(
+    bin_prefix: Annotated[str, typer.Option("--bin", "-b", help="6-to-8 digit BIN prefix.")],
+    last4: Annotated[str, typer.Option("--last4", "-l", help="4-digit card suffix.")],
+    amount: Annotated[float, typer.Option("--amount", "-m", help="Authorization amount.")],
+    response_code: Annotated[
+        str,
+        typer.Option(
+            "--response",
+            "-r",
+            help=(
+                "Auth response (approved, insufficient_funds, do_not_honor, "
+                "cvv_mismatch, invalid_expiry, expired_card, invalid_pan, pickup_card)."
+            ),
+        ),
+    ] = "approved",
+    attempt_id: Annotated[
+        str, typer.Option("--attempt-id", "-e", help="Unique attempt identifier.")
+    ] = "",
+    ip_address: Annotated[str, typer.Option("--ip", help="Source IP address.")] = "",
+    merchant_id: Annotated[
+        str, typer.Option("--merchant-id", help="Merchant identifier.")
+    ] = "default_merchant",
+    timestamp: Annotated[
+        str, typer.Option("--timestamp", "-t", help="Optional ISO-8601 timestamp.")
+    ] = "",
+    tenant_id: Annotated[str, typer.Option("--tenant-id", help="Tenant identifier.")] = "default",
+    store_file: Annotated[
+        Path,
+        typer.Option("--store-file", "-s", help="Path to BIN attack state JSON file."),
+    ] = Path("bin_attack_store.json"),
+    output_format: Annotated[
+        str, typer.Option("--format", "-f", help="Output format (table or json).")
+    ] = "table",
+) -> None:
+    """Ingest a card authorization attempt and evaluate BIN attack risk."""
+    try:
+        resp_enum = AuthResponseCode(response_code.lower())
+        attempt = BinAuthAttempt.from_dict(
+            {
+                "attempt_id": attempt_id or f"att_{uuid4().hex[:10]}",
+                "bin_prefix": bin_prefix,
+                "last4": last4,
+                "amount": amount,
+                "response_code": resp_enum.value,
+                "timestamp": timestamp or datetime.now(UTC).isoformat(),
+                "ip_address": ip_address,
+                "merchant_id": merchant_id,
+                "tenant_id": tenant_id,
+            }
+        )
+    except ValueError as exc:
+        _abort(f"Invalid BIN attempt parameters: {exc}")
+
+    engine, store = _load_bin_attack_state(store_file)
+    assessment = engine.record_and_evaluate(attempt)
+    _save_bin_attack_state(store, store_file)
+
+    if output_format.lower() == "table":
+        typer.echo(f"Assessment ID:    {assessment.assessment_id}")
+        typer.echo(f"BIN Prefix:       {assessment.bin_prefix}")
+        typer.echo(f"Risk Score:       {assessment.risk_score:.4f}")
+        typer.echo(f"Risk Level:       {assessment.risk_level.value}")
+        typer.echo(f"Action:           {assessment.action.value}")
+        typer.echo(f"Decline Ratio:    {assessment.decline_ratio:.2%}")
+        anoms = ", ".join(a.value for a in assessment.anomalies) or "none"
+        typer.echo(f"Anomalies:        {anoms}")
+    else:
+        typer.echo(json.dumps(assessment.to_dict(), indent=2))
+
+
+@app.command("bin-attack-eval")
+def bin_attack_eval(
+    bin_prefix: Annotated[str, typer.Option("--bin", "-b", help="BIN prefix to evaluate.")],
+    store_file: Annotated[
+        Path,
+        typer.Option("--store-file", "-s", help="Path to BIN attack state JSON file."),
+    ] = Path("bin_attack_store.json"),
+    output_format: Annotated[
+        str, typer.Option("--format", "-f", help="Output format (table or json).")
+    ] = "table",
+) -> None:
+    """Evaluate a stored BIN prefix's card-testing attack risk."""
+    engine, store = _load_bin_attack_state(store_file)
+    try:
+        assessment = engine.evaluate_bin(bin_prefix)
+    except KeyError:
+        _abort(f"BIN prefix '{bin_prefix}' not found in BIN attack store.")
+    _save_bin_attack_state(store, store_file)
+
+    if output_format.lower() == "table":
+        typer.echo(f"Assessment ID:    {assessment.assessment_id}")
+        typer.echo(f"BIN Prefix:       {assessment.bin_prefix}")
+        typer.echo(f"Risk Score:       {assessment.risk_score:.4f}")
+        typer.echo(f"Risk Level:       {assessment.risk_level.value}")
+        typer.echo(f"Action:           {assessment.action.value}")
+    else:
+        typer.echo(json.dumps(assessment.to_dict(), indent=2))
+
+
+@app.command("bin-attack-inspect")
+def bin_attack_inspect(
+    bin_prefix: Annotated[str, typer.Option("--bin", "-b", help="BIN prefix to inspect.")] = "",
+    assessment_id: Annotated[
+        str, typer.Option("--assessment-id", "-i", help="Assessment ID to inspect.")
+    ] = "",
+    store_file: Annotated[
+        Path,
+        typer.Option("--store-file", "-s", help="Path to BIN attack state JSON file."),
+    ] = Path("bin_attack_store.json"),
+    output_format: Annotated[
+        str, typer.Option("--format", "-f", help="Output format (table or json).")
+    ] = "table",
+) -> None:
+    """Inspect a monitored BIN prefix profile or assessment."""
+    if not bin_prefix and not assessment_id:
+        _abort("Must provide either --bin or --assessment-id to inspect.")
+
+    _, store = _load_bin_attack_state(store_file)
+    if assessment_id:
+        assessment = store.get_assessment(assessment_id)
+        if assessment is None:
+            _abort(f"Assessment '{assessment_id}' not found in BIN attack store.")
+        if output_format.lower() == "table":
+            typer.echo(f"Assessment ID:    {assessment.assessment_id}")
+            typer.echo(f"BIN Prefix:       {assessment.bin_prefix}")
+            typer.echo(f"Risk Score:       {assessment.risk_score:.4f}")
+            typer.echo(f"Action:           {assessment.action.value}")
+        else:
+            typer.echo(json.dumps(assessment.to_dict(), indent=2))
+        return
+
+    profile = store.get_profile(bin_prefix)
+    if profile is None:
+        _abort(f"BIN prefix '{bin_prefix}' not found in BIN attack store.")
+    if output_format.lower() == "table":
+        typer.echo(f"BIN Prefix:       {profile.bin_prefix}")
+        typer.echo(f"Tenant ID:        {profile.tenant_id}")
+        typer.echo(f"Attempts:         {len(profile.attempts)}")
+        typer.echo(f"Risk Level:       {profile.risk_level.value}")
+    else:
+        typer.echo(json.dumps(profile.to_dict(), indent=2))
+
+
+@app.command("bin-attack-summary")
+def bin_attack_summary(
+    store_file: Annotated[
+        Path,
+        typer.Option("--store-file", "-s", help="Path to BIN attack state JSON file."),
+    ] = Path("bin_attack_store.json"),
+    output_format: Annotated[
+        str, typer.Option("--format", "-f", help="Output format (table or json).")
+    ] = "table",
+) -> None:
+    """Display summary metrics of monitored BIN prefixes and assessments."""
+    _, store = _load_bin_attack_state(store_file)
+    summary_data = store.summary()
+    if output_format.lower() == "table":
+        typer.echo("BIN Attack Defense Store Summary:")
+        typer.echo(f"  Total BINs:         {summary_data['total_bins']}")
         typer.echo(f"  Total Assessments:  {summary_data['total_assessments']}")
         for level, cnt in summary_data["risk_distribution"].items():
             typer.echo(f"    {level:25s}: {cnt}")
