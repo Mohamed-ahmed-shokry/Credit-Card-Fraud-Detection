@@ -10,6 +10,7 @@ import time
 import urllib.error
 import urllib.request
 from collections import defaultdict
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Any, NoReturn, cast
 from uuid import uuid4
@@ -147,6 +148,13 @@ from fraud_detection.feedback import (
     RetrainingTriggerPolicy,
     match_labels_with_audit_log,
     partition_into_cohorts,
+)
+from fraud_detection.first_party_fraud import (
+    ClaimOutcome,
+    FirstPartyAccountStore,
+    FirstPartyEventRecord,
+    FirstPartyFraudEngine,
+    OrderClaimType,
 )
 from fraud_detection.geolocation import (
     DEFAULT_MAX_SPEED_KMH,
@@ -11152,6 +11160,208 @@ def mule_summary(
         typer.echo(f"  Total Assessments:  {summary_data['total_assessments']}")
         for act, cnt in actions.items():
             typer.echo(f"    {act:25s}: {cnt}")
+    else:
+        typer.echo(json.dumps(summary_data, indent=2))
+
+
+def _load_first_party_state(
+    store_file: Path | None,
+) -> tuple[FirstPartyFraudEngine, FirstPartyAccountStore]:
+    """Load persistent first-party account profiles and assessments from a JSON store file."""
+    store = FirstPartyAccountStore()
+    if store_file is None or not store_file.exists():
+        return FirstPartyFraudEngine(store=store), store
+
+    try:
+        data = json.loads(store_file.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            _abort("Invalid first-party store file format: expected JSON object.")
+    except (OSError, json.JSONDecodeError) as exc:
+        _abort(f"Could not read first-party store file: {exc}")
+
+    store.load_state(data)
+    return FirstPartyFraudEngine(store=store), store
+
+
+def _save_first_party_state(store: FirstPartyAccountStore, store_file: Path) -> None:
+    """Persist first-party account store atomically to disk."""
+    _atomic_write_text(json.dumps(store.export_state(), indent=2), store_file)
+
+
+@app.command("first-party-ingest")
+def first_party_ingest(
+    account_id: Annotated[str, typer.Option("--account-id", "-a", help="Account identifier.")],
+    claim_type: Annotated[
+        str,
+        typer.Option(
+            "--claim-type",
+            "-c",
+            help=(
+                "Event type (purchase, refund_return, inr_claim, "
+                "friendly_dispute, promo_redemption)."
+            ),
+        ),
+    ],
+    amount: Annotated[float, typer.Option("--amount", "-m", help="Monetary amount.")],
+    event_id: Annotated[
+        str, typer.Option("--event-id", "-e", help="Unique event identifier.")
+    ] = "",
+    merchant_category: Annotated[
+        str, typer.Option("--category", help="Merchant category (e.g. apparel, electronics).")
+    ] = "general",
+    outcome: Annotated[
+        str, typer.Option("--outcome", help="Claim outcome (approved, pending, denied, reversed).")
+    ] = "approved",
+    three_ds: Annotated[
+        bool, typer.Option("--three-ds", help="Whether 3DS authentication succeeded.")
+    ] = False,
+    delivery_confirmed: Annotated[
+        bool, typer.Option("--delivery-confirmed", help="Whether carrier delivery was confirmed.")
+    ] = False,
+    timestamp: Annotated[
+        str, typer.Option("--timestamp", "-t", help="Optional ISO-8601 timestamp.")
+    ] = "",
+    tenant_id: Annotated[str, typer.Option("--tenant-id", help="Tenant identifier.")] = "default",
+    store_file: Annotated[
+        Path,
+        typer.Option("--store-file", "-s", help="Path to first-party state JSON file."),
+    ] = Path("first_party_store.json"),
+    output_format: Annotated[
+        str, typer.Option("--format", "-f", help="Output format (table or json).")
+    ] = "table",
+) -> None:
+    """Ingest an order, refund, INR, dispute, or promo event and evaluate first-party risk."""
+    try:
+        claim_enum = OrderClaimType(claim_type.lower())
+        outcome_enum = ClaimOutcome(outcome.lower())
+    except ValueError as exc:
+        _abort(f"Invalid claim type or outcome: {exc}")
+
+    engine, store = _load_first_party_state(store_file)
+    record = FirstPartyEventRecord.from_dict(
+        {
+            "event_id": event_id or f"fp_{uuid4().hex[:10]}",
+            "account_id": account_id,
+            "claim_type": claim_enum.value,
+            "amount": amount,
+            "timestamp": timestamp or datetime.now(UTC).isoformat(),
+            "merchant_category": merchant_category,
+            "outcome": outcome_enum.value,
+            "three_ds_authenticated": three_ds,
+            "delivery_confirmed": delivery_confirmed,
+            "tenant_id": tenant_id,
+        }
+    )
+    assessment = engine.record_and_evaluate(record)
+    _save_first_party_state(store, store_file)
+
+    if output_format.lower() == "table":
+        typer.echo(f"Assessment ID:    {assessment.assessment_id}")
+        typer.echo(f"Account ID:       {assessment.account_id}")
+        typer.echo(f"Risk Score:       {assessment.risk_score:.4f}")
+        typer.echo(f"Risk Level:       {assessment.risk_level.value}")
+        typer.echo(f"Action:           {assessment.action.value}")
+        typer.echo(f"Return Ratio:     {assessment.return_ratio:.2%}")
+        anoms = ", ".join(a.value for a in assessment.anomalies) or "none"
+        typer.echo(f"Anomalies:        {anoms}")
+    else:
+        typer.echo(json.dumps(assessment.to_dict(), indent=2))
+
+
+@app.command("first-party-eval")
+def first_party_eval(
+    account_id: Annotated[str, typer.Option("--account-id", "-a", help="Account ID to evaluate.")],
+    store_file: Annotated[
+        Path,
+        typer.Option("--store-file", "-s", help="Path to first-party state JSON file."),
+    ] = Path("first_party_store.json"),
+    output_format: Annotated[
+        str, typer.Option("--format", "-f", help="Output format (table or json).")
+    ] = "table",
+) -> None:
+    """Evaluate a stored account's first-party abuse risk profile."""
+    engine, store = _load_first_party_state(store_file)
+    try:
+        assessment = engine.evaluate_account(account_id)
+    except KeyError:
+        _abort(f"Account '{account_id}' not found in first-party store.")
+    _save_first_party_state(store, store_file)
+
+    if output_format.lower() == "table":
+        typer.echo(f"Assessment ID:    {assessment.assessment_id}")
+        typer.echo(f"Account ID:       {assessment.account_id}")
+        typer.echo(f"Risk Score:       {assessment.risk_score:.4f}")
+        typer.echo(f"Risk Level:       {assessment.risk_level.value}")
+        typer.echo(f"Action:           {assessment.action.value}")
+    else:
+        typer.echo(json.dumps(assessment.to_dict(), indent=2))
+
+
+@app.command("first-party-inspect")
+def first_party_inspect(
+    account_id: Annotated[
+        str, typer.Option("--account-id", "-a", help="Account ID to inspect.")
+    ] = "",
+    assessment_id: Annotated[
+        str, typer.Option("--assessment-id", "-i", help="Assessment ID to inspect.")
+    ] = "",
+    store_file: Annotated[
+        Path,
+        typer.Option("--store-file", "-s", help="Path to first-party state JSON file."),
+    ] = Path("first_party_store.json"),
+    output_format: Annotated[
+        str, typer.Option("--format", "-f", help="Output format (table or json).")
+    ] = "table",
+) -> None:
+    """Inspect a monitored first-party account profile or assessment."""
+    if not account_id and not assessment_id:
+        _abort("Must provide either --account-id or --assessment-id to inspect.")
+
+    _, store = _load_first_party_state(store_file)
+    if assessment_id:
+        assessment = store.get_assessment(assessment_id)
+        if assessment is None:
+            _abort(f"Assessment '{assessment_id}' not found in first-party store.")
+        if output_format.lower() == "table":
+            typer.echo(f"Assessment ID:    {assessment.assessment_id}")
+            typer.echo(f"Account ID:       {assessment.account_id}")
+            typer.echo(f"Risk Score:       {assessment.risk_score:.4f}")
+            typer.echo(f"Action:           {assessment.action.value}")
+        else:
+            typer.echo(json.dumps(assessment.to_dict(), indent=2))
+        return
+
+    profile = store.get_profile(account_id)
+    if profile is None:
+        _abort(f"Account profile '{account_id}' not found in first-party store.")
+    if output_format.lower() == "table":
+        typer.echo(f"Account ID:       {profile.account_id}")
+        typer.echo(f"Tenant ID:        {profile.tenant_id}")
+        typer.echo(f"Events:           {len(profile.events)}")
+        typer.echo(f"Risk Level:       {profile.risk_level.value}")
+    else:
+        typer.echo(json.dumps(profile.to_dict(), indent=2))
+
+
+@app.command("first-party-summary")
+def first_party_summary(
+    store_file: Annotated[
+        Path,
+        typer.Option("--store-file", "-s", help="Path to first-party state JSON file."),
+    ] = Path("first_party_store.json"),
+    output_format: Annotated[
+        str, typer.Option("--format", "-f", help="Output format (table or json).")
+    ] = "table",
+) -> None:
+    """Display summary metrics of monitored first-party accounts and assessments."""
+    _, store = _load_first_party_state(store_file)
+    summary_data = store.summary()
+    if output_format.lower() == "table":
+        typer.echo("First-Party Fraud Store Summary:")
+        typer.echo(f"  Total Accounts:     {summary_data['total_accounts']}")
+        typer.echo(f"  Total Assessments:  {summary_data['total_assessments']}")
+        for level, cnt in summary_data["risk_distribution"].items():
+            typer.echo(f"    {level:25s}: {cnt}")
     else:
         typer.echo(json.dumps(summary_data, indent=2))
 

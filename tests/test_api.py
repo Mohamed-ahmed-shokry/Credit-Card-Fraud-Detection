@@ -7071,3 +7071,104 @@ def test_mule_api_error_branches(api_context: tuple[Path, Any, Path]) -> None:
         assert client.get("/v1/mule/assessments/mule_1").status_code == 500
         assert client.get("/v1/mule/assessments").status_code == 500
         assert client.get("/v1/mule/accounts/acct_x").status_code == 500
+
+
+def test_first_party_api_endpoints_and_metrics(api_context: tuple[Path, Any, Path]) -> None:
+    """Verify /v1/first-party/* endpoints and Prometheus metrics end to end."""
+    _, model, _ = api_context
+    app = create_app(model=model)
+
+    with TestClient(app) as client:
+        events = [
+            {
+                "event_id": "fp-e1",
+                "account_id": "fp-acct-1",
+                "claim_type": "purchase",
+                "amount": 100.0,
+                "timestamp": "2026-11-14T10:00:00+00:00",
+                "merchant_category": "apparel",
+            },
+            {
+                "event_id": "fp-e2",
+                "account_id": "fp-acct-1",
+                "claim_type": "refund_return",
+                "amount": 100.0,
+                "timestamp": "2026-11-14T11:00:00+00:00",
+                "merchant_category": "apparel",
+            },
+            {
+                "event_id": "fp-e3",
+                "account_id": "fp-acct-1",
+                "claim_type": "refund_return",
+                "amount": 100.0,
+                "timestamp": "2026-11-14T11:30:00+00:00",
+                "merchant_category": "electronics",
+            },
+        ]
+        last_resp = None
+        for ev in events:
+            last_resp = client.post("/v1/first-party/events", json=ev)
+            assert last_resp.status_code == 200
+        assert last_resp is not None
+        data = last_resp.json()
+        assert data["action"] == "restrict_instant_refund"
+        assessment_id = data["assessment_id"]
+
+        eval_resp = client.post("/v1/first-party/evaluate", json={"account_id": "fp-acct-1"})
+        assert eval_resp.status_code == 200
+
+        get_resp = client.get(f"/v1/first-party/assessments/{assessment_id}")
+        assert get_resp.status_code == 200
+        assert get_resp.json()["assessment_id"] == assessment_id
+
+        list_resp = client.get("/v1/first-party/assessments", params={"account_id": "fp-acct-1"})
+        assert list_resp.status_code == 200
+        assert list_resp.json()["total_count"] >= 2
+
+        acct_resp = client.get("/v1/first-party/accounts/fp-acct-1")
+        assert acct_resp.status_code == 200
+        assert len(acct_resp.json()["events"]) == 3
+
+        metrics_resp = client.get("/v1/first-party/metrics")
+        assert metrics_resp.status_code == 200
+        assert metrics_resp.json()["status"] == "operational"
+        assert metrics_resp.json()["total_accounts"] >= 1
+
+        prom = client.get("/metrics")
+        assert prom.status_code == 200
+        assert "fraud_first_party_evaluations_total" in prom.text
+        assert "fraud_first_party_restricted_total" in prom.text
+
+
+def test_first_party_api_error_branches(api_context: tuple[Path, Any, Path]) -> None:
+    """Validate 404 and 500 error branches on /v1/first-party/* endpoints."""
+    _, model, _ = api_context
+    app = create_app(model=model)
+
+    with TestClient(app) as client:
+        assert (
+            client.post("/v1/first-party/evaluate", json={"account_id": "missing"}).status_code
+            == 404
+        )
+        assert client.get("/v1/first-party/assessments/missing").status_code == 404
+        assert client.get("/v1/first-party/accounts/missing").status_code == 404
+
+        app.state.first_party_engine = None
+        ev_payload = {
+            "event_id": "fp-x",
+            "account_id": "acct-x",
+            "claim_type": "purchase",
+            "amount": 50.0,
+            "timestamp": "2026-11-14T10:00:00+00:00",
+        }
+        assert client.post("/v1/first-party/events", json=ev_payload).status_code == 500
+        assert (
+            client.post("/v1/first-party/evaluate", json={"account_id": "acct-x"}).status_code
+            == 500
+        )
+        assert client.get("/v1/first-party/assessments/fp-1").status_code == 500
+        assert client.get("/v1/first-party/assessments").status_code == 500
+        assert client.get("/v1/first-party/accounts/acct-x").status_code == 500
+        metrics_uninit = client.get("/v1/first-party/metrics")
+        assert metrics_uninit.status_code == 200
+        assert metrics_uninit.json()["status"] == "uninitialized"

@@ -57,7 +57,8 @@ and multi-tenant policy partitioning, dynamic rule federation, and account isola
 and account takeover (ATO) detection, credential stuffing defense, and identity session anomaly scoring (Phase 47),
 anti-money laundering transaction monitoring, structuring/smurfing detection, and regulatory SAR engine (Phase 48),
 and synthetic identity fraud (SIF) detection, PII inconsistency, and identity verification engine (Phase 49),
-and money mule account & rapid fund exfiltration detection engine (Phase 50).
+and money mule account & rapid fund exfiltration detection engine (Phase 50),
+and first-party fraud, refund abuse & friendly fraud detection engine (Phase 51).
 
 ## Phase 1 — Distribution
 
@@ -2821,7 +2822,78 @@ Provide deterministic, real-time mule account detection, fund exfiltration scori
 - Task 9: Update `ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md` and verify 100% green local & remote CI.
 
 ### Micro-Commits
+- `2a75fa2`..`9db5893`: Implemented `first_party_fraud.py` (`RefundAbuseAnalyzer`, `FriendlyFraudAnalyzer`, `PromoAbuseDetector`, `FirstPartyAccountStore`, `FirstPartyFraudEngine`), registered `FIRST_PARTY_*` / `REFUND_RESTRICTED` / `ACCOUNT_PRIVILEGES_REVOKED` events in `events.py`, added `/v1/first-party/*` endpoints and Prometheus metrics in `api.py`, added `first-party-*` CLI commands in `cli.py`, achieved 99.23% unit branch coverage, added API & CLI integration tests, and documented architecture and usage.
+
+### Micro-Commits
 - `1818507`..`ded7e8a`: Implemented `mule_detection.py` (`PassThroughAnalyzer`, `MuleNetworkAnalyzer`, `DormancyBurstDetector`, `MuleAccountStore`, `MuleDetectionEngine`), registered `MULE_*` events in `events.py`, added `/v1/mule/*` endpoints and Prometheus metrics in `api.py`, added `mule-*` CLI commands in `cli.py`, added full unit/integration tests, and documented architecture and usage.
+
+
+## Phase 51 — First-Party Fraud, Refund Abuse & Friendly Fraud Detection Engine (Done)
+
+Phase 51 implements an in-process, zero-external-dependency First-Party Fraud, Refund Abuse & Friendly Fraud Detection Engine (`first_party_fraud.py`). It detects legitimate cardholders and account owners exploiting merchant refund, chargeback, and promotional policies via serial friendly-fraud disputes ("cyber shoplifting"), high-ratio wardrobing/return abuse, Item-Not-Received (INR) / empty-box claim bursts, and multi-account promo/referral cycling.
+
+### Objective
+
+Provide deterministic, real-time first-party fraud scoring, refund/dispute abuse analytics, automated policy routing (`ALLOW`, `REQUIRE_SIGNATURE_DELIVERY`, `RESTRICT_INSTANT_REFUND`, `DENY_REFUND_MANUAL_REVIEW`, `REVOKE_PRIVILEGES_AND_BLOCK`), REST API endpoints, and CLI workflows with zero external services.
+
+### Scope
+
+1. **Domain Models & Taxonomies (`first_party_fraud.py`)**:
+   - `FirstPartyRiskLevel`: `LOW`, `MEDIUM`, `HIGH`, `CRITICAL`.
+   - `FirstPartyAction`: `ALLOW`, `REQUIRE_SIGNATURE_DELIVERY`, `RESTRICT_INSTANT_REFUND`, `DENY_REFUND_MANUAL_REVIEW`, `REVOKE_PRIVILEGES_AND_BLOCK`.
+   - `FirstPartyAnomalyType`: `SERIAL_FRIENDLY_FRAUD`, `HIGH_RETURN_RATIO`, `WARDROBING_PATTERN`, `INR_CLAIM_BURST`, `HIGH_VALUE_REFUND_SKEW`, `PROMO_BONUS_ABUSE`, `LINKED_ACCOUNT_CYCLING`, `PRE_DISPUTE_VELOCITY`.
+   - `OrderClaimType` (`PURCHASE`, `REFUND_RETURN`, `INR_CLAIM`, `FRIENDLY_DISPUTE`, `PROMO_REDEMPTION`) and `ClaimOutcome` (`APPROVED`, `PENDING`, `DENIED`, `REVERSED`).
+   - `FirstPartyEventRecord`, `FirstPartyAccountProfile`, `FirstPartyAssessment` with lossless dict/JSON serialization.
+2. **Refund & Return Abuse Analyzer (`RefundAbuseAnalyzer`)**:
+   - Computes total purchase vs. refund/return volume, return-to-purchase ratio, high-value refund skew (average refund amount exceeding average purchase amount), wardrobing patterns (rapid post-delivery returns on high-value/apparel/electronics categories), and INR claim bursts.
+3. **Friendly Fraud & Promo Cycling Analyzer (`FriendlyFraudAnalyzer`, `PromoAbuseDetector`)**:
+   - Detects serial "unauthorized" or "goods not received" disputes on accounts with authenticated/verified delivery history (3DS/AVS/CVV/signature/matching device), promo/referral redemption ratios, and linked-account cycling across shared payment/shipping fingerprints.
+4. **Composite Scoring Engine & Thread-Safe Store (`FirstPartyFraudEngine`, `FirstPartyAccountStore`)**:
+   - Aggregates refund abuse, friendly fraud, and promo cycling signals into calibrated risk scores (`0.0`–`1.0`) and policy actions.
+   - Integrates optionally with `CaseManager` (auto-creating compliance/dispute cases on `DENY_REFUND_MANUAL_REVIEW` / `REVOKE_PRIVILEGES_AND_BLOCK`) and `EventBus` (`FIRST_PARTY_EVALUATED`, `FIRST_PARTY_ABUSE_DETECTED`, `REFUND_RESTRICTED`, `ACCOUNT_PRIVILEGES_REVOKED`).
+5. **REST API (`/v1/first-party/*`) & Prometheus Metrics (`api.py`)**:
+   - `POST /v1/first-party/events`, `POST /v1/first-party/evaluate`, `GET /v1/first-party/assessments`, `GET /v1/first-party/assessments/{assessment_id}`, `GET /v1/first-party/accounts/{account_id}`, `GET /v1/first-party/metrics`.
+6. **CLI Workflows (`cli.py`)**:
+   - `first-party-ingest`, `first-party-eval`, `first-party-inspect`, `first-party-summary` with table/JSON formatting and store persistence.
+7. **Documentation**:
+   - `ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`.
+
+### Acceptance Criteria
+
+1. **AC-1 (Domain Models & Taxonomies)**: `FirstPartyRiskLevel`, `FirstPartyAction`, `FirstPartyAnomalyType`, `OrderClaimType`, `ClaimOutcome`, `FirstPartyEventRecord`, `FirstPartyAccountProfile`, and `FirstPartyAssessment` serialize/deserialize cleanly with unit tests.
+2. **AC-2 (Refund & Return Abuse)**: `RefundAbuseAnalyzer` accurately computes return-to-purchase ratios, high-value refund skew, wardrobing patterns, and INR claim bursts.
+3. **AC-3 (Friendly Fraud & Promo Cycling)**: `FriendlyFraudAnalyzer` and `PromoAbuseDetector` flag serial verified-delivery disputes, promo redemption abuse, and linked-account cycling.
+4. **AC-4 (Engine, Store & Escalation)**: `FirstPartyFraudEngine` and `FirstPartyAccountStore` compute calibrated scores, enforce policy routing, evict cleanly at capacity, and auto-create `CaseManager` cases on high-severity findings.
+5. **AC-5 (EventBus Streaming)**: Lifecycle transitions emit `FIRST_PARTY_EVALUATED`, `FIRST_PARTY_ABUSE_DETECTED`, `REFUND_RESTRICTED`, and `ACCOUNT_PRIVILEGES_REVOKED` events.
+6. **AC-6 (REST API & Metrics)**: `/v1/first-party/*` endpoints and Prometheus metrics work end to end and are verified in `tests/test_api.py`.
+7. **AC-7 (CLI Workflows)**: `first-party-ingest`, `first-party-eval`, `first-party-inspect`, and `first-party-summary` work end to end and are verified in `tests/test_cli.py` and real CLI execution.
+8. **AC-8 (All CI-Parity Checks & Remote CI Green)**: `ruff format --check src tests`, `ruff check src tests`, `mypy src`, `pytest --cov=fraud_detection --cov-report=term-missing`, `python -m build`, `twine check dist/*`, and all remote GitHub Actions CI jobs pass 100%.
+
+### Validation & CI Plan
+
+- Focused unit tests: `python -m pytest tests/test_first_party_fraud.py -v`
+- API & CLI & Event integration tests: `python -m pytest tests/test_api.py tests/test_cli.py -k "first_party"`
+- Full local CI parity: `ruff format --check src tests`, `ruff check src tests`, `mypy src`, `pytest --cov=fraud_detection --cov-report=term-missing`, `python -m build`, `twine check dist/*`
+- Remote CI: GitHub Actions `CI` workflow on `phase/first-party-fraud-detection` PR.
+
+### Exclusions
+
+- External carrier proof-of-delivery webhooks, third-party consortium return-history networks, and distributed SQL/graph persistence (out of scope for in-process zero-dependency reference engine).
+
+### Micro-Task Breakdown
+
+- Task 1: Define Phase 51 roadmap & initialize `docs/PROGRESS.md`.
+- Task 2: Create `src/fraud_detection/first_party_fraud.py` domain enums and data models + tests.
+- Task 3: Implement `RefundAbuseAnalyzer` + tests.
+- Task 4: Implement `FriendlyFraudAnalyzer` & `PromoAbuseDetector` + tests.
+- Task 5: Implement `FirstPartyAccountStore` & `FirstPartyFraudEngine` + tests.
+- Task 6: Register `FIRST_PARTY_*` / `REFUND_RESTRICTED` / `ACCOUNT_PRIVILEGES_REVOKED` events in `events.py` and wire `EventBus` into `FirstPartyFraudEngine` + tests.
+- Task 7: Add `/v1/first-party/*` REST endpoints and Prometheus metrics in `api.py` + tests.
+- Task 8: Add `first-party-*` CLI commands in `cli.py` + tests.
+- Task 9: Update `ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md` and verify 100% green local & remote CI.
+
+### Micro-Commits
+- `2a75fa2`..`9db5893`: Implemented `first_party_fraud.py` (`RefundAbuseAnalyzer`, `FriendlyFraudAnalyzer`, `PromoAbuseDetector`, `FirstPartyAccountStore`, `FirstPartyFraudEngine`), registered `FIRST_PARTY_*` / `REFUND_RESTRICTED` / `ACCOUNT_PRIVILEGES_REVOKED` events in `events.py`, added `/v1/first-party/*` endpoints and Prometheus metrics in `api.py`, added `first-party-*` CLI commands in `cli.py`, achieved 99.23% unit branch coverage, added API & CLI integration tests, and documented architecture and usage.
 
 
 ## Contributing to the roadmap
