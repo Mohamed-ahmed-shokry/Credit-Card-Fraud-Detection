@@ -902,6 +902,36 @@ flowchart TD
 - **Store, EventBus, API & CLI**: `FirstPartyAccountStore` provides thread-safe secondary indexing (`tenant_id`, `shipping_address_hash`, `payment_instrument_hash`) with capacity eviction; `FirstPartyFraudEngine` emits `FIRST_PARTY_EVALUATED`, `FIRST_PARTY_ABUSE_DETECTED`, `REFUND_RESTRICTED`, and `ACCOUNT_PRIVILEGES_REVOKED`; FastAPI exposes `/v1/first-party/*` endpoints and Prometheus counters (`fraud_first_party_evaluations_total`, `fraud_first_party_anomalies_total`, `fraud_first_party_restricted_total`); Typer CLI exposes `first-party-ingest`, `first-party-eval`, `first-party-inspect`, and `first-party-summary`.
 
 
+## Phase 52 — Card-Testing & BIN Enumeration Attack Defense Engine
+
+Phase 52 delivers an in-process, zero-external-dependency Card-Testing & BIN Enumeration Attack Defense Engine (`bin_attack.py`) that detects sequential PAN/last4 enumeration, CVV/expiry brute-force probing, micro-authorization velocity spikes, high issuer decline ratios, and distributed multi-IP BIN sweeps.
+
+```mermaid
+flowchart TD
+    subgraph Ingestion
+        AuthIn["Auth Attempt\nPOST /v1/bin-attack/attempts / CLI"] --> Engine["BinAttackDefenseEngine"]
+    end
+
+    subgraph Analyzers
+        Engine --> Enum["EnumerationAnalyzer\n(Sequential Last4 & CVV/Expiry Probing)"]
+        Engine --> Vel["VelocityDeclineAnalyzer\n(Micro-Auths, Decline Ratio, IP/BIN Sweeps)"]
+    end
+
+    subgraph Policy & Escalation
+        Enum & Vel --> Score["Composite BIN Attack Score"]
+        Score -->|"< 0.25"| Allow["ALLOW"]
+        Score -->|"0.25 - 0.44"| Chal["CHALLENGE_3DS"]
+        Score -->|"0.45 - 0.64"| Rate["RATE_LIMIT_MERCHANT_IP"]
+        Score -->|"0.65 - 0.84"| Temp["TEMP_BLOCK_BIN_PREFIX\n(CaseManager + CARD_TESTING_BLOCKED)"]
+        Score -->|">= 0.85"| Block["BLOCK_GATEWAY_SESSION\n(CaseManager + CARD_TESTING_BLOCKED)"]
+    end
+```
+
+- **Enumeration & Probing (`EnumerationAnalyzer`)**: Tracks sequential `last4` runs within a BIN prefix and repeated `cvv_mismatch`, `invalid_expiry`, `expired_card`, and `invalid_pan` responses.
+- **Velocity & Distributed Sweeps (`VelocityDeclineAnalyzer`)**: Flags micro-authorization bursts (`<= $5.00`), high decline ratios (`>= 0.70`), single-IP multi-card bursts, and distributed multi-IP BIN sweeps.
+- **Store, EventBus, API & CLI**: `BinAttackStore` provides thread-safe storage with capacity eviction and tenant indexing; `BinAttackDefenseEngine` emits `BIN_ATTACK_EVALUATED`, `BIN_ENUMERATION_DETECTED`, and `CARD_TESTING_BLOCKED`; FastAPI exposes `/v1/bin-attack/*` endpoints and Prometheus counters (`fraud_bin_attack_evaluations_total`, `fraud_bin_attack_anomalies_total`, `fraud_bin_attack_blocked_total`); Typer CLI exposes `bin-attack-ingest`, `bin-attack-eval`, `bin-attack-inspect`, and `bin-attack-summary`.
+
+
 ## Extension guidance
 
 
