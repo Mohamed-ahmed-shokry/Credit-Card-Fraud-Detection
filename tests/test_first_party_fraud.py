@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from fraud_detection.cases import CaseManager
+from fraud_detection.events import EventBus, EventType, FraudDomainEvent
 from fraud_detection.first_party_fraud import (
     WARDROBING_CATEGORIES,
     ClaimOutcome,
@@ -362,3 +363,105 @@ def test_store_eviction_linking_and_engine_case_escalation() -> None:
     restored_store.load_state(exported)
     assert restored_store.summary()["total_accounts"] == 2
     assert restored_store.get_assessment(assessment.assessment_id) is not None
+
+
+def test_event_bus_publishing_and_policy_tiers() -> None:
+    bus = EventBus()
+    received: list[EventType] = []
+
+    def _capture(event: FraudDomainEvent) -> None:
+        received.append(event.event_type)
+
+    bus.subscribe(_capture)
+    engine = FirstPartyFraudEngine(event_bus=bus)
+    now = datetime(2026, 11, 14, 12, 0, 0, tzinfo=UTC)
+
+    # Low risk -> ALLOW
+    low = engine.record_and_evaluate(
+        FirstPartyEventRecord(
+            event_id="ev-low",
+            account_id="acct-low",
+            claim_type=OrderClaimType.PURCHASE,
+            amount=100.0,
+            timestamp=now,
+        ),
+        now=now,
+    )
+    assert low.action == FirstPartyAction.ALLOW
+    assert EventType.FIRST_PARTY_EVALUATED in received
+
+    # Medium/High -> RESTRICT_INSTANT_REFUND
+    received.clear()
+    engine.record_event(
+        FirstPartyEventRecord(
+            event_id="ev-r1",
+            account_id="acct-mid",
+            claim_type=OrderClaimType.PURCHASE,
+            amount=100.0,
+            timestamp=now,
+        )
+    )
+    engine.record_event(
+        FirstPartyEventRecord(
+            event_id="ev-r2",
+            account_id="acct-mid",
+            claim_type=OrderClaimType.REFUND_RETURN,
+            amount=100.0,
+            timestamp=now,
+            merchant_category="apparel",
+        )
+    )
+    mid = engine.record_and_evaluate(
+        FirstPartyEventRecord(
+            event_id="ev-r3",
+            account_id="acct-mid",
+            claim_type=OrderClaimType.REFUND_RETURN,
+            amount=100.0,
+            timestamp=now,
+            merchant_category="jewelry",
+        ),
+        now=now,
+    )
+    assert mid.action == FirstPartyAction.RESTRICT_INSTANT_REFUND
+    assert EventType.FIRST_PARTY_ABUSE_DETECTED in received
+    assert EventType.REFUND_RESTRICTED in received
+
+    # Critical -> REVOKE_PRIVILEGES_AND_BLOCK
+    received.clear()
+    for idx in range(3):
+        engine.record_event(
+            FirstPartyEventRecord(
+                event_id=f"ev-c-{idx}",
+                account_id="acct-crit",
+                claim_type=OrderClaimType.FRIENDLY_DISPUTE,
+                amount=300.0,
+                timestamp=now,
+                three_ds_authenticated=True,
+            )
+        )
+    for idx in range(3):
+        engine.record_event(
+            FirstPartyEventRecord(
+                event_id=f"ev-ci-{idx}",
+                account_id="acct-crit",
+                claim_type=OrderClaimType.INR_CLAIM,
+                amount=200.0,
+                timestamp=now,
+            )
+        )
+    crit = engine.record_and_evaluate(
+        FirstPartyEventRecord(
+            event_id="ev-cp",
+            account_id="acct-crit",
+            claim_type=OrderClaimType.PROMO_REDEMPTION,
+            amount=50.0,
+            timestamp=now,
+            promo_code="FREE50",
+        ),
+        now=now,
+    )
+    assert crit.action == FirstPartyAction.REVOKE_PRIVILEGES_AND_BLOCK
+    assert EventType.ACCOUNT_PRIVILEGES_REVOKED in received
+    assert len(engine.list_assessments(risk_level=FirstPartyRiskLevel.CRITICAL)) == 1
+    assert engine.get_profile("acct-crit") is not None
+    assert engine.summary()["total_accounts"] == 3
