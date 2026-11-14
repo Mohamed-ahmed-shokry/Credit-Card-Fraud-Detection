@@ -76,6 +76,15 @@ from fraud_detection.audit import (
     build_scoring_audit_event,
     build_shadow_scoring_audit_event,
 )
+from fraud_detection.bin_attack import (
+    AuthResponseCode,
+    BinAttackAction,
+    BinAttackAssessment,
+    BinAttackDefenseEngine,
+    BinAttackRiskLevel,
+    BinAuthAttempt,
+    BinPrefixProfile,
+)
 from fraud_detection.cases import (
     CaseAssignmentError,
     CaseDisposition,
@@ -372,6 +381,11 @@ OPERATIONAL_PATHS = frozenset(
         "/v1/first-party/assessments",
         "/v1/first-party/accounts",
         "/v1/first-party/metrics",
+        "/v1/bin-attack/attempts",
+        "/v1/bin-attack/evaluate",
+        "/v1/bin-attack/assessments",
+        "/v1/bin-attack/bins",
+        "/v1/bin-attack/metrics",
     }
 )
 UNMATCHED_ROUTE_LABEL = "unmatched"
@@ -2467,6 +2481,84 @@ def _first_party_profile_to_response(
     return FirstPartyAccountProfileResponse(**profile.to_dict())
 
 
+class BinAuthAttemptRequest(BaseModel):
+    """Card authorization attempt payload for BIN attack / card-testing evaluation."""
+
+    attempt_id: str
+    bin_prefix: str = Field(..., min_length=6, max_length=8)
+    last4: str = Field(..., min_length=4, max_length=4)
+    amount: float = Field(..., ge=0)
+    response_code: AuthResponseCode
+    timestamp: str
+    merchant_id: str = "default_merchant"
+    ip_address: str = ""
+    device_id: str = ""
+    card_fingerprint: str = ""
+    currency: str = "USD"
+    tenant_id: str = "default"
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class BinAttackEvaluateRequest(BaseModel):
+    """Request to evaluate an existing BIN prefix for card-testing attacks."""
+
+    bin_prefix: str = Field(..., min_length=6, max_length=8)
+
+
+class BinAttackAssessmentResponse(BaseModel):
+    """BIN enumeration and card-testing risk assessment response."""
+
+    assessment_id: str
+    bin_prefix: str
+    tenant_id: str
+    risk_score: float
+    risk_level: str
+    action: str
+    anomalies: list[str]
+    total_attempts: int
+    decline_ratio: float
+    micro_auth_ratio: float
+    unique_ips: int
+    unique_cards: int
+    sequential_run_length: int
+    probing_count: int
+    case_id: str | None = None
+    reasons: list[str]
+    evaluated_at: str
+
+
+class BinAttackAssessmentListResponse(BaseModel):
+    """List of BIN attack assessments."""
+
+    total_count: int
+    assessments: list[BinAttackAssessmentResponse]
+
+
+class BinPrefixProfileResponse(BaseModel):
+    """Monitored BIN prefix profile response."""
+
+    bin_prefix: str
+    tenant_id: str
+    created_at: str
+    attempts: list[dict[str, Any]]
+    risk_level: str
+    last_action: str
+    last_assessed_at: str | None = None
+    last_assessment_id: str | None = None
+
+
+def _bin_attack_assessment_to_response(
+    assessment: BinAttackAssessment,
+) -> BinAttackAssessmentResponse:
+    return BinAttackAssessmentResponse(**assessment.to_dict())
+
+
+def _bin_attack_profile_to_response(
+    profile: BinPrefixProfile,
+) -> BinPrefixProfileResponse:
+    return BinPrefixProfileResponse(**profile.to_dict())
+
+
 def create_app(
     *,
     model: FraudModel | None = None,
@@ -2556,6 +2648,7 @@ def create_app(
     sif_engine: SyntheticIdentityEngine | None = None,
     mule_engine: MuleDetectionEngine | None = None,
     first_party_engine: FirstPartyFraudEngine | None = None,
+    bin_attack_engine: BinAttackDefenseEngine | None = None,
 ) -> FastAPI:
     """Create an application using an injected model or a trusted artifact path.
 
@@ -3100,6 +3193,24 @@ def create_app(
     first_party_restricted_counter = Counter(
         "fraud_first_party_restricted_total",
         "Total accounts restricted or blocked for first-party abuse.",
+        ["tenant_id"],
+        registry=metrics_registry,
+    )
+    bin_attack_evaluations_counter = Counter(
+        "fraud_bin_attack_evaluations_total",
+        "Total BIN attack and card-testing evaluations performed.",
+        ["tenant_id", "action", "risk_level"],
+        registry=metrics_registry,
+    )
+    bin_attack_anomalies_counter = Counter(
+        "fraud_bin_attack_anomalies_total",
+        "Total BIN enumeration and card-testing anomalies detected.",
+        ["tenant_id", "anomaly_type"],
+        registry=metrics_registry,
+    )
+    bin_attack_blocked_counter = Counter(
+        "fraud_bin_attack_blocked_total",
+        "Total BIN prefixes temporarily blocked or sessions blocked.",
         ["tenant_id"],
         registry=metrics_registry,
     )
@@ -3701,6 +3812,14 @@ def create_app(
         application.state.first_party_evaluations_counter = first_party_evaluations_counter
         application.state.first_party_anomalies_counter = first_party_anomalies_counter
         application.state.first_party_restricted_counter = first_party_restricted_counter
+        resolved_bin_attack_engine = bin_attack_engine or BinAttackDefenseEngine(
+            case_manager=application.state.case_manager,
+            event_bus=resolved_event_bus,
+        )
+        application.state.bin_attack_engine = resolved_bin_attack_engine
+        application.state.bin_attack_evaluations_counter = bin_attack_evaluations_counter
+        application.state.bin_attack_anomalies_counter = bin_attack_anomalies_counter
+        application.state.bin_attack_blocked_counter = bin_attack_blocked_counter
         application.state.audit_sink = resolved_audit_sink
         application.state.explanation_provider = explanation_provider
         application.state.fallback_mode = resolved_fallback_mode
@@ -8476,6 +8595,204 @@ def create_app(
         if engine is None:
             return {
                 "total_accounts": 0,
+                "total_assessments": 0,
+                "status": "uninitialized",
+            }
+        return {**engine.summary(), "status": "operational"}
+
+    def _record_bin_attack_metrics(
+        request: Request,
+        assessment: BinAttackAssessment,
+    ) -> None:
+        eval_c = getattr(request.app.state, "bin_attack_evaluations_counter", None)
+        if eval_c is not None:
+            eval_c.labels(
+                tenant_id=assessment.tenant_id,
+                action=assessment.action.value,
+                risk_level=assessment.risk_level.value,
+            ).inc()
+        anom_c = getattr(request.app.state, "bin_attack_anomalies_counter", None)
+        if anom_c is not None:
+            for anomaly in assessment.anomalies:
+                anom_c.labels(
+                    tenant_id=assessment.tenant_id,
+                    anomaly_type=anomaly.value,
+                ).inc()
+        blk_c = getattr(request.app.state, "bin_attack_blocked_counter", None)
+        if blk_c is not None and assessment.action in {
+            BinAttackAction.TEMP_BLOCK_BIN_PREFIX,
+            BinAttackAction.BLOCK_GATEWAY_SESSION,
+        }:
+            blk_c.labels(tenant_id=assessment.tenant_id).inc()
+
+    @application.post(
+        "/v1/bin-attack/attempts",
+        response_model=BinAttackAssessmentResponse,
+        responses={
+            422: {"description": "Invalid attempt payload."},
+            500: {"description": "BIN attack engine not initialized."},
+        },
+        tags=["bin_attack"],
+    )
+    async def bin_attack_ingest_attempt_endpoint(
+        payload: BinAuthAttemptRequest,
+        request: Request,
+    ) -> BinAttackAssessmentResponse | JSONResponse:
+        """Ingest a card authorization attempt and evaluate BIN attack risk."""
+        engine: BinAttackDefenseEngine | None = getattr(
+            request.app.state, "bin_attack_engine", None
+        )
+        if engine is None:
+            return JSONResponse(
+                status_code=500,
+                content={"detail": "BIN attack engine not initialized."},
+            )
+        try:
+            attempt = BinAuthAttempt.from_dict(payload.model_dump())
+        except ValueError as exc:
+            return JSONResponse(status_code=422, content={"detail": str(exc)})
+        assessment = engine.record_and_evaluate(attempt)
+        _record_bin_attack_metrics(request, assessment)
+        return _bin_attack_assessment_to_response(assessment)
+
+    @application.post(
+        "/v1/bin-attack/evaluate",
+        response_model=BinAttackAssessmentResponse,
+        responses={
+            404: {"description": "BIN prefix not found."},
+            500: {"description": "BIN attack engine not initialized."},
+        },
+        tags=["bin_attack"],
+    )
+    async def bin_attack_evaluate_endpoint(
+        payload: BinAttackEvaluateRequest,
+        request: Request,
+    ) -> BinAttackAssessmentResponse | JSONResponse:
+        """Evaluate an existing BIN prefix for card-testing attacks."""
+        engine: BinAttackDefenseEngine | None = getattr(
+            request.app.state, "bin_attack_engine", None
+        )
+        if engine is None:
+            return JSONResponse(
+                status_code=500,
+                content={"detail": "BIN attack engine not initialized."},
+            )
+        try:
+            assessment = engine.evaluate_bin(payload.bin_prefix)
+        except KeyError:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": f"BIN prefix '{payload.bin_prefix}' not found."},
+            )
+        _record_bin_attack_metrics(request, assessment)
+        return _bin_attack_assessment_to_response(assessment)
+
+    @application.get(
+        "/v1/bin-attack/assessments/{assessment_id}",
+        response_model=BinAttackAssessmentResponse,
+        responses={
+            404: {"description": "Assessment not found."},
+            500: {"description": "BIN attack engine not initialized."},
+        },
+        tags=["bin_attack"],
+    )
+    async def bin_attack_get_assessment_endpoint(
+        assessment_id: str,
+        request: Request,
+    ) -> BinAttackAssessmentResponse | JSONResponse:
+        """Retrieve a specific BIN attack assessment by ID."""
+        engine: BinAttackDefenseEngine | None = getattr(
+            request.app.state, "bin_attack_engine", None
+        )
+        if engine is None:
+            return JSONResponse(
+                status_code=500,
+                content={"detail": "BIN attack engine not initialized."},
+            )
+        assessment = engine.get_assessment(assessment_id)
+        if assessment is None:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": f"BIN attack assessment '{assessment_id}' not found."},
+            )
+        return _bin_attack_assessment_to_response(assessment)
+
+    @application.get(
+        "/v1/bin-attack/assessments",
+        response_model=BinAttackAssessmentListResponse,
+        responses={500: {"description": "BIN attack engine not initialized."}},
+        tags=["bin_attack"],
+    )
+    async def bin_attack_list_assessments_endpoint(
+        request: Request,
+        bin_prefix: str | None = None,
+        risk_level: BinAttackRiskLevel | None = None,
+        tenant_id: str | None = None,
+        limit: int = Query(default=100, ge=1, le=1000),
+    ) -> BinAttackAssessmentListResponse | JSONResponse:
+        """Query BIN attack assessments with optional filters."""
+        engine: BinAttackDefenseEngine | None = getattr(
+            request.app.state, "bin_attack_engine", None
+        )
+        if engine is None:
+            return JSONResponse(
+                status_code=500,
+                content={"detail": "BIN attack engine not initialized."},
+            )
+        items = engine.list_assessments(
+            bin_prefix=bin_prefix,
+            risk_level=risk_level,
+            tenant_id=tenant_id,
+            limit=limit,
+        )
+        return BinAttackAssessmentListResponse(
+            total_count=len(items),
+            assessments=[_bin_attack_assessment_to_response(a) for a in items],
+        )
+
+    @application.get(
+        "/v1/bin-attack/bins/{bin_prefix}",
+        response_model=BinPrefixProfileResponse,
+        responses={
+            404: {"description": "BIN prefix not found."},
+            500: {"description": "BIN attack engine not initialized."},
+        },
+        tags=["bin_attack"],
+    )
+    async def bin_attack_get_bin_endpoint(
+        bin_prefix: str,
+        request: Request,
+    ) -> BinPrefixProfileResponse | JSONResponse:
+        """Fetch a monitored BIN prefix profile and its authorization attempts."""
+        engine: BinAttackDefenseEngine | None = getattr(
+            request.app.state, "bin_attack_engine", None
+        )
+        if engine is None:
+            return JSONResponse(
+                status_code=500,
+                content={"detail": "BIN attack engine not initialized."},
+            )
+        prof = engine.get_profile(bin_prefix)
+        if prof is None:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": f"BIN prefix '{bin_prefix}' not found."},
+            )
+        return _bin_attack_profile_to_response(prof)
+
+    @application.get(
+        "/v1/bin-attack/metrics",
+        response_model=dict[str, Any],
+        tags=["bin_attack"],
+    )
+    async def bin_attack_metrics_endpoint(request: Request) -> dict[str, Any]:
+        """Summary metrics of BIN attack defense and storage."""
+        engine: BinAttackDefenseEngine | None = getattr(
+            request.app.state, "bin_attack_engine", None
+        )
+        if engine is None:
+            return {
+                "total_bins": 0,
                 "total_assessments": 0,
                 "status": "uninitialized",
             }
