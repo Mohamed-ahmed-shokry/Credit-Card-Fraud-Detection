@@ -121,6 +121,9 @@ class EventType(StrEnum):
     FIRST_PARTY_ABUSE_DETECTED = "fraud.first_party.abuse_detected"
     REFUND_RESTRICTED = "fraud.first_party.refund_restricted"
     ACCOUNT_PRIVILEGES_REVOKED = "fraud.first_party.privileges_revoked"
+    BIN_ATTACK_EVALUATED = "fraud.bin_attack.evaluated"
+    BIN_ENUMERATION_DETECTED = "fraud.bin_attack.enumeration_detected"
+    CARD_TESTING_BLOCKED = "fraud.bin_attack.card_testing_blocked"
 
 
 class EventDeliveryStatus(StrEnum):
