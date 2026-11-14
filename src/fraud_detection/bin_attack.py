@@ -17,6 +17,7 @@ from uuid import uuid4
 
 if TYPE_CHECKING:
     from fraud_detection.cases import CaseManager
+    from fraud_detection.events import EventBus
 
 __all__ = [
     "PROBING_RESPONSE_CODES",
@@ -588,11 +589,13 @@ class BinAttackDefenseEngine:
         enumeration_analyzer: EnumerationAnalyzer | None = None,
         velocity_analyzer: VelocityDeclineAnalyzer | None = None,
         case_manager: CaseManager | None = None,
+        event_bus: EventBus | None = None,
     ) -> None:
         self.store = store or BinAttackStore()
         self.enumeration_analyzer = enumeration_analyzer or EnumerationAnalyzer()
         self.velocity_analyzer = velocity_analyzer or VelocityDeclineAnalyzer()
         self.case_manager = case_manager
+        self.event_bus = event_bus
 
     def record_attempt(self, attempt: BinAuthAttempt) -> BinPrefixProfile:
         """Ingest a card authorization attempt for a BIN prefix."""
@@ -672,7 +675,61 @@ class BinAttackDefenseEngine:
         profile.last_assessed_at = evaluated_at
         profile.last_assessment_id = assessment_id
         self.store.save_assessment(assessment)
+        self._publish_events(assessment=assessment, profile=profile)
         return assessment
+
+    def _publish_events(
+        self,
+        *,
+        assessment: BinAttackAssessment,
+        profile: BinPrefixProfile,
+    ) -> None:
+        if self.event_bus is None:
+            return
+        from fraud_detection.events import EventType, FraudDomainEvent
+
+        self.event_bus.publish(
+            FraudDomainEvent(
+                event_type=EventType.BIN_ATTACK_EVALUATED,
+                payload={
+                    "assessment_id": assessment.assessment_id,
+                    "bin_prefix": profile.bin_prefix,
+                    "risk_score": assessment.risk_score,
+                    "action": assessment.action.value,
+                },
+                tenant_id=profile.tenant_id,
+            ),
+            synchronous=True,
+        )
+        if BinAttackAnomalyType.SEQUENTIAL_PAN_ENUMERATION in assessment.anomalies:
+            self.event_bus.publish(
+                FraudDomainEvent(
+                    event_type=EventType.BIN_ENUMERATION_DETECTED,
+                    payload={
+                        "assessment_id": assessment.assessment_id,
+                        "bin_prefix": profile.bin_prefix,
+                        "sequential_run_length": assessment.sequential_run_length,
+                    },
+                    tenant_id=profile.tenant_id,
+                ),
+                synchronous=True,
+            )
+        if assessment.action in {
+            BinAttackAction.TEMP_BLOCK_BIN_PREFIX,
+            BinAttackAction.BLOCK_GATEWAY_SESSION,
+        }:
+            self.event_bus.publish(
+                FraudDomainEvent(
+                    event_type=EventType.CARD_TESTING_BLOCKED,
+                    payload={
+                        "assessment_id": assessment.assessment_id,
+                        "bin_prefix": profile.bin_prefix,
+                        "action": assessment.action.value,
+                    },
+                    tenant_id=profile.tenant_id,
+                ),
+                synchronous=True,
+            )
 
     def record_and_evaluate(
         self,
