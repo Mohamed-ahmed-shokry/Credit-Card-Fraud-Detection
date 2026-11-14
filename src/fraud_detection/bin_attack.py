@@ -12,7 +12,11 @@ from collections import OrderedDict, defaultdict
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
-from typing import Any
+from typing import TYPE_CHECKING, Any
+from uuid import uuid4
+
+if TYPE_CHECKING:
+    from fraud_detection.cases import CaseManager
 
 __all__ = [
     "PROBING_RESPONSE_CODES",
@@ -20,6 +24,7 @@ __all__ = [
     "BinAttackAction",
     "BinAttackAnomalyType",
     "BinAttackAssessment",
+    "BinAttackDefenseEngine",
     "BinAttackRiskLevel",
     "BinAttackStore",
     "BinAuthAttempt",
@@ -571,3 +576,184 @@ class BinAttackStore:
             for a_raw in payload.get("assessments", []):
                 assessment = BinAttackAssessment.from_dict(a_raw)
                 self._assessments[assessment.assessment_id] = assessment
+
+
+class BinAttackDefenseEngine:
+    """Composite card-testing and BIN enumeration attack defense engine."""
+
+    def __init__(
+        self,
+        *,
+        store: BinAttackStore | None = None,
+        enumeration_analyzer: EnumerationAnalyzer | None = None,
+        velocity_analyzer: VelocityDeclineAnalyzer | None = None,
+        case_manager: CaseManager | None = None,
+    ) -> None:
+        self.store = store or BinAttackStore()
+        self.enumeration_analyzer = enumeration_analyzer or EnumerationAnalyzer()
+        self.velocity_analyzer = velocity_analyzer or VelocityDeclineAnalyzer()
+        self.case_manager = case_manager
+
+    def record_attempt(self, attempt: BinAuthAttempt) -> BinPrefixProfile:
+        """Ingest a card authorization attempt for a BIN prefix."""
+        return self.store.record_attempt(attempt)
+
+    def evaluate_bin(
+        self,
+        bin_prefix: str,
+        *,
+        now: datetime | None = None,
+    ) -> BinAttackAssessment:
+        """Evaluate accumulated card-testing and BIN enumeration signals."""
+        profile = self.store.get_profile(bin_prefix)
+        if profile is None:
+            raise KeyError(f"Unknown BIN prefix: {bin_prefix}")
+
+        enum_metrics = self.enumeration_analyzer.analyze(profile.attempts, now=now)
+        vel_metrics = self.velocity_analyzer.analyze(profile.attempts, now=now)
+
+        anomalies: list[BinAttackAnomalyType] = []
+        for item in (*enum_metrics.anomalies, *vel_metrics.anomalies):
+            if item not in anomalies:
+                anomalies.append(item)
+        reasons = (*enum_metrics.reasons, *vel_metrics.reasons)
+
+        score = self._compute_score(
+            enum_metrics=enum_metrics,
+            vel_metrics=vel_metrics,
+            anomalies=anomalies,
+        )
+        risk_level, action = self._route_policy(score)
+
+        assessment_id = f"bin_{uuid4().hex[:12]}"
+        case_id: str | None = None
+        if self.case_manager is not None and action in {
+            BinAttackAction.TEMP_BLOCK_BIN_PREFIX,
+            BinAttackAction.BLOCK_GATEWAY_SESSION,
+        }:
+            total_volume = sum(a.amount for a in profile.attempts)
+            case = self.case_manager.create_case(
+                transaction_id=assessment_id,
+                fraud_score=score,
+                amount=total_volume,
+                tenant_id=profile.tenant_id,
+                metadata={
+                    "source": "bin_attack",
+                    "bin_prefix": profile.bin_prefix,
+                    "action": action.value,
+                    "anomalies": [a.value for a in anomalies],
+                },
+            )
+            case_id = case.case_id
+
+        evaluated_at = now or datetime.now(UTC)
+        assessment = BinAttackAssessment(
+            assessment_id=assessment_id,
+            bin_prefix=profile.bin_prefix,
+            tenant_id=profile.tenant_id,
+            risk_score=score,
+            risk_level=risk_level,
+            action=action,
+            anomalies=tuple(anomalies),
+            total_attempts=vel_metrics.total_attempts,
+            decline_ratio=vel_metrics.decline_ratio,
+            micro_auth_ratio=vel_metrics.micro_auth_ratio,
+            unique_ips=vel_metrics.unique_ips,
+            unique_cards=vel_metrics.unique_cards,
+            sequential_run_length=enum_metrics.sequential_run_length,
+            probing_count=enum_metrics.probing_count,
+            case_id=case_id,
+            reasons=reasons,
+            evaluated_at=evaluated_at,
+        )
+
+        profile.risk_level = risk_level
+        profile.last_action = action
+        profile.last_assessed_at = evaluated_at
+        profile.last_assessment_id = assessment_id
+        self.store.save_assessment(assessment)
+        return assessment
+
+    def record_and_evaluate(
+        self,
+        attempt: BinAuthAttempt,
+        *,
+        now: datetime | None = None,
+    ) -> BinAttackAssessment:
+        """Ingest an authorization attempt and immediately evaluate the BIN prefix."""
+        self.record_attempt(attempt)
+        return self.evaluate_bin(attempt.bin_prefix, now=now)
+
+    def get_assessment(self, assessment_id: str) -> BinAttackAssessment | None:
+        return self.store.get_assessment(assessment_id)
+
+    def list_assessments(
+        self,
+        *,
+        bin_prefix: str | None = None,
+        risk_level: BinAttackRiskLevel | None = None,
+        tenant_id: str | None = None,
+        limit: int = 100,
+    ) -> list[BinAttackAssessment]:
+        return self.store.list_assessments(
+            bin_prefix=bin_prefix,
+            risk_level=risk_level,
+            tenant_id=tenant_id,
+            limit=limit,
+        )
+
+    def get_profile(self, bin_prefix: str) -> BinPrefixProfile | None:
+        return self.store.get_profile(bin_prefix)
+
+    def summary(self) -> dict[str, Any]:
+        return self.store.summary()
+
+    @staticmethod
+    def _compute_score(
+        *,
+        enum_metrics: EnumerationMetrics,
+        vel_metrics: VelocityDeclineMetrics,
+        anomalies: list[BinAttackAnomalyType],
+    ) -> float:
+        score = 0.0
+        if BinAttackAnomalyType.SEQUENTIAL_PAN_ENUMERATION in anomalies:
+            score += 0.30
+        if BinAttackAnomalyType.CVV_EXPIRY_PROBING in anomalies:
+            score += 0.20
+        if BinAttackAnomalyType.MICRO_AUTH_VELOCITY in anomalies:
+            score += 0.20
+        if BinAttackAnomalyType.HIGH_DECLINE_RATIO in anomalies:
+            score += 0.15
+        if BinAttackAnomalyType.DISTRIBUTED_BIN_SWEEP in anomalies:
+            score += 0.20
+        if BinAttackAnomalyType.MULTI_CARD_IP_BURST in anomalies:
+            score += 0.15
+        if enum_metrics.sequential_run_length >= 6:
+            score += 0.10
+        if vel_metrics.decline_ratio >= 0.90 and vel_metrics.total_attempts >= 4:
+            score += 0.05
+        return min(round(score, 6), 1.0)
+
+    @staticmethod
+    def _route_policy(score: float) -> tuple[BinAttackRiskLevel, BinAttackAction]:
+        if score >= 0.85:
+            return (
+                BinAttackRiskLevel.CRITICAL,
+                BinAttackAction.BLOCK_GATEWAY_SESSION,
+            )
+        if score >= 0.65:
+            return (
+                BinAttackRiskLevel.HIGH,
+                BinAttackAction.TEMP_BLOCK_BIN_PREFIX,
+            )
+        if score >= 0.45:
+            return (
+                BinAttackRiskLevel.HIGH,
+                BinAttackAction.RATE_LIMIT_MERCHANT_IP,
+            )
+        if score >= 0.25:
+            return (
+                BinAttackRiskLevel.MEDIUM,
+                BinAttackAction.CHALLENGE_3DS,
+            )
+        return (BinAttackRiskLevel.LOW, BinAttackAction.ALLOW)
