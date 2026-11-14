@@ -18,6 +18,7 @@ from uuid import uuid4
 
 if TYPE_CHECKING:
     from fraud_detection.cases import CaseManager
+    from fraud_detection.events import EventBus
 
 __all__ = [
     "WARDROBING_CATEGORIES",
@@ -721,12 +722,14 @@ class FirstPartyFraudEngine:
         friendly_analyzer: FriendlyFraudAnalyzer | None = None,
         promo_detector: PromoAbuseDetector | None = None,
         case_manager: CaseManager | None = None,
+        event_bus: EventBus | None = None,
     ) -> None:
         self.store = store or FirstPartyAccountStore()
         self.refund_analyzer = refund_analyzer or RefundAbuseAnalyzer()
         self.friendly_analyzer = friendly_analyzer or FriendlyFraudAnalyzer()
         self.promo_detector = promo_detector or PromoAbuseDetector()
         self.case_manager = case_manager
+        self.event_bus = event_bus
 
     def record_event(self, record: FirstPartyEventRecord) -> FirstPartyAccountProfile:
         """Ingest a first-party order, refund, INR, dispute, or promo event."""
@@ -819,7 +822,75 @@ class FirstPartyFraudEngine:
         profile.last_assessed_at = evaluated_at
         profile.last_assessment_id = assessment_id
         self.store.save_assessment(assessment)
+        self._publish_events(assessment=assessment, profile=profile)
         return assessment
+
+    def _publish_events(
+        self,
+        *,
+        assessment: FirstPartyAssessment,
+        profile: FirstPartyAccountProfile,
+    ) -> None:
+        if self.event_bus is None:
+            return
+        from fraud_detection.events import EventType, FraudDomainEvent
+
+        self.event_bus.publish(
+            FraudDomainEvent(
+                event_type=EventType.FIRST_PARTY_EVALUATED,
+                payload={
+                    "assessment_id": assessment.assessment_id,
+                    "account_id": profile.account_id,
+                    "risk_score": assessment.risk_score,
+                    "action": assessment.action.value,
+                },
+                tenant_id=profile.tenant_id,
+            ),
+            synchronous=True,
+        )
+        if assessment.anomalies:
+            self.event_bus.publish(
+                FraudDomainEvent(
+                    event_type=EventType.FIRST_PARTY_ABUSE_DETECTED,
+                    payload={
+                        "assessment_id": assessment.assessment_id,
+                        "account_id": profile.account_id,
+                        "anomalies": [a.value for a in assessment.anomalies],
+                        "risk_score": assessment.risk_score,
+                    },
+                    tenant_id=profile.tenant_id,
+                ),
+                synchronous=True,
+            )
+        if assessment.action in {
+            FirstPartyAction.RESTRICT_INSTANT_REFUND,
+            FirstPartyAction.DENY_REFUND_MANUAL_REVIEW,
+        }:
+            self.event_bus.publish(
+                FraudDomainEvent(
+                    event_type=EventType.REFUND_RESTRICTED,
+                    payload={
+                        "assessment_id": assessment.assessment_id,
+                        "account_id": profile.account_id,
+                        "action": assessment.action.value,
+                    },
+                    tenant_id=profile.tenant_id,
+                ),
+                synchronous=True,
+            )
+        elif assessment.action == FirstPartyAction.REVOKE_PRIVILEGES_AND_BLOCK:
+            self.event_bus.publish(
+                FraudDomainEvent(
+                    event_type=EventType.ACCOUNT_PRIVILEGES_REVOKED,
+                    payload={
+                        "assessment_id": assessment.assessment_id,
+                        "account_id": profile.account_id,
+                        "risk_score": assessment.risk_score,
+                    },
+                    tenant_id=profile.tenant_id,
+                ),
+                synchronous=True,
+            )
 
     def record_and_evaluate(
         self,
