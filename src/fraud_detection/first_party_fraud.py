@@ -25,6 +25,8 @@ __all__ = [
     "FriendlyFraudAnalyzer",
     "FriendlyFraudMetrics",
     "OrderClaimType",
+    "PromoAbuseDetector",
+    "PromoAbuseMetrics",
     "RefundAbuseAnalyzer",
     "RefundAbuseMetrics",
 ]
@@ -497,6 +499,63 @@ class FriendlyFraudAnalyzer:
             dispute_count=len(window_disputes),
             verified_dispute_count=len(verified_disputes),
             recent_dispute_count=len(recent_disputes),
+            anomalies=tuple(anomalies),
+            reasons=tuple(reasons),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class PromoAbuseMetrics:
+    """Computed promotional/referral abuse and linked-account cycling metrics."""
+
+    promo_redemption_count: int
+    unique_promo_codes: int
+    linked_account_count: int
+    anomalies: tuple[FirstPartyAnomalyType, ...]
+    reasons: tuple[str, ...]
+
+
+class PromoAbuseDetector:
+    """Detects promotional/referral bonus abuse and linked-account cycling."""
+
+    def __init__(
+        self,
+        *,
+        promo_threshold: int = 3,
+        linked_account_threshold: int = 2,
+    ) -> None:
+        self.promo_threshold = promo_threshold
+        self.linked_account_threshold = linked_account_threshold
+
+    def analyze(
+        self,
+        events: list[FirstPartyEventRecord],
+        *,
+        linked_accounts: set[str] | None = None,
+    ) -> PromoAbuseMetrics:
+        promos = [e for e in events if e.claim_type == OrderClaimType.PROMO_REDEMPTION]
+        purchases = [e for e in events if e.claim_type == OrderClaimType.PURCHASE]
+        unique_codes = {e.promo_code for e in promos if e.promo_code}
+        linked_count = len(linked_accounts) if linked_accounts else 0
+
+        anomalies: list[FirstPartyAnomalyType] = []
+        reasons: list[str] = []
+
+        if len(promos) >= self.promo_threshold or (len(promos) >= 2 and not purchases):
+            anomalies.append(FirstPartyAnomalyType.PROMO_BONUS_ABUSE)
+            reasons.append(
+                f"{len(promos)} promo redemptions across {max(len(unique_codes), 1)} code(s)"
+            )
+        if linked_count >= self.linked_account_threshold:
+            anomalies.append(FirstPartyAnomalyType.LINKED_ACCOUNT_CYCLING)
+            reasons.append(
+                f"Account shares payment/shipping identifiers with {linked_count} linked accounts"
+            )
+
+        return PromoAbuseMetrics(
+            promo_redemption_count=len(promos),
+            unique_promo_codes=len(unique_codes),
+            linked_account_count=linked_count,
             anomalies=tuple(anomalies),
             reasons=tuple(reasons),
         )
