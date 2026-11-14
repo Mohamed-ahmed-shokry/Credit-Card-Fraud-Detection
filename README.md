@@ -2159,6 +2159,67 @@ FastAPI Synthetic Identity REST endpoints:
 - `GET /v1/sif/metrics`: Summary of tracked profiles and recorded assessments.
 - Prometheus metrics: `fraud_sif_evaluations_total`, `fraud_sif_anomalies_total`, `fraud_sif_high_risk_total`, `fraud_sif_blocks_total`.
 
+### Money Mule Account & Rapid Exfiltration Detection Engine
+
+Phase 50 introduces real-time Money Mule detection (`mule_detection.py`), identifying pass-through conduit behavior, rapid dwell-time compression, fan-in/fan-out concentration, dormancy wake-up bursts, and high-risk off-ramp cash-outs:
+
+```bash
+# Ingest an inbound/outbound transfer and evaluate mule risk
+fraud-detect mule-ingest \
+  --account-id acct_100 \
+  --counterparty-id crypto_offramp \
+  --direction outbound \
+  --amount 4900 \
+  --channel crypto_exchange \
+  --format json
+
+# Evaluate an existing account, inspect history, or view store summary
+fraud-detect mule-eval --account-id acct_100
+fraud-detect mule-inspect --account-id acct_100
+fraud-detect mule-summary --format table
+```
+
+FastAPI Money Mule REST endpoints:
+- `POST /v1/mule/transfers`: Ingest a transfer and evaluate the account for mule activity.
+- `POST /v1/mule/evaluate`: Evaluate a monitored account's mule risk on demand.
+- `GET /v1/mule/assessments/{assessment_id}`: Fetch a specific mule risk assessment.
+- `GET /v1/mule/assessments`: Query mule assessments with optional tenant filter.
+- `GET /v1/mule/accounts/{account_id}`: Inspect a monitored account's profile and transfers.
+- `GET /v1/mule/metrics`: Summary metrics of monitored accounts and recorded assessments.
+- Prometheus metrics: `fraud_mule_evaluations_total`, `fraud_mule_anomalies_total`, `fraud_mule_flagged_total`.
+
+### First-Party Fraud, Refund Abuse & Friendly Fraud Detection (Phase 51)
+
+```bash
+# Ingest a purchase, refund/wardrobing return, INR claim, or friendly-fraud dispute
+fraud-detect first-party-ingest \
+  --account-id acct_200 \
+  --claim-type purchase \
+  --amount 100 \
+  --category apparel
+
+fraud-detect first-party-ingest \
+  --account-id acct_200 \
+  --claim-type refund_return \
+  --amount 100 \
+  --category apparel \
+  --format json
+
+# Evaluate an existing account, inspect history, or view store summary
+fraud-detect first-party-eval --account-id acct_200
+fraud-detect first-party-inspect --account-id acct_200
+fraud-detect first-party-summary --format table
+```
+
+FastAPI First-Party Fraud REST endpoints:
+- `POST /v1/first-party/events`: Ingest an order/refund/INR/dispute/promo event and evaluate first-party risk.
+- `POST /v1/first-party/evaluate`: Evaluate a monitored account's first-party abuse risk on demand.
+- `GET /v1/first-party/assessments/{assessment_id}`: Fetch a specific first-party assessment.
+- `GET /v1/first-party/assessments`: Query first-party assessments with optional account/risk/tenant filters.
+- `GET /v1/first-party/accounts/{account_id}`: Inspect a monitored account's profile and event history.
+- `GET /v1/first-party/metrics`: Summary metrics of monitored accounts and recorded assessments.
+- Prometheus metrics: `fraud_first_party_evaluations_total`, `fraud_first_party_anomalies_total`, `fraud_first_party_restricted_total`.
+
 ## Reference label-delay analysis
 
 
