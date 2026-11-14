@@ -10854,3 +10854,129 @@ def test_first_party_cli_workflows_and_errors(tmp_path: Path) -> None:
     nondict = tmp_path / "nondict_fp.json"
     nondict.write_text("[]", encoding="utf-8")
     assert runner.invoke(app, ["first-party-summary", "-s", str(nondict)]).exit_code == 2
+
+
+def test_bin_attack_cli_workflows_and_errors(tmp_path: Path) -> None:
+    """Validate bin-attack-ingest, eval, inspect, summary, and error paths."""
+    runner = CliRunner()
+    store_file = tmp_path / "bin_state.json"
+
+    for idx in range(3):
+        res = runner.invoke(
+            app,
+            [
+                "bin-attack-ingest",
+                "-b",
+                "453201",
+                "-l",
+                f"100{idx}",
+                "-m",
+                "1.0",
+                "-r",
+                "cvv_mismatch",
+                "--ip",
+                "198.51.100.5",
+                "-t",
+                f"2026-11-15T00:30:0{idx}+00:00",
+                "-s",
+                str(store_file),
+            ],
+        )
+        assert res.exit_code == 0
+        assert "BIN Prefix:       453201" in res.stdout
+
+    r4 = runner.invoke(
+        app,
+        [
+            "bin-attack-ingest",
+            "-b",
+            "453201",
+            "-l",
+            "1003",
+            "-m",
+            "1.0",
+            "-r",
+            "cvv_mismatch",
+            "--ip",
+            "198.51.100.5",
+            "-t",
+            "2026-11-15T00:30:03+00:00",
+            "-s",
+            str(store_file),
+            "--format",
+            "json",
+        ],
+    )
+    assert r4.exit_code == 0
+    data_r4 = json.loads(r4.stdout)
+    ass_id = data_r4["assessment_id"]
+    assert data_r4["action"] == "block_gateway_session"
+
+    r_eval = runner.invoke(app, ["bin-attack-eval", "-b", "453201", "-s", str(store_file)])
+    assert r_eval.exit_code == 0
+    assert "BIN Prefix:       453201" in r_eval.stdout
+
+    r_eval_json = runner.invoke(
+        app, ["bin-attack-eval", "-b", "453201", "-s", str(store_file), "--format", "json"]
+    )
+    assert r_eval_json.exit_code == 0
+
+    r_insp_bin = runner.invoke(app, ["bin-attack-inspect", "-b", "453201", "-s", str(store_file)])
+    assert r_insp_bin.exit_code == 0
+    assert "Attempts:         4" in r_insp_bin.stdout
+
+    r_insp_ass = runner.invoke(
+        app,
+        ["bin-attack-inspect", "-i", ass_id, "-s", str(store_file), "--format", "json"],
+    )
+    assert r_insp_ass.exit_code == 0
+    assert json.loads(r_insp_ass.stdout)["assessment_id"] == ass_id
+
+    r_sum = runner.invoke(app, ["bin-attack-summary", "-s", str(store_file)])
+    assert r_sum.exit_code == 0
+    assert "Total BINs:         1" in r_sum.stdout
+
+    r_sum_json = runner.invoke(
+        app, ["bin-attack-summary", "-s", str(store_file), "--format", "json"]
+    )
+    assert r_sum_json.exit_code == 0
+    assert json.loads(r_sum_json.stdout)["total_assessments"] >= 5
+
+    # Error branches
+    assert (
+        runner.invoke(
+            app,
+            [
+                "bin-attack-ingest",
+                "-b",
+                "bad",
+                "-l",
+                "0001",
+                "-m",
+                "1.0",
+                "-s",
+                str(store_file),
+            ],
+        ).exit_code
+        == 2
+    )
+    assert (
+        runner.invoke(app, ["bin-attack-eval", "-b", "999999", "-s", str(store_file)]).exit_code
+        == 2
+    )
+    assert runner.invoke(app, ["bin-attack-inspect", "-s", str(store_file)]).exit_code == 2
+    assert (
+        runner.invoke(app, ["bin-attack-inspect", "-b", "999999", "-s", str(store_file)]).exit_code
+        == 2
+    )
+    assert (
+        runner.invoke(app, ["bin-attack-inspect", "-i", "missing", "-s", str(store_file)]).exit_code
+        == 2
+    )
+
+    bad_store = tmp_path / "bad_bin.json"
+    bad_store.write_text("{invalid", encoding="utf-8")
+    assert runner.invoke(app, ["bin-attack-summary", "-s", str(bad_store)]).exit_code == 2
+    nondict = tmp_path / "nondict_bin.json"
+    nondict.write_text("[]", encoding="utf-8")
+    assert runner.invoke(app, ["bin-attack-summary", "-s", str(nondict)]).exit_code == 2
