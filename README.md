@@ -2220,6 +2220,33 @@ FastAPI First-Party Fraud REST endpoints:
 - `GET /v1/first-party/metrics`: Summary metrics of monitored accounts and recorded assessments.
 - Prometheus metrics: `fraud_first_party_evaluations_total`, `fraud_first_party_anomalies_total`, `fraud_first_party_restricted_total`.
 
+### Card-Testing & BIN Enumeration Attack Defense (Phase 52)
+
+```bash
+# Ingest authorization attempts for a BIN prefix
+fraud-detect bin-attack-ingest \
+  --bin 453201 \
+  --last4 1001 \
+  --amount 1.0 \
+  --response cvv_mismatch \
+  --ip 198.51.100.5 \
+  --format json
+
+# Evaluate a BIN prefix, inspect history, or view store summary
+fraud-detect bin-attack-eval --bin 453201
+fraud-detect bin-attack-inspect --bin 453201
+fraud-detect bin-attack-summary --format table
+```
+
+FastAPI BIN Attack Defense REST endpoints:
+- `POST /v1/bin-attack/attempts`: Ingest a card authorization attempt and evaluate BIN attack risk.
+- `POST /v1/bin-attack/evaluate`: Evaluate a monitored BIN prefix on demand.
+- `GET /v1/bin-attack/assessments/{assessment_id}`: Fetch a specific BIN attack assessment.
+- `GET /v1/bin-attack/assessments`: Query BIN attack assessments with optional BIN/risk/tenant filters.
+- `GET /v1/bin-attack/bins/{bin_prefix}`: Inspect a monitored BIN prefix profile and its attempts.
+- `GET /v1/bin-attack/metrics`: Summary metrics of monitored BIN prefixes and recorded assessments.
+- Prometheus metrics: `fraud_bin_attack_evaluations_total`, `fraud_bin_attack_anomalies_total`, `fraud_bin_attack_blocked_total`.
+
 ## Reference label-delay analysis
 
 
