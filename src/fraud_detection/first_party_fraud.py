@@ -13,7 +13,11 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
-from typing import Any
+from typing import TYPE_CHECKING, Any
+from uuid import uuid4
+
+if TYPE_CHECKING:
+    from fraud_detection.cases import CaseManager
 
 __all__ = [
     "WARDROBING_CATEGORIES",
@@ -24,6 +28,7 @@ __all__ = [
     "FirstPartyAnomalyType",
     "FirstPartyAssessment",
     "FirstPartyEventRecord",
+    "FirstPartyFraudEngine",
     "FirstPartyRiskLevel",
     "FriendlyFraudAnalyzer",
     "FriendlyFraudMetrics",
@@ -703,3 +708,203 @@ class FirstPartyAccountStore:
             for a_raw in payload.get("assessments", []):
                 assessment = FirstPartyAssessment.from_dict(a_raw)
                 self._assessments[assessment.assessment_id] = assessment
+
+
+class FirstPartyFraudEngine:
+    """Composite first-party fraud, refund abuse, and friendly fraud engine."""
+
+    def __init__(
+        self,
+        *,
+        store: FirstPartyAccountStore | None = None,
+        refund_analyzer: RefundAbuseAnalyzer | None = None,
+        friendly_analyzer: FriendlyFraudAnalyzer | None = None,
+        promo_detector: PromoAbuseDetector | None = None,
+        case_manager: CaseManager | None = None,
+    ) -> None:
+        self.store = store or FirstPartyAccountStore()
+        self.refund_analyzer = refund_analyzer or RefundAbuseAnalyzer()
+        self.friendly_analyzer = friendly_analyzer or FriendlyFraudAnalyzer()
+        self.promo_detector = promo_detector or PromoAbuseDetector()
+        self.case_manager = case_manager
+
+    def record_event(self, record: FirstPartyEventRecord) -> FirstPartyAccountProfile:
+        """Ingest a first-party order, refund, INR, dispute, or promo event."""
+        return self.store.record_event(record)
+
+    def evaluate_account(
+        self,
+        account_id: str,
+        *,
+        now: datetime | None = None,
+    ) -> FirstPartyAssessment:
+        """Evaluate accumulated first-party abuse signals for an account."""
+        profile = self.store.get_profile(account_id)
+        if profile is None:
+            raise KeyError(f"Unknown first-party account: {account_id}")
+
+        refund_metrics = self.refund_analyzer.analyze(profile.events, now=now)
+        friendly_metrics = self.friendly_analyzer.analyze(profile.events, now=now)
+        promo_metrics = self.promo_detector.analyze(
+            profile.events,
+            linked_accounts=profile.linked_accounts,
+        )
+
+        anomalies: list[FirstPartyAnomalyType] = []
+        for item in (
+            *refund_metrics.anomalies,
+            *friendly_metrics.anomalies,
+            *promo_metrics.anomalies,
+        ):
+            if item not in anomalies:
+                anomalies.append(item)
+
+        reasons = (
+            *refund_metrics.reasons,
+            *friendly_metrics.reasons,
+            *promo_metrics.reasons,
+        )
+
+        score = self._compute_score(
+            refund_metrics=refund_metrics,
+            friendly_metrics=friendly_metrics,
+            promo_metrics=promo_metrics,
+            anomalies=anomalies,
+        )
+        risk_level, action = self._route_policy(score)
+
+        assessment_id = f"fpa_{uuid4().hex[:12]}"
+        case_id: str | None = None
+        if self.case_manager is not None and action in {
+            FirstPartyAction.DENY_REFUND_MANUAL_REVIEW,
+            FirstPartyAction.REVOKE_PRIVILEGES_AND_BLOCK,
+        }:
+            case = self.case_manager.create_case(
+                transaction_id=assessment_id,
+                fraud_score=score,
+                amount=refund_metrics.refund_volume or refund_metrics.purchase_volume,
+                tenant_id=profile.tenant_id,
+                metadata={
+                    "source": "first_party_fraud",
+                    "account_id": profile.account_id,
+                    "action": action.value,
+                    "anomalies": [a.value for a in anomalies],
+                },
+            )
+            case_id = case.case_id
+
+        evaluated_at = now or datetime.now(UTC)
+        assessment = FirstPartyAssessment(
+            assessment_id=assessment_id,
+            account_id=profile.account_id,
+            tenant_id=profile.tenant_id,
+            risk_score=score,
+            risk_level=risk_level,
+            action=action,
+            anomalies=tuple(anomalies),
+            return_ratio=refund_metrics.return_ratio,
+            purchase_volume=refund_metrics.purchase_volume,
+            refund_volume=refund_metrics.refund_volume,
+            dispute_count=friendly_metrics.dispute_count,
+            inr_claim_count=refund_metrics.inr_claim_count,
+            promo_redemption_count=promo_metrics.promo_redemption_count,
+            linked_account_count=promo_metrics.linked_account_count,
+            case_id=case_id,
+            reasons=reasons,
+            evaluated_at=evaluated_at,
+        )
+
+        profile.risk_level = risk_level
+        profile.last_action = action
+        profile.last_assessed_at = evaluated_at
+        profile.last_assessment_id = assessment_id
+        self.store.save_assessment(assessment)
+        return assessment
+
+    def record_and_evaluate(
+        self,
+        record: FirstPartyEventRecord,
+        *,
+        now: datetime | None = None,
+    ) -> FirstPartyAssessment:
+        """Ingest an event and immediately evaluate the account."""
+        self.record_event(record)
+        return self.evaluate_account(record.account_id, now=now)
+
+    def get_assessment(self, assessment_id: str) -> FirstPartyAssessment | None:
+        return self.store.get_assessment(assessment_id)
+
+    def list_assessments(
+        self,
+        *,
+        account_id: str | None = None,
+        risk_level: FirstPartyRiskLevel | None = None,
+        tenant_id: str | None = None,
+        limit: int = 100,
+    ) -> list[FirstPartyAssessment]:
+        return self.store.list_assessments(
+            account_id=account_id,
+            risk_level=risk_level,
+            tenant_id=tenant_id,
+            limit=limit,
+        )
+
+    def get_profile(self, account_id: str) -> FirstPartyAccountProfile | None:
+        return self.store.get_profile(account_id)
+
+    def summary(self) -> dict[str, Any]:
+        return self.store.summary()
+
+    @staticmethod
+    def _compute_score(
+        *,
+        refund_metrics: RefundAbuseMetrics,
+        friendly_metrics: FriendlyFraudMetrics,
+        promo_metrics: PromoAbuseMetrics,
+        anomalies: list[FirstPartyAnomalyType],
+    ) -> float:
+        score = 0.0
+        score += min(refund_metrics.return_ratio * 0.25, 0.30)
+        if FirstPartyAnomalyType.WARDROBING_PATTERN in anomalies:
+            score += 0.15
+        if FirstPartyAnomalyType.INR_CLAIM_BURST in anomalies:
+            score += 0.20
+        if FirstPartyAnomalyType.HIGH_VALUE_REFUND_SKEW in anomalies:
+            score += 0.10
+        if FirstPartyAnomalyType.SERIAL_FRIENDLY_FRAUD in anomalies:
+            score += 0.30
+        if FirstPartyAnomalyType.PRE_DISPUTE_VELOCITY in anomalies:
+            score += 0.10
+        if FirstPartyAnomalyType.PROMO_BONUS_ABUSE in anomalies:
+            score += 0.15
+        if FirstPartyAnomalyType.LINKED_ACCOUNT_CYCLING in anomalies:
+            score += 0.15
+        if friendly_metrics.verified_dispute_count >= 3:
+            score += 0.10
+        if promo_metrics.linked_account_count >= 3:
+            score += 0.05
+        return min(round(score, 6), 1.0)
+
+    @staticmethod
+    def _route_policy(score: float) -> tuple[FirstPartyRiskLevel, FirstPartyAction]:
+        if score >= 0.85:
+            return (
+                FirstPartyRiskLevel.CRITICAL,
+                FirstPartyAction.REVOKE_PRIVILEGES_AND_BLOCK,
+            )
+        if score >= 0.65:
+            return (
+                FirstPartyRiskLevel.HIGH,
+                FirstPartyAction.DENY_REFUND_MANUAL_REVIEW,
+            )
+        if score >= 0.45:
+            return (
+                FirstPartyRiskLevel.HIGH,
+                FirstPartyAction.RESTRICT_INSTANT_REFUND,
+            )
+        if score >= 0.25:
+            return (
+                FirstPartyRiskLevel.MEDIUM,
+                FirstPartyAction.REQUIRE_SIGNATURE_DELIVERY,
+            )
+        return (FirstPartyRiskLevel.LOW, FirstPartyAction.ALLOW)
