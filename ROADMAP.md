@@ -2823,6 +2823,9 @@ Provide deterministic, real-time mule account detection, fund exfiltration scori
 - Task 9: Update `ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md` and verify 100% green local & remote CI.
 
 ### Micro-Commits
+- `1306236`..`66b0ce8`: Implemented `bin_attack.py` (`EnumerationAnalyzer`, `VelocityDeclineAnalyzer`, `BinAttackStore`, `BinAttackDefenseEngine`), registered `BIN_*` / `CARD_TESTING_BLOCKED` events in `events.py`, added `/v1/bin-attack/*` endpoints and Prometheus metrics in `api.py`, added `bin-attack-*` CLI commands in `cli.py`, achieved 98.87% unit branch coverage, added API & CLI integration tests, and documented architecture and usage.
+
+### Micro-Commits
 - `2a75fa2`..`9db5893`: Implemented `first_party_fraud.py` (`RefundAbuseAnalyzer`, `FriendlyFraudAnalyzer`, `PromoAbuseDetector`, `FirstPartyAccountStore`, `FirstPartyFraudEngine`), registered `FIRST_PARTY_*` / `REFUND_RESTRICTED` / `ACCOUNT_PRIVILEGES_REVOKED` events in `events.py`, added `/v1/first-party/*` endpoints and Prometheus metrics in `api.py`, added `first-party-*` CLI commands in `cli.py`, achieved 99.23% unit branch coverage, added API & CLI integration tests, and documented architecture and usage.
 
 ### Micro-Commits
@@ -2894,10 +2897,13 @@ Provide deterministic, real-time first-party fraud scoring, refund/dispute abuse
 - Task 9: Update `ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md` and verify 100% green local & remote CI.
 
 ### Micro-Commits
+- `1306236`..`66b0ce8`: Implemented `bin_attack.py` (`EnumerationAnalyzer`, `VelocityDeclineAnalyzer`, `BinAttackStore`, `BinAttackDefenseEngine`), registered `BIN_*` / `CARD_TESTING_BLOCKED` events in `events.py`, added `/v1/bin-attack/*` endpoints and Prometheus metrics in `api.py`, added `bin-attack-*` CLI commands in `cli.py`, achieved 98.87% unit branch coverage, added API & CLI integration tests, and documented architecture and usage.
+
+### Micro-Commits
 - `2a75fa2`..`9db5893`: Implemented `first_party_fraud.py` (`RefundAbuseAnalyzer`, `FriendlyFraudAnalyzer`, `PromoAbuseDetector`, `FirstPartyAccountStore`, `FirstPartyFraudEngine`), registered `FIRST_PARTY_*` / `REFUND_RESTRICTED` / `ACCOUNT_PRIVILEGES_REVOKED` events in `events.py`, added `/v1/first-party/*` endpoints and Prometheus metrics in `api.py`, added `first-party-*` CLI commands in `cli.py`, achieved 99.23% unit branch coverage, added API & CLI integration tests, and documented architecture and usage.
 
 
-## Phase 52 — Card-Testing & BIN Enumeration Attack Defense Engine (In progress)
+## Phase 52 — Card-Testing & BIN Enumeration Attack Defense Engine (Done)
 
 Phase 52 implements an in-process, zero-external-dependency Card-Testing & BIN Enumeration Attack Defense Engine (`bin_attack.py`). It detects automated payment-gateway probing, sequential PAN/BIN enumeration, CVV/expiry brute-force sweeps, micro-authorization velocity spikes, and distributed botnet BIN attacks across merchants and IP/device clusters.
 
@@ -2960,6 +2966,9 @@ Provide deterministic, real-time card-testing and BIN enumeration detection, aut
 - Task 7: Add `/v1/bin-attack/*` REST endpoints and Prometheus metrics in `api.py` + tests.
 - Task 8: Add `bin-attack-*` CLI commands in `cli.py` + tests.
 - Task 9: Update `ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md` and verify 100% green local & remote CI.
+
+### Micro-Commits
+- `1306236`..`66b0ce8`: Implemented `bin_attack.py` (`EnumerationAnalyzer`, `VelocityDeclineAnalyzer`, `BinAttackStore`, `BinAttackDefenseEngine`), registered `BIN_*` / `CARD_TESTING_BLOCKED` events in `events.py`, added `/v1/bin-attack/*` endpoints and Prometheus metrics in `api.py`, added `bin-attack-*` CLI commands in `cli.py`, achieved 98.87% unit branch coverage, added API & CLI integration tests, and documented architecture and usage.
 
 
 ## Contributing to the roadmap
