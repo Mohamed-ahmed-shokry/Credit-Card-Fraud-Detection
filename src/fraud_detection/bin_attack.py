@@ -7,7 +7,8 @@ distributed botnet BIN attacks across merchants and IP/device clusters.
 
 from __future__ import annotations
 
-from collections import defaultdict
+import threading
+from collections import OrderedDict, defaultdict
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -20,6 +21,7 @@ __all__ = [
     "BinAttackAnomalyType",
     "BinAttackAssessment",
     "BinAttackRiskLevel",
+    "BinAttackStore",
     "BinAuthAttempt",
     "BinPrefixProfile",
     "EnumerationAnalyzer",
@@ -462,3 +464,110 @@ class VelocityDeclineAnalyzer:
             anomalies=tuple(anomalies),
             reasons=tuple(reasons),
         )
+
+
+class BinAttackStore:
+    """Thread-safe in-memory store for BIN prefix profiles and assessments."""
+
+    def __init__(
+        self,
+        *,
+        max_bins: int = 10_000,
+        max_assessments: int = 20_000,
+        max_attempts_per_bin: int = 500,
+    ) -> None:
+        self._lock = threading.RLock()
+        self._max_bins = max_bins
+        self._max_assessments = max_assessments
+        self._max_attempts_per_bin = max_attempts_per_bin
+        self._profiles: OrderedDict[str, BinPrefixProfile] = OrderedDict()
+        self._assessments: OrderedDict[str, BinAttackAssessment] = OrderedDict()
+        self._tenant_index: dict[str, set[str]] = {}
+
+    def record_attempt(self, attempt: BinAuthAttempt) -> BinPrefixProfile:
+        with self._lock:
+            profile = self._profiles.get(attempt.bin_prefix)
+            if profile is None:
+                while len(self._profiles) >= self._max_bins:
+                    evicted_bin, evicted = self._profiles.popitem(last=False)
+                    self._tenant_index.get(evicted.tenant_id, set()).discard(evicted_bin)
+                profile = BinPrefixProfile(
+                    bin_prefix=attempt.bin_prefix,
+                    tenant_id=attempt.tenant_id,
+                    created_at=attempt.timestamp,
+                )
+            else:
+                self._profiles.move_to_end(attempt.bin_prefix)
+
+            profile.attempts.append(attempt)
+            if len(profile.attempts) > self._max_attempts_per_bin:
+                profile.attempts = profile.attempts[-self._max_attempts_per_bin :]
+
+            self._profiles[attempt.bin_prefix] = profile
+            self._tenant_index.setdefault(attempt.tenant_id, set()).add(attempt.bin_prefix)
+            return profile
+
+    def get_profile(self, bin_prefix: str) -> BinPrefixProfile | None:
+        with self._lock:
+            return self._profiles.get(bin_prefix)
+
+    def save_assessment(self, assessment: BinAttackAssessment) -> None:
+        with self._lock:
+            while len(self._assessments) >= self._max_assessments:
+                self._assessments.popitem(last=False)
+            self._assessments[assessment.assessment_id] = assessment
+
+    def get_assessment(self, assessment_id: str) -> BinAttackAssessment | None:
+        with self._lock:
+            return self._assessments.get(assessment_id)
+
+    def list_assessments(
+        self,
+        *,
+        bin_prefix: str | None = None,
+        risk_level: BinAttackRiskLevel | None = None,
+        tenant_id: str | None = None,
+        limit: int = 100,
+    ) -> list[BinAttackAssessment]:
+        with self._lock:
+            items = list(self._assessments.values())
+            items.reverse()
+            filtered = [
+                item
+                for item in items
+                if (bin_prefix is None or item.bin_prefix == bin_prefix)
+                and (risk_level is None or item.risk_level == risk_level)
+                and (tenant_id is None or item.tenant_id == tenant_id)
+            ]
+            return filtered[:limit]
+
+    def summary(self) -> dict[str, Any]:
+        with self._lock:
+            risk_counts: dict[str, int] = {level.value: 0 for level in BinAttackRiskLevel}
+            for profile in self._profiles.values():
+                risk_counts[profile.risk_level.value] += 1
+            return {
+                "total_bins": len(self._profiles),
+                "total_assessments": len(self._assessments),
+                "risk_distribution": risk_counts,
+            }
+
+    def export_state(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "profiles": [p.to_dict() for p in self._profiles.values()],
+                "assessments": [a.to_dict() for a in self._assessments.values()],
+            }
+
+    def load_state(self, payload: dict[str, Any]) -> None:
+        with self._lock:
+            self._profiles.clear()
+            self._assessments.clear()
+            self._tenant_index.clear()
+            for p_raw in payload.get("profiles", []):
+                profile = BinPrefixProfile.from_dict(p_raw)
+                self._profiles[profile.bin_prefix] = profile
+                self._tenant_index.setdefault(profile.tenant_id, set()).add(profile.bin_prefix)
+            for a_raw in payload.get("assessments", []):
+                assessment = BinAttackAssessment.from_dict(a_raw)
+                self._assessments[assessment.assessment_id] = assessment
