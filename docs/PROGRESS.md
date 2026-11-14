@@ -9,7 +9,7 @@
 - [x] Task 1: Define Phase 52 roadmap & initialize `docs/PROGRESS.md`.
 - [x] Task 2: Create `src/fraud_detection/bin_attack.py` domain enums and data models + unit tests in `tests/test_bin_attack.py`.
 - [x] Task 3: Implement `EnumerationAnalyzer` + unit tests.
-- [ ] Task 4: Implement `VelocityDeclineAnalyzer` + unit tests.
+- [x] Task 4: Implement `VelocityDeclineAnalyzer` + unit tests.
 - [ ] Task 5: Implement `BinAttackStore` & `BinAttackDefenseEngine` + unit tests.
 - [ ] Task 6: Register `BIN_*` / `CARD_TESTING_BLOCKED` events in `src/fraud_detection/events.py` and wire `EventBus` into `BinAttackDefenseEngine` + tests.
 - [ ] Task 7: Add `/v1/bin-attack/*` REST endpoints and Prometheus metrics in `src/fraud_detection/api.py` + tests in `tests/test_api.py`.
@@ -21,7 +21,7 @@
 |-----------|--------|----------|
 | AC-1 (Domain Models & Taxonomies) | PASSED | `BinAttackRiskLevel`, `BinAttackAction`, `BinAttackAnomalyType`, `AuthResponseCode`, `BinAuthAttempt`, `BinPrefixProfile`, `BinAttackAssessment` verified in `tests/test_bin_attack.py` |
 | AC-2 (Sequential Enumeration & CVV/Expiry Probing) | PASSED | `EnumerationAnalyzer` verified on sequential `last4` runs and CVV/expiry probing in `tests/test_bin_attack.py` |
-| AC-3 (Micro-Auth Velocity & Distributed Sweeps) | PENDING | Pending Task 4 |
+| AC-3 (Micro-Auth Velocity & Distributed Sweeps) | PASSED | `VelocityDeclineAnalyzer` verified on micro-auth bursts, decline ratio, multi-card IP bursts, and distributed sweeps in `tests/test_bin_attack.py` |
 | AC-4 (Engine, Store & Escalation) | PENDING | Pending Task 5 |
 | AC-5 (EventBus Streaming) | PENDING | Pending Task 6 |
 | AC-6 (REST API & Metrics) | PENDING | Pending Task 7 |
