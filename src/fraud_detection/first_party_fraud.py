@@ -388,7 +388,8 @@ class RefundAbuseAnalyzer:
         if return_ratio >= self.return_ratio_threshold and refund_volume >= self.min_refund_volume:
             anomalies.append(FirstPartyAnomalyType.HIGH_RETURN_RATIO)
             reasons.append(
-                f"Return-to-purchase ratio {return_ratio:.2f} exceeds {self.return_ratio_threshold:.2f}"
+                f"Return-to-purchase ratio {return_ratio:.2f} exceeds "
+                f"{self.return_ratio_threshold:.2f}"
             )
         if wardrobing_count >= self.wardrobing_threshold:
             anomalies.append(FirstPartyAnomalyType.WARDROBING_PATTERN)
@@ -401,7 +402,8 @@ class RefundAbuseAnalyzer:
         if high_value_skew:
             anomalies.append(FirstPartyAnomalyType.HIGH_VALUE_REFUND_SKEW)
             reasons.append(
-                f"Average refund (${avg_refund:.2f}) >= {self.skew_multiplier:.1f}x avg purchase (${avg_purchase:.2f})"
+                f"Average refund (${avg_refund:.2f}) >= {self.skew_multiplier:.1f}x "
+                f"avg purchase (${avg_purchase:.2f})"
             )
 
         return RefundAbuseMetrics(
