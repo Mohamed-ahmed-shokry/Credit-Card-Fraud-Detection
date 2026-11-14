@@ -465,3 +465,109 @@ def test_event_bus_publishing_and_policy_tiers() -> None:
     assert len(engine.list_assessments(risk_level=FirstPartyRiskLevel.CRITICAL)) == 1
     assert engine.get_profile("acct-crit") is not None
     assert engine.summary()["total_accounts"] == 3
+
+
+def test_edge_cases_and_remaining_policy_tiers() -> None:
+    tiny_store = FirstPartyAccountStore(max_events_per_account=2, max_assessments=1)
+    now = datetime(2026, 11, 14, 12, 0, 0, tzinfo=UTC)
+    for idx in range(3):
+        tiny_store.record_event(
+            FirstPartyEventRecord(
+                event_id=f"te-{idx}",
+                account_id="acct-tiny",
+                claim_type=OrderClaimType.PURCHASE,
+                amount=50.0,
+                timestamp=now,
+            )
+        )
+    profile = tiny_store.get_profile("acct-tiny")
+    assert profile is not None
+    assert len(profile.events) == 2
+
+    high_store = FirstPartyAccountStore(max_assessments=1)
+    engine = FirstPartyFraudEngine(store=high_store)
+    assert engine.get_assessment("missing") is None
+
+    # Medium tier -> REQUIRE_SIGNATURE_DELIVERY (ratio 1.0 -> 0.25)
+    engine.record_event(
+        FirstPartyEventRecord(
+            event_id="m-1",
+            account_id="acct-med",
+            claim_type=OrderClaimType.PURCHASE,
+            amount=100.0,
+            timestamp=now,
+        )
+    )
+    med = engine.record_and_evaluate(
+        FirstPartyEventRecord(
+            event_id="m-2",
+            account_id="acct-med",
+            claim_type=OrderClaimType.REFUND_RETURN,
+            amount=100.0,
+            timestamp=now,
+            merchant_category="books",
+        ),
+        now=now,
+    )
+    assert med.risk_level == FirstPartyRiskLevel.MEDIUM
+    assert med.action == FirstPartyAction.REQUIRE_SIGNATURE_DELIVERY
+
+    # High tier -> DENY_REFUND_MANUAL_REVIEW (0.65..0.84):
+    # 3 linked accounts (0.20) + promo abuse (0.15) + serial friendly fraud (0.40) => 0.75
+    for idx, peer in enumerate(["p1", "p2", "p3"]):
+        high_store.record_event(
+            FirstPartyEventRecord(
+                event_id=f"lk-{idx}",
+                account_id=peer,
+                claim_type=OrderClaimType.PURCHASE,
+                amount=20.0,
+                timestamp=now,
+                shipping_address_hash="shared-ship",
+                payment_instrument_hash="shared-pay",
+            )
+        )
+    engine.record_event(
+        FirstPartyEventRecord(
+            event_id="h-1",
+            account_id="acct-high",
+            claim_type=OrderClaimType.PROMO_REDEMPTION,
+            amount=10.0,
+            timestamp=now,
+            shipping_address_hash="shared-ship",
+            payment_instrument_hash="shared-pay",
+        )
+    )
+    engine.record_event(
+        FirstPartyEventRecord(
+            event_id="h-2",
+            account_id="acct-high",
+            claim_type=OrderClaimType.PROMO_REDEMPTION,
+            amount=10.0,
+            timestamp=now,
+        )
+    )
+    engine.record_event(
+        FirstPartyEventRecord(
+            event_id="h-3",
+            account_id="acct-high",
+            claim_type=OrderClaimType.FRIENDLY_DISPUTE,
+            amount=100.0,
+            timestamp=now,
+            three_ds_authenticated=True,
+        )
+    )
+    high = engine.record_and_evaluate(
+        FirstPartyEventRecord(
+            event_id="h-4",
+            account_id="acct-high",
+            claim_type=OrderClaimType.FRIENDLY_DISPUTE,
+            amount=100.0,
+            timestamp=now - timedelta(days=30),
+            delivery_confirmed=True,
+        ),
+        now=now,
+    )
+    assert high.risk_level == FirstPartyRiskLevel.HIGH
+    assert high.action == FirstPartyAction.DENY_REFUND_MANUAL_REVIEW
+    # max_assessments=1 evicted med
+    assert engine.get_assessment(med.assessment_id) is None
