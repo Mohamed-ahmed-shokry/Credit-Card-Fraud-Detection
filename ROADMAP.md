@@ -58,7 +58,8 @@ and account takeover (ATO) detection, credential stuffing defense, and identity 
 anti-money laundering transaction monitoring, structuring/smurfing detection, and regulatory SAR engine (Phase 48),
 and synthetic identity fraud (SIF) detection, PII inconsistency, and identity verification engine (Phase 49),
 and money mule account & rapid fund exfiltration detection engine (Phase 50),
-and first-party fraud, refund abuse & friendly fraud detection engine (Phase 51).
+and first-party fraud, refund abuse & friendly fraud detection engine (Phase 51),
+and card-testing & BIN enumeration attack defense engine (Phase 52).
 
 ## Phase 1 — Distribution
 
@@ -2894,6 +2895,71 @@ Provide deterministic, real-time first-party fraud scoring, refund/dispute abuse
 
 ### Micro-Commits
 - `2a75fa2`..`9db5893`: Implemented `first_party_fraud.py` (`RefundAbuseAnalyzer`, `FriendlyFraudAnalyzer`, `PromoAbuseDetector`, `FirstPartyAccountStore`, `FirstPartyFraudEngine`), registered `FIRST_PARTY_*` / `REFUND_RESTRICTED` / `ACCOUNT_PRIVILEGES_REVOKED` events in `events.py`, added `/v1/first-party/*` endpoints and Prometheus metrics in `api.py`, added `first-party-*` CLI commands in `cli.py`, achieved 99.23% unit branch coverage, added API & CLI integration tests, and documented architecture and usage.
+
+
+## Phase 52 — Card-Testing & BIN Enumeration Attack Defense Engine (In progress)
+
+Phase 52 implements an in-process, zero-external-dependency Card-Testing & BIN Enumeration Attack Defense Engine (`bin_attack.py`). It detects automated payment-gateway probing, sequential PAN/BIN enumeration, CVV/expiry brute-force sweeps, micro-authorization velocity spikes, and distributed botnet BIN attacks across merchants and IP/device clusters.
+
+### Objective
+
+Provide deterministic, real-time card-testing and BIN enumeration detection, automated gateway throttling/blocking policy routing (`ALLOW`, `CHALLENGE_3DS`, `RATE_LIMIT_MERCHANT_IP`, `TEMP_BLOCK_BIN_PREFIX`, `BLOCK_GATEWAY_SESSION`), REST API endpoints, and CLI workflows with zero external services.
+
+### Scope
+
+1. **Domain Models & Taxonomies (`bin_attack.py`)**:
+   - `BinAttackRiskLevel`: `LOW`, `MEDIUM`, `HIGH`, `CRITICAL`.
+   - `BinAttackAction`: `ALLOW`, `CHALLENGE_3DS`, `RATE_LIMIT_MERCHANT_IP`, `TEMP_BLOCK_BIN_PREFIX`, `BLOCK_GATEWAY_SESSION`.
+   - `BinAttackAnomalyType`: `SEQUENTIAL_PAN_ENUMERATION`, `CVV_EXPIRY_PROBING`, `MICRO_AUTH_VELOCITY`, `HIGH_DECLINE_RATIO`, `DISTRIBUTED_BIN_SWEEP`, `MULTI_CARD_IP_BURST`.
+   - `AuthResponseCode` (`APPROVED`, `INSUFFICIENT_FUNDS`, `DO_NOT_HONOR`, `CVV_MISMATCH`, `INVALID_EXPIRY`, `EXPIRED_CARD`, `INVALID_PAN`, `PICKUP_CARD`).
+   - `BinAuthAttempt`, `BinPrefixProfile`, `BinAttackAssessment` with lossless dict/JSON serialization.
+2. **Sequential Enumeration & CVV/Expiry Probing Analyzer (`EnumerationAnalyzer`)**:
+   - Detects sequential or narrow-stride `last4` / PAN-suffix probing within a 6/8-digit BIN prefix (`bin_prefix`) and repeated `CVV_MISMATCH` / `INVALID_EXPIRY` / `EXPIRED_CARD` responses.
+3. **Micro-Auth Velocity & Distributed Sweep Analyzer (`VelocityDeclineAnalyzer`)**:
+   - Tracks sub-threshold micro-authorization bursts (`amount <= micro_auth_threshold`), high issuer decline ratios, distinct cards per IP/device, and distributed multi-IP sweeps targeting the same BIN prefix.
+4. **Composite Defense Engine & Thread-Safe Store (`BinAttackDefenseEngine`, `BinAttackStore`)**:
+   - Aggregates enumeration, probing, micro-auth velocity, and decline-ratio signals into calibrated risk scores (`0.0`–`1.0`) and policy actions.
+   - Integrates optionally with `CaseManager` (auto-creating security cases on `TEMP_BLOCK_BIN_PREFIX` / `BLOCK_GATEWAY_SESSION`) and `EventBus` (`BIN_ATTACK_EVALUATED`, `BIN_ENUMERATION_DETECTED`, `CARD_TESTING_BLOCKED`).
+5. **REST API (`/v1/bin-attack/*`) & Prometheus Metrics (`api.py`)**:
+   - `POST /v1/bin-attack/attempts`, `POST /v1/bin-attack/evaluate`, `GET /v1/bin-attack/assessments`, `GET /v1/bin-attack/assessments/{assessment_id}`, `GET /v1/bin-attack/bins/{bin_prefix}`, `GET /v1/bin-attack/metrics`.
+6. **CLI Workflows (`cli.py`)**:
+   - `bin-attack-ingest`, `bin-attack-eval`, `bin-attack-inspect`, `bin-attack-summary` with table/JSON formatting and store persistence.
+7. **Documentation**:
+   - `ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`.
+
+### Acceptance Criteria
+
+1. **AC-1 (Domain Models & Taxonomies)**: `BinAttackRiskLevel`, `BinAttackAction`, `BinAttackAnomalyType`, `AuthResponseCode`, `BinAuthAttempt`, `BinPrefixProfile`, and `BinAttackAssessment` serialize/deserialize cleanly with unit tests.
+2. **AC-2 (Sequential Enumeration & CVV/Expiry Probing)**: `EnumerationAnalyzer` accurately detects sequential `last4` probing and CVV/expiry brute-force sweeps.
+3. **AC-3 (Micro-Auth Velocity & Distributed Sweeps)**: `VelocityDeclineAnalyzer` flags micro-authorization bursts, high decline ratios, multi-card IP bursts, and distributed BIN sweeps.
+4. **AC-4 (Engine, Store & Escalation)**: `BinAttackDefenseEngine` and `BinAttackStore` compute calibrated scores, enforce policy routing, evict cleanly at capacity, and auto-create `CaseManager` cases on high-severity findings.
+5. **AC-5 (EventBus Streaming)**: Lifecycle transitions emit `BIN_ATTACK_EVALUATED`, `BIN_ENUMERATION_DETECTED`, and `CARD_TESTING_BLOCKED` events.
+6. **AC-6 (REST API & Metrics)**: `/v1/bin-attack/*` endpoints and Prometheus metrics work end to end and are verified in `tests/test_api.py`.
+7. **AC-7 (CLI Workflows)**: `bin-attack-ingest`, `bin-attack-eval`, `bin-attack-inspect`, and `bin-attack-summary` work end to end and are verified in `tests/test_cli.py` and real CLI execution.
+8. **AC-8 (All CI-Parity Checks & Remote CI Green)**: `ruff format --check src tests`, `ruff check src tests`, `mypy src`, `pytest --cov=fraud_detection --cov-report=term-missing`, `python -m build`, `twine check dist/*`, and all remote GitHub Actions CI jobs pass 100%.
+
+### Validation & CI Plan
+
+- Focused unit tests: `python -m pytest tests/test_bin_attack.py -v`
+- API & CLI integration tests: `python -m pytest tests/test_api.py tests/test_cli.py -k "bin_attack"`
+- Full local CI parity: `ruff format --check src tests`, `ruff check src tests`, `mypy src`, `pytest --cov=fraud_detection --cov-report=term-missing`, `python -m build`, `twine check dist/*`
+- Remote CI: GitHub Actions `CI` workflow on `phase/bin-attack-defense` PR.
+
+### Exclusions
+
+- Live network WAF/CDN rate-limit rule pushers and external card-scheme BIN directory feeds (out of scope for in-process zero-dependency reference engine).
+
+### Micro-Task Breakdown
+
+- Task 1: Define Phase 52 roadmap & initialize `docs/PROGRESS.md`.
+- Task 2: Create `src/fraud_detection/bin_attack.py` domain enums and data models + tests.
+- Task 3: Implement `EnumerationAnalyzer` + tests.
+- Task 4: Implement `VelocityDeclineAnalyzer` + tests.
+- Task 5: Implement `BinAttackStore` & `BinAttackDefenseEngine` + tests.
+- Task 6: Register `BIN_*` / `CARD_TESTING_BLOCKED` events in `events.py` and wire `EventBus` into `BinAttackDefenseEngine` + tests.
+- Task 7: Add `/v1/bin-attack/*` REST endpoints and Prometheus metrics in `api.py` + tests.
+- Task 8: Add `bin-attack-*` CLI commands in `cli.py` + tests.
+- Task 9: Update `ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md` and verify 100% green local & remote CI.
 
 
 ## Contributing to the roadmap
