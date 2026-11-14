@@ -22,6 +22,8 @@ __all__ = [
     "FirstPartyAssessment",
     "FirstPartyEventRecord",
     "FirstPartyRiskLevel",
+    "FriendlyFraudAnalyzer",
+    "FriendlyFraudMetrics",
     "OrderClaimType",
     "RefundAbuseAnalyzer",
     "RefundAbuseMetrics",
@@ -413,6 +415,88 @@ class RefundAbuseAnalyzer:
             inr_claim_count=len(inr_claims),
             wardrobing_count=wardrobing_count,
             high_value_skew=high_value_skew,
+            anomalies=tuple(anomalies),
+            reasons=tuple(reasons),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class FriendlyFraudMetrics:
+    """Computed friendly-fraud dispute and pre-dispute velocity metrics."""
+
+    dispute_count: int
+    verified_dispute_count: int
+    recent_dispute_count: int
+    anomalies: tuple[FirstPartyAnomalyType, ...]
+    reasons: tuple[str, ...]
+
+
+class FriendlyFraudAnalyzer:
+    """Detects serial friendly-fraud disputes on authenticated or delivered orders."""
+
+    def __init__(
+        self,
+        *,
+        window_days: int = 180,
+        pre_dispute_window_days: int = 14,
+        serial_dispute_threshold: int = 2,
+        pre_dispute_velocity_threshold: int = 2,
+    ) -> None:
+        self.window_days = window_days
+        self.pre_dispute_window_days = pre_dispute_window_days
+        self.serial_dispute_threshold = serial_dispute_threshold
+        self.pre_dispute_velocity_threshold = pre_dispute_velocity_threshold
+
+    def analyze(
+        self,
+        events: list[FirstPartyEventRecord],
+        *,
+        now: datetime | None = None,
+    ) -> FriendlyFraudMetrics:
+        disputes = [e for e in events if e.claim_type == OrderClaimType.FRIENDLY_DISPUTE]
+        if not disputes:
+            return FriendlyFraudMetrics(
+                dispute_count=0,
+                verified_dispute_count=0,
+                recent_dispute_count=0,
+                anomalies=(),
+                reasons=(),
+            )
+        ref_time = now or max(e.timestamp for e in events)
+        cutoff = ref_time - timedelta(days=self.window_days)
+        recent_cutoff = ref_time - timedelta(days=self.pre_dispute_window_days)
+
+        window_disputes = [d for d in disputes if d.timestamp >= cutoff]
+        verified_disputes = [
+            d
+            for d in window_disputes
+            if (
+                d.three_ds_authenticated
+                or d.delivery_confirmed
+                or d.signature_captured
+                or d.avs_cvv_matched
+            )
+        ]
+        recent_disputes = [d for d in window_disputes if d.timestamp >= recent_cutoff]
+
+        anomalies: list[FirstPartyAnomalyType] = []
+        reasons: list[str] = []
+        if len(verified_disputes) >= self.serial_dispute_threshold:
+            anomalies.append(FirstPartyAnomalyType.SERIAL_FRIENDLY_FRAUD)
+            reasons.append(
+                f"{len(verified_disputes)} friendly-fraud disputes on "
+                "authenticated/delivered orders"
+            )
+        if len(recent_disputes) >= self.pre_dispute_velocity_threshold:
+            anomalies.append(FirstPartyAnomalyType.PRE_DISPUTE_VELOCITY)
+            reasons.append(
+                f"{len(recent_disputes)} disputes filed within {self.pre_dispute_window_days}d"
+            )
+
+        return FriendlyFraudMetrics(
+            dispute_count=len(window_disputes),
+            verified_dispute_count=len(verified_disputes),
+            recent_dispute_count=len(recent_disputes),
             anomalies=tuple(anomalies),
             reasons=tuple(reasons),
         )
