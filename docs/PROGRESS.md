@@ -8,7 +8,7 @@
 ## Task Status
 - [x] Task 1: Define Phase 51 roadmap & initialize `docs/PROGRESS.md`.
 - [x] Task 2: Create `src/fraud_detection/first_party_fraud.py` domain enums and data models + unit tests in `tests/test_first_party_fraud.py`.
-- [ ] Task 3: Implement `RefundAbuseAnalyzer` + unit tests.
+- [x] Task 3: Implement `RefundAbuseAnalyzer` + unit tests.
 - [ ] Task 4: Implement `FriendlyFraudAnalyzer` & `PromoAbuseDetector` + unit tests.
 - [ ] Task 5: Implement `FirstPartyAccountStore` & `FirstPartyFraudEngine` + unit tests.
 - [ ] Task 6: Register `FIRST_PARTY_*` / `REFUND_RESTRICTED` / `ACCOUNT_PRIVILEGES_REVOKED` events in `src/fraud_detection/events.py` and wire `EventBus` into `FirstPartyFraudEngine` + tests.
@@ -20,7 +20,7 @@
 | Criterion | Status | Evidence |
 |-----------|--------|----------|
 | AC-1 (Domain Models & Taxonomies) | PASSED | `FirstPartyRiskLevel`, `FirstPartyAction`, `FirstPartyAnomalyType`, `OrderClaimType`, `ClaimOutcome`, `FirstPartyEventRecord`, `FirstPartyAccountProfile`, `FirstPartyAssessment` verified in `tests/test_first_party_fraud.py` |
-| AC-2 (Refund & Return Abuse) | PENDING | Pending Task 3 |
+| AC-2 (Refund & Return Abuse) | PASSED | `RefundAbuseAnalyzer` verified on return-to-purchase ratios, wardrobing, INR claim bursts, and high-value refund skew in `tests/test_first_party_fraud.py` |
 | AC-3 (Friendly Fraud & Promo Cycling) | PENDING | Pending Task 4 |
 | AC-4 (Engine, Store & Escalation) | PENDING | Pending Task 5 |
 | AC-5 (EventBus Streaming) | PENDING | Pending Task 6 |
