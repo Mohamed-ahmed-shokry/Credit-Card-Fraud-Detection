@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -15,6 +15,7 @@ from fraud_detection.bin_attack import (
     BinAttackRiskLevel,
     BinAuthAttempt,
     BinPrefixProfile,
+    EnumerationAnalyzer,
     _coerce_utc_datetime,
 )
 
@@ -109,3 +110,40 @@ def test_bin_attack_enums_and_model_round_trip() -> None:
         evaluated_at=datetime(2026, 11, 15, 0, 31, 0, tzinfo=UTC),
     )
     assert BinAttackAssessment.from_dict(assessment.to_dict()) == assessment
+
+
+def test_enumeration_analyzer_detects_sequential_pan_and_probing() -> None:
+    analyzer = EnumerationAnalyzer()
+    empty = analyzer.analyze([])
+    assert empty.sequential_run_length == 0
+    assert empty.anomalies == ()
+
+    now = datetime(2026, 11, 15, 0, 30, 0, tzinfo=UTC)
+    attempts = [
+        BinAuthAttempt(
+            attempt_id=f"seq-{i}",
+            bin_prefix="411111",
+            last4=f"{1000 + i:04d}",
+            amount=1.0,
+            response_code=AuthResponseCode.CVV_MISMATCH,
+            timestamp=now - timedelta(seconds=10 * i),
+        )
+        for i in range(4)
+    ]
+    # Add a non-sequential outlier to cover run-reset branch
+    attempts.append(
+        BinAuthAttempt(
+            attempt_id="seq-outlier",
+            bin_prefix="411111",
+            last4="9999",
+            amount=1.0,
+            response_code=AuthResponseCode.APPROVED,
+            timestamp=now,
+        )
+    )
+    metrics = analyzer.analyze(attempts, now=now)
+    assert metrics.sequential_run_length == 4
+    assert metrics.probing_count == 4
+    assert metrics.unique_last4_count == 5
+    assert BinAttackAnomalyType.SEQUENTIAL_PAN_ENUMERATION in metrics.anomalies
+    assert BinAttackAnomalyType.CVV_EXPIRY_PROBING in metrics.anomalies
