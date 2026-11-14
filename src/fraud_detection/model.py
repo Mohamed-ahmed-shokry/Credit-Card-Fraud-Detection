@@ -370,16 +370,14 @@ class FraudModel:
         for i, record in enumerate(records):
             str_record = {str(k): v for k, v in record.items()}
             eval_res = rules.evaluate_record(str_record)
-            if eval_res.matched and eval_res.action is not None:
-                if rule_precedence == RulePrecedence.RULES_OVERRIDE_MODEL:
-                    final_decisions[i] = eval_res.action.value
-                    matched_rule_ids[i] = eval_res.matched_rule_id
-                    matched_rule_names[i] = eval_res.matched_rule_name
-                elif rule_precedence == RulePrecedence.MODEL_OVERRIDES_RULES:
-                    if model_decisions[i] != "DENY":
-                        final_decisions[i] = eval_res.action.value
-                        matched_rule_ids[i] = eval_res.matched_rule_id
-                        matched_rule_names[i] = eval_res.matched_rule_name
+            should_apply_rule = rule_precedence == RulePrecedence.RULES_OVERRIDE_MODEL or (
+                rule_precedence == RulePrecedence.MODEL_OVERRIDES_RULES
+                and model_decisions[i] != "DENY"
+            )
+            if eval_res.matched and eval_res.action is not None and should_apply_rule:
+                final_decisions[i] = eval_res.action.value
+                matched_rule_ids[i] = eval_res.matched_rule_id
+                matched_rule_names[i] = eval_res.matched_rule_name
 
         return final_decisions, matched_rule_ids, matched_rule_names
 

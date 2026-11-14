@@ -1,32 +1,35 @@
-# Phase 43 Progress Record
+# Phase 51 Progress Record
 
 ### Overview
-- **Phase**: Phase 43 — Asynchronous Real-Time Event Bus & Streaming Webhook Dispatcher
-- **Branch**: `phase/webhook-event-dispatcher`
+- **Phase**: Phase 51 — First-Party Fraud, Refund Abuse & Friendly Fraud Detection Engine
+- **Branch**: `phase/first-party-fraud-detection`
 - **Status**: Completed
 
 ## Task Status
-- [x] Task 1: Create `src/fraud_detection/events.py` with domain event models (`EventType`, `EventDeliveryStatus`, `FraudDomainEvent`, `WebhookSubscription`, `EventError` hierarchy) and unit tests in `tests/test_events.py`.
-- [x] Task 2: Implement HMAC-SHA256 signature generation/verification and PCI-DSS payload sanitization in `src/fraud_detection/events.py` with unit tests.
-- [x] Task 3: Implement `DeadLetterQueue`, `DispatchConfig`, and `WebhookDispatcher` with jittered exponential backoff and circuit breaking in `src/fraud_detection/events.py` with unit tests.
-- [x] Task 4: Implement in-memory thread-safe `EventBus` and Decision DAG event publisher in `src/fraud_detection/events.py` and `src/fraud_detection/pipeline.py` with unit tests.
-- [x] Task 5: Implement `/v1/webhooks/*` endpoints, test ping dispatcher, and Prometheus metrics in `src/fraud_detection/api.py` with integration tests in `tests/test_api.py`.
-- [x] Task 6: Implement CLI commands `webhook-list`, `webhook-test`, and `webhook-replay-dlq` in `src/fraud_detection/cli.py` with tests in `tests/test_cli.py`.
-- [x] Task 7: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate.
+- [x] Task 1: Define Phase 51 roadmap & initialize `docs/PROGRESS.md`.
+- [x] Task 2: Create `src/fraud_detection/first_party_fraud.py` domain enums and data models + unit tests in `tests/test_first_party_fraud.py`.
+- [x] Task 3: Implement `RefundAbuseAnalyzer` + unit tests.
+- [x] Task 4: Implement `FriendlyFraudAnalyzer` & `PromoAbuseDetector` + unit tests.
+- [x] Task 5: Implement `FirstPartyAccountStore` & `FirstPartyFraudEngine` + unit tests.
+- [x] Task 6: Register `FIRST_PARTY_*` / `REFUND_RESTRICTED` / `ACCOUNT_PRIVILEGES_REVOKED` events in `src/fraud_detection/events.py` and wire `EventBus` into `FirstPartyFraudEngine` + tests.
+- [x] Task 7: Add `/v1/first-party/*` REST endpoints and Prometheus metrics in `src/fraud_detection/api.py` + tests in `tests/test_api.py`.
+- [x] Task 8: Add `first-party-ingest`, `first-party-eval`, `first-party-inspect`, and `first-party-summary` CLI commands in `src/fraud_detection/cli.py` + tests in `tests/test_cli.py`.
+- [x] Task 9: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate with 100% Green CI.
 
 ## Acceptance Criteria Status
 | Criterion | Status | Evidence |
 |-----------|--------|----------|
-| AC-1 (Domain Models & Validation) | PASSED | 3 unit tests in `tests/test_events.py` verifying `FraudDomainEvent`, `WebhookSubscription`, status enums, matching, and validation error bounds. |
-| AC-2 (HMAC-SHA256 Webhook Signing & Sanitization) | PASSED | 2 unit tests in `tests/test_events.py` verifying HMAC-SHA256 signing, tamper detection, timestamp replay tolerance, and PCI-DSS Luhn PAN redaction. |
-| AC-3 (Resilient Webhook Dispatcher & DLQ) | PASSED | 3 unit tests in `tests/test_events.py` verifying DeadLetterQueue capacity bounding, tenant eviction, DispatchConfig bounds, WebhookDispatcher retries with backoff, circuit breaking, and dead-letter routing. |
-| AC-4 (Event Bus & DAG Integration) | PASSED | 2 unit & integration tests in `tests/test_events.py` and `tests/test_pipeline.py` verifying SubscriptionRegistry manifest import/export, EventBus pub-sub filtering, and ActionAggregatorStageProcessor automated event publishing. |
-| AC-5 (API Serving & Prometheus Telemetry) | PASSED | `test_webhook_api_endpoints_and_telemetry` in `tests/test_api.py` verifying `/v1/webhooks/*` CRUD, test ping dispatch, DLQ listing/replay, and Prometheus counters. |
-| AC-6 (CLI Webhook Workflows) | PASSED | `test_webhook_cli_commands` in `tests/test_cli.py` verifying `webhook-list`, `webhook-test`, and `webhook-replay-dlq` CLI workflows with standard exit codes and JSON/table reporting. |
-| AC-7 (Quality Standards & 100% Green CI) | PASSED | All local CI-parity checks and remote GitHub Actions CI workflow runs pass 100%, branch coverage >= 97.0%, 0 mypy issues, Ruff clean. |
+| AC-1 (Domain Models & Taxonomies) | PASSED | `FirstPartyRiskLevel`, `FirstPartyAction`, `FirstPartyAnomalyType`, `OrderClaimType`, `ClaimOutcome`, `FirstPartyEventRecord`, `FirstPartyAccountProfile`, `FirstPartyAssessment` verified in `tests/test_first_party_fraud.py` |
+| AC-2 (Refund & Return Abuse) | PASSED | `RefundAbuseAnalyzer` verified on return-to-purchase ratios, wardrobing, INR claim bursts, and high-value refund skew in `tests/test_first_party_fraud.py` |
+| AC-3 (Friendly Fraud & Promo Cycling) | PASSED | `FriendlyFraudAnalyzer` and `PromoAbuseDetector` verified on verified-delivery disputes, pre-dispute velocity, promo abuse, and linked-account cycling in `tests/test_first_party_fraud.py` |
+| AC-4 (Engine, Store & Escalation) | PASSED | `FirstPartyFraudEngine` and `FirstPartyAccountStore` verified on scoring, policy routing, capacity eviction, linked accounts, and `CaseManager` escalation in `tests/test_first_party_fraud.py` |
+| AC-5 (EventBus Streaming) | PASSED | `FIRST_PARTY_EVALUATED`, `FIRST_PARTY_ABUSE_DETECTED`, `REFUND_RESTRICTED`, `ACCOUNT_PRIVILEGES_REVOKED` registered in `events.py` and verified in `tests/test_first_party_fraud.py` |
+| AC-6 (REST API & Metrics) | PASSED | `/v1/first-party/*` endpoints and Prometheus counters (`fraud_first_party_evaluations_total`, `fraud_first_party_anomalies_total`, `fraud_first_party_restricted_total`) verified in `tests/test_api.py` |
+| AC-7 (CLI Workflows) | PASSED | `first-party-ingest`, `first-party-eval`, `first-party-inspect`, and `first-party-summary` verified in `tests/test_cli.py` |
+| AC-8 (Quality Standards & 100% Green CI) | PASSED | Ruff format/lint clean (71 files), mypy clean (36 source files, 0 issues), `python -m build` & `twine check` passed, `first_party_fraud.py` branch coverage 99.23%, E2E CLI verified, remote CI verification pending PR watch |
 
 ## Decision Log
 | Date | Decision | Alternatives Considered | Rationale |
-|------|----------|-------------------------|-----------|
-| 2026-10-31 | Select Phase 43: Asynchronous Real-Time Event Bus & Streaming Webhook Dispatcher | Heavy external message brokers (Kafka/RabbitMQ) | An in-process, zero-dependency streaming bus and HTTP webhook dispatcher keeps the package self-contained, reproducible in tests, and deployable anywhere without external infrastructure dependencies. |
-| 2026-10-31 | Create branch `phase/webhook-event-dispatcher` from latest `origin/main` (`1542e5e`) | Reusing old merged phase branch | Clean git branch tracking upstream main with zero merge artifact pollution. |
+|---|---|---|---|
+| 2026-11-14 | Select Phase 51: First-Party Fraud, Refund Abuse & Friendly Fraud Detection Engine | Bio-behavioral Keystroke Dynamics; External Webhook Replay | `cases.py`, `chargeback.py`, and `feedback.py` already model `FRIENDLY_FRAUD`, leaving pre-dispute/real-time first-party refund abuse, wardrobing, INR claims, and promo cycling as the clearest missing link in the fraud lifecycle. |
+| 2026-11-14 | Create dedicated phase branch `phase/first-party-fraud-detection` | Working on `main` directly | Follows repository branching and CI PR workflow. |

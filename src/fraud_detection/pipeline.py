@@ -1511,6 +1511,7 @@ class ActionAggregatorStageProcessor:
         is_fraud = final_action == DecisionAction.DENY.value
         final_prob = float(prob) if prob is not None else (1.0 if is_fraud else 0.0)
 
+        sync_pub = bool(context.metadata.get("synchronous_event_publish", False))
         bus = context.metadata.get("event_bus")
         if bus is not None:
             with contextlib.suppress(Exception):
@@ -1540,7 +1541,105 @@ class ActionAggregatorStageProcessor:
                     if context.metadata.get("traceparent")
                     else None,
                 )
-                bus.publish(event, synchronous=False)
+                bus.publish(event, synchronous=sync_pub)
+
+        challenge_info: dict[str, Any] | None = None
+        if final_action == DecisionAction.CHALLENGE.value:
+            challenge_mgr = context.metadata.get("challenge_manager")
+            if challenge_mgr is not None:
+                with contextlib.suppress(Exception):
+                    from fraud_detection.challenge import ChallengeMethod
+
+                    tx_id = str(context.metadata.get("transaction_id") or uuid4().hex)
+                    u_id = str(context.metadata.get("user_id") or "usr_unknown")
+                    t_id = str(context.metadata.get("tenant_id") or "default")
+                    dest = str(context.metadata.get("challenge_destination") or u_id)
+                    m_val = str(context.metadata.get("challenge_method") or "sms_otp")
+                    c_session, _ = challenge_mgr.create_challenge(
+                        transaction_id=tx_id,
+                        user_id=u_id,
+                        tenant_id=t_id,
+                        destination=dest,
+                        method=ChallengeMethod(m_val),
+                    )
+                    challenge_info = {
+                        "challenge_id": c_session.challenge_id,
+                        "challenge_status": c_session.status.value,
+                        "challenge_method": c_session.method.value,
+                        "challenge_target_masked": c_session.target_masked,
+                        "challenge_expires_at": c_session.expires_at,
+                    }
+                    if bus is not None:
+                        from fraud_detection.events import EventType, FraudDomainEvent
+
+                        bus.publish(
+                            FraudDomainEvent(
+                                event_type=EventType.CHALLENGE_ISSUED,
+                                tenant_id=t_id,
+                                payload={
+                                    "challenge_id": c_session.challenge_id,
+                                    "transaction_id": tx_id,
+                                    "user_id": u_id,
+                                    "method": c_session.method.value,
+                                    "target_masked": c_session.target_masked,
+                                    "expires_at": c_session.expires_at,
+                                },
+                            ),
+                            synchronous=sync_pub,
+                        )
+
+        case_info: dict[str, Any] | None = None
+        if final_action == "REVIEW":
+            case_mgr = context.metadata.get("case_manager")
+            if case_mgr is not None:
+                with contextlib.suppress(Exception):
+                    tx_id = str(context.metadata.get("transaction_id") or uuid4().hex)
+                    t_id = str(context.metadata.get("tenant_id") or "default")
+                    tx_amt_raw = (
+                        context.transaction.get("Amount")
+                        or context.transaction.get("amount")
+                        or 0.0
+                    )
+                    try:
+                        tx_amt = float(tx_amt_raw)
+                    except (ValueError, TypeError):
+                        tx_amt = 0.0
+                    auto_case = case_mgr.create_case(
+                        transaction_id=tx_id,
+                        fraud_score=round(final_prob, 5),
+                        amount=tx_amt,
+                        tenant_id=t_id,
+                        metadata={
+                            "matched_rule": matched_rule,
+                            "rule_action": rule_action,
+                            "decision": final_action,
+                        },
+                    )
+                    case_info = {
+                        "case_id": auto_case.case_id,
+                        "case_status": auto_case.status.value,
+                        "case_priority": auto_case.priority.value,
+                        "sla_expires_at": auto_case.sla_expires_at,
+                    }
+                    if bus is not None:
+                        from fraud_detection.events import EventType, FraudDomainEvent
+
+                        bus.publish(
+                            FraudDomainEvent(
+                                event_type=EventType.CASE_CREATED,
+                                tenant_id=t_id,
+                                payload={
+                                    "case_id": auto_case.case_id,
+                                    "transaction_id": tx_id,
+                                    "priority": auto_case.priority.value,
+                                    "status": auto_case.status.value,
+                                    "fraud_score": auto_case.fraud_score,
+                                    "amount": auto_case.amount,
+                                    "sla_expires_at": auto_case.sla_expires_at,
+                                },
+                            ),
+                            synchronous=sync_pub,
+                        )
 
         return {
             "decision": final_action,
@@ -1553,6 +1652,8 @@ class ActionAggregatorStageProcessor:
             "threshold": effective_threshold,
             "review_threshold": effective_review,
             "deny_threshold": effective_deny,
+            "challenge": challenge_info,
+            "case": case_info,
         }
 
 

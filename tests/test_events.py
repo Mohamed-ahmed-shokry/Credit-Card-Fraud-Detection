@@ -657,3 +657,75 @@ def test_events_edge_cases_and_coverage(monkeypatch: pytest.MonkeyPatch) -> None
     bus.unsubscribe(token)
     assert bus.listeners_count == 0
     bus.close()
+
+
+def test_aml_domain_events_dispatch_and_routing() -> None:
+    """Validate AML domain event types serialization, registration, and dispatch."""
+    assert EventType.AML_TRANSACTION_MONITORED == "fraud.aml.transaction_monitored"
+    assert EventType.AML_ALERT_TRIGGERED == "fraud.aml.alert_triggered"
+    assert EventType.AML_SANCTION_MATCH_DETECTED == "fraud.aml.sanction_match_detected"
+    assert EventType.AML_SAR_CREATED == "fraud.aml.sar_created"
+    assert EventType.AML_SAR_STATUS_UPDATED == "fraud.aml.sar_status_updated"
+
+    # Test bus dispatch with typed subscriber
+    bus = EventBus()
+    received: list[FraudDomainEvent] = []
+    bus.subscribe(
+        lambda ev: received.append(ev),
+        event_type=EventType.AML_ALERT_TRIGGERED,
+    )
+
+    alert_evt = FraudDomainEvent(
+        event_type=EventType.AML_ALERT_TRIGGERED,
+        payload={"alert_id": "alt-99", "typology": "structuring_smurfing"},
+        tenant_id="tenant_aml",
+    )
+    bus.publish(alert_evt, synchronous=True)
+
+    # Should match
+    assert len(received) == 1
+    assert received[0].event_type == EventType.AML_ALERT_TRIGGERED
+    assert received[0].payload["alert_id"] == "alt-99"
+
+    # Another event type should not trigger the filtered listener
+    other_evt = FraudDomainEvent(
+        event_type=EventType.AML_SAR_CREATED,
+        payload={"sar_id": "sar-1"},
+        tenant_id="tenant_aml",
+    )
+    bus.publish(other_evt, synchronous=True)
+    assert len(received) == 1
+    bus.close()
+
+
+def test_sif_domain_events_dispatch_and_routing() -> None:
+    """Validate SIF domain event types registration, serialization, and EventBus routing."""
+    assert EventType.SIF_APPLICATION_EVALUATED == "fraud.sif.application_evaluated"
+    assert EventType.SIF_ANOMALY_DETECTED == "fraud.sif.anomaly_detected"
+    assert EventType.SIF_IDENTITY_CONFIRMED == "fraud.sif.identity_confirmed"
+    assert EventType.SIF_APPLICATION_DECLINED == "fraud.sif.application_declined"
+
+    bus = EventBus()
+    received: list[FraudDomainEvent] = []
+    bus.subscribe(
+        lambda ev: received.append(ev),
+        event_type=EventType.SIF_ANOMALY_DETECTED,
+    )
+
+    evt = FraudDomainEvent(
+        event_type=EventType.SIF_ANOMALY_DETECTED,
+        payload={"assessment_id": "sif_123", "anomalies": ["ssn_dob_mismatch"]},
+        tenant_id="tenant_sif",
+    )
+    bus.publish(evt, synchronous=True)
+    assert len(received) == 1
+    assert received[0].payload["assessment_id"] == "sif_123"
+
+    other = FraudDomainEvent(
+        event_type=EventType.SIF_APPLICATION_DECLINED,
+        payload={"assessment_id": "sif_999"},
+        tenant_id="tenant_sif",
+    )
+    bus.publish(other, synchronous=True)
+    assert len(received) == 1
+    bus.close()
