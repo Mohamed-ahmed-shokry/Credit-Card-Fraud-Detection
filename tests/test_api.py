@@ -7172,3 +7172,102 @@ def test_first_party_api_error_branches(api_context: tuple[Path, Any, Path]) -> 
         metrics_uninit = client.get("/v1/first-party/metrics")
         assert metrics_uninit.status_code == 200
         assert metrics_uninit.json()["status"] == "uninitialized"
+
+
+def test_bin_attack_api_endpoints_and_metrics(api_context: tuple[Path, Any, Path]) -> None:
+    """Verify /v1/bin-attack/* endpoints and Prometheus metrics end to end."""
+    _, model, _ = api_context
+    app = create_app(model=model)
+
+    with TestClient(app) as client:
+        last_resp = None
+        for idx in range(4):
+            last_resp = client.post(
+                "/v1/bin-attack/attempts",
+                json={
+                    "attempt_id": f"bin-att-{idx}",
+                    "bin_prefix": "453201",
+                    "last4": f"100{idx}",
+                    "amount": 1.0,
+                    "response_code": "cvv_mismatch",
+                    "timestamp": f"2026-11-15T00:30:0{idx}+00:00",
+                    "ip_address": "198.51.100.77",
+                },
+            )
+            assert last_resp.status_code == 200
+        assert last_resp is not None
+        data = last_resp.json()
+        assert data["action"] == "block_gateway_session"
+        assessment_id = data["assessment_id"]
+
+        eval_resp = client.post("/v1/bin-attack/evaluate", json={"bin_prefix": "453201"})
+        assert eval_resp.status_code == 200
+
+        get_resp = client.get(f"/v1/bin-attack/assessments/{assessment_id}")
+        assert get_resp.status_code == 200
+        assert get_resp.json()["assessment_id"] == assessment_id
+
+        list_resp = client.get("/v1/bin-attack/assessments", params={"bin_prefix": "453201"})
+        assert list_resp.status_code == 200
+        assert list_resp.json()["total_count"] >= 2
+
+        bin_resp = client.get("/v1/bin-attack/bins/453201")
+        assert bin_resp.status_code == 200
+        assert len(bin_resp.json()["attempts"]) == 4
+
+        metrics_resp = client.get("/v1/bin-attack/metrics")
+        assert metrics_resp.status_code == 200
+        assert metrics_resp.json()["status"] == "operational"
+        assert metrics_resp.json()["total_bins"] >= 1
+
+        prom = client.get("/metrics")
+        assert prom.status_code == 200
+        assert "fraud_bin_attack_evaluations_total" in prom.text
+        assert "fraud_bin_attack_blocked_total" in prom.text
+
+
+def test_bin_attack_api_error_branches(api_context: tuple[Path, Any, Path]) -> None:
+    """Validate 404, 422, and 500 error branches on /v1/bin-attack/* endpoints."""
+    _, model, _ = api_context
+    app = create_app(model=model)
+
+    with TestClient(app) as client:
+        assert (
+            client.post(
+                "/v1/bin-attack/attempts",
+                json={
+                    "attempt_id": "bad-bin",
+                    "bin_prefix": "45320a",
+                    "last4": "0001",
+                    "amount": 1.0,
+                    "response_code": "approved",
+                    "timestamp": "2026-11-15T00:30:00+00:00",
+                },
+            ).status_code
+            == 422
+        )
+        assert (
+            client.post("/v1/bin-attack/evaluate", json={"bin_prefix": "999999"}).status_code == 404
+        )
+        assert client.get("/v1/bin-attack/assessments/missing").status_code == 404
+        assert client.get("/v1/bin-attack/bins/999999").status_code == 404
+
+        app.state.bin_attack_engine = None
+        att_payload = {
+            "attempt_id": "att-x",
+            "bin_prefix": "411111",
+            "last4": "0001",
+            "amount": 1.0,
+            "response_code": "approved",
+            "timestamp": "2026-11-15T00:30:00+00:00",
+        }
+        assert client.post("/v1/bin-attack/attempts", json=att_payload).status_code == 500
+        assert (
+            client.post("/v1/bin-attack/evaluate", json={"bin_prefix": "411111"}).status_code == 500
+        )
+        assert client.get("/v1/bin-attack/assessments/bin_1").status_code == 500
+        assert client.get("/v1/bin-attack/assessments").status_code == 500
+        assert client.get("/v1/bin-attack/bins/411111").status_code == 500
+        metrics_uninit = client.get("/v1/bin-attack/metrics")
+        assert metrics_uninit.status_code == 200
+        assert metrics_uninit.json()["status"] == "uninitialized"
