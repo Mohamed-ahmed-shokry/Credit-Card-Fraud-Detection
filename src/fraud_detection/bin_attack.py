@@ -8,7 +8,7 @@ distributed botnet BIN attacks across merchants and IP/device clusters.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Any
 
@@ -21,6 +21,8 @@ __all__ = [
     "BinAttackRiskLevel",
     "BinAuthAttempt",
     "BinPrefixProfile",
+    "EnumerationAnalyzer",
+    "EnumerationMetrics",
 ]
 
 
@@ -256,4 +258,82 @@ class BinAttackAssessment:
             case_id=payload.get("case_id"),
             reasons=tuple(str(r) for r in payload.get("reasons", [])),
             evaluated_at=_coerce_utc_datetime(payload["evaluated_at"]),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class EnumerationMetrics:
+    """Computed sequential PAN enumeration and CVV/expiry probing metrics."""
+
+    sequential_run_length: int
+    probing_count: int
+    unique_last4_count: int
+    anomalies: tuple[BinAttackAnomalyType, ...]
+    reasons: tuple[str, ...]
+
+
+class EnumerationAnalyzer:
+    """Detects sequential PAN/last4 enumeration and CVV/expiry brute-force probing."""
+
+    def __init__(
+        self,
+        *,
+        window_seconds: int = 600,
+        sequential_run_threshold: int = 4,
+        max_stride: int = 2,
+        probing_threshold: int = 3,
+    ) -> None:
+        self.window_seconds = window_seconds
+        self.sequential_run_threshold = sequential_run_threshold
+        self.max_stride = max_stride
+        self.probing_threshold = probing_threshold
+
+    def analyze(
+        self,
+        attempts: list[BinAuthAttempt],
+        *,
+        now: datetime | None = None,
+    ) -> EnumerationMetrics:
+        if not attempts:
+            return EnumerationMetrics(
+                sequential_run_length=0,
+                probing_count=0,
+                unique_last4_count=0,
+                anomalies=(),
+                reasons=(),
+            )
+        ref_time = now or max(a.timestamp for a in attempts)
+        cutoff = ref_time - timedelta(seconds=self.window_seconds)
+        window_attempts = [a for a in attempts if a.timestamp >= cutoff]
+
+        unique_last4 = sorted({int(a.last4) for a in window_attempts})
+        best_run = 1 if unique_last4 else 0
+        current_run = 1
+        for idx in range(1, len(unique_last4)):
+            if 1 <= (unique_last4[idx] - unique_last4[idx - 1]) <= self.max_stride:
+                current_run += 1
+                best_run = max(best_run, current_run)
+            else:
+                current_run = 1
+
+        probing_count = sum(1 for a in window_attempts if a.response_code in PROBING_RESPONSE_CODES)
+
+        anomalies: list[BinAttackAnomalyType] = []
+        reasons: list[str] = []
+
+        if best_run >= self.sequential_run_threshold:
+            anomalies.append(BinAttackAnomalyType.SEQUENTIAL_PAN_ENUMERATION)
+            reasons.append(f"Sequential last4 run of {best_run} within {self.window_seconds}s")
+        if probing_count >= self.probing_threshold:
+            anomalies.append(BinAttackAnomalyType.CVV_EXPIRY_PROBING)
+            reasons.append(
+                f"{probing_count} CVV/expiry/PAN probing declines within {self.window_seconds}s"
+            )
+
+        return EnumerationMetrics(
+            sequential_run_length=best_run,
+            probing_count=probing_count,
+            unique_last4_count=len(unique_last4),
+            anomalies=tuple(anomalies),
+            reasons=tuple(reasons),
         )
