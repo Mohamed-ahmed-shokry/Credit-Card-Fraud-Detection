@@ -15,7 +15,9 @@ from fraud_detection.first_party_fraud import (
     FirstPartyAssessment,
     FirstPartyEventRecord,
     FirstPartyRiskLevel,
+    FriendlyFraudAnalyzer,
     OrderClaimType,
+    PromoAbuseDetector,
     RefundAbuseAnalyzer,
     _coerce_utc_datetime,
 )
@@ -178,3 +180,57 @@ def test_refund_abuse_analyzer_detects_wardrobing_inr_and_skew() -> None:
 
     refund_only = analyzer.analyze([events[2]], now=now)
     assert refund_only.return_ratio == 1.0
+
+
+def test_friendly_fraud_and_promo_abuse_analyzers() -> None:
+    ff = FriendlyFraudAnalyzer()
+    empty_ff = ff.analyze([])
+    assert empty_ff.dispute_count == 0
+    assert empty_ff.anomalies == ()
+
+    now = datetime(2026, 11, 14, 12, 0, 0, tzinfo=UTC)
+    disputes = [
+        FirstPartyEventRecord(
+            event_id="d-1",
+            account_id="acct-ff",
+            claim_type=OrderClaimType.FRIENDLY_DISPUTE,
+            amount=320.0,
+            timestamp=now - timedelta(days=3),
+            three_ds_authenticated=True,
+            delivery_confirmed=True,
+        ),
+        FirstPartyEventRecord(
+            event_id="d-2",
+            account_id="acct-ff",
+            claim_type=OrderClaimType.FRIENDLY_DISPUTE,
+            amount=410.0,
+            timestamp=now - timedelta(days=1),
+            avs_cvv_matched=True,
+            signature_captured=True,
+        ),
+    ]
+    ff_metrics = ff.analyze(disputes, now=now)
+    assert ff_metrics.dispute_count == 2
+    assert ff_metrics.verified_dispute_count == 2
+    assert ff_metrics.recent_dispute_count == 2
+    assert FirstPartyAnomalyType.SERIAL_FRIENDLY_FRAUD in ff_metrics.anomalies
+    assert FirstPartyAnomalyType.PRE_DISPUTE_VELOCITY in ff_metrics.anomalies
+
+    promo = PromoAbuseDetector()
+    promo_events = [
+        FirstPartyEventRecord(
+            event_id=f"pr-{i}",
+            account_id="acct-promo",
+            claim_type=OrderClaimType.PROMO_REDEMPTION,
+            amount=25.0,
+            timestamp=now - timedelta(hours=i),
+            promo_code=f"WELCOME{i}",
+        )
+        for i in range(3)
+    ]
+    promo_metrics = promo.analyze(promo_events, linked_accounts={"acct-a", "acct-b"})
+    assert promo_metrics.promo_redemption_count == 3
+    assert promo_metrics.unique_promo_codes == 3
+    assert promo_metrics.linked_account_count == 2
+    assert FirstPartyAnomalyType.PROMO_BONUS_ABUSE in promo_metrics.anomalies
+    assert FirstPartyAnomalyType.LINKED_ACCOUNT_CYCLING in promo_metrics.anomalies
