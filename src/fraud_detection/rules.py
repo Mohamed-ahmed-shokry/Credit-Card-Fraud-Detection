@@ -319,3 +319,191 @@ class RuleSet:
         temp_file = dest.with_name(f".{dest.name}.tmp")
         temp_file.write_text(self.to_json() + "\n", encoding="utf-8")
         temp_file.replace(dest)
+
+
+def build_fraud_ring_rule(
+    rule_id: str = "RULE_FRAUD_RING_DENY",
+    name: str = "Fraud Ring Auto Deny",
+    action: RuleAction = RuleAction.DENY,
+    min_ring_size: int = 3,
+    min_risk_diffusion: float = 0.75,
+    priority: int = 10,
+    reason: str = "Transaction associated with high-risk fraud syndicate or attack cluster.",
+) -> DecisionRule:
+    """Build a pre-configured DecisionRule for fraud ring and risk diffusion mitigation."""
+    conditions = (
+        RuleCondition(
+            field="graph_ring_size",
+            operator=RuleOperator.GREATER_THAN_OR_EQUAL,
+            value=min_ring_size,
+        ),
+        RuleCondition(
+            field="graph_risk_diffusion",
+            operator=RuleOperator.GREATER_THAN_OR_EQUAL,
+            value=min_risk_diffusion,
+        ),
+    )
+    return DecisionRule(
+        rule_id=rule_id,
+        name=name,
+        action=action,
+        conditions=conditions,
+        priority=priority,
+        reason=reason,
+    )
+
+
+def build_impossible_travel_rule(
+    rule_id: str = "RULE_IMPOSSIBLE_TRAVEL_DENY",
+    name: str = "Impossible Travel Auto Deny",
+    action: RuleAction = RuleAction.DENY,
+    min_speed_kmh: float = 900.0,
+    priority: int = 15,
+    reason: str = "Transaction speed of travel physically impossible under airliner speeds.",
+) -> DecisionRule:
+    """Build a pre-configured DecisionRule for impossible travel mitigation."""
+    conditions = (
+        RuleCondition(
+            field="geo_is_impossible_travel",
+            operator=RuleOperator.EQUALS,
+            value=1.0,
+        ),
+        RuleCondition(
+            field="geo_speed_kmh",
+            operator=RuleOperator.GREATER_THAN,
+            value=min_speed_kmh,
+        ),
+    )
+    return DecisionRule(
+        rule_id=rule_id,
+        name=name,
+        action=action,
+        conditions=conditions,
+        priority=priority,
+        reason=reason,
+    )
+
+
+def build_geo_proxy_rule(
+    rule_id: str = "RULE_GEO_PROXY_CHALLENGE",
+    name: str = "Anonymous Proxy Challenge",
+    action: RuleAction = RuleAction.CHALLENGE,
+    priority: int = 25,
+    reason: str = "Transaction origin IP associated with anonymous VPN, Tor, or proxy.",
+) -> DecisionRule:
+    """Build a pre-configured DecisionRule for anonymous proxy and VPN mitigation."""
+    conditions = (
+        RuleCondition(
+            field="geo_is_proxy",
+            operator=RuleOperator.EQUALS,
+            value=1.0,
+        ),
+    )
+    return DecisionRule(
+        rule_id=rule_id,
+        name=name,
+        action=action,
+        conditions=conditions,
+        priority=priority,
+        reason=reason,
+    )
+
+
+def build_device_emulator_rule(
+    rule_id: str = "RULE_DEVICE_EMULATOR_DENY",
+    name: str = "Device Emulator Auto Deny",
+    action: RuleAction = RuleAction.DENY,
+    priority: int = 12,
+    reason: str = "Transaction originating from automated bot, webdriver, or emulator environment.",
+) -> DecisionRule:
+    """Build a pre-configured DecisionRule for headless and emulator device mitigation."""
+    conditions = (
+        RuleCondition(
+            field="device_is_emulator",
+            operator=RuleOperator.EQUALS,
+            value=1.0,
+        ),
+    )
+    return DecisionRule(
+        rule_id=rule_id,
+        name=name,
+        action=action,
+        conditions=conditions,
+        priority=priority,
+        reason=reason,
+    )
+
+
+def build_device_card_cycling_rule(
+    rule_id: str = "RULE_DEVICE_CARD_CYCLING_DENY",
+    name: str = "Device Card Cycling Auto Deny",
+    action: RuleAction = RuleAction.DENY,
+    priority: int = 14,
+    reason: str = "Device cycling multiple payment cards across short temporal window.",
+) -> DecisionRule:
+    """Build a pre-configured DecisionRule for device card cycling mitigation."""
+    conditions = (
+        RuleCondition(
+            field="device_is_card_cycling",
+            operator=RuleOperator.EQUALS,
+            value=1.0,
+        ),
+    )
+    return DecisionRule(
+        rule_id=rule_id,
+        name=name,
+        action=action,
+        conditions=conditions,
+        priority=priority,
+        reason=reason,
+    )
+
+
+def build_merchant_chargeback_rule(
+    rule_id: str = "RULE_MERCHANT_CHARGEBACK_DENY",
+    name: str = "Merchant Excessive Chargeback Auto Deny",
+    action: RuleAction = RuleAction.DENY,
+    priority: int = 16,
+    reason: str = "Merchant exceeds Empirical Bayes smoothed chargeback rate threshold.",
+) -> DecisionRule:
+    """Build a pre-configured DecisionRule for excessive merchant chargeback mitigation."""
+    conditions = (
+        RuleCondition(
+            field="merchant_is_high_chargeback",
+            operator=RuleOperator.EQUALS,
+            value=1.0,
+        ),
+    )
+    return DecisionRule(
+        rule_id=rule_id,
+        name=name,
+        action=action,
+        conditions=conditions,
+        priority=priority,
+        reason=reason,
+    )
+
+
+def build_merchant_bust_out_rule(
+    rule_id: str = "RULE_MERCHANT_BUST_OUT_DENY",
+    name: str = "Merchant Bust-Out Surge Auto Deny",
+    action: RuleAction = RuleAction.DENY,
+    priority: int = 18,
+    reason: str = "Merchant exhibiting extreme ticket-size Z-score surge and bust-out anomaly.",
+) -> DecisionRule:
+    """Build a pre-configured DecisionRule for merchant bust-out surge mitigation."""
+    conditions = (
+        RuleCondition(
+            field="merchant_is_bust_out_surge",
+            operator=RuleOperator.EQUALS,
+            value=1.0,
+        ),
+    )
+    return DecisionRule(
+        rule_id=rule_id,
+        name=name,
+        action=action,
+        conditions=conditions,
+        priority=priority,
+        reason=reason,
+    )

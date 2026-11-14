@@ -330,3 +330,30 @@ def test_external_provider_enforces_token_budget() -> None:
     res3 = provider.explain(req)
     assert res3.fallback_triggered is True
     assert res3.fallback_reason == "Token budget exhausted"
+
+
+def test_cost_controller_properties_and_window_expiry() -> None:
+    """Test cost controller tokens_consumed, record_tokens, window expiry, and default tokens."""
+    controller = CostController(max_requests_per_minute=2, max_tokens_budget=10)
+    assert controller.tokens_consumed == 0
+    assert controller.record_tokens(5) is True
+    assert controller.tokens_consumed == 5
+    assert controller.record_tokens(6) is False  # exceeds budget
+
+    # Window expiry on a fresh rate-limited controller
+    rate_ctrl = CostController(max_requests_per_minute=1)
+    rate_ctrl._timestamps.append(time.time() - 100.0)  # noqa: SLF001
+    allowed, err = rate_ctrl.check_and_record(tokens_used=0)
+    assert allowed is True
+    assert err is None
+
+    # Provider default tokens_per_request when budget configured
+    p = ExternalExplanationProvider(
+        endpoint_fn=lambda _p: "ok",
+        cost_controller=CostController(max_tokens_budget=5),
+    )
+    assert p.tokens_per_request == 1
+
+    # Record tokens with no budget
+    no_budget_ctrl = CostController()
+    assert no_budget_ctrl.record_tokens(100) is True

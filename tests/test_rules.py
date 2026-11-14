@@ -12,6 +12,13 @@ from fraud_detection.rules import (
     RuleOperator,
     RulePrecedence,
     RuleSet,
+    build_device_card_cycling_rule,
+    build_device_emulator_rule,
+    build_fraud_ring_rule,
+    build_geo_proxy_rule,
+    build_impossible_travel_rule,
+    build_merchant_bust_out_rule,
+    build_merchant_chargeback_rule,
 )
 
 
@@ -283,3 +290,121 @@ def test_ruleset_io_and_persistence(tmp_path: Path) -> None:
     bad_file.write_text("{corrupt json", encoding="utf-8")
     with pytest.raises(RuleError, match="Invalid JSON"):
         RuleSet.load_file(bad_file)
+
+
+def test_build_fraud_ring_rule_and_graph_evaluation() -> None:
+    rule = build_fraud_ring_rule(
+        rule_id="RULE_RING_CRIT",
+        min_ring_size=4,
+        min_risk_diffusion=0.8,
+    )
+    assert rule.rule_id == "RULE_RING_CRIT"
+    assert rule.action == RuleAction.DENY
+    assert rule.priority == 10
+
+    # Matching record
+    match_rec = {
+        "graph_ring_size": 5,
+        "graph_risk_diffusion": 0.85,
+    }
+    assert rule.evaluate(match_rec) is True
+
+    # Non-matching records
+    assert rule.evaluate({"graph_ring_size": 2, "graph_risk_diffusion": 0.9}) is False
+    assert rule.evaluate({"graph_ring_size": 6, "graph_risk_diffusion": 0.5}) is False
+    assert rule.evaluate({"Amount": 500.0}) is False
+
+
+def test_build_impossible_travel_and_geo_proxy_rules() -> None:
+    imp_rule = build_impossible_travel_rule(min_speed_kmh=800.0)
+    assert imp_rule.rule_id == "RULE_IMPOSSIBLE_TRAVEL_DENY"
+    assert imp_rule.action == RuleAction.DENY
+    assert imp_rule.priority == 15
+
+    # Impossible speed match
+    assert imp_rule.evaluate({"geo_is_impossible_travel": 1.0, "geo_speed_kmh": 850.0}) is True
+    # Sub-threshold speed
+    assert imp_rule.evaluate({"geo_is_impossible_travel": 1.0, "geo_speed_kmh": 750.0}) is False
+    # Not impossible travel
+    assert imp_rule.evaluate({"geo_is_impossible_travel": 0.0, "geo_speed_kmh": 950.0}) is False
+
+    proxy_rule = build_geo_proxy_rule()
+    assert proxy_rule.rule_id == "RULE_GEO_PROXY_CHALLENGE"
+    assert proxy_rule.action == RuleAction.CHALLENGE
+    assert proxy_rule.priority == 25
+
+    assert proxy_rule.evaluate({"geo_is_proxy": 1.0}) is True
+    assert proxy_rule.evaluate({"geo_is_proxy": 0.0}) is False
+    assert proxy_rule.evaluate({}) is False
+
+
+def test_rule_branch_coverage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # 1. DecisionRule.from_dict validations
+    with pytest.raises(RuleError, match="must be a dictionary"):
+        DecisionRule.from_dict("not-a-dict")  # type: ignore[arg-type]
+
+    with pytest.raises(RuleError, match="conditions must be a list"):
+        DecisionRule.from_dict(
+            {"rule_id": "r", "name": "n", "action": "deny", "conditions": "not-list"}
+        )
+
+    # 2. RuleSet.from_dict validations
+    with pytest.raises(RuleError, match="must be a dictionary containing 'rules'"):
+        RuleSet.from_dict({"not_rules": []})
+
+    with pytest.raises(RuleError, match="'rules' must be a list"):
+        RuleSet.from_dict({"rules": "not-list"})
+
+    # 3. RuleEvaluationResult.to_dict and RuleSet iteration
+    cond = RuleCondition("Amount", RuleOperator.GREATER_THAN, 100.0)
+    rule = DecisionRule("R1", "High Amount", RuleAction.DENY, (cond,))
+    ruleset = RuleSet((rule,))
+    assert list(ruleset) == [rule]
+
+    res = ruleset.evaluate_record({"Amount": 200.0})
+    d = res.to_dict()
+    assert d["matched"] is True
+    assert d["action"] == "DENY"
+
+    # 4. OSError on load_file
+    fake_file = tmp_path / "rules.json"
+    fake_file.write_text("{}", encoding="utf-8")
+
+    def _raise_os_error(*_args: object, **_kwargs: object) -> str:
+        raise OSError("disk error")
+
+    monkeypatch.setattr(Path, "read_text", _raise_os_error)
+    with pytest.raises(RuleError, match="Failed to read rules file"):
+        RuleSet.load_file(fake_file)
+
+
+def test_device_rules() -> None:
+    emu_rule = build_device_emulator_rule()
+    assert emu_rule.rule_id == "RULE_DEVICE_EMULATOR_DENY"
+    assert emu_rule.action == RuleAction.DENY
+    assert emu_rule.evaluate({"device_is_emulator": 1.0}) is True
+    assert emu_rule.evaluate({"device_is_emulator": 0.0}) is False
+    assert emu_rule.evaluate({}) is False
+
+    cycle_rule = build_device_card_cycling_rule()
+    assert cycle_rule.rule_id == "RULE_DEVICE_CARD_CYCLING_DENY"
+    assert cycle_rule.action == RuleAction.DENY
+    assert cycle_rule.evaluate({"device_is_card_cycling": 1.0}) is True
+    assert cycle_rule.evaluate({"device_is_card_cycling": 0.0}) is False
+    assert cycle_rule.evaluate({}) is False
+
+
+def test_merchant_rules() -> None:
+    cb_rule = build_merchant_chargeback_rule()
+    assert cb_rule.rule_id == "RULE_MERCHANT_CHARGEBACK_DENY"
+    assert cb_rule.action == RuleAction.DENY
+    assert cb_rule.evaluate({"merchant_is_high_chargeback": 1.0}) is True
+    assert cb_rule.evaluate({"merchant_is_high_chargeback": 0.0}) is False
+    assert cb_rule.evaluate({}) is False
+
+    bo_rule = build_merchant_bust_out_rule()
+    assert bo_rule.rule_id == "RULE_MERCHANT_BUST_OUT_DENY"
+    assert bo_rule.action == RuleAction.DENY
+    assert bo_rule.evaluate({"merchant_is_bust_out_surge": 1.0}) is True
+    assert bo_rule.evaluate({"merchant_is_bust_out_surge": 0.0}) is False
+    assert bo_rule.evaluate({}) is False

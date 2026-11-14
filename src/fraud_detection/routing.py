@@ -65,9 +65,7 @@ class CanaryConfig:
                 f"got {self.max_probability_divergence}"
             )
         if self.min_evaluations < 1:
-            raise RoutingError(
-                f"min_evaluations must be at least 1, got {self.min_evaluations}"
-            )
+            raise RoutingError(f"min_evaluations must be at least 1, got {self.min_evaluations}")
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize configuration parameters to dictionary."""

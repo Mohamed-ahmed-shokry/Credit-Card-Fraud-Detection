@@ -63,9 +63,7 @@ def test_feature_definition_validation_and_casting() -> None:
         f_int.validate_and_cast("invalid_int")
 
     # Bool casting
-    f_bool = FeatureDefinition(
-        name="is_active", feature_type=FeatureType.BOOL, default_value=False
-    )
+    f_bool = FeatureDefinition(name="is_active", feature_type=FeatureType.BOOL, default_value=False)
     assert f_bool.validate_and_cast(True) is True
     assert f_bool.validate_and_cast("true") is True
     assert f_bool.validate_and_cast("YES") is True
@@ -146,9 +144,7 @@ def test_feature_snapshot_validation_and_serialization() -> None:
 
 
 def test_in_memory_feature_store_crud_and_lookups() -> None:
-    f_risk = FeatureDefinition(
-        name="risk_score", feature_type=FeatureType.FLOAT, default_value=0.1
-    )
+    f_risk = FeatureDefinition(name="risk_score", feature_type=FeatureType.FLOAT, default_value=0.1)
     f_tier = FeatureDefinition(
         name="tier", feature_type=FeatureType.STRING, default_value="standard"
     )
@@ -318,9 +314,7 @@ def test_file_feature_store_save_and_load(tmp_path: Path) -> None:
     f_risk = FeatureDefinition(name="risk", feature_type=FeatureType.FLOAT, default_value=0.0)
     view = FeatureView(name="v1", entity_key="card_id", features=(f_risk,))
     store = FileFeatureStore(views=[view])
-    store.put_snapshot(
-        "v1", FeatureSnapshot(entity_id="c1", timestamp=10.0, values={"risk": 0.42})
-    )
+    store.put_snapshot("v1", FeatureSnapshot(entity_id="c1", timestamp=10.0, values={"risk": 0.42}))
 
     file_path = tmp_path / "sub" / "store.json"
     store.save_to_file(file_path)
