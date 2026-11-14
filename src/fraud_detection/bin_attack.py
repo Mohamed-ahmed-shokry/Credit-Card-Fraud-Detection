@@ -7,6 +7,7 @@ distributed botnet BIN attacks across merchants and IP/device clusters.
 
 from __future__ import annotations
 
+from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -23,6 +24,8 @@ __all__ = [
     "BinPrefixProfile",
     "EnumerationAnalyzer",
     "EnumerationMetrics",
+    "VelocityDeclineAnalyzer",
+    "VelocityDeclineMetrics",
 ]
 
 
@@ -334,6 +337,128 @@ class EnumerationAnalyzer:
             sequential_run_length=best_run,
             probing_count=probing_count,
             unique_last4_count=len(unique_last4),
+            anomalies=tuple(anomalies),
+            reasons=tuple(reasons),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class VelocityDeclineMetrics:
+    """Computed micro-auth velocity, decline ratio, and IP/card sweep metrics."""
+
+    total_attempts: int
+    decline_ratio: float
+    micro_auth_ratio: float
+    unique_ips: int
+    unique_cards: int
+    max_cards_per_ip: int
+    anomalies: tuple[BinAttackAnomalyType, ...]
+    reasons: tuple[str, ...]
+
+
+class VelocityDeclineAnalyzer:
+    """Detects micro-auth velocity spikes, high decline ratios, and distributed BIN sweeps."""
+
+    def __init__(
+        self,
+        *,
+        window_seconds: int = 300,
+        micro_auth_amount: float = 5.0,
+        micro_auth_threshold: int = 4,
+        min_attempts_for_decline: int = 4,
+        decline_ratio_threshold: float = 0.70,
+        distributed_ip_threshold: int = 4,
+        multi_card_ip_threshold: int = 4,
+    ) -> None:
+        self.window_seconds = window_seconds
+        self.micro_auth_amount = micro_auth_amount
+        self.micro_auth_threshold = micro_auth_threshold
+        self.min_attempts_for_decline = min_attempts_for_decline
+        self.decline_ratio_threshold = decline_ratio_threshold
+        self.distributed_ip_threshold = distributed_ip_threshold
+        self.multi_card_ip_threshold = multi_card_ip_threshold
+
+    def analyze(
+        self,
+        attempts: list[BinAuthAttempt],
+        *,
+        now: datetime | None = None,
+    ) -> VelocityDeclineMetrics:
+        if not attempts:
+            return VelocityDeclineMetrics(
+                total_attempts=0,
+                decline_ratio=0.0,
+                micro_auth_ratio=0.0,
+                unique_ips=0,
+                unique_cards=0,
+                max_cards_per_ip=0,
+                anomalies=(),
+                reasons=(),
+            )
+        ref_time = now or max(a.timestamp for a in attempts)
+        cutoff = ref_time - timedelta(seconds=self.window_seconds)
+        window_attempts = [a for a in attempts if a.timestamp >= cutoff]
+        if not window_attempts:
+            return VelocityDeclineMetrics(
+                total_attempts=0,
+                decline_ratio=0.0,
+                micro_auth_ratio=0.0,
+                unique_ips=0,
+                unique_cards=0,
+                max_cards_per_ip=0,
+                anomalies=(),
+                reasons=(),
+            )
+
+        total = len(window_attempts)
+        declines = sum(1 for a in window_attempts if a.response_code != AuthResponseCode.APPROVED)
+        micro_auths = sum(1 for a in window_attempts if a.amount <= self.micro_auth_amount)
+        decline_ratio = declines / total
+        micro_auth_ratio = micro_auths / total
+
+        cards_by_ip: dict[str, set[str]] = defaultdict(set)
+        all_cards: set[str] = set()
+        for att in window_attempts:
+            card_key = att.card_fingerprint or f"{att.bin_prefix}:{att.last4}"
+            all_cards.add(card_key)
+            if att.ip_address:
+                cards_by_ip[att.ip_address].add(card_key)
+
+        unique_ips = len(cards_by_ip)
+        unique_cards = len(all_cards)
+        max_cards_per_ip = max((len(c) for c in cards_by_ip.values()), default=0)
+
+        anomalies: list[BinAttackAnomalyType] = []
+        reasons: list[str] = []
+
+        if micro_auths >= self.micro_auth_threshold:
+            anomalies.append(BinAttackAnomalyType.MICRO_AUTH_VELOCITY)
+            reasons.append(
+                f"{micro_auths} micro-authorizations <= ${self.micro_auth_amount:.2f} "
+                f"within {self.window_seconds}s"
+            )
+        if total >= self.min_attempts_for_decline and decline_ratio >= self.decline_ratio_threshold:
+            anomalies.append(BinAttackAnomalyType.HIGH_DECLINE_RATIO)
+            reasons.append(f"Decline ratio {decline_ratio:.2f} across {total} attempts")
+        if (
+            unique_ips >= self.distributed_ip_threshold
+            and unique_cards >= self.distributed_ip_threshold
+        ):
+            anomalies.append(BinAttackAnomalyType.DISTRIBUTED_BIN_SWEEP)
+            reasons.append(
+                f"Distributed BIN sweep across {unique_ips} IPs and {unique_cards} cards"
+            )
+        if max_cards_per_ip >= self.multi_card_ip_threshold:
+            anomalies.append(BinAttackAnomalyType.MULTI_CARD_IP_BURST)
+            reasons.append(f"Single IP probed {max_cards_per_ip} distinct cards")
+
+        return VelocityDeclineMetrics(
+            total_attempts=total,
+            decline_ratio=decline_ratio,
+            micro_auth_ratio=micro_auth_ratio,
+            unique_ips=unique_ips,
+            unique_cards=unique_cards,
+            max_cards_per_ip=max_cards_per_ip,
             anomalies=tuple(anomalies),
             reasons=tuple(reasons),
         )
