@@ -2822,10 +2822,13 @@ Provide deterministic, real-time mule account detection, fund exfiltration scori
 - Task 9: Update `ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md` and verify 100% green local & remote CI.
 
 ### Micro-Commits
+- `2a75fa2`..`9db5893`: Implemented `first_party_fraud.py` (`RefundAbuseAnalyzer`, `FriendlyFraudAnalyzer`, `PromoAbuseDetector`, `FirstPartyAccountStore`, `FirstPartyFraudEngine`), registered `FIRST_PARTY_*` / `REFUND_RESTRICTED` / `ACCOUNT_PRIVILEGES_REVOKED` events in `events.py`, added `/v1/first-party/*` endpoints and Prometheus metrics in `api.py`, added `first-party-*` CLI commands in `cli.py`, achieved 99.23% unit branch coverage, added API & CLI integration tests, and documented architecture and usage.
+
+### Micro-Commits
 - `1818507`..`ded7e8a`: Implemented `mule_detection.py` (`PassThroughAnalyzer`, `MuleNetworkAnalyzer`, `DormancyBurstDetector`, `MuleAccountStore`, `MuleDetectionEngine`), registered `MULE_*` events in `events.py`, added `/v1/mule/*` endpoints and Prometheus metrics in `api.py`, added `mule-*` CLI commands in `cli.py`, added full unit/integration tests, and documented architecture and usage.
 
 
-## Phase 51 — First-Party Fraud, Refund Abuse & Friendly Fraud Detection Engine (In progress)
+## Phase 51 — First-Party Fraud, Refund Abuse & Friendly Fraud Detection Engine (Done)
 
 Phase 51 implements an in-process, zero-external-dependency First-Party Fraud, Refund Abuse & Friendly Fraud Detection Engine (`first_party_fraud.py`). It detects legitimate cardholders and account owners exploiting merchant refund, chargeback, and promotional policies via serial friendly-fraud disputes ("cyber shoplifting"), high-ratio wardrobing/return abuse, Item-Not-Received (INR) / empty-box claim bursts, and multi-account promo/referral cycling.
 
@@ -2888,6 +2891,9 @@ Provide deterministic, real-time first-party fraud scoring, refund/dispute abuse
 - Task 7: Add `/v1/first-party/*` REST endpoints and Prometheus metrics in `api.py` + tests.
 - Task 8: Add `first-party-*` CLI commands in `cli.py` + tests.
 - Task 9: Update `ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md` and verify 100% green local & remote CI.
+
+### Micro-Commits
+- `2a75fa2`..`9db5893`: Implemented `first_party_fraud.py` (`RefundAbuseAnalyzer`, `FriendlyFraudAnalyzer`, `PromoAbuseDetector`, `FirstPartyAccountStore`, `FirstPartyFraudEngine`), registered `FIRST_PARTY_*` / `REFUND_RESTRICTED` / `ACCOUNT_PRIVILEGES_REVOKED` events in `events.py`, added `/v1/first-party/*` endpoints and Prometheus metrics in `api.py`, added `first-party-*` CLI commands in `cli.py`, achieved 99.23% unit branch coverage, added API & CLI integration tests, and documented architecture and usage.
 
 
 ## Contributing to the roadmap
