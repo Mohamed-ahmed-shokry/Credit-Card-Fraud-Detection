@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -16,6 +16,7 @@ from fraud_detection.first_party_fraud import (
     FirstPartyEventRecord,
     FirstPartyRiskLevel,
     OrderClaimType,
+    RefundAbuseAnalyzer,
     _coerce_utc_datetime,
 )
 
@@ -106,3 +107,74 @@ def test_first_party_enums_and_model_round_trip() -> None:
     )
     restored_assessment = FirstPartyAssessment.from_dict(assessment.to_dict())
     assert restored_assessment == assessment
+
+
+def test_refund_abuse_analyzer_detects_wardrobing_inr_and_skew() -> None:
+    analyzer = RefundAbuseAnalyzer()
+    empty = analyzer.analyze([])
+    assert empty.return_ratio == 0.0
+    assert empty.anomalies == ()
+
+    now = datetime(2026, 11, 14, 12, 0, 0, tzinfo=UTC)
+    events = [
+        FirstPartyEventRecord(
+            event_id="p-1",
+            account_id="acct-1",
+            claim_type=OrderClaimType.PURCHASE,
+            amount=100.0,
+            timestamp=now - timedelta(days=10),
+            merchant_category="apparel",
+        ),
+        FirstPartyEventRecord(
+            event_id="p-2",
+            account_id="acct-1",
+            claim_type=OrderClaimType.PURCHASE,
+            amount=100.0,
+            timestamp=now - timedelta(days=8),
+            merchant_category="electronics",
+        ),
+        FirstPartyEventRecord(
+            event_id="r-1",
+            account_id="acct-1",
+            claim_type=OrderClaimType.REFUND_RETURN,
+            amount=200.0,
+            timestamp=now - timedelta(days=5),
+            merchant_category="apparel",
+        ),
+        FirstPartyEventRecord(
+            event_id="r-2",
+            account_id="acct-1",
+            claim_type=OrderClaimType.REFUND_RETURN,
+            amount=180.0,
+            timestamp=now - timedelta(days=3),
+            merchant_category="electronics",
+        ),
+        FirstPartyEventRecord(
+            event_id="inr-1",
+            account_id="acct-1",
+            claim_type=OrderClaimType.INR_CLAIM,
+            amount=150.0,
+            timestamp=now - timedelta(days=2),
+        ),
+        FirstPartyEventRecord(
+            event_id="inr-2",
+            account_id="acct-1",
+            claim_type=OrderClaimType.INR_CLAIM,
+            amount=150.0,
+            timestamp=now - timedelta(days=1),
+        ),
+    ]
+    metrics = analyzer.analyze(events, now=now)
+    assert metrics.purchase_volume == 200.0
+    assert metrics.refund_volume == 680.0
+    assert metrics.return_ratio == 2.0
+    assert metrics.inr_claim_count == 2
+    assert metrics.wardrobing_count == 2
+    assert metrics.high_value_skew is True
+    assert FirstPartyAnomalyType.HIGH_RETURN_RATIO in metrics.anomalies
+    assert FirstPartyAnomalyType.WARDROBING_PATTERN in metrics.anomalies
+    assert FirstPartyAnomalyType.INR_CLAIM_BURST in metrics.anomalies
+    assert FirstPartyAnomalyType.HIGH_VALUE_REFUND_SKEW in metrics.anomalies
+
+    refund_only = analyzer.analyze([events[2]], now=now)
+    assert refund_only.return_ratio == 1.0
