@@ -8,11 +8,11 @@ and multi-account promo/referral cycling.
 
 from __future__ import annotations
 
+import threading
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
-import threading
 from typing import Any
 
 __all__ = [
