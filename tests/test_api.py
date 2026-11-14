@@ -6974,3 +6974,100 @@ def test_sif_api_error_branches_and_edge_cases(api_context: tuple[Path, Any, Pat
         assert client.post("/v1/sif/profiles", json=eval_payload).status_code == 500
         assert client.get("/v1/sif/applicants/app_1").status_code == 500
         assert client.get("/v1/sif/profiles").status_code == 500
+
+
+def test_mule_api_endpoints_and_metrics(api_context: tuple[Path, Any, Path]) -> None:
+    """Validate /v1/mule/* transfer ingestion, evaluation, retrieval, and Prometheus metrics."""
+    from fraud_detection.mule_detection import MuleDetectionEngine
+
+    _, model, _ = api_context
+    mule_engine = MuleDetectionEngine()
+    app = create_app(model=model, mule_engine=mule_engine)
+
+    with TestClient(app) as client:
+        # 1. Ingest inbound + rapid crypto outbound transfers
+        r1 = client.post(
+            "/v1/mule/transfers",
+            json={
+                "account_id": "acct_api_mule",
+                "counterparty_id": "src_victim_1",
+                "direction": "inbound",
+                "amount": 5000.0,
+                "channel": "p2p_wallet",
+                "timestamp": "2026-11-12T10:00:00+00:00",
+            },
+        )
+        assert r1.status_code == 200
+        assert r1.json()["action"] == "allow"
+
+        r2 = client.post(
+            "/v1/mule/transfers",
+            json={
+                "account_id": "acct_api_mule",
+                "counterparty_id": "crypto_1",
+                "direction": "outbound",
+                "amount": 4900.0,
+                "channel": "crypto_exchange",
+                "timestamp": "2026-11-12T10:30:00+00:00",
+            },
+        )
+        assert r2.status_code == 200
+        ass_data = r2.json()
+        assert ass_data["risk_level"] in ("high", "critical")
+        assert ass_data["pass_through_ratio"] >= 0.95
+        ass_id = ass_data["assessment_id"]
+
+        # 2. Evaluate on demand (existing + fresh account)
+        ev1 = client.post("/v1/mule/evaluate", json={"account_id": "acct_api_mule"})
+        assert ev1.status_code == 200
+        ev2 = client.post("/v1/mule/evaluate", json={"account_id": "acct_api_fresh"})
+        assert ev2.status_code == 200
+        assert ev2.json()["action"] == "allow"
+
+        # 3. Get assessment & list assessments
+        get_ass = client.get(f"/v1/mule/assessments/{ass_id}")
+        assert get_ass.status_code == 200
+        assert get_ass.json()["assessment_id"] == ass_id
+
+        list_ass = client.get("/v1/mule/assessments", params={"tenant_id": "default"})
+        assert list_ass.status_code == 200
+        assert list_ass.json()["total_count"] >= 3
+
+        # 4. Get account profile
+        get_acct = client.get("/v1/mule/accounts/acct_api_mule")
+        assert get_acct.status_code == 200
+        assert len(get_acct.json()["transfers"]) == 2
+
+        # 5. Summary and Prometheus metrics
+        summary = client.get("/v1/mule/metrics")
+        assert summary.status_code == 200
+        assert summary.json()["status"] == "operational"
+        assert summary.json()["total_accounts_monitored"] >= 2
+
+        prom = client.get("/metrics")
+        assert prom.status_code == 200
+        assert "fraud_mule_evaluations_total" in prom.text
+        assert "fraud_mule_flagged_total" in prom.text
+
+
+def test_mule_api_error_branches(api_context: tuple[Path, Any, Path]) -> None:
+    """Validate 404 and 500 error branches on /v1/mule/* endpoints."""
+    _, model, _ = api_context
+    app = create_app(model=model)
+
+    with TestClient(app) as client:
+        assert client.get("/v1/mule/assessments/mule_missing").status_code == 404
+        assert client.get("/v1/mule/accounts/acct_missing").status_code == 404
+
+        app.state.mule_engine = None
+        xfer_payload = {
+            "account_id": "acct_x",
+            "counterparty_id": "cp_x",
+            "direction": "inbound",
+            "amount": 100.0,
+        }
+        assert client.post("/v1/mule/transfers", json=xfer_payload).status_code == 500
+        assert client.post("/v1/mule/evaluate", json={"account_id": "acct_x"}).status_code == 500
+        assert client.get("/v1/mule/assessments/mule_1").status_code == 500
+        assert client.get("/v1/mule/assessments").status_code == 500
+        assert client.get("/v1/mule/accounts/acct_x").status_code == 500
