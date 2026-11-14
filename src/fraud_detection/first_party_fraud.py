@@ -8,15 +8,18 @@ and multi-account promo/referral cycling.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
+import threading
 from typing import Any
 
 __all__ = [
     "WARDROBING_CATEGORIES",
     "ClaimOutcome",
     "FirstPartyAccountProfile",
+    "FirstPartyAccountStore",
     "FirstPartyAction",
     "FirstPartyAnomalyType",
     "FirstPartyAssessment",
@@ -559,3 +562,144 @@ class PromoAbuseDetector:
             anomalies=tuple(anomalies),
             reasons=tuple(reasons),
         )
+
+
+class FirstPartyAccountStore:
+    """Thread-safe in-memory store for first-party account profiles and assessments."""
+
+    def __init__(
+        self,
+        *,
+        max_accounts: int = 10_000,
+        max_assessments: int = 20_000,
+        max_events_per_account: int = 500,
+    ) -> None:
+        self._lock = threading.RLock()
+        self._max_accounts = max_accounts
+        self._max_assessments = max_assessments
+        self._max_events_per_account = max_events_per_account
+        self._profiles: OrderedDict[str, FirstPartyAccountProfile] = OrderedDict()
+        self._assessments: OrderedDict[str, FirstPartyAssessment] = OrderedDict()
+        self._tenant_index: dict[str, set[str]] = {}
+        self._shipping_index: dict[str, set[str]] = {}
+        self._payment_index: dict[str, set[str]] = {}
+
+    def record_event(self, record: FirstPartyEventRecord) -> FirstPartyAccountProfile:
+        with self._lock:
+            profile = self._profiles.get(record.account_id)
+            if profile is None:
+                while len(self._profiles) >= self._max_accounts:
+                    evicted_id, evicted = self._profiles.popitem(last=False)
+                    self._tenant_index.get(evicted.tenant_id, set()).discard(evicted_id)
+                profile = FirstPartyAccountProfile(
+                    account_id=record.account_id,
+                    tenant_id=record.tenant_id,
+                    created_at=record.timestamp,
+                )
+            else:
+                self._profiles.move_to_end(record.account_id)
+
+            profile.events.append(record)
+            if len(profile.events) > self._max_events_per_account:
+                profile.events = profile.events[-self._max_events_per_account :]
+
+            self._profiles[record.account_id] = profile
+            self._tenant_index.setdefault(record.tenant_id, set()).add(record.account_id)
+
+            if record.shipping_address_hash:
+                peers = self._shipping_index.setdefault(record.shipping_address_hash, set())
+                peers.add(record.account_id)
+                for peer in peers:
+                    if peer != record.account_id:
+                        profile.linked_accounts.add(peer)
+                        peer_profile = self._profiles.get(peer)
+                        if peer_profile is not None:
+                            peer_profile.linked_accounts.add(record.account_id)
+
+            if record.payment_instrument_hash:
+                peers = self._payment_index.setdefault(record.payment_instrument_hash, set())
+                peers.add(record.account_id)
+                for peer in peers:
+                    if peer != record.account_id:
+                        profile.linked_accounts.add(peer)
+                        peer_profile = self._profiles.get(peer)
+                        if peer_profile is not None:
+                            peer_profile.linked_accounts.add(record.account_id)
+
+            return profile
+
+    def get_profile(self, account_id: str) -> FirstPartyAccountProfile | None:
+        with self._lock:
+            return self._profiles.get(account_id)
+
+    def save_assessment(self, assessment: FirstPartyAssessment) -> None:
+        with self._lock:
+            while len(self._assessments) >= self._max_assessments:
+                self._assessments.popitem(last=False)
+            self._assessments[assessment.assessment_id] = assessment
+
+    def get_assessment(self, assessment_id: str) -> FirstPartyAssessment | None:
+        with self._lock:
+            return self._assessments.get(assessment_id)
+
+    def list_assessments(
+        self,
+        *,
+        account_id: str | None = None,
+        risk_level: FirstPartyRiskLevel | None = None,
+        tenant_id: str | None = None,
+        limit: int = 100,
+    ) -> list[FirstPartyAssessment]:
+        with self._lock:
+            items = list(self._assessments.values())
+            items.reverse()
+            filtered = [
+                item
+                for item in items
+                if (account_id is None or item.account_id == account_id)
+                and (risk_level is None or item.risk_level == risk_level)
+                and (tenant_id is None or item.tenant_id == tenant_id)
+            ]
+            return filtered[:limit]
+
+    def summary(self) -> dict[str, Any]:
+        with self._lock:
+            risk_counts: dict[str, int] = {level.value: 0 for level in FirstPartyRiskLevel}
+            for profile in self._profiles.values():
+                risk_counts[profile.risk_level.value] += 1
+            return {
+                "total_accounts": len(self._profiles),
+                "total_assessments": len(self._assessments),
+                "risk_distribution": risk_counts,
+            }
+
+    def export_state(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "profiles": [p.to_dict() for p in self._profiles.values()],
+                "assessments": [a.to_dict() for a in self._assessments.values()],
+            }
+
+    def load_state(self, payload: dict[str, Any]) -> None:
+        with self._lock:
+            self._profiles.clear()
+            self._assessments.clear()
+            self._tenant_index.clear()
+            self._shipping_index.clear()
+            self._payment_index.clear()
+            for p_raw in payload.get("profiles", []):
+                profile = FirstPartyAccountProfile.from_dict(p_raw)
+                self._profiles[profile.account_id] = profile
+                self._tenant_index.setdefault(profile.tenant_id, set()).add(profile.account_id)
+                for ev in profile.events:
+                    if ev.shipping_address_hash:
+                        self._shipping_index.setdefault(ev.shipping_address_hash, set()).add(
+                            profile.account_id
+                        )
+                    if ev.payment_instrument_hash:
+                        self._payment_index.setdefault(ev.payment_instrument_hash, set()).add(
+                            profile.account_id
+                        )
+            for a_raw in payload.get("assessments", []):
+                assessment = FirstPartyAssessment.from_dict(a_raw)
+                self._assessments[assessment.assessment_id] = assessment
