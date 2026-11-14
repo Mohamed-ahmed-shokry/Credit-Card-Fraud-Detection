@@ -12,13 +12,16 @@ from fraud_detection.bin_attack import (
     BinAttackAction,
     BinAttackAnomalyType,
     BinAttackAssessment,
+    BinAttackDefenseEngine,
     BinAttackRiskLevel,
+    BinAttackStore,
     BinAuthAttempt,
     BinPrefixProfile,
     EnumerationAnalyzer,
     VelocityDeclineAnalyzer,
     _coerce_utc_datetime,
 )
+from fraud_detection.cases import CaseManager
 
 
 def test_bin_attack_enums_and_model_round_trip() -> None:
@@ -204,3 +207,74 @@ def test_velocity_decline_analyzer_detects_micro_auth_and_distributed_sweeps() -
     m2 = analyzer.analyze(dist_attempts, now=now)
     assert m2.unique_ips == 4
     assert BinAttackAnomalyType.DISTRIBUTED_BIN_SWEEP in m2.anomalies
+
+
+def test_store_eviction_and_engine_case_escalation() -> None:
+    store = BinAttackStore(max_bins=2, max_assessments=2, max_attempts_per_bin=10)
+    now = datetime(2026, 11, 15, 0, 30, 0, tzinfo=UTC)
+
+    store.record_attempt(
+        BinAuthAttempt(
+            attempt_id="old-b",
+            bin_prefix="400000",
+            last4="0001",
+            amount=50.0,
+            response_code=AuthResponseCode.APPROVED,
+            timestamp=now,
+        )
+    )
+    store.record_attempt(
+        BinAuthAttempt(
+            attempt_id="b1",
+            bin_prefix="411111",
+            last4="0001",
+            amount=50.0,
+            response_code=AuthResponseCode.APPROVED,
+            timestamp=now,
+        )
+    )
+    # Third BIN evicts 400000
+    store.record_attempt(
+        BinAuthAttempt(
+            attempt_id="b2",
+            bin_prefix="422222",
+            last4="1000",
+            amount=1.0,
+            response_code=AuthResponseCode.CVV_MISMATCH,
+            timestamp=now,
+            ip_address="203.0.113.5",
+        )
+    )
+    assert store.get_profile("400000") is None
+
+    case_mgr = CaseManager()
+    engine = BinAttackDefenseEngine(store=store, case_manager=case_mgr)
+    with pytest.raises(KeyError):
+        engine.evaluate_bin("999999")
+
+    # Drive 422222 to CRITICAL (BLOCK_GATEWAY_SESSION) with sequential + probing + micro-auth
+    for idx in range(1, 6):
+        engine.record_attempt(
+            BinAuthAttempt(
+                attempt_id=f"b2-{idx}",
+                bin_prefix="422222",
+                last4=f"{1000 + idx:04d}",
+                amount=1.0,
+                response_code=AuthResponseCode.CVV_MISMATCH,
+                timestamp=now + timedelta(seconds=idx),
+                ip_address="203.0.113.5",
+            )
+        )
+    assessment = engine.evaluate_bin("422222", now=now + timedelta(seconds=10))
+    assert assessment.risk_level == BinAttackRiskLevel.CRITICAL
+    assert assessment.action == BinAttackAction.BLOCK_GATEWAY_SESSION
+    assert assessment.case_id is not None
+    assert len(case_mgr.store.list_cases()) == 1
+    assert engine.get_assessment(assessment.assessment_id) == assessment
+    assert len(engine.list_assessments(bin_prefix="422222")) == 1
+
+    exported = store.export_state()
+    restored = BinAttackStore()
+    restored.load_state(exported)
+    assert restored.summary()["total_bins"] == 2
+    assert restored.get_assessment(assessment.assessment_id) is not None
