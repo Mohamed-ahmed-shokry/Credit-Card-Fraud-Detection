@@ -9,7 +9,7 @@ and multi-account promo/referral cycling.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Any
 
@@ -23,6 +23,8 @@ __all__ = [
     "FirstPartyEventRecord",
     "FirstPartyRiskLevel",
     "OrderClaimType",
+    "RefundAbuseAnalyzer",
+    "RefundAbuseMetrics",
 ]
 
 
@@ -291,4 +293,124 @@ class FirstPartyAssessment:
             case_id=payload.get("case_id"),
             reasons=tuple(str(r) for r in payload.get("reasons", [])),
             evaluated_at=_coerce_utc_datetime(payload["evaluated_at"]),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class RefundAbuseMetrics:
+    """Computed refund, wardrobing, and INR claim metrics for an account."""
+
+    purchase_volume: float
+    refund_volume: float
+    return_ratio: float
+    inr_claim_count: int
+    wardrobing_count: int
+    high_value_skew: bool
+    anomalies: tuple[FirstPartyAnomalyType, ...]
+    reasons: tuple[str, ...]
+
+
+class RefundAbuseAnalyzer:
+    """Detects serial return abuse, wardrobing, high-value refund skew, and INR bursts."""
+
+    def __init__(
+        self,
+        *,
+        window_days: int = 90,
+        return_ratio_threshold: float = 0.50,
+        min_refund_volume: float = 100.0,
+        wardrobing_threshold: int = 2,
+        inr_claim_threshold: int = 2,
+        skew_multiplier: float = 1.5,
+    ) -> None:
+        self.window_days = window_days
+        self.return_ratio_threshold = return_ratio_threshold
+        self.min_refund_volume = min_refund_volume
+        self.wardrobing_threshold = wardrobing_threshold
+        self.inr_claim_threshold = inr_claim_threshold
+        self.skew_multiplier = skew_multiplier
+
+    def analyze(
+        self,
+        events: list[FirstPartyEventRecord],
+        *,
+        now: datetime | None = None,
+    ) -> RefundAbuseMetrics:
+        if not events:
+            return RefundAbuseMetrics(
+                purchase_volume=0.0,
+                refund_volume=0.0,
+                return_ratio=0.0,
+                inr_claim_count=0,
+                wardrobing_count=0,
+                high_value_skew=False,
+                anomalies=(),
+                reasons=(),
+            )
+        ref_time = now or max(e.timestamp for e in events)
+        cutoff = ref_time - timedelta(days=self.window_days)
+        window_events = [e for e in events if e.timestamp >= cutoff]
+
+        purchases = [e for e in window_events if e.claim_type == OrderClaimType.PURCHASE]
+        refunds = [
+            e
+            for e in window_events
+            if e.claim_type in {OrderClaimType.REFUND_RETURN, OrderClaimType.INR_CLAIM}
+            and e.outcome != ClaimOutcome.DENIED
+        ]
+        inr_claims = [e for e in window_events if e.claim_type == OrderClaimType.INR_CLAIM]
+
+        purchase_volume = sum(e.amount for e in purchases)
+        refund_volume = sum(e.amount for e in refunds)
+        if purchase_volume > 0:
+            return_ratio = min(refund_volume / purchase_volume, 2.0)
+        else:
+            return_ratio = 1.0 if refund_volume > 0 else 0.0
+
+        wardrobing_count = sum(
+            1
+            for e in window_events
+            if e.claim_type == OrderClaimType.REFUND_RETURN
+            and e.merchant_category.lower() in WARDROBING_CATEGORIES
+        )
+
+        avg_purchase = purchase_volume / len(purchases) if purchases else 0.0
+        avg_refund = refund_volume / len(refunds) if refunds else 0.0
+        high_value_skew = (
+            avg_purchase > 0
+            and avg_refund >= self.skew_multiplier * avg_purchase
+            and len(refunds) >= 2
+        )
+
+        anomalies: list[FirstPartyAnomalyType] = []
+        reasons: list[str] = []
+
+        if return_ratio >= self.return_ratio_threshold and refund_volume >= self.min_refund_volume:
+            anomalies.append(FirstPartyAnomalyType.HIGH_RETURN_RATIO)
+            reasons.append(
+                f"Return-to-purchase ratio {return_ratio:.2f} exceeds {self.return_ratio_threshold:.2f}"
+            )
+        if wardrobing_count >= self.wardrobing_threshold:
+            anomalies.append(FirstPartyAnomalyType.WARDROBING_PATTERN)
+            reasons.append(f"{wardrobing_count} returns in wardrobing-prone categories")
+        if len(inr_claims) >= self.inr_claim_threshold:
+            anomalies.append(FirstPartyAnomalyType.INR_CLAIM_BURST)
+            reasons.append(
+                f"{len(inr_claims)} Item-Not-Received (INR) claims within {self.window_days}d"
+            )
+        if high_value_skew:
+            anomalies.append(FirstPartyAnomalyType.HIGH_VALUE_REFUND_SKEW)
+            reasons.append(
+                f"Average refund (${avg_refund:.2f}) >= {self.skew_multiplier:.1f}x avg purchase (${avg_purchase:.2f})"
+            )
+
+        return RefundAbuseMetrics(
+            purchase_volume=purchase_volume,
+            refund_volume=refund_volume,
+            return_ratio=return_ratio,
+            inr_claim_count=len(inr_claims),
+            wardrobing_count=wardrobing_count,
+            high_value_skew=high_value_skew,
+            anomalies=tuple(anomalies),
+            reasons=tuple(reasons),
         )
