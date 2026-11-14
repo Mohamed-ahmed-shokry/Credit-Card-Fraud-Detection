@@ -11,7 +11,7 @@
 - [x] Task 3: Implement `RefundAbuseAnalyzer` + unit tests.
 - [x] Task 4: Implement `FriendlyFraudAnalyzer` & `PromoAbuseDetector` + unit tests.
 - [x] Task 5: Implement `FirstPartyAccountStore` & `FirstPartyFraudEngine` + unit tests.
-- [ ] Task 6: Register `FIRST_PARTY_*` / `REFUND_RESTRICTED` / `ACCOUNT_PRIVILEGES_REVOKED` events in `src/fraud_detection/events.py` and wire `EventBus` into `FirstPartyFraudEngine` + tests.
+- [x] Task 6: Register `FIRST_PARTY_*` / `REFUND_RESTRICTED` / `ACCOUNT_PRIVILEGES_REVOKED` events in `src/fraud_detection/events.py` and wire `EventBus` into `FirstPartyFraudEngine` + tests.
 - [ ] Task 7: Add `/v1/first-party/*` REST endpoints and Prometheus metrics in `src/fraud_detection/api.py` + tests in `tests/test_api.py`.
 - [ ] Task 8: Add `first-party-ingest`, `first-party-eval`, `first-party-inspect`, and `first-party-summary` CLI commands in `src/fraud_detection/cli.py` + tests in `tests/test_cli.py`.
 - [ ] Task 9: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate with 100% Green CI.
@@ -23,7 +23,7 @@
 | AC-2 (Refund & Return Abuse) | PASSED | `RefundAbuseAnalyzer` verified on return-to-purchase ratios, wardrobing, INR claim bursts, and high-value refund skew in `tests/test_first_party_fraud.py` |
 | AC-3 (Friendly Fraud & Promo Cycling) | PASSED | `FriendlyFraudAnalyzer` and `PromoAbuseDetector` verified on verified-delivery disputes, pre-dispute velocity, promo abuse, and linked-account cycling in `tests/test_first_party_fraud.py` |
 | AC-4 (Engine, Store & Escalation) | PASSED | `FirstPartyFraudEngine` and `FirstPartyAccountStore` verified on scoring, policy routing, capacity eviction, linked accounts, and `CaseManager` escalation in `tests/test_first_party_fraud.py` |
-| AC-5 (EventBus Streaming) | PENDING | Pending Task 6 |
+| AC-5 (EventBus Streaming) | PASSED | `FIRST_PARTY_EVALUATED`, `FIRST_PARTY_ABUSE_DETECTED`, `REFUND_RESTRICTED`, `ACCOUNT_PRIVILEGES_REVOKED` registered in `events.py` and verified in `tests/test_first_party_fraud.py` |
 | AC-6 (REST API & Metrics) | PENDING | Pending Task 7 |
 | AC-7 (CLI Workflows) | PENDING | Pending Task 8 |
 | AC-8 (Quality Standards & 100% Green CI) | PENDING | Pending Task 9 |
