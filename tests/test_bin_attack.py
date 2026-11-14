@@ -16,6 +16,7 @@ from fraud_detection.bin_attack import (
     BinAuthAttempt,
     BinPrefixProfile,
     EnumerationAnalyzer,
+    VelocityDeclineAnalyzer,
     _coerce_utc_datetime,
 )
 
@@ -147,3 +148,59 @@ def test_enumeration_analyzer_detects_sequential_pan_and_probing() -> None:
     assert metrics.unique_last4_count == 5
     assert BinAttackAnomalyType.SEQUENTIAL_PAN_ENUMERATION in metrics.anomalies
     assert BinAttackAnomalyType.CVV_EXPIRY_PROBING in metrics.anomalies
+
+
+def test_velocity_decline_analyzer_detects_micro_auth_and_distributed_sweeps() -> None:
+    analyzer = VelocityDeclineAnalyzer()
+    assert analyzer.analyze([]).total_attempts == 0
+
+    now = datetime(2026, 11, 15, 0, 30, 0, tzinfo=UTC)
+    old_only = [
+        BinAuthAttempt(
+            attempt_id="old-1",
+            bin_prefix="411111",
+            last4="0001",
+            amount=1.0,
+            response_code=AuthResponseCode.APPROVED,
+            timestamp=now - timedelta(hours=2),
+        )
+    ]
+    assert analyzer.analyze(old_only, now=now).total_attempts == 0
+
+    # Single IP probing 4 cards with $1 micro-auths and high declines
+    single_ip_attempts = [
+        BinAuthAttempt(
+            attempt_id=f"m-{i}",
+            bin_prefix="411111",
+            last4=f"000{i}",
+            amount=1.0,
+            response_code=AuthResponseCode.DO_NOT_HONOR,
+            timestamp=now - timedelta(seconds=5 * i),
+            ip_address="198.51.100.1",
+        )
+        for i in range(4)
+    ]
+    m1 = analyzer.analyze(single_ip_attempts, now=now)
+    assert m1.decline_ratio == 1.0
+    assert m1.micro_auth_ratio == 1.0
+    assert m1.max_cards_per_ip == 4
+    assert BinAttackAnomalyType.MICRO_AUTH_VELOCITY in m1.anomalies
+    assert BinAttackAnomalyType.HIGH_DECLINE_RATIO in m1.anomalies
+    assert BinAttackAnomalyType.MULTI_CARD_IP_BURST in m1.anomalies
+
+    # Distributed sweep across 4 distinct IPs and 4 distinct cards
+    dist_attempts = [
+        BinAuthAttempt(
+            attempt_id=f"d-{i}",
+            bin_prefix="520000",
+            last4=f"100{i}",
+            amount=2.0,
+            response_code=AuthResponseCode.CVV_MISMATCH,
+            timestamp=now - timedelta(seconds=5 * i),
+            ip_address=f"198.51.100.{i + 1}",
+        )
+        for i in range(4)
+    ]
+    m2 = analyzer.analyze(dist_attempts, now=now)
+    assert m2.unique_ips == 4
+    assert BinAttackAnomalyType.DISTRIBUTED_BIN_SWEEP in m2.anomalies
