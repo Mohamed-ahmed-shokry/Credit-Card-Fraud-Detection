@@ -13,7 +13,7 @@
 - [x] Task 5: Implement `BinAttackStore` & `BinAttackDefenseEngine` + unit tests.
 - [x] Task 6: Register `BIN_*` / `CARD_TESTING_BLOCKED` events in `src/fraud_detection/events.py` and wire `EventBus` into `BinAttackDefenseEngine` + tests.
 - [x] Task 7: Add `/v1/bin-attack/*` REST endpoints and Prometheus metrics in `src/fraud_detection/api.py` + tests in `tests/test_api.py`.
-- [ ] Task 8: Add `bin-attack-ingest`, `bin-attack-eval`, `bin-attack-inspect`, and `bin-attack-summary` CLI commands in `src/fraud_detection/cli.py` + tests in `tests/test_cli.py`.
+- [x] Task 8: Add `bin-attack-ingest`, `bin-attack-eval`, `bin-attack-inspect`, and `bin-attack-summary` CLI commands in `src/fraud_detection/cli.py` + tests in `tests/test_cli.py`.
 - [ ] Task 9: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate with 100% Green CI.
 
 ## Acceptance Criteria Status
@@ -25,7 +25,7 @@
 | AC-4 (Engine, Store & Escalation) | PASSED | `BinAttackDefenseEngine` and `BinAttackStore` verified on scoring, policy routing, capacity eviction, and `CaseManager` escalation in `tests/test_bin_attack.py` |
 | AC-5 (EventBus Streaming) | PASSED | `BIN_ATTACK_EVALUATED`, `BIN_ENUMERATION_DETECTED`, and `CARD_TESTING_BLOCKED` registered in `events.py` and verified in `tests/test_bin_attack.py` |
 | AC-6 (REST API & Metrics) | PASSED | `/v1/bin-attack/*` endpoints and Prometheus counters (`fraud_bin_attack_evaluations_total`, `fraud_bin_attack_anomalies_total`, `fraud_bin_attack_blocked_total`) verified in `tests/test_api.py` |
-| AC-7 (CLI Workflows) | PENDING | Pending Task 8 |
+| AC-7 (CLI Workflows) | PASSED | `bin-attack-ingest`, `bin-attack-eval`, `bin-attack-inspect`, and `bin-attack-summary` verified in `tests/test_cli.py` |
 | AC-8 (Quality Standards & 100% Green CI) | PENDING | Pending Task 9 |
 
 ## Decision Log
