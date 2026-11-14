@@ -10706,3 +10706,151 @@ def test_mule_cli_workflows_and_errors(tmp_path: Path) -> None:
     nondict = tmp_path / "nondict_mule.json"
     nondict.write_text("[]", encoding="utf-8")
     assert runner.invoke(app, ["mule-summary", "-s", str(nondict)]).exit_code == 2
+
+
+def test_first_party_cli_workflows_and_errors(tmp_path: Path) -> None:
+    """Validate first-party-ingest, eval, inspect, summary, and error paths."""
+    runner = CliRunner()
+    store_file = tmp_path / "fp_state.json"
+
+    r1 = runner.invoke(
+        app,
+        [
+            "first-party-ingest",
+            "-a",
+            "fp_cli_1",
+            "-c",
+            "purchase",
+            "-m",
+            "100",
+            "--category",
+            "apparel",
+            "-t",
+            "2026-11-14T10:00:00+00:00",
+            "-s",
+            str(store_file),
+        ],
+    )
+    assert r1.exit_code == 0
+    assert "Account ID:       fp_cli_1" in r1.stdout
+
+    r2 = runner.invoke(
+        app,
+        [
+            "first-party-ingest",
+            "-a",
+            "fp_cli_1",
+            "-c",
+            "refund_return",
+            "-m",
+            "100",
+            "--category",
+            "apparel",
+            "-t",
+            "2026-11-14T11:00:00+00:00",
+            "-s",
+            str(store_file),
+        ],
+    )
+    assert r2.exit_code == 0
+
+    r3 = runner.invoke(
+        app,
+        [
+            "first-party-ingest",
+            "-a",
+            "fp_cli_1",
+            "-c",
+            "refund_return",
+            "-m",
+            "100",
+            "--category",
+            "electronics",
+            "-t",
+            "2026-11-14T11:30:00+00:00",
+            "-s",
+            str(store_file),
+            "--format",
+            "json",
+        ],
+    )
+    assert r3.exit_code == 0
+    data_r3 = json.loads(r3.stdout)
+    ass_id = data_r3["assessment_id"]
+    assert data_r3["action"] == "restrict_instant_refund"
+
+    r_eval = runner.invoke(app, ["first-party-eval", "-a", "fp_cli_1", "-s", str(store_file)])
+    assert r_eval.exit_code == 0
+    assert "Account ID:       fp_cli_1" in r_eval.stdout
+
+    r_eval_json = runner.invoke(
+        app,
+        ["first-party-eval", "-a", "fp_cli_1", "-s", str(store_file), "--format", "json"],
+    )
+    assert r_eval_json.exit_code == 0
+
+    r_insp_acct = runner.invoke(
+        app, ["first-party-inspect", "-a", "fp_cli_1", "-s", str(store_file)]
+    )
+    assert r_insp_acct.exit_code == 0
+    assert "Events:           3" in r_insp_acct.stdout
+
+    r_insp_ass = runner.invoke(
+        app,
+        ["first-party-inspect", "-i", ass_id, "-s", str(store_file), "--format", "json"],
+    )
+    assert r_insp_ass.exit_code == 0
+    assert json.loads(r_insp_ass.stdout)["assessment_id"] == ass_id
+
+    r_sum = runner.invoke(app, ["first-party-summary", "-s", str(store_file)])
+    assert r_sum.exit_code == 0
+    assert "Total Accounts:     1" in r_sum.stdout
+
+    r_sum_json = runner.invoke(
+        app, ["first-party-summary", "-s", str(store_file), "--format", "json"]
+    )
+    assert r_sum_json.exit_code == 0
+    assert json.loads(r_sum_json.stdout)["total_assessments"] >= 4
+
+    # Error branches
+    assert (
+        runner.invoke(
+            app,
+            [
+                "first-party-ingest",
+                "-a",
+                "x",
+                "-c",
+                "bad_claim",
+                "-m",
+                "10",
+                "-s",
+                str(store_file),
+            ],
+        ).exit_code
+        == 2
+    )
+    assert (
+        runner.invoke(app, ["first-party-eval", "-a", "missing", "-s", str(store_file)]).exit_code
+        == 2
+    )
+    assert runner.invoke(app, ["first-party-inspect", "-s", str(store_file)]).exit_code == 2
+    assert (
+        runner.invoke(
+            app, ["first-party-inspect", "-a", "missing", "-s", str(store_file)]
+        ).exit_code
+        == 2
+    )
+    assert (
+        runner.invoke(
+            app, ["first-party-inspect", "-i", "missing", "-s", str(store_file)]
+        ).exit_code
+        == 2
+    )
+
+    bad_store = tmp_path / "bad_fp.json"
+    bad_store.write_text("{invalid", encoding="utf-8")
+    assert runner.invoke(app, ["first-party-summary", "-s", str(bad_store)]).exit_code == 2
+    nondict = tmp_path / "nondict_fp.json"
+    nondict.write_text("[]", encoding="utf-8")
+    assert runner.invoke(app, ["first-party-summary", "-s", str(nondict)]).exit_code == 2

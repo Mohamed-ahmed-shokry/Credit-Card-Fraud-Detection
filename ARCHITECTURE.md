@@ -871,6 +871,37 @@ flowchart TD
 - **Store, EventBus, API & CLI**: `MuleAccountStore` provides thread-safe secondary indexing (`tenant_id`, `counterparty_id`) with capacity eviction; `MuleDetectionEngine` emits `MULE_ACTIVITY_EVALUATED`, `MULE_FUNDS_HELD`, `MULE_ACCOUNT_FLAGGED`, and `MULE_NETWORK_DETECTED`; FastAPI exposes `/v1/mule/*` endpoints and Prometheus counters (`fraud_mule_evaluations_total`, `fraud_mule_anomalies_total`, `fraud_mule_flagged_total`); Typer CLI exposes `mule-ingest`, `mule-eval`, `mule-inspect`, and `mule-summary`.
 
 
+## Phase 51 — First-Party Fraud, Refund Abuse & Friendly Fraud Detection Engine
+
+Phase 51 delivers an in-process, zero-external-dependency First-Party Fraud, Refund Abuse & Friendly Fraud Detection Engine (`first_party_fraud.py`) that detects cardholders and account owners exploiting merchant refund, chargeback, and promotional policies via serial friendly-fraud disputes, wardrobing/return abuse, Item-Not-Received (INR) claim bursts, and linked-account promo cycling.
+
+```mermaid
+flowchart TD
+    subgraph Ingestion
+        EvtIn["Order / Refund / INR / Dispute / Promo\nPOST /v1/first-party/events / CLI"] --> Engine["FirstPartyFraudEngine"]
+    end
+
+    subgraph Analyzers
+        Engine --> RA["RefundAbuseAnalyzer\n(Return Ratio, Wardrobing, INR, Skew)"]
+        Engine --> FF["FriendlyFraudAnalyzer\n(Verified-Delivery Disputes & Velocity)"]
+        Engine --> PA["PromoAbuseDetector\n(Bonus Abuse & Linked Account Cycling)"]
+    end
+
+    subgraph Policy & Escalation
+        RA & FF & PA --> Score["Composite First-Party Risk Score"]
+        Score -->|"< 0.25"| Allow["ALLOW"]
+        Score -->|"0.25 - 0.44"| Sig["REQUIRE_SIGNATURE_DELIVERY"]
+        Score -->|"0.45 - 0.64"| Restrict["RESTRICT_INSTANT_REFUND\n(Event: REFUND_RESTRICTED)"]
+        Score -->|"0.65 - 0.84"| Deny["DENY_REFUND_MANUAL_REVIEW\n(CaseManager + REFUND_RESTRICTED)"]
+        Score -->|">= 0.85"| Revoke["REVOKE_PRIVILEGES_AND_BLOCK\n(CaseManager + ACCOUNT_PRIVILEGES_REVOKED)"]
+    end
+```
+
+- **Refund & Return Abuse (`RefundAbuseAnalyzer`)**: Tracks return-to-purchase ratios, high-value refund skew, wardrobing-prone category returns (`apparel`, `luxury_fashion`, `electronics`, `cameras`, `jewelry`, `footwear`), and INR claim bursts.
+- **Friendly Fraud & Promo Cycling (`FriendlyFraudAnalyzer`, `PromoAbuseDetector`)**: Flags serial disputes on 3DS/AVS/CVV/delivery-confirmed orders, pre-dispute velocity, promo bonus abuse, and accounts linked via shared shipping address or payment instrument hashes.
+- **Store, EventBus, API & CLI**: `FirstPartyAccountStore` provides thread-safe secondary indexing (`tenant_id`, `shipping_address_hash`, `payment_instrument_hash`) with capacity eviction; `FirstPartyFraudEngine` emits `FIRST_PARTY_EVALUATED`, `FIRST_PARTY_ABUSE_DETECTED`, `REFUND_RESTRICTED`, and `ACCOUNT_PRIVILEGES_REVOKED`; FastAPI exposes `/v1/first-party/*` endpoints and Prometheus counters (`fraud_first_party_evaluations_total`, `fraud_first_party_anomalies_total`, `fraud_first_party_restricted_total`); Typer CLI exposes `first-party-ingest`, `first-party-eval`, `first-party-inspect`, and `first-party-summary`.
+
+
 ## Extension guidance
 
 
