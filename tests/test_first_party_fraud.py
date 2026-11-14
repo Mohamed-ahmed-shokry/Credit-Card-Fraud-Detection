@@ -6,14 +6,17 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from fraud_detection.cases import CaseManager
 from fraud_detection.first_party_fraud import (
     WARDROBING_CATEGORIES,
     ClaimOutcome,
     FirstPartyAccountProfile,
+    FirstPartyAccountStore,
     FirstPartyAction,
     FirstPartyAnomalyType,
     FirstPartyAssessment,
     FirstPartyEventRecord,
+    FirstPartyFraudEngine,
     FirstPartyRiskLevel,
     FriendlyFraudAnalyzer,
     OrderClaimType,
@@ -234,3 +237,128 @@ def test_friendly_fraud_and_promo_abuse_analyzers() -> None:
     assert promo_metrics.linked_account_count == 2
     assert FirstPartyAnomalyType.PROMO_BONUS_ABUSE in promo_metrics.anomalies
     assert FirstPartyAnomalyType.LINKED_ACCOUNT_CYCLING in promo_metrics.anomalies
+
+
+def test_store_eviction_linking_and_engine_case_escalation() -> None:
+    store = FirstPartyAccountStore(
+        max_accounts=2,
+        max_assessments=2,
+        max_events_per_account=20,
+    )
+    now = datetime(2026, 11, 14, 12, 0, 0, tzinfo=UTC)
+    store.record_event(
+        FirstPartyEventRecord(
+            event_id="e-old",
+            account_id="acct-old",
+            claim_type=OrderClaimType.PURCHASE,
+            amount=50.0,
+            timestamp=now,
+        )
+    )
+    store.record_event(
+        FirstPartyEventRecord(
+            event_id="e-a",
+            account_id="acct-a",
+            claim_type=OrderClaimType.PURCHASE,
+            amount=50.0,
+            timestamp=now,
+            shipping_address_hash="ship-1",
+            payment_instrument_hash="pay-1",
+        )
+    )
+    # Third account evicts acct-old and links with acct-a
+    store.record_event(
+        FirstPartyEventRecord(
+            event_id="e-b",
+            account_id="acct-b",
+            claim_type=OrderClaimType.PURCHASE,
+            amount=50.0,
+            timestamp=now,
+            shipping_address_hash="ship-1",
+            payment_instrument_hash="pay-1",
+        )
+    )
+    assert store.get_profile("acct-old") is None
+    profile_b = store.get_profile("acct-b")
+    assert profile_b is not None
+    assert "acct-a" in profile_b.linked_accounts
+
+    case_mgr = CaseManager()
+    engine = FirstPartyFraudEngine(store=store, case_manager=case_mgr)
+
+    with pytest.raises(KeyError):
+        engine.evaluate_account("missing-acct")
+
+    # Drive acct-b to critical/block score with serial disputes + INR + wardrobing
+    engine.record_event(
+        FirstPartyEventRecord(
+            event_id="e-b2",
+            account_id="acct-b",
+            claim_type=OrderClaimType.REFUND_RETURN,
+            amount=250.0,
+            timestamp=now,
+            merchant_category="apparel",
+        )
+    )
+    engine.record_event(
+        FirstPartyEventRecord(
+            event_id="e-b3",
+            account_id="acct-b",
+            claim_type=OrderClaimType.REFUND_RETURN,
+            amount=250.0,
+            timestamp=now,
+            merchant_category="electronics",
+        )
+    )
+    engine.record_event(
+        FirstPartyEventRecord(
+            event_id="e-b4",
+            account_id="acct-b",
+            claim_type=OrderClaimType.INR_CLAIM,
+            amount=100.0,
+            timestamp=now,
+        )
+    )
+    engine.record_event(
+        FirstPartyEventRecord(
+            event_id="e-b5",
+            account_id="acct-b",
+            claim_type=OrderClaimType.INR_CLAIM,
+            amount=100.0,
+            timestamp=now,
+        )
+    )
+    engine.record_event(
+        FirstPartyEventRecord(
+            event_id="e-b6",
+            account_id="acct-b",
+            claim_type=OrderClaimType.FRIENDLY_DISPUTE,
+            amount=300.0,
+            timestamp=now,
+            three_ds_authenticated=True,
+        )
+    )
+    assessment = engine.record_and_evaluate(
+        FirstPartyEventRecord(
+            event_id="e-b7",
+            account_id="acct-b",
+            claim_type=OrderClaimType.FRIENDLY_DISPUTE,
+            amount=300.0,
+            timestamp=now,
+            delivery_confirmed=True,
+        ),
+        now=now,
+    )
+    assert assessment.risk_level == FirstPartyRiskLevel.CRITICAL
+    assert assessment.action == FirstPartyAction.REVOKE_PRIVILEGES_AND_BLOCK
+    assert assessment.case_id is not None
+    assert len(case_mgr.store.list_cases()) == 1
+    assert engine.get_assessment(assessment.assessment_id) == assessment
+    assert len(engine.list_assessments(account_id="acct-b")) == 1
+
+    # Export/load state round-trip
+    exported = store.export_state()
+    restored_store = FirstPartyAccountStore()
+    restored_store.load_state(exported)
+    assert restored_store.summary()["total_accounts"] == 2
+    assert restored_store.get_assessment(assessment.assessment_id) is not None
