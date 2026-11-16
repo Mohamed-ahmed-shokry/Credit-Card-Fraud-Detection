@@ -14,13 +14,11 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 from uuid import uuid4
 
 from fraud_detection.cases import CaseManager, CaseNotFoundError, CaseStatus
-
-if TYPE_CHECKING:
-    from fraud_detection.events import EventBus
+from fraud_detection.events import EventBus, EventType, FraudDomainEvent
 
 
 def _utc_now_iso() -> str:
@@ -680,4 +678,54 @@ class UnifiedRiskOrchestrator:
             profile.last_assessment_id = assessment.assessment_id
             profile.last_updated = now.isoformat()
             self.store.save_assessment(assessment)
+            self._emit_events(assessment)
             return assessment
+
+    def _emit_events(self, assessment: UnifiedRiskAssessment) -> None:
+        if self.event_bus is None:
+            return
+        base_payload = {
+            "assessment_id": assessment.assessment_id,
+            "entity_id": assessment.entity_id,
+            "composite_score": assessment.composite_score,
+            "risk_level": assessment.risk_level.value,
+            "action": assessment.action.value,
+        }
+        self.event_bus.publish(
+            FraudDomainEvent(
+                event_type=EventType.ENTITY_RISK_ORCHESTRATED,
+                tenant_id=assessment.tenant_id,
+                payload=base_payload,
+            )
+        )
+        if assessment.patterns_detected:
+            self.event_bus.publish(
+                FraudDomainEvent(
+                    event_type=EventType.CROSS_SIGNAL_PATTERN_DETECTED,
+                    tenant_id=assessment.tenant_id,
+                    payload={
+                        **base_payload,
+                        "patterns": [p.value for p in assessment.patterns_detected],
+                    },
+                )
+            )
+        if assessment.correlated_case_id:
+            self.event_bus.publish(
+                FraudDomainEvent(
+                    event_type=EventType.UNIFIED_CASE_CORRELATED,
+                    tenant_id=assessment.tenant_id,
+                    payload={
+                        **base_payload,
+                        "case_id": assessment.correlated_case_id,
+                        "case_created": assessment.case_created,
+                    },
+                )
+            )
+        if assessment.risk_level in {UnifiedRiskLevel.HIGH, UnifiedRiskLevel.CRITICAL}:
+            self.event_bus.publish(
+                FraudDomainEvent(
+                    event_type=EventType.ENTITY_ESCALATION_TRIGGERED,
+                    tenant_id=assessment.tenant_id,
+                    payload=base_payload,
+                )
+            )

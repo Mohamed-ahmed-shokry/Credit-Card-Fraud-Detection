@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from fraud_detection.cases import CaseManager, CaseStatus
+from fraud_detection.events import EventBus, EventType, FraudDomainEvent
 from fraud_detection.risk_orchestrator import (
     CrossSignalAnalyzer,
     CrossSignalPattern,
@@ -254,3 +255,33 @@ def test_correlator_handles_missing_case_id_and_stale_window() -> None:
     res = orchestrator.evaluate_entity("ent-window", reference_time=now)
     assert res.contributing_signal_ids == []
     assert res.domain_scores["ato"] == 0.85
+
+
+def test_orchestrator_emits_lifecycle_events() -> None:
+    bus = EventBus()
+    case_mgr = CaseManager()
+    received: list[EventType] = []
+
+    def _capture(ev: FraudDomainEvent) -> None:
+        received.append(ev.event_type)
+
+    bus.subscribe(_capture)
+    orchestrator = UnifiedRiskOrchestrator(case_manager=case_mgr, event_bus=bus)
+    orchestrator.evaluate_entity(
+        "ent-events",
+        tenant_id="tenant-a",
+        signals=[
+            DomainRiskSignal(
+                entity_id="ent-events", domain=RiskDomain.ATO, score=0.78, tenant_id="tenant-a"
+            ),
+            DomainRiskSignal(
+                entity_id="ent-events", domain=RiskDomain.MULE, score=0.81, tenant_id="tenant-a"
+            ),
+        ],
+    )
+    assert received == [
+        EventType.ENTITY_RISK_ORCHESTRATED,
+        EventType.CROSS_SIGNAL_PATTERN_DETECTED,
+        EventType.UNIFIED_CASE_CORRELATED,
+        EventType.ENTITY_ESCALATION_TRIGGERED,
+    ]
