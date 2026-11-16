@@ -285,3 +285,43 @@ def test_orchestrator_emits_lifecycle_events() -> None:
         EventType.UNIFIED_CASE_CORRELATED,
         EventType.ENTITY_ESCALATION_TRIGGERED,
     ]
+
+
+def test_orchestrator_edge_branches_and_string_domain() -> None:
+    bus = EventBus()
+    received: list[EventType] = []
+    bus.subscribe(lambda ev: received.append(ev.event_type))
+
+    orch = UnifiedRiskOrchestrator(event_bus=bus)
+    # String domain coercion + naive ISO timestamp
+    sig = DomainRiskSignal(
+        entity_id="ent-edge",
+        domain="ato",
+        score=0.72,
+        tenant_id="t1",
+        timestamp="2026-11-16T01:00:00",
+    )
+    orch.ingest_signal(sig)
+    high = orch.evaluate_entity(
+        "ent-edge",
+        tenant_id="t1",
+        reference_time=datetime(2026, 11, 16, 1, 5, tzinfo=UTC),
+    )
+    assert high.risk_level is UnifiedRiskLevel.HIGH
+    assert high.correlated_case_id is None
+    assert EventType.ENTITY_RISK_ORCHESTRATED in received
+    assert EventType.ENTITY_ESCALATION_TRIGGERED in received
+
+    # Low-risk evaluation resets high_risk_streak and emits only ENTITY_RISK_ORCHESTRATED
+    received.clear()
+    prof = orch.store.get_profile("ent-edge", tenant_id="t1")
+    assert prof is not None
+    prof.signals.clear()
+    prof.domain_scores.clear()
+    low = orch.evaluate_entity("ent-edge", tenant_id="t1")
+    assert low.risk_level is UnifiedRiskLevel.LOW
+    assert prof.high_risk_streak == 0
+    assert received == [EventType.ENTITY_RISK_ORCHESTRATED]
+
+    # Filtering by tenant_id and risk_level
+    assert len(orch.store.list_assessments(tenant_id="t1", risk_level=UnifiedRiskLevel.HIGH)) == 1
