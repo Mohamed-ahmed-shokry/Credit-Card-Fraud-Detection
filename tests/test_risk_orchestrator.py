@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from fraud_detection.risk_orchestrator import (
+    CrossSignalAnalyzer,
     CrossSignalPattern,
     DomainRiskSignal,
     EntityRiskProfile,
@@ -73,3 +74,36 @@ def test_domain_models_round_trip_and_validation() -> None:
     assert restored_assessment.risk_level is UnifiedRiskLevel.CRITICAL
     assert restored_assessment.action is OrchestratorAction.BLOCK_AND_ESCALATE
     assert restored_assessment.patterns_detected == [CrossSignalPattern.ATO_TO_MULE_EXFILTRATION]
+
+
+def test_cross_signal_analyzer_detects_all_compound_patterns() -> None:
+    analyzer = CrossSignalAnalyzer()
+    policy = OrchestratorPolicy(elevated_threshold=0.55)
+
+    # Low scores -> no patterns
+    low_patterns, low_rationale = analyzer.analyze(
+        {"ato": 0.2, "aml": 0.3}, policy=policy, high_risk_streak=0
+    )
+    assert low_patterns == []
+    assert low_rationale == []
+
+    # ATO + Mule + Synthetic + AML + First-Party + streak >= 2 -> all 5 patterns
+    patterns, rationale = analyzer.analyze(
+        {
+            "ato": 0.78,
+            "mule": 0.82,
+            "synthetic_identity": 0.75,
+            "aml": 0.68,
+            "first_party": 0.61,
+        },
+        policy=policy,
+        high_risk_streak=2,
+    )
+    assert set(patterns) == {
+        CrossSignalPattern.ATO_TO_MULE_EXFILTRATION,
+        CrossSignalPattern.SYNTHETIC_TO_AML_LAYERING,
+        CrossSignalPattern.SYNTHETIC_BUST_OUT,
+        CrossSignalPattern.MULTI_VECTOR_SYNDICATE,
+        CrossSignalPattern.ESCALATED_REPEAT_OFFENDER,
+    }
+    assert len(rationale) == 5

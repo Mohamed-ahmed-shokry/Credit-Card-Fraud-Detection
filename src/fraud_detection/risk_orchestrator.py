@@ -278,3 +278,54 @@ class UnifiedRiskAssessment:
             evaluated_at=str(payload.get("evaluated_at") or _utc_now_iso()),
             metadata=dict(payload.get("metadata", {})),
         )
+
+
+class CrossSignalAnalyzer:
+    """Detects compound multi-engine attack patterns from per-domain risk scores."""
+
+    def analyze(
+        self,
+        domain_scores: dict[str, float],
+        *,
+        policy: OrchestratorPolicy,
+        high_risk_streak: int = 0,
+    ) -> tuple[list[CrossSignalPattern], list[str]]:
+        patterns: list[CrossSignalPattern] = []
+        rationale: list[str] = []
+        thr = policy.elevated_threshold
+
+        ato = domain_scores.get(RiskDomain.ATO.value, 0.0)
+        aml = domain_scores.get(RiskDomain.AML.value, 0.0)
+        synthetic = domain_scores.get(RiskDomain.SYNTHETIC_IDENTITY.value, 0.0)
+        mule = domain_scores.get(RiskDomain.MULE.value, 0.0)
+        first_party = domain_scores.get(RiskDomain.FIRST_PARTY.value, 0.0)
+
+        if ato >= thr and mule >= thr:
+            patterns.append(CrossSignalPattern.ATO_TO_MULE_EXFILTRATION)
+            rationale.append(
+                f"ATO ({ato:.2f}) + Mule ({mule:.2f}) indicates account takeover exfiltration"
+            )
+        if synthetic >= thr and aml >= thr:
+            patterns.append(CrossSignalPattern.SYNTHETIC_TO_AML_LAYERING)
+            rationale.append(
+                f"Synthetic identity ({synthetic:.2f}) + AML ({aml:.2f}) indicates layering"
+            )
+        if synthetic >= thr and first_party >= thr:
+            patterns.append(CrossSignalPattern.SYNTHETIC_BUST_OUT)
+            rationale.append(
+                f"Synthetic identity ({synthetic:.2f}) + First-party ({first_party:.2f}) "
+                "indicates bust-out credit/refund abuse"
+            )
+
+        elevated_domains = [d for d, s in domain_scores.items() if s >= thr]
+        if len(elevated_domains) >= 3:
+            patterns.append(CrossSignalPattern.MULTI_VECTOR_SYNDICATE)
+            rationale.append(
+                f"{len(elevated_domains)} domains elevated ({', '.join(sorted(elevated_domains))})"
+            )
+
+        if high_risk_streak >= 2 and domain_scores and max(domain_scores.values()) >= thr:
+            patterns.append(CrossSignalPattern.ESCALATED_REPEAT_OFFENDER)
+            rationale.append(f"Repeat elevated risk across {high_risk_streak} consecutive sweeps")
+
+        return patterns, rationale
