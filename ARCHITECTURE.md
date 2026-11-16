@@ -902,6 +902,35 @@ flowchart TD
 - **Store, EventBus, API & CLI**: `FirstPartyAccountStore` provides thread-safe secondary indexing (`tenant_id`, `shipping_address_hash`, `payment_instrument_hash`) with capacity eviction; `FirstPartyFraudEngine` emits `FIRST_PARTY_EVALUATED`, `FIRST_PARTY_ABUSE_DETECTED`, `REFUND_RESTRICTED`, and `ACCOUNT_PRIVILEGES_REVOKED`; FastAPI exposes `/v1/first-party/*` endpoints and Prometheus counters (`fraud_first_party_evaluations_total`, `fraud_first_party_anomalies_total`, `fraud_first_party_restricted_total`); Typer CLI exposes `first-party-ingest`, `first-party-eval`, `first-party-inspect`, and `first-party-summary`.
 
 
+## Phase 53 — Unified Cross-Engine Risk Orchestrator & Entity Case Correlation
+
+Phase 53 delivers an in-process, zero-external-dependency Unified Cross-Engine Risk Orchestrator (`risk_orchestrator.py`) that correlates risk signals across specialized fraud domains (`ATO`, `AML`, `SYNTHETIC_IDENTITY`, `MULE`, `FIRST_PARTY`, `TRANSACTION`, `CUSTOM`), detects compound multi-vector attack patterns, computes calibrated composite entity scores, and deduplicates/correlates investigation cases in `CaseManager`.
+
+```mermaid
+flowchart TD
+    subgraph DomainSignals
+        ATO["ATO / AML / SIF / Mule / First-Party / Tx Signals"] --> Store["UnifiedRiskStore"]
+    end
+
+    subgraph Orchestration
+        Store --> Analyzer["CrossSignalAnalyzer\n(Compound Attack Patterns)"]
+        Analyzer --> Scorer["UnifiedRiskOrchestrator\n(Weighted Blend + Pattern Uplift)"]
+    end
+
+    subgraph PolicyAndCases
+        Scorer -->|"< 0.35"| Allow["ALLOW"]
+        Scorer -->|"0.35 - 0.54"| StepUp["STEP_UP_CHALLENGE"]
+        Scorer -->|"0.55 - 0.64"| Hold["HOLD_AND_REVIEW"]
+        Scorer -->|"0.65 - 0.84"| Restrict["RESTRICT_ENTITY\n(Correlated Case + Event)"]
+        Scorer -->|">= 0.85"| Escalate["BLOCK_AND_ESCALATE\n(Correlated Case + Event)"]
+    end
+```
+
+- **Cross-Signal Pattern Detection (`CrossSignalAnalyzer`)**: Detects `ATO_TO_MULE_EXFILTRATION`, `SYNTHETIC_TO_AML_LAYERING`, `SYNTHETIC_BUST_OUT`, `MULTI_VECTOR_SYNDICATE`, and `ESCALATED_REPEAT_OFFENDER` across active correlation windows.
+- **Entity Case Correlation (`EntityCaseCorrelator`)**: Reuses and enriches open/investigating `CaseManager` cases for the same entity (preventing duplicate alert fatigue) or opens a new unified case when none is active.
+- **Store, EventBus, API & CLI**: `UnifiedRiskStore` tracks entity profiles and assessments with thread-safe capacity eviction and JSON persistence; `UnifiedRiskOrchestrator` emits `ENTITY_RISK_ORCHESTRATED`, `CROSS_SIGNAL_PATTERN_DETECTED`, `UNIFIED_CASE_CORRELATED`, and `ENTITY_ESCALATION_TRIGGERED`; FastAPI exposes `/v1/orchestrator/*` endpoints and Prometheus counters (`fraud_orchestrator_evaluations_total`, `fraud_orchestrator_patterns_total`, `fraud_orchestrator_escalations_total`); Typer CLI exposes `orchestrator-ingest`, `orchestrator-eval`, `orchestrator-inspect`, and `orchestrator-summary`.
+
+
 ## Extension guidance
 
 
