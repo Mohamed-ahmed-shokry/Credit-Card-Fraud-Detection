@@ -10942,6 +10942,28 @@ def test_orchestrator_cli_end_to_end(tmp_path: Path) -> None:
     assert sum_json.exit_code == 0
     assert json.loads(sum_json.stdout)["assessment_count"] == 2
 
+    # Single-domain entity evaluation in table format (no compound patterns)
+    runner.invoke(
+        app,
+        [
+            "orchestrator-ingest",
+            "-e",
+            "ent-single",
+            "-d",
+            "ato",
+            "--score",
+            "0.25",
+            "-s",
+            str(store_file),
+        ],
+    )
+    single_eval = runner.invoke(
+        app,
+        ["orchestrator-eval", "-e", "ent-single", "-s", str(store_file), "-f", "table"],
+    )
+    assert single_eval.exit_code == 0
+    assert "Patterns:" not in single_eval.stdout
+
 
 def test_orchestrator_cli_error_branches(tmp_path: Path) -> None:
     """Validate error handling in orchestrator-* CLI commands."""

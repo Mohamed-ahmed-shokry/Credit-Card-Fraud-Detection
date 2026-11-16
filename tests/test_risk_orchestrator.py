@@ -325,3 +325,12 @@ def test_orchestrator_edge_branches_and_string_domain() -> None:
 
     # Filtering by tenant_id and risk_level
     assert len(orch.store.list_assessments(tenant_id="t1", risk_level=UnifiedRiskLevel.HIGH)) == 1
+
+    # Non-zero low score (< medium_threshold) and saving duplicate assessment_id
+    low_sig = orch.evaluate_entity(
+        "ent-low-nonzero",
+        signals=[DomainRiskSignal(entity_id="ent-low-nonzero", domain=RiskDomain.ATO, score=0.15)],
+    )
+    assert low_sig.risk_level is UnifiedRiskLevel.LOW
+    assert low_sig.action is OrchestratorAction.ALLOW
+    orch.store.save_assessment(low_sig)
