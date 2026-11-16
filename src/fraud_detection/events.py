@@ -121,6 +121,10 @@ class EventType(StrEnum):
     FIRST_PARTY_ABUSE_DETECTED = "fraud.first_party.abuse_detected"
     REFUND_RESTRICTED = "fraud.first_party.refund_restricted"
     ACCOUNT_PRIVILEGES_REVOKED = "fraud.first_party.privileges_revoked"
+    ENTITY_RISK_ORCHESTRATED = "fraud.orchestrator.entity_risk_evaluated"
+    CROSS_SIGNAL_PATTERN_DETECTED = "fraud.orchestrator.cross_signal_pattern_detected"
+    UNIFIED_CASE_CORRELATED = "fraud.orchestrator.unified_case_correlated"
+    ENTITY_ESCALATION_TRIGGERED = "fraud.orchestrator.entity_escalation_triggered"
 
 
 class EventDeliveryStatus(StrEnum):

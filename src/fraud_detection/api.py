@@ -207,6 +207,15 @@ from fraud_detection.retraining import (
     export_certified_candidate,
     verify_certified_candidate,
 )
+from fraud_detection.risk_orchestrator import (
+    DomainRiskSignal,
+    EntityRiskProfile,
+    OrchestratorAction,
+    RiskDomain,
+    UnifiedRiskAssessment,
+    UnifiedRiskLevel,
+    UnifiedRiskOrchestrator,
+)
 from fraud_detection.routing import (
     CanaryConfig,
     CanaryStatus,
@@ -2467,6 +2476,80 @@ def _first_party_profile_to_response(
     return FirstPartyAccountProfileResponse(**profile.to_dict())
 
 
+class OrchestratorSignalRequest(BaseModel):
+    """Request payload for ingesting a domain risk signal into the orchestrator."""
+
+    entity_id: str = Field(..., min_length=1)
+    domain: RiskDomain
+    score: float = Field(..., ge=0.0, le=1.0)
+    tenant_id: str = "default"
+    source_assessment_id: str | None = None
+    transaction_id: str | None = None
+    reason_codes: list[str] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class OrchestratorEvaluateRequest(BaseModel):
+    """Request payload for evaluating an entity's cross-engine unified risk."""
+
+    entity_id: str = Field(..., min_length=1)
+    tenant_id: str = "default"
+    signals: list[OrchestratorSignalRequest] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class OrchestratorAssessmentResponse(BaseModel):
+    """Response payload for a unified cross-engine risk assessment."""
+
+    assessment_id: str
+    entity_id: str
+    tenant_id: str
+    composite_score: float
+    risk_level: str
+    action: str
+    domain_scores: dict[str, float]
+    patterns_detected: list[str]
+    contributing_signal_ids: list[str]
+    correlated_case_id: str | None = None
+    case_created: bool = False
+    rationale: list[str]
+    evaluated_at: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class OrchestratorAssessmentListResponse(BaseModel):
+    """Response payload for listing unified risk assessments."""
+
+    total_count: int
+    assessments: list[OrchestratorAssessmentResponse]
+
+
+class OrchestratorEntityProfileResponse(BaseModel):
+    """Response payload for an entity's cross-domain risk profile."""
+
+    entity_id: str
+    tenant_id: str
+    signal_count: int
+    domain_scores: dict[str, float]
+    signals: list[dict[str, Any]]
+    last_updated: str
+    last_assessment_id: str | None = None
+    active_case_id: str | None = None
+    high_risk_streak: int
+
+
+def _orchestrator_assessment_to_response(
+    assessment: UnifiedRiskAssessment,
+) -> OrchestratorAssessmentResponse:
+    return OrchestratorAssessmentResponse(**assessment.to_dict())
+
+
+def _orchestrator_profile_to_response(
+    profile: EntityRiskProfile,
+) -> OrchestratorEntityProfileResponse:
+    return OrchestratorEntityProfileResponse(**profile.to_dict())
+
+
 def create_app(
     *,
     model: FraudModel | None = None,
@@ -2556,6 +2639,7 @@ def create_app(
     sif_engine: SyntheticIdentityEngine | None = None,
     mule_engine: MuleDetectionEngine | None = None,
     first_party_engine: FirstPartyFraudEngine | None = None,
+    risk_orchestrator: UnifiedRiskOrchestrator | None = None,
 ) -> FastAPI:
     """Create an application using an injected model or a trusted artifact path.
 
@@ -3100,6 +3184,24 @@ def create_app(
     first_party_restricted_counter = Counter(
         "fraud_first_party_restricted_total",
         "Total accounts restricted or blocked for first-party abuse.",
+        ["tenant_id"],
+        registry=metrics_registry,
+    )
+    orchestrator_evaluations_counter = Counter(
+        "fraud_orchestrator_evaluations_total",
+        "Total cross-engine unified risk evaluations performed.",
+        ["tenant_id", "action", "risk_level"],
+        registry=metrics_registry,
+    )
+    orchestrator_patterns_counter = Counter(
+        "fraud_orchestrator_patterns_total",
+        "Total cross-signal compound patterns detected by the risk orchestrator.",
+        ["tenant_id", "pattern"],
+        registry=metrics_registry,
+    )
+    orchestrator_escalations_counter = Counter(
+        "fraud_orchestrator_escalations_total",
+        "Total entities restricted or escalated by the unified risk orchestrator.",
         ["tenant_id"],
         registry=metrics_registry,
     )
@@ -3701,6 +3803,14 @@ def create_app(
         application.state.first_party_evaluations_counter = first_party_evaluations_counter
         application.state.first_party_anomalies_counter = first_party_anomalies_counter
         application.state.first_party_restricted_counter = first_party_restricted_counter
+        resolved_risk_orchestrator = risk_orchestrator or UnifiedRiskOrchestrator(
+            case_manager=application.state.case_manager,
+            event_bus=resolved_event_bus,
+        )
+        application.state.risk_orchestrator = resolved_risk_orchestrator
+        application.state.orchestrator_evaluations_counter = orchestrator_evaluations_counter
+        application.state.orchestrator_patterns_counter = orchestrator_patterns_counter
+        application.state.orchestrator_escalations_counter = orchestrator_escalations_counter
         application.state.audit_sink = resolved_audit_sink
         application.state.explanation_provider = explanation_provider
         application.state.fallback_mode = resolved_fallback_mode
@@ -8480,6 +8590,189 @@ def create_app(
                 "status": "uninitialized",
             }
         return {**engine.summary(), "status": "operational"}
+
+    def _record_orchestrator_metrics(
+        request: Request,
+        assessment: UnifiedRiskAssessment,
+    ) -> None:
+        eval_c = getattr(request.app.state, "orchestrator_evaluations_counter", None)
+        if eval_c is not None:
+            eval_c.labels(
+                tenant_id=assessment.tenant_id,
+                action=assessment.action.value,
+                risk_level=assessment.risk_level.value,
+            ).inc()
+        pat_c = getattr(request.app.state, "orchestrator_patterns_counter", None)
+        if pat_c is not None:
+            for pattern in assessment.patterns_detected:
+                pat_c.labels(
+                    tenant_id=assessment.tenant_id,
+                    pattern=pattern.value,
+                ).inc()
+        esc_c = getattr(request.app.state, "orchestrator_escalations_counter", None)
+        if esc_c is not None and assessment.action in {
+            OrchestratorAction.RESTRICT_ENTITY,
+            OrchestratorAction.BLOCK_AND_ESCALATE,
+        }:
+            esc_c.labels(tenant_id=assessment.tenant_id).inc()
+
+    @application.post(
+        "/v1/orchestrator/signals",
+        response_model=OrchestratorEntityProfileResponse,
+        responses={
+            422: {"description": "Invalid signal payload."},
+            500: {"description": "Risk orchestrator not initialized."},
+        },
+        tags=["risk_orchestrator"],
+    )
+    async def orchestrator_ingest_signal_endpoint(
+        payload: OrchestratorSignalRequest,
+        request: Request,
+    ) -> OrchestratorEntityProfileResponse | JSONResponse:
+        """Ingest a domain risk signal into the unified risk orchestrator."""
+        orch: UnifiedRiskOrchestrator | None = getattr(request.app.state, "risk_orchestrator", None)
+        if orch is None:
+            return JSONResponse(
+                status_code=500,
+                content={"detail": "Risk orchestrator not initialized."},
+            )
+        signal = DomainRiskSignal.from_dict(payload.model_dump())
+        profile = orch.ingest_signal(signal)
+        return _orchestrator_profile_to_response(profile)
+
+    @application.post(
+        "/v1/orchestrator/evaluate",
+        response_model=OrchestratorAssessmentResponse,
+        responses={
+            422: {"description": "Invalid evaluation payload."},
+            500: {"description": "Risk orchestrator not initialized."},
+        },
+        tags=["risk_orchestrator"],
+    )
+    async def orchestrator_evaluate_endpoint(
+        payload: OrchestratorEvaluateRequest,
+        request: Request,
+    ) -> OrchestratorAssessmentResponse | JSONResponse:
+        """Evaluate an entity's cross-engine unified risk and correlate cases."""
+        orch: UnifiedRiskOrchestrator | None = getattr(request.app.state, "risk_orchestrator", None)
+        if orch is None:
+            return JSONResponse(
+                status_code=500,
+                content={"detail": "Risk orchestrator not initialized."},
+            )
+        inline_signals = [DomainRiskSignal.from_dict(sig.model_dump()) for sig in payload.signals]
+        assessment = orch.evaluate_entity(
+            payload.entity_id,
+            tenant_id=payload.tenant_id,
+            signals=inline_signals,
+            metadata=payload.metadata,
+        )
+        _record_orchestrator_metrics(request, assessment)
+        return _orchestrator_assessment_to_response(assessment)
+
+    @application.get(
+        "/v1/orchestrator/assessments/{assessment_id}",
+        response_model=OrchestratorAssessmentResponse,
+        responses={
+            404: {"description": "Assessment not found."},
+            500: {"description": "Risk orchestrator not initialized."},
+        },
+        tags=["risk_orchestrator"],
+    )
+    async def orchestrator_get_assessment_endpoint(
+        assessment_id: str,
+        request: Request,
+    ) -> OrchestratorAssessmentResponse | JSONResponse:
+        """Retrieve a specific unified risk assessment by ID."""
+        orch: UnifiedRiskOrchestrator | None = getattr(request.app.state, "risk_orchestrator", None)
+        if orch is None:
+            return JSONResponse(
+                status_code=500,
+                content={"detail": "Risk orchestrator not initialized."},
+            )
+        assessment = orch.store.get_assessment(assessment_id)
+        if assessment is None:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": f"Orchestrator assessment '{assessment_id}' not found."},
+            )
+        return _orchestrator_assessment_to_response(assessment)
+
+    @application.get(
+        "/v1/orchestrator/assessments",
+        response_model=OrchestratorAssessmentListResponse,
+        responses={500: {"description": "Risk orchestrator not initialized."}},
+        tags=["risk_orchestrator"],
+    )
+    async def orchestrator_list_assessments_endpoint(
+        request: Request,
+        entity_id: str | None = None,
+        risk_level: UnifiedRiskLevel | None = None,
+        tenant_id: str | None = None,
+        limit: int = Query(default=100, ge=1, le=1000),
+    ) -> OrchestratorAssessmentListResponse | JSONResponse:
+        """Query unified risk assessments with optional filters."""
+        orch: UnifiedRiskOrchestrator | None = getattr(request.app.state, "risk_orchestrator", None)
+        if orch is None:
+            return JSONResponse(
+                status_code=500,
+                content={"detail": "Risk orchestrator not initialized."},
+            )
+        items = orch.store.list_assessments(
+            entity_id=entity_id,
+            tenant_id=tenant_id,
+            risk_level=risk_level,
+            limit=limit,
+        )
+        return OrchestratorAssessmentListResponse(
+            total_count=len(items),
+            assessments=[_orchestrator_assessment_to_response(a) for a in items],
+        )
+
+    @application.get(
+        "/v1/orchestrator/entities/{entity_id}",
+        response_model=OrchestratorEntityProfileResponse,
+        responses={
+            404: {"description": "Entity not found."},
+            500: {"description": "Risk orchestrator not initialized."},
+        },
+        tags=["risk_orchestrator"],
+    )
+    async def orchestrator_get_entity_endpoint(
+        entity_id: str,
+        request: Request,
+        tenant_id: str = "default",
+    ) -> OrchestratorEntityProfileResponse | JSONResponse:
+        """Fetch an entity's cross-domain risk profile and ingested signals."""
+        orch: UnifiedRiskOrchestrator | None = getattr(request.app.state, "risk_orchestrator", None)
+        if orch is None:
+            return JSONResponse(
+                status_code=500,
+                content={"detail": "Risk orchestrator not initialized."},
+            )
+        prof = orch.store.get_profile(entity_id, tenant_id=tenant_id)
+        if prof is None:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": f"Orchestrator entity '{entity_id}' not found."},
+            )
+        return _orchestrator_profile_to_response(prof)
+
+    @application.get(
+        "/v1/orchestrator/metrics",
+        response_model=dict[str, Any],
+        tags=["risk_orchestrator"],
+    )
+    async def orchestrator_metrics_endpoint(request: Request) -> dict[str, Any]:
+        """Summary metrics of unified cross-engine risk orchestration."""
+        orch: UnifiedRiskOrchestrator | None = getattr(request.app.state, "risk_orchestrator", None)
+        if orch is None:
+            return {
+                "entity_count": 0,
+                "assessment_count": 0,
+                "status": "uninitialized",
+            }
+        return {**orch.store.summary(), "status": "operational"}
 
     @application.get(
         "/v1/routing/status",

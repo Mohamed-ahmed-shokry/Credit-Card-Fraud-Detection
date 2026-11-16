@@ -10854,3 +10854,135 @@ def test_first_party_cli_workflows_and_errors(tmp_path: Path) -> None:
     nondict = tmp_path / "nondict_fp.json"
     nondict.write_text("[]", encoding="utf-8")
     assert runner.invoke(app, ["first-party-summary", "-s", str(nondict)]).exit_code == 2
+
+
+def test_orchestrator_cli_end_to_end(tmp_path: Path) -> None:
+    """Exercise orchestrator-* CLI commands end to end."""
+    store_file = tmp_path / "orch_store.json"
+
+    res1 = runner.invoke(
+        app,
+        [
+            "orchestrator-ingest",
+            "-e",
+            "ent-cli-1",
+            "-d",
+            "ato",
+            "--score",
+            "0.78",
+            "-r",
+            "IMPOSSIBLE_TRAVEL",
+            "-s",
+            str(store_file),
+            "-f",
+            "table",
+        ],
+    )
+    assert res1.exit_code == 0
+    assert "ent-cli-1" in res1.stdout
+
+    res2 = runner.invoke(
+        app,
+        [
+            "orchestrator-ingest",
+            "-e",
+            "ent-cli-1",
+            "-d",
+            "mule",
+            "--score",
+            "0.84",
+            "-s",
+            str(store_file),
+            "-f",
+            "json",
+        ],
+    )
+    assert res2.exit_code == 0
+    assert json.loads(res2.stdout)["signal_count"] == 2
+
+    ev_res = runner.invoke(
+        app,
+        ["orchestrator-eval", "-e", "ent-cli-1", "-s", str(store_file), "-f", "table"],
+    )
+    assert ev_res.exit_code == 0
+    assert "ato_to_mule_exfiltration" in ev_res.stdout
+
+    ev_json = runner.invoke(
+        app,
+        ["orchestrator-eval", "-e", "ent-cli-1", "-s", str(store_file), "-f", "json"],
+    )
+    assert ev_json.exit_code == 0
+    assert json.loads(ev_json.stdout)["risk_level"] == "critical"
+
+    insp_tbl = runner.invoke(
+        app,
+        ["orchestrator-inspect", "-e", "ent-cli-1", "-s", str(store_file), "-f", "table"],
+    )
+    assert insp_tbl.exit_code == 0
+    assert "ent-cli-1" in insp_tbl.stdout
+
+    insp_json = runner.invoke(
+        app,
+        ["orchestrator-inspect", "-e", "ent-cli-1", "-s", str(store_file), "-f", "json"],
+    )
+    assert insp_json.exit_code == 0
+    assert json.loads(insp_json.stdout)["entity_id"] == "ent-cli-1"
+
+    sum_tbl = runner.invoke(
+        app,
+        ["orchestrator-summary", "-s", str(store_file), "-f", "table"],
+    )
+    assert sum_tbl.exit_code == 0
+    assert "Unified Risk Orchestrator Summary" in sum_tbl.stdout
+
+    sum_json = runner.invoke(
+        app,
+        ["orchestrator-summary", "-s", str(store_file), "-f", "json"],
+    )
+    assert sum_json.exit_code == 0
+    assert json.loads(sum_json.stdout)["assessment_count"] == 2
+
+    # Single-domain entity evaluation in table format (no compound patterns)
+    runner.invoke(
+        app,
+        [
+            "orchestrator-ingest",
+            "-e",
+            "ent-single",
+            "-d",
+            "ato",
+            "--score",
+            "0.25",
+            "-s",
+            str(store_file),
+        ],
+    )
+    single_eval = runner.invoke(
+        app,
+        ["orchestrator-eval", "-e", "ent-single", "-s", str(store_file), "-f", "table"],
+    )
+    assert single_eval.exit_code == 0
+    assert "Patterns:" not in single_eval.stdout
+
+
+def test_orchestrator_cli_error_branches(tmp_path: Path) -> None:
+    """Validate error handling in orchestrator-* CLI commands."""
+    store_file = tmp_path / "orch_missing.json"
+    assert (
+        runner.invoke(app, ["orchestrator-eval", "-e", "missing", "-s", str(store_file)]).exit_code
+        == 2
+    )
+    assert (
+        runner.invoke(
+            app, ["orchestrator-inspect", "-e", "missing", "-s", str(store_file)]
+        ).exit_code
+        == 2
+    )
+
+    bad_store = tmp_path / "bad_orch.json"
+    bad_store.write_text("{invalid", encoding="utf-8")
+    assert runner.invoke(app, ["orchestrator-summary", "-s", str(bad_store)]).exit_code == 2
+
+    nondict = tmp_path / "nondict_orch.json"
+    nondict.write_text("[]", encoding="utf-8")
+    assert runner.invoke(app, ["orchestrator-summary", "-s", str(nondict)]).exit_code == 2

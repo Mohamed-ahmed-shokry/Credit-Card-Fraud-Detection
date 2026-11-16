@@ -7172,3 +7172,93 @@ def test_first_party_api_error_branches(api_context: tuple[Path, Any, Path]) -> 
         metrics_uninit = client.get("/v1/first-party/metrics")
         assert metrics_uninit.status_code == 200
         assert metrics_uninit.json()["status"] == "uninitialized"
+
+
+def test_orchestrator_api_lifecycle_and_metrics(api_context: tuple[Path, Any, Path]) -> None:
+    """Verify /v1/orchestrator/* signal ingestion, evaluation, case correlation, and metrics."""
+    _, model, _ = api_context
+    app = create_app(model=model)
+
+    with TestClient(app) as client:
+        sig_resp = client.post(
+            "/v1/orchestrator/signals",
+            json={
+                "entity_id": "ent-api-1",
+                "domain": "ato",
+                "score": 0.78,
+                "tenant_id": "default",
+                "reason_codes": ["IMPOSSIBLE_TRAVEL"],
+            },
+        )
+        assert sig_resp.status_code == 200
+        assert sig_resp.json()["signal_count"] == 1
+
+        eval_resp = client.post(
+            "/v1/orchestrator/evaluate",
+            json={
+                "entity_id": "ent-api-1",
+                "tenant_id": "default",
+                "signals": [
+                    {
+                        "entity_id": "ent-api-1",
+                        "domain": "mule",
+                        "score": 0.82,
+                        "tenant_id": "default",
+                    }
+                ],
+            },
+        )
+        assert eval_resp.status_code == 200
+        data = eval_resp.json()
+        assert data["risk_level"] == "critical"
+        assert data["action"] == "block_and_escalate"
+        assert "ato_to_mule_exfiltration" in data["patterns_detected"]
+        assert data["correlated_case_id"] is not None
+        assert data["case_created"] is True
+        aid = data["assessment_id"]
+
+        get_resp = client.get(f"/v1/orchestrator/assessments/{aid}")
+        assert get_resp.status_code == 200
+        assert get_resp.json()["assessment_id"] == aid
+
+        list_resp = client.get("/v1/orchestrator/assessments?entity_id=ent-api-1")
+        assert list_resp.status_code == 200
+        assert list_resp.json()["total_count"] == 1
+
+        ent_resp = client.get("/v1/orchestrator/entities/ent-api-1")
+        assert ent_resp.status_code == 200
+        assert ent_resp.json()["signal_count"] == 2
+
+        metrics_resp = client.get("/v1/orchestrator/metrics")
+        assert metrics_resp.status_code == 200
+        assert metrics_resp.json()["status"] == "operational"
+        assert metrics_resp.json()["correlated_assessments"] == 1
+
+        prom = client.get("/metrics")
+        assert prom.status_code == 200
+        assert "fraud_orchestrator_evaluations_total" in prom.text
+        assert "fraud_orchestrator_patterns_total" in prom.text
+        assert "fraud_orchestrator_escalations_total" in prom.text
+
+
+def test_orchestrator_api_error_branches(api_context: tuple[Path, Any, Path]) -> None:
+    """Validate 404 and 500 error branches on /v1/orchestrator/* endpoints."""
+    _, model, _ = api_context
+    app = create_app(model=model)
+
+    with TestClient(app) as client:
+        assert client.get("/v1/orchestrator/assessments/missing").status_code == 404
+        assert client.get("/v1/orchestrator/entities/missing").status_code == 404
+
+        app.state.risk_orchestrator = None
+        sig_payload = {"entity_id": "ent-x", "domain": "ato", "score": 0.5}
+        assert client.post("/v1/orchestrator/signals", json=sig_payload).status_code == 500
+        assert (
+            client.post("/v1/orchestrator/evaluate", json={"entity_id": "ent-x"}).status_code == 500
+        )
+        assert client.get("/v1/orchestrator/assessments/ora-1").status_code == 500
+        assert client.get("/v1/orchestrator/assessments").status_code == 500
+        assert client.get("/v1/orchestrator/entities/ent-x").status_code == 500
+        metrics_uninit = client.get("/v1/orchestrator/metrics")
+        assert metrics_uninit.status_code == 200
+        assert metrics_uninit.json()["status"] == "uninitialized"

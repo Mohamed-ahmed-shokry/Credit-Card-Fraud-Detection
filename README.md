@@ -2220,6 +2220,28 @@ FastAPI First-Party Fraud REST endpoints:
 - `GET /v1/first-party/metrics`: Summary metrics of monitored accounts and recorded assessments.
 - Prometheus metrics: `fraud_first_party_evaluations_total`, `fraud_first_party_anomalies_total`, `fraud_first_party_restricted_total`.
 
+### Unified Cross-Engine Risk Orchestrator & Entity Case Correlation (Phase 53)
+
+```bash
+# Ingest domain risk signals for a shared entity
+fraud-detect orchestrator-ingest --entity-id ent_100 --domain ato --score 0.78
+fraud-detect orchestrator-ingest --entity-id ent_100 --domain mule --score 0.84
+
+# Evaluate cross-engine risk, inspect profile, or view store summary
+fraud-detect orchestrator-eval --entity-id ent_100
+fraud-detect orchestrator-inspect --entity-id ent_100
+fraud-detect orchestrator-summary --format table
+```
+
+FastAPI Unified Risk Orchestrator REST endpoints:
+- `POST /v1/orchestrator/signals`: Ingest a domain risk signal (`ato`, `aml`, `synthetic_identity`, `mule`, `first_party`, `transaction`, `custom`).
+- `POST /v1/orchestrator/evaluate`: Evaluate an entity's cross-engine unified risk, detect compound patterns, and correlate `CaseManager` cases.
+- `GET /v1/orchestrator/assessments/{assessment_id}`: Fetch a specific unified risk assessment.
+- `GET /v1/orchestrator/assessments`: Query unified risk assessments with optional entity/risk/tenant filters.
+- `GET /v1/orchestrator/entities/{entity_id}`: Inspect an entity's cross-domain risk profile and ingested signals.
+- `GET /v1/orchestrator/metrics`: Summary metrics of orchestrated entities, assessments, and correlated cases.
+- Prometheus metrics: `fraud_orchestrator_evaluations_total`, `fraud_orchestrator_patterns_total`, `fraud_orchestrator_escalations_total`.
+
 ## Reference label-delay analysis
 
 
