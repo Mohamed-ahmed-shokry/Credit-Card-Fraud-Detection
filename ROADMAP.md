@@ -2896,7 +2896,7 @@ Provide deterministic, real-time first-party fraud scoring, refund/dispute abuse
 - `2a75fa2`..`9db5893`: Implemented `first_party_fraud.py` (`RefundAbuseAnalyzer`, `FriendlyFraudAnalyzer`, `PromoAbuseDetector`, `FirstPartyAccountStore`, `FirstPartyFraudEngine`), registered `FIRST_PARTY_*` / `REFUND_RESTRICTED` / `ACCOUNT_PRIVILEGES_REVOKED` events in `events.py`, added `/v1/first-party/*` endpoints and Prometheus metrics in `api.py`, added `first-party-*` CLI commands in `cli.py`, achieved 99.23% unit branch coverage, added API & CLI integration tests, and documented architecture and usage.
 
 
-## Phase 53 — Unified Cross-Engine Risk Orchestrator & Entity Case Correlation (In Progress)
+## Phase 53 — Unified Cross-Engine Risk Orchestrator & Entity Case Correlation (Done)
 
 Phase 53 implements an in-process, zero-external-dependency Unified Cross-Engine Risk Orchestrator & Entity Case Correlation Engine (`risk_orchestrator.py`). It aggregates domain risk signals across specialized fraud engines (`ATO`, `AML`, `SYNTHETIC_IDENTITY`, `MULE`, `FIRST_PARTY`, `TRANSACTION`), detects compound multi-vector attack patterns, computes calibrated composite entity risk scores, and correlates/deduplicates investigation cases in `CaseManager`.
 
@@ -2957,6 +2957,9 @@ Provide deterministic cross-engine entity risk orchestration, compound pattern d
 - Task 6: Add `/v1/orchestrator/*` REST endpoints and Prometheus metrics in `api.py` + tests.
 - Task 7: Add `orchestrator-*` CLI commands in `cli.py` + tests.
 - Task 8: Update `ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md` and verify 100% green local & remote CI.
+
+### Micro-Commits
+- `0492397`..`6f6bf62`: Implemented `risk_orchestrator.py` (`RiskDomain`, `UnifiedRiskLevel`, `OrchestratorAction`, `CrossSignalPattern`, `CrossSignalAnalyzer`, `EntityCaseCorrelator`, `UnifiedRiskStore`, `UnifiedRiskOrchestrator`), registered `ENTITY_RISK_ORCHESTRATED` / `CROSS_SIGNAL_PATTERN_DETECTED` / `UNIFIED_CASE_CORRELATED` / `ENTITY_ESCALATION_TRIGGERED` events in `events.py`, added `/v1/orchestrator/*` endpoints and Prometheus metrics in `api.py`, added `orchestrator-*` CLI commands in `cli.py`, achieved 100% branch coverage on `risk_orchestrator.py` (`1232 passed`, `97.01%` total branch coverage), and documented architecture and usage.
 
 
 ## Contributing to the roadmap
