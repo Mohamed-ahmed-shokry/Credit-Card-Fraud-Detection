@@ -2896,6 +2896,69 @@ Provide deterministic, real-time first-party fraud scoring, refund/dispute abuse
 - `2a75fa2`..`9db5893`: Implemented `first_party_fraud.py` (`RefundAbuseAnalyzer`, `FriendlyFraudAnalyzer`, `PromoAbuseDetector`, `FirstPartyAccountStore`, `FirstPartyFraudEngine`), registered `FIRST_PARTY_*` / `REFUND_RESTRICTED` / `ACCOUNT_PRIVILEGES_REVOKED` events in `events.py`, added `/v1/first-party/*` endpoints and Prometheus metrics in `api.py`, added `first-party-*` CLI commands in `cli.py`, achieved 99.23% unit branch coverage, added API & CLI integration tests, and documented architecture and usage.
 
 
+## Phase 53 — Unified Cross-Engine Risk Orchestrator & Entity Case Correlation (In Progress)
+
+Phase 53 implements an in-process, zero-external-dependency Unified Cross-Engine Risk Orchestrator & Entity Case Correlation Engine (`risk_orchestrator.py`). It aggregates domain risk signals across specialized fraud engines (`ATO`, `AML`, `SYNTHETIC_IDENTITY`, `MULE`, `FIRST_PARTY`, `TRANSACTION`), detects compound multi-vector attack patterns, computes calibrated composite entity risk scores, and correlates/deduplicates investigation cases in `CaseManager`.
+
+### Objective
+
+Provide deterministic cross-engine entity risk orchestration, compound pattern detection, automated policy routing (`ALLOW`, `STEP_UP_CHALLENGE`, `HOLD_AND_REVIEW`, `RESTRICT_ENTITY`, `BLOCK_AND_ESCALATE`), unified `CaseManager` case correlation, `EventBus` streaming, REST API endpoints, and CLI workflows with zero external services.
+
+### Scope
+
+1. **Domain Models & Taxonomies (`risk_orchestrator.py`)**:
+   - `RiskDomain`: `ATO`, `AML`, `SYNTHETIC_IDENTITY`, `MULE`, `FIRST_PARTY`, `TRANSACTION`, `CUSTOM`.
+   - `UnifiedRiskLevel`: `LOW`, `MEDIUM`, `HIGH`, `CRITICAL`.
+   - `OrchestratorAction`: `ALLOW`, `STEP_UP_CHALLENGE`, `HOLD_AND_REVIEW`, `RESTRICT_ENTITY`, `BLOCK_AND_ESCALATE`.
+   - `CrossSignalPattern`: `ATO_TO_MULE_EXFILTRATION`, `SYNTHETIC_TO_AML_LAYERING`, `SYNTHETIC_BUST_OUT`, `MULTI_VECTOR_SYNDICATE`, `ESCALATED_REPEAT_OFFENDER`.
+   - `DomainRiskSignal`, `OrchestratorPolicy`, `EntityRiskProfile`, `UnifiedRiskAssessment` with lossless dict/JSON serialization.
+2. **Cross-Signal Pattern Analyzer (`CrossSignalAnalyzer`)**:
+   - Evaluates per-domain latest/peak risk scores for an entity and detects compound cross-engine patterns (`ATO_TO_MULE_EXFILTRATION`, `SYNTHETIC_TO_AML_LAYERING`, `SYNTHETIC_BUST_OUT`, `MULTI_VECTOR_SYNDICATE`, `ESCALATED_REPEAT_OFFENDER`) with deterministic pattern uplift.
+3. **Case Correlation & Engine (`EntityCaseCorrelator`, `UnifiedRiskStore`, `UnifiedRiskOrchestrator`)**:
+   - Thread-safe entity signal & assessment store with capacity eviction.
+   - Calibrated composite risk scoring (max-domain dominance + weighted blend + compound pattern uplift) and policy action mapping.
+   - Correlates high-risk assessments with `CaseManager` (reusing/updating an active entity case or creating a unified case to prevent duplicate alert fatigue).
+   - Emits `ENTITY_RISK_ORCHESTRATED`, `CROSS_SIGNAL_PATTERN_DETECTED`, `UNIFIED_CASE_CORRELATED`, and `ENTITY_ESCALATION_TRIGGERED` events on `EventBus`.
+4. **REST API (`/v1/orchestrator/*`) & Prometheus Metrics (`api.py`)**:
+   - `POST /v1/orchestrator/signals`, `POST /v1/orchestrator/evaluate`, `GET /v1/orchestrator/assessments`, `GET /v1/orchestrator/assessments/{assessment_id}`, `GET /v1/orchestrator/entities/{entity_id}`, `GET /v1/orchestrator/metrics`.
+5. **CLI Workflows (`cli.py`)**:
+   - `orchestrator-ingest`, `orchestrator-eval`, `orchestrator-inspect`, `orchestrator-summary` with table/JSON formatting and store persistence.
+6. **Documentation**:
+   - `ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`.
+
+### Acceptance Criteria
+
+1. **AC-1 (Domain Models & Taxonomies)**: `RiskDomain`, `UnifiedRiskLevel`, `OrchestratorAction`, `CrossSignalPattern`, `DomainRiskSignal`, `OrchestratorPolicy`, `EntityRiskProfile`, and `UnifiedRiskAssessment` serialize/deserialize cleanly with unit tests.
+2. **AC-2 (Cross-Signal Pattern Detection)**: `CrossSignalAnalyzer` accurately detects compound attack patterns (`ATO_TO_MULE_EXFILTRATION`, `SYNTHETIC_TO_AML_LAYERING`, `SYNTHETIC_BUST_OUT`, `MULTI_VECTOR_SYNDICATE`, `ESCALATED_REPEAT_OFFENDER`).
+3. **AC-3 (Orchestrator, Store & Case Correlation)**: `UnifiedRiskOrchestrator`, `UnifiedRiskStore`, and `EntityCaseCorrelator` compute calibrated scores, enforce capacity eviction, and correlate/deduplicate `CaseManager` cases.
+4. **AC-4 (EventBus Streaming)**: Lifecycle transitions emit `ENTITY_RISK_ORCHESTRATED`, `CROSS_SIGNAL_PATTERN_DETECTED`, `UNIFIED_CASE_CORRELATED`, and `ENTITY_ESCALATION_TRIGGERED`.
+5. **AC-5 (REST API & Metrics)**: `/v1/orchestrator/*` endpoints and Prometheus metrics work end to end and are verified in `tests/test_api.py`.
+6. **AC-6 (CLI Workflows)**: `orchestrator-ingest`, `orchestrator-eval`, `orchestrator-inspect`, and `orchestrator-summary` work end to end and are verified in `tests/test_cli.py` and real CLI execution.
+7. **AC-7 (All CI-Parity Checks & Remote CI Green)**: `ruff format --check src tests`, `ruff check src tests`, `mypy src`, `pytest --cov=fraud_detection --cov-report=term-missing`, `python -m build`, `twine check dist/*`, and all remote GitHub Actions CI jobs pass 100%.
+
+### Validation & CI Plan
+
+- Focused unit tests: `python -m pytest tests/test_risk_orchestrator.py -v`
+- API & CLI & Event integration tests: `python -m pytest tests/test_api.py tests/test_cli.py -k "orchestrator"`
+- Full local CI parity: `ruff format --check src tests`, `ruff check src tests`, `mypy src`, `pytest --cov=fraud_detection --cov-report=term-missing`, `python -m build`, `twine check dist/*`
+- Remote CI: GitHub Actions `CI` workflow on `phase/unified-risk-orchestrator` PR.
+
+### Exclusions
+
+- External SOAR/SIEM webhook dispatchers and distributed streaming brokers (out of scope for in-process zero-dependency reference orchestrator).
+
+### Micro-Task Breakdown
+
+- Task 1: Define Phase 53 roadmap & initialize `docs/PROGRESS.md`.
+- Task 2: Create `src/fraud_detection/risk_orchestrator.py` domain enums and data models + tests.
+- Task 3: Implement `CrossSignalAnalyzer` + tests.
+- Task 4: Implement `EntityCaseCorrelator`, `UnifiedRiskStore`, and `UnifiedRiskOrchestrator` + tests.
+- Task 5: Register `ENTITY_RISK_ORCHESTRATED` / `CROSS_SIGNAL_PATTERN_DETECTED` / `UNIFIED_CASE_CORRELATED` / `ENTITY_ESCALATION_TRIGGERED` events in `events.py` and wire `EventBus` into `UnifiedRiskOrchestrator` + tests.
+- Task 6: Add `/v1/orchestrator/*` REST endpoints and Prometheus metrics in `api.py` + tests.
+- Task 7: Add `orchestrator-*` CLI commands in `cli.py` + tests.
+- Task 8: Update `ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md` and verify 100% green local & remote CI.
+
+
 ## Contributing to the roadmap
 
 Open an issue or a pull request that references the relevant phase item.
