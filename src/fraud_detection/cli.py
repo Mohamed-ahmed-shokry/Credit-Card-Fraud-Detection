@@ -235,6 +235,12 @@ from fraud_detection.retraining import (
     VerificationStatus,
     export_certified_candidate,
 )
+from fraud_detection.risk_orchestrator import (
+    DomainRiskSignal,
+    RiskDomain,
+    UnifiedRiskOrchestrator,
+    UnifiedRiskStore,
+)
 from fraud_detection.routing import (
     CanaryConfig,
     TrafficSplitStrategy,
@@ -11362,6 +11368,158 @@ def first_party_summary(
         typer.echo(f"  Total Assessments:  {summary_data['total_assessments']}")
         for level, cnt in summary_data["risk_distribution"].items():
             typer.echo(f"    {level:25s}: {cnt}")
+    else:
+        typer.echo(json.dumps(summary_data, indent=2))
+
+
+def _load_orchestrator_state(
+    store_file: Path,
+) -> tuple[UnifiedRiskOrchestrator, UnifiedRiskStore]:
+    """Load persistent orchestrator entity profiles and assessments from a JSON store file."""
+    if not store_file.exists():
+        store = UnifiedRiskStore()
+        return UnifiedRiskOrchestrator(store=store), store
+    try:
+        data = json.loads(store_file.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            _abort("Invalid orchestrator store file format: expected JSON object.")
+    except (OSError, json.JSONDecodeError) as exc:
+        _abort(f"Could not read orchestrator store file: {exc}")
+    store = UnifiedRiskStore.from_dict(data)
+    return UnifiedRiskOrchestrator(store=store), store
+
+
+def _save_orchestrator_state(store: UnifiedRiskStore, store_file: Path) -> None:
+    """Persist orchestrator store atomically to disk."""
+    _atomic_write_text(json.dumps(store.to_dict(), indent=2), store_file)
+
+
+@app.command("orchestrator-ingest")
+def orchestrator_ingest(
+    entity_id: Annotated[str, typer.Option("--entity-id", "-e", help="Entity identifier.")],
+    domain: Annotated[
+        RiskDomain, typer.Option("--domain", "-d", help="Source risk domain engine.")
+    ],
+    score: Annotated[float, typer.Option("--score", help="Normalized domain risk score (0-1).")],
+    tenant_id: Annotated[str, typer.Option("--tenant-id", "-t", help="Tenant identifier.")] = (
+        "default"
+    ),
+    reason_code: Annotated[
+        list[str] | None,
+        typer.Option("--reason-code", "-r", help="Reason code(s) for the domain signal."),
+    ] = None,
+    store_file: Annotated[
+        Path,
+        typer.Option("--store-file", "-s", help="Path to orchestrator state JSON file."),
+    ] = Path("orchestrator_store.json"),
+    output_format: Annotated[
+        str, typer.Option("--format", "-f", help="Output format (table or json).")
+    ] = "table",
+) -> None:
+    """Ingest a domain risk signal into the unified risk orchestrator store."""
+    orch, store = _load_orchestrator_state(store_file)
+    signal = DomainRiskSignal(
+        entity_id=entity_id,
+        domain=domain,
+        score=score,
+        tenant_id=tenant_id,
+        reason_codes=list(reason_code or []),
+    )
+    profile = orch.ingest_signal(signal)
+    _save_orchestrator_state(store, store_file)
+    if output_format.lower() == "table":
+        typer.echo(f"Entity:        {profile.entity_id}")
+        typer.echo(f"Tenant:        {profile.tenant_id}")
+        typer.echo(f"Signal ID:     {signal.signal_id}")
+        typer.echo(f"Signal Count:  {len(profile.signals)}")
+        typer.echo(f"Domain Scores: {json.dumps(profile.domain_scores)}")
+    else:
+        typer.echo(json.dumps(profile.to_dict(), indent=2))
+
+
+@app.command("orchestrator-eval")
+def orchestrator_eval(
+    entity_id: Annotated[str, typer.Option("--entity-id", "-e", help="Entity identifier.")],
+    tenant_id: Annotated[str, typer.Option("--tenant-id", "-t", help="Tenant identifier.")] = (
+        "default"
+    ),
+    store_file: Annotated[
+        Path,
+        typer.Option("--store-file", "-s", help="Path to orchestrator state JSON file."),
+    ] = Path("orchestrator_store.json"),
+    output_format: Annotated[
+        str, typer.Option("--format", "-f", help="Output format (table or json).")
+    ] = "table",
+) -> None:
+    """Evaluate a stored entity's cross-engine unified risk and compound patterns."""
+    orch, store = _load_orchestrator_state(store_file)
+    if store.get_profile(entity_id, tenant_id=tenant_id) is None:
+        _abort(f"Orchestrator entity '{entity_id}' not found in store.")
+    assessment = orch.evaluate_entity(entity_id, tenant_id=tenant_id)
+    _save_orchestrator_state(store, store_file)
+    if output_format.lower() == "table":
+        typer.echo(f"Assessment ID:    {assessment.assessment_id}")
+        typer.echo(f"Entity:           {assessment.entity_id}")
+        typer.echo(f"Composite Score:  {assessment.composite_score:.4f}")
+        typer.echo(f"Risk Level:       {assessment.risk_level.value}")
+        typer.echo(f"Action:           {assessment.action.value}")
+        if assessment.patterns_detected:
+            typer.echo(
+                "Patterns:         " + ", ".join(p.value for p in assessment.patterns_detected)
+            )
+    else:
+        typer.echo(json.dumps(assessment.to_dict(), indent=2))
+
+
+@app.command("orchestrator-inspect")
+def orchestrator_inspect(
+    entity_id: Annotated[str, typer.Option("--entity-id", "-e", help="Entity identifier.")],
+    tenant_id: Annotated[str, typer.Option("--tenant-id", "-t", help="Tenant identifier.")] = (
+        "default"
+    ),
+    store_file: Annotated[
+        Path,
+        typer.Option("--store-file", "-s", help="Path to orchestrator state JSON file."),
+    ] = Path("orchestrator_store.json"),
+    output_format: Annotated[
+        str, typer.Option("--format", "-f", help="Output format (table or json).")
+    ] = "table",
+) -> None:
+    """Inspect a stored entity's cross-domain risk profile."""
+    _, store = _load_orchestrator_state(store_file)
+    profile = store.get_profile(entity_id, tenant_id=tenant_id)
+    if profile is None:
+        _abort(f"Orchestrator entity '{entity_id}' not found in store.")
+    if output_format.lower() == "table":
+        typer.echo(f"Entity:          {profile.entity_id}")
+        typer.echo(f"Tenant:          {profile.tenant_id}")
+        typer.echo(f"Signals:         {len(profile.signals)}")
+        typer.echo(f"High-Risk Streak:{profile.high_risk_streak}")
+        typer.echo(f"Domain Scores:   {json.dumps(profile.domain_scores)}")
+    else:
+        typer.echo(json.dumps(profile.to_dict(), indent=2))
+
+
+@app.command("orchestrator-summary")
+def orchestrator_summary(
+    store_file: Annotated[
+        Path,
+        typer.Option("--store-file", "-s", help="Path to orchestrator state JSON file."),
+    ] = Path("orchestrator_store.json"),
+    output_format: Annotated[
+        str, typer.Option("--format", "-f", help="Output format (table or json).")
+    ] = "table",
+) -> None:
+    """Display summary metrics of orchestrated entities and cross-signal assessments."""
+    _, store = _load_orchestrator_state(store_file)
+    summary_data = store.summary()
+    if output_format.lower() == "table":
+        typer.echo("Unified Risk Orchestrator Summary:")
+        typer.echo(f"  Entities:             {summary_data['entity_count']}")
+        typer.echo(f"  Assessments:          {summary_data['assessment_count']}")
+        typer.echo(f"  Correlated Cases:     {summary_data['correlated_assessments']}")
+        for level, cnt in summary_data["by_risk_level"].items():
+            typer.echo(f"    {level:22s}: {cnt}")
     else:
         typer.echo(json.dumps(summary_data, indent=2))
 
