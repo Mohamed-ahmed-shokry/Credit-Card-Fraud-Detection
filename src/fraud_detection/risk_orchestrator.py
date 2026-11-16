@@ -8,11 +8,19 @@ risk scores, and correlates investigation cases in ``CaseManager``.
 
 from __future__ import annotations
 
+import json
+import threading
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
-from typing import Any
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
+
+from fraud_detection.cases import CaseManager, CaseNotFoundError, CaseStatus
+
+if TYPE_CHECKING:
+    from fraud_detection.events import EventBus
 
 
 def _utc_now_iso() -> str:
@@ -329,3 +337,347 @@ class CrossSignalAnalyzer:
             rationale.append(f"Repeat elevated risk across {high_risk_streak} consecutive sweeps")
 
         return patterns, rationale
+
+
+class EntityCaseCorrelator:
+    """Correlates cross-engine entity assessments into unified CaseManager cases."""
+
+    def correlate(
+        self,
+        *,
+        case_manager: CaseManager,
+        profile: EntityRiskProfile,
+        assessment: UnifiedRiskAssessment,
+    ) -> tuple[str, bool]:
+        if profile.active_case_id:
+            try:
+                existing = case_manager.get_case(profile.active_case_id)
+                if existing.status not in {CaseStatus.RESOLVED, CaseStatus.CLOSED}:
+                    existing.fraud_score = max(existing.fraud_score, assessment.composite_score)
+                    existing.metadata["cross_engine_domains"] = dict(assessment.domain_scores)
+                    existing.metadata["patterns"] = [p.value for p in assessment.patterns_detected]
+                    existing.metadata["last_orchestrator_assessment_id"] = assessment.assessment_id
+                    existing.add_audit_entry(
+                        action="orchestrator_correlated",
+                        actor="risk_orchestrator",
+                        details={
+                            "assessment_id": assessment.assessment_id,
+                            "composite_score": assessment.composite_score,
+                            "patterns": [p.value for p in assessment.patterns_detected],
+                        },
+                    )
+                    case_manager.store.put(existing)
+                    return existing.case_id, False
+            except CaseNotFoundError:
+                pass
+
+        created = case_manager.create_case(
+            transaction_id=f"entity:{profile.entity_id}",
+            fraud_score=assessment.composite_score,
+            tenant_id=profile.tenant_id,
+            metadata={
+                "source": "risk_orchestrator",
+                "entity_id": profile.entity_id,
+                "assessment_id": assessment.assessment_id,
+                "cross_engine_domains": dict(assessment.domain_scores),
+                "patterns": [p.value for p in assessment.patterns_detected],
+            },
+        )
+        profile.active_case_id = created.case_id
+        return created.case_id, True
+
+
+class UnifiedRiskStore:
+    """Thread-safe in-memory store for entity risk profiles and assessments."""
+
+    def __init__(
+        self,
+        *,
+        max_entities: int = 5000,
+        max_assessments: int = 10000,
+        max_signals_per_entity: int = 200,
+    ) -> None:
+        self._lock = threading.RLock()
+        self.max_entities = max(1, max_entities)
+        self.max_assessments = max(1, max_assessments)
+        self.max_signals_per_entity = max(1, max_signals_per_entity)
+        self._profiles: dict[tuple[str, str], EntityRiskProfile] = {}
+        self._assessments: dict[str, UnifiedRiskAssessment] = {}
+        self._assessment_order: list[str] = []
+
+    def _evict_entities_if_needed(self) -> None:
+        while len(self._profiles) > self.max_entities:
+            oldest_key = min(
+                self._profiles,
+                key=lambda k: self._profiles[k].last_updated,
+            )
+            del self._profiles[oldest_key]
+
+    def _evict_assessments_if_needed(self) -> None:
+        while len(self._assessment_order) > self.max_assessments:
+            oldest_id = self._assessment_order.pop(0)
+            self._assessments.pop(oldest_id, None)
+
+    def get_or_create_profile(
+        self, entity_id: str, tenant_id: str = "default"
+    ) -> EntityRiskProfile:
+        key = (tenant_id.strip() or "default", entity_id.strip())
+        with self._lock:
+            profile = self._profiles.get(key)
+            if profile is None:
+                profile = EntityRiskProfile(entity_id=key[1], tenant_id=key[0])
+                self._profiles[key] = profile
+                self._evict_entities_if_needed()
+            return profile
+
+    def get_profile(self, entity_id: str, tenant_id: str = "default") -> EntityRiskProfile | None:
+        key = (tenant_id.strip() or "default", entity_id.strip())
+        with self._lock:
+            return self._profiles.get(key)
+
+    def record_signal(self, signal: DomainRiskSignal) -> EntityRiskProfile:
+        with self._lock:
+            profile = self.get_or_create_profile(signal.entity_id, signal.tenant_id)
+            profile.signals.append(signal)
+            if len(profile.signals) > self.max_signals_per_entity:
+                profile.signals = profile.signals[-self.max_signals_per_entity :]
+            domain_key = RiskDomain(signal.domain).value
+            profile.domain_scores[domain_key] = max(
+                profile.domain_scores.get(domain_key, 0.0), signal.score
+            )
+            profile.last_updated = _utc_now_iso()
+            return profile
+
+    def save_assessment(self, assessment: UnifiedRiskAssessment) -> None:
+        with self._lock:
+            if assessment.assessment_id not in self._assessments:
+                self._assessment_order.append(assessment.assessment_id)
+            self._assessments[assessment.assessment_id] = assessment
+            self._evict_assessments_if_needed()
+
+    def get_assessment(self, assessment_id: str) -> UnifiedRiskAssessment | None:
+        with self._lock:
+            return self._assessments.get(assessment_id)
+
+    def list_assessments(
+        self,
+        *,
+        entity_id: str | None = None,
+        tenant_id: str | None = None,
+        risk_level: UnifiedRiskLevel | None = None,
+        limit: int = 100,
+    ) -> list[UnifiedRiskAssessment]:
+        with self._lock:
+            items = [
+                self._assessments[aid]
+                for aid in reversed(self._assessment_order)
+                if aid in self._assessments
+            ]
+            if entity_id is not None:
+                items = [a for a in items if a.entity_id == entity_id]
+            if tenant_id is not None:
+                items = [a for a in items if a.tenant_id == tenant_id]
+            if risk_level is not None:
+                items = [a for a in items if a.risk_level is risk_level]
+            return items[: max(1, limit)]
+
+    def summary(self) -> dict[str, Any]:
+        with self._lock:
+            by_level: dict[str, int] = {lvl.value: 0 for lvl in UnifiedRiskLevel}
+            by_pattern: dict[str, int] = {pat.value: 0 for pat in CrossSignalPattern}
+            correlated_cases = 0
+            for assessment in self._assessments.values():
+                by_level[assessment.risk_level.value] = (
+                    by_level.get(assessment.risk_level.value, 0) + 1
+                )
+                for pat in assessment.patterns_detected:
+                    by_pattern[pat.value] = by_pattern.get(pat.value, 0) + 1
+                if assessment.correlated_case_id:
+                    correlated_cases += 1
+            return {
+                "entity_count": len(self._profiles),
+                "assessment_count": len(self._assessments),
+                "correlated_assessments": correlated_cases,
+                "by_risk_level": by_level,
+                "by_pattern": by_pattern,
+            }
+
+    def to_dict(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "max_entities": self.max_entities,
+                "max_assessments": self.max_assessments,
+                "max_signals_per_entity": self.max_signals_per_entity,
+                "profiles": [p.to_dict() for p in self._profiles.values()],
+                "assessments": [
+                    self._assessments[aid].to_dict()
+                    for aid in self._assessment_order
+                    if aid in self._assessments
+                ],
+            }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> UnifiedRiskStore:
+        store = cls(
+            max_entities=int(payload.get("max_entities", 5000)),
+            max_assessments=int(payload.get("max_assessments", 10000)),
+            max_signals_per_entity=int(payload.get("max_signals_per_entity", 200)),
+        )
+        for p_raw in payload.get("profiles", []):
+            profile = EntityRiskProfile.from_dict(p_raw)
+            store._profiles[(profile.tenant_id, profile.entity_id)] = profile
+        for a_raw in payload.get("assessments", []):
+            assessment = UnifiedRiskAssessment.from_dict(a_raw)
+            store._assessments[assessment.assessment_id] = assessment
+            store._assessment_order.append(assessment.assessment_id)
+        return store
+
+    def save_json(self, path: str | Path) -> Path:
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(self.to_dict(), indent=2), encoding="utf-8")
+        return target
+
+    @classmethod
+    def load_json(cls, path: str | Path) -> UnifiedRiskStore:
+        source = Path(path)
+        if not source.exists():
+            return cls()
+        return cls.from_dict(json.loads(source.read_text(encoding="utf-8")))
+
+
+class UnifiedRiskOrchestrator:
+    """Orchestrates cross-engine signals, compound pattern detection, and case correlation."""
+
+    def __init__(
+        self,
+        *,
+        policy: OrchestratorPolicy | None = None,
+        store: UnifiedRiskStore | None = None,
+        analyzer: CrossSignalAnalyzer | None = None,
+        correlator: EntityCaseCorrelator | None = None,
+        case_manager: CaseManager | None = None,
+        event_bus: EventBus | None = None,
+    ) -> None:
+        self.policy = policy or OrchestratorPolicy()
+        self.store = store or UnifiedRiskStore()
+        self.analyzer = analyzer or CrossSignalAnalyzer()
+        self.correlator = correlator or EntityCaseCorrelator()
+        self.case_manager = case_manager
+        self.event_bus = event_bus
+        self._lock = threading.RLock()
+
+    def ingest_signal(self, signal: DomainRiskSignal) -> EntityRiskProfile:
+        with self._lock:
+            return self.store.record_signal(signal)
+
+    def _active_domain_scores(
+        self, profile: EntityRiskProfile, reference_time: datetime
+    ) -> tuple[dict[str, float], list[str]]:
+        cutoff = reference_time - timedelta(seconds=self.policy.correlation_window_seconds)
+        scores: dict[str, float] = {}
+        signal_ids: list[str] = []
+        for sig in profile.signals:
+            if _parse_iso(sig.timestamp) >= cutoff:
+                domain_key = RiskDomain(sig.domain).value
+                scores[domain_key] = max(scores.get(domain_key, 0.0), sig.score)
+                signal_ids.append(sig.signal_id)
+        if not scores and profile.domain_scores:
+            scores = dict(profile.domain_scores)
+        return scores, signal_ids
+
+    def _score_and_route(
+        self,
+        domain_scores: dict[str, float],
+        patterns: list[CrossSignalPattern],
+    ) -> tuple[float, UnifiedRiskLevel, OrchestratorAction]:
+        if not domain_scores:
+            return 0.0, UnifiedRiskLevel.LOW, OrchestratorAction.ALLOW
+
+        total_weight = sum(self.policy.weight_for(RiskDomain(d)) for d in domain_scores)
+        weighted_avg = (
+            sum(s * self.policy.weight_for(RiskDomain(d)) for d, s in domain_scores.items())
+            / total_weight
+        )
+        peak = max(domain_scores.values())
+        base = 0.65 * peak + 0.35 * weighted_avg
+        uplift = min(0.25, len(patterns) * self.policy.pattern_uplift)
+        composite = round(_clamp(base + uplift), 6)
+
+        if composite >= self.policy.critical_threshold:
+            return composite, UnifiedRiskLevel.CRITICAL, OrchestratorAction.BLOCK_AND_ESCALATE
+        if composite >= self.policy.high_threshold:
+            return composite, UnifiedRiskLevel.HIGH, OrchestratorAction.RESTRICT_ENTITY
+        if composite >= self.policy.elevated_threshold:
+            return composite, UnifiedRiskLevel.MEDIUM, OrchestratorAction.HOLD_AND_REVIEW
+        if composite >= self.policy.medium_threshold:
+            return composite, UnifiedRiskLevel.MEDIUM, OrchestratorAction.STEP_UP_CHALLENGE
+        return composite, UnifiedRiskLevel.LOW, OrchestratorAction.ALLOW
+
+    def evaluate_entity(
+        self,
+        entity_id: str,
+        *,
+        tenant_id: str = "default",
+        signals: list[DomainRiskSignal] | None = None,
+        metadata: dict[str, Any] | None = None,
+        reference_time: datetime | None = None,
+    ) -> UnifiedRiskAssessment:
+        with self._lock:
+            for sig in signals or []:
+                self.store.record_signal(sig)
+
+            profile = self.store.get_or_create_profile(entity_id, tenant_id=tenant_id)
+            now = reference_time or datetime.now(UTC)
+            domain_scores, signal_ids = self._active_domain_scores(profile, now)
+            profile.domain_scores = dict(domain_scores)
+
+            patterns, rationale = self.analyzer.analyze(
+                domain_scores,
+                policy=self.policy,
+                high_risk_streak=profile.high_risk_streak,
+            )
+            composite_score, risk_level, action = self._score_and_route(domain_scores, patterns)
+            if not rationale and domain_scores:
+                top_domain = max(domain_scores, key=lambda k: domain_scores[k])
+                rationale.append(
+                    f"Dominant risk domain '{top_domain}' scored {domain_scores[top_domain]:.2f}"
+                )
+
+            if risk_level in {UnifiedRiskLevel.HIGH, UnifiedRiskLevel.CRITICAL}:
+                profile.high_risk_streak += 1
+            else:
+                profile.high_risk_streak = 0
+
+            assessment = UnifiedRiskAssessment(
+                assessment_id=f"ora_{uuid4().hex[:12]}",
+                entity_id=profile.entity_id,
+                tenant_id=profile.tenant_id,
+                composite_score=composite_score,
+                risk_level=risk_level,
+                action=action,
+                domain_scores=domain_scores,
+                patterns_detected=patterns,
+                contributing_signal_ids=signal_ids,
+                rationale=rationale,
+                evaluated_at=now.isoformat(),
+                metadata=dict(metadata or {}),
+            )
+
+            if (
+                self.case_manager is not None
+                and self.policy.auto_correlate_cases
+                and risk_level in {UnifiedRiskLevel.HIGH, UnifiedRiskLevel.CRITICAL}
+            ):
+                case_id, created = self.correlator.correlate(
+                    case_manager=self.case_manager,
+                    profile=profile,
+                    assessment=assessment,
+                )
+                assessment.correlated_case_id = case_id
+                assessment.case_created = created
+
+            profile.last_assessment_id = assessment.assessment_id
+            profile.last_updated = now.isoformat()
+            self.store.save_assessment(assessment)
+            return assessment
