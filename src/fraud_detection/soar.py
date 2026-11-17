@@ -11,12 +11,14 @@ from __future__ import annotations
 import json
 import threading
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from fraud_detection.cases import CaseManager, CaseNotFoundError, CaseStatus
+from fraud_detection.events import EventBus, EventType, FraudDomainEvent
 from fraud_detection.risk_orchestrator import (
     CrossSignalPattern,
     UnifiedRiskAssessment,
@@ -726,3 +728,311 @@ class SoarStore:
         if not source.exists():
             return cls()
         return cls.from_dict(json.loads(source.read_text(encoding="utf-8")))
+
+
+class SoarEngine:
+    """Executes deterministic SOAR containment playbooks with TTL tracking and rollback."""
+
+    def __init__(
+        self,
+        *,
+        catalog: PlaybookCatalog | None = None,
+        store: SoarStore | None = None,
+        case_manager: CaseManager | None = None,
+        event_bus: EventBus | None = None,
+    ) -> None:
+        self.catalog = catalog or PlaybookCatalog()
+        self.store = store or SoarStore()
+        self.case_manager = case_manager
+        self.event_bus = event_bus
+        self._lock = threading.RLock()
+
+    def _emit_event(
+        self,
+        event_type: EventType,
+        *,
+        tenant_id: str,
+        payload: dict[str, Any],
+    ) -> None:
+        if self.event_bus is None:
+            return
+        self.event_bus.publish(
+            FraudDomainEvent(
+                event_type=event_type,
+                tenant_id=tenant_id,
+                payload=payload,
+            )
+        )
+
+    def _escalate_case(
+        self,
+        *,
+        assessment: UnifiedRiskAssessment,
+        playbook: ResponsePlaybook,
+        execution_id: str,
+    ) -> str | None:
+        if self.case_manager is None:
+            return assessment.correlated_case_id
+
+        if assessment.correlated_case_id:
+            try:
+                existing = self.case_manager.get_case(assessment.correlated_case_id)
+                if existing.status not in {CaseStatus.RESOLVED, CaseStatus.CLOSED}:
+                    existing.metadata["soar_execution_id"] = execution_id
+                    existing.metadata["soar_playbook_id"] = playbook.playbook_id
+                    existing.add_audit_entry(
+                        action="soar_playbook_escalated",
+                        actor="soar_engine",
+                        details={
+                            "execution_id": execution_id,
+                            "playbook_id": playbook.playbook_id,
+                        },
+                    )
+                    self.case_manager.store.put(existing)
+                    return existing.case_id
+            except CaseNotFoundError:
+                pass
+
+        created = self.case_manager.create_case(
+            transaction_id=f"soar:{assessment.entity_id}:{execution_id}",
+            fraud_score=assessment.composite_score,
+            tenant_id=assessment.tenant_id,
+            metadata={
+                "source": "soar_engine",
+                "entity_id": assessment.entity_id,
+                "execution_id": execution_id,
+                "playbook_id": playbook.playbook_id,
+                "patterns": [p.value for p in assessment.patterns_detected],
+            },
+        )
+        return created.case_id
+
+    def execute_for_assessment(
+        self,
+        assessment: UnifiedRiskAssessment,
+        *,
+        playbook_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        reference_time: datetime | None = None,
+    ) -> PlaybookExecutionRecord:
+        now = reference_time or datetime.now(UTC)
+        with self._lock:
+            playbook = self.catalog.select_playbook(assessment, playbook_id=playbook_id)
+            execution_id = f"soar_{uuid4().hex[:12]}"
+
+            if playbook is None:
+                skipped = PlaybookExecutionRecord(
+                    execution_id=execution_id,
+                    playbook_id=playbook_id or "none",
+                    entity_id=assessment.entity_id,
+                    tenant_id=assessment.tenant_id,
+                    status=PlaybookRunStatus.SKIPPED,
+                    composite_score=assessment.composite_score,
+                    risk_level=assessment.risk_level,
+                    source_assessment_id=assessment.assessment_id,
+                    triggered_patterns=list(assessment.patterns_detected),
+                    correlated_case_id=assessment.correlated_case_id,
+                    executed_at=now.isoformat(),
+                    metadata=dict(metadata or {}),
+                )
+                self.store.save_execution(skipped)
+                return skipped
+
+            self._emit_event(
+                EventType.SOAR_PLAYBOOK_TRIGGERED,
+                tenant_id=assessment.tenant_id,
+                payload={
+                    "execution_id": execution_id,
+                    "playbook_id": playbook.playbook_id,
+                    "entity_id": assessment.entity_id,
+                    "composite_score": assessment.composite_score,
+                    "risk_level": assessment.risk_level.value,
+                },
+            )
+
+            step_results: list[PlaybookStepResult] = []
+            correlated_case_id = assessment.correlated_case_id
+
+            for step in playbook.steps:
+                ctrl = ContainmentControlType(step.control_type)
+                if ctrl is ContainmentControlType.ESCALATE_CASE:
+                    escalated_case_id = self._escalate_case(
+                        assessment=assessment,
+                        playbook=playbook,
+                        execution_id=execution_id,
+                    )
+                    if escalated_case_id:
+                        correlated_case_id = escalated_case_id
+                    step_results.append(
+                        PlaybookStepResult(
+                            control_type=ctrl,
+                            applied=escalated_case_id is not None,
+                            case_id=escalated_case_id,
+                            message=(
+                                f"Escalated investigation case {escalated_case_id}"
+                                if escalated_case_id
+                                else "Case escalation skipped (no CaseManager configured)"
+                            ),
+                            executed_at=now.isoformat(),
+                        )
+                    )
+                    continue
+
+                existing_cnt = self.store.find_active_control(
+                    assessment.entity_id,
+                    ctrl,
+                    tenant_id=assessment.tenant_id,
+                    reference_time=now,
+                )
+                if existing_cnt is not None:
+                    step_results.append(
+                        PlaybookStepResult(
+                            control_type=ctrl,
+                            applied=False,
+                            containment_id=existing_cnt.containment_id,
+                            message=(
+                                f"Control '{ctrl.value}' already active "
+                                f"({existing_cnt.containment_id})"
+                            ),
+                            executed_at=now.isoformat(),
+                        )
+                    )
+                    continue
+
+                expires_at = (
+                    (now + timedelta(seconds=step.ttl_seconds)).isoformat()
+                    if step.ttl_seconds is not None
+                    else None
+                )
+                containment = ActiveContainmentRecord(
+                    entity_id=assessment.entity_id,
+                    tenant_id=assessment.tenant_id,
+                    control_type=ctrl,
+                    execution_id=execution_id,
+                    playbook_id=playbook.playbook_id,
+                    state=ContainmentState.ACTIVE,
+                    reason=step.description or f"Applied by {playbook.playbook_id}",
+                    applied_at=now.isoformat(),
+                    expires_at=expires_at,
+                    metadata=dict(step.parameters),
+                )
+                self.store.save_containment(containment)
+                self._emit_event(
+                    EventType.SOAR_CONTAINMENT_APPLIED,
+                    tenant_id=assessment.tenant_id,
+                    payload={
+                        "execution_id": execution_id,
+                        "playbook_id": playbook.playbook_id,
+                        "containment_id": containment.containment_id,
+                        "entity_id": assessment.entity_id,
+                        "control_type": ctrl.value,
+                        "expires_at": expires_at,
+                    },
+                )
+                step_results.append(
+                    PlaybookStepResult(
+                        control_type=ctrl,
+                        applied=True,
+                        containment_id=containment.containment_id,
+                        message=step.description or f"Applied {ctrl.value}",
+                        executed_at=now.isoformat(),
+                    )
+                )
+
+            applied_any = any(r.applied for r in step_results)
+            all_applied = bool(step_results) and all(r.applied for r in step_results)
+            if all_applied:
+                status = PlaybookRunStatus.COMPLETED
+            elif applied_any:
+                status = PlaybookRunStatus.PARTIAL
+            else:
+                status = PlaybookRunStatus.SKIPPED
+
+            record = PlaybookExecutionRecord(
+                execution_id=execution_id,
+                playbook_id=playbook.playbook_id,
+                entity_id=assessment.entity_id,
+                tenant_id=assessment.tenant_id,
+                status=status,
+                composite_score=assessment.composite_score,
+                risk_level=assessment.risk_level,
+                source_assessment_id=assessment.assessment_id,
+                triggered_patterns=list(assessment.patterns_detected),
+                step_results=step_results,
+                correlated_case_id=correlated_case_id,
+                executed_at=now.isoformat(),
+                metadata=dict(metadata or {}),
+            )
+            self.store.save_execution(record)
+            self._emit_event(
+                EventType.SOAR_PLAYBOOK_COMPLETED,
+                tenant_id=assessment.tenant_id,
+                payload={
+                    "execution_id": record.execution_id,
+                    "playbook_id": record.playbook_id,
+                    "entity_id": record.entity_id,
+                    "status": PlaybookRunStatus(record.status).value,
+                    "correlated_case_id": record.correlated_case_id,
+                },
+            )
+            return record
+
+    def release_containment(
+        self,
+        containment_id: str,
+        *,
+        reason: str = "operator_release",
+        reference_time: datetime | None = None,
+    ) -> ActiveContainmentRecord:
+        now = reference_time or datetime.now(UTC)
+        with self._lock:
+            rec = self.store.get_containment(containment_id)
+            if rec is None:
+                raise KeyError(f"Containment '{containment_id}' not found")
+            if rec.state is ContainmentState.ACTIVE:
+                rec.state = ContainmentState.RELEASED
+                rec.released_at = now.isoformat()
+                rec.release_reason = reason
+                self.store.save_containment(rec)
+                self._emit_event(
+                    EventType.SOAR_CONTAINMENT_ROLLED_BACK,
+                    tenant_id=rec.tenant_id,
+                    payload={
+                        "containment_id": rec.containment_id,
+                        "execution_id": rec.execution_id,
+                        "entity_id": rec.entity_id,
+                        "control_type": ContainmentControlType(rec.control_type).value,
+                        "reason": reason,
+                    },
+                )
+            return rec
+
+    def rollback_execution(
+        self,
+        execution_id: str,
+        *,
+        reason: str = "operator_rollback",
+        reference_time: datetime | None = None,
+    ) -> PlaybookExecutionRecord:
+        now = reference_time or datetime.now(UTC)
+        with self._lock:
+            record = self.store.get_execution(execution_id)
+            if record is None:
+                raise KeyError(f"Playbook execution '{execution_id}' not found")
+            released_ids: list[str] = []
+            for step in record.step_results:
+                if step.containment_id and step.applied:
+                    cnt = self.store.get_containment(step.containment_id)
+                    if cnt is not None and cnt.state is ContainmentState.ACTIVE:
+                        self.release_containment(
+                            cnt.containment_id,
+                            reason=reason,
+                            reference_time=now,
+                        )
+                        released_ids.append(cnt.containment_id)
+            record.status = PlaybookRunStatus.ROLLED_BACK
+            record.rolled_back_at = now.isoformat()
+            record.rollback_reason = reason
+            record.metadata["released_containment_ids"] = released_ids
+            self.store.save_execution(record)
+            return record
