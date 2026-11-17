@@ -2242,6 +2242,33 @@ FastAPI Unified Risk Orchestrator REST endpoints:
 - `GET /v1/orchestrator/metrics`: Summary metrics of orchestrated entities, assessments, and correlated cases.
 - Prometheus metrics: `fraud_orchestrator_evaluations_total`, `fraud_orchestrator_patterns_total`, `fraud_orchestrator_escalations_total`.
 
+### Automated SOAR Incident Response Playbooks & Containment Engine (Phase 54)
+
+```bash
+# Execute a matching SOAR containment playbook for a high-risk entity
+fraud-detect soar-execute \
+  --entity-id ent_100 \
+  --score 0.91 \
+  --risk-level critical \
+  --pattern ato_to_mule_exfiltration \
+  --format json
+
+# Inspect active entity containments, roll back an execution, or view summary
+fraud-detect soar-inspect --entity-id ent_100
+fraud-detect soar-rollback --execution-id soar_1234567890ab --reason false_positive_cleared
+fraud-detect soar-summary --format table
+```
+
+FastAPI SOAR Response Playbooks REST endpoints:
+- `POST /v1/soar/execute`: Match and execute a deterministic containment playbook (`LOCK_ACCOUNT`, `FREEZE_CARD`, `HOLD_PAYOUTS`, `REVOKE_SESSIONS`, `REQUIRE_STEP_UP`, `QUARANTINE_DEVICE`, `ESCALATE_CASE`).
+- `POST /v1/soar/executions/{execution_id}/rollback`: Roll back an execution and release all active compensating controls it applied.
+- `GET /v1/soar/executions/{execution_id}`: Fetch a specific SOAR playbook execution record.
+- `GET /v1/soar/executions`: Query SOAR playbook executions with optional entity/tenant/status filters.
+- `GET /v1/soar/containments/{entity_id}`: Inspect active or historical compensating controls for an entity.
+- `GET /v1/soar/playbooks`: List registered SOAR playbooks and their trigger criteria.
+- `GET /v1/soar/metrics`: Summary metrics of playbook executions and active containments.
+- Prometheus metrics: `fraud_soar_playbooks_executed_total`, `fraud_soar_containments_applied_total`, `fraud_soar_rollbacks_total`.
+
 ## Reference label-delay analysis
 
 
