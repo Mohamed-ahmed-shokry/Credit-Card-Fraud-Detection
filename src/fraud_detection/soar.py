@@ -319,3 +319,165 @@ class PlaybookExecutionRecord:
             rollback_reason=payload.get("rollback_reason"),
             metadata=dict(payload.get("metadata", {})),
         )
+
+
+_RISK_LEVEL_ORDER: dict[UnifiedRiskLevel, int] = {
+    UnifiedRiskLevel.LOW: 0,
+    UnifiedRiskLevel.MEDIUM: 1,
+    UnifiedRiskLevel.HIGH: 2,
+    UnifiedRiskLevel.CRITICAL: 3,
+}
+
+
+def build_default_playbooks() -> list[ResponsePlaybook]:
+    """Build standard SOAR containment playbooks for compound fraud patterns."""
+    return [
+        ResponsePlaybook(
+            playbook_id="pb_ato_mule_exfiltration",
+            name="ATO to Mule Exfiltration Containment",
+            description="Locks compromised account, revokes sessions, holds payouts, and escalates case",
+            trigger_patterns=[CrossSignalPattern.ATO_TO_MULE_EXFILTRATION],
+            min_risk_level=UnifiedRiskLevel.HIGH,
+            min_composite_score=0.65,
+            priority=10,
+            steps=[
+                PlaybookStepSpec(
+                    control_type=ContainmentControlType.REVOKE_SESSIONS,
+                    description="Terminate active authentication sessions immediately",
+                    ttl_seconds=86400,
+                ),
+                PlaybookStepSpec(
+                    control_type=ContainmentControlType.LOCK_ACCOUNT,
+                    description="Lock compromised account pending security verification",
+                    ttl_seconds=86400,
+                ),
+                PlaybookStepSpec(
+                    control_type=ContainmentControlType.HOLD_PAYOUTS,
+                    description="Hold outbound ACH, wire, and off-ramp payouts",
+                    ttl_seconds=172800,
+                ),
+                PlaybookStepSpec(
+                    control_type=ContainmentControlType.ESCALATE_CASE,
+                    description="Escalate correlated investigation case to priority review",
+                    ttl_seconds=None,
+                ),
+            ],
+        ),
+        ResponsePlaybook(
+            playbook_id="pb_synthetic_aml_layering",
+            name="Synthetic Identity AML Layering Containment",
+            description="Freezes cards, holds payouts, locks account, and escalates AML case",
+            trigger_patterns=[CrossSignalPattern.SYNTHETIC_TO_AML_LAYERING],
+            min_risk_level=UnifiedRiskLevel.HIGH,
+            min_composite_score=0.65,
+            priority=20,
+            steps=[
+                PlaybookStepSpec(
+                    control_type=ContainmentControlType.FREEZE_CARD,
+                    description="Freeze associated credit and debit instruments",
+                    ttl_seconds=172800,
+                ),
+                PlaybookStepSpec(
+                    control_type=ContainmentControlType.HOLD_PAYOUTS,
+                    description="Hold outbound layering transfers",
+                    ttl_seconds=172800,
+                ),
+                PlaybookStepSpec(
+                    control_type=ContainmentControlType.LOCK_ACCOUNT,
+                    description="Lock synthetic identity account profile",
+                    ttl_seconds=172800,
+                ),
+                PlaybookStepSpec(
+                    control_type=ContainmentControlType.ESCALATE_CASE,
+                    description="Escalate case for regulatory AML/SAR review",
+                    ttl_seconds=None,
+                ),
+            ],
+        ),
+        ResponsePlaybook(
+            playbook_id="pb_synthetic_bust_out",
+            name="Synthetic Bust-Out & Refund Abuse Containment",
+            description="Freezes card credit line, holds refunds/payouts, and requires step-up",
+            trigger_patterns=[CrossSignalPattern.SYNTHETIC_BUST_OUT],
+            min_risk_level=UnifiedRiskLevel.HIGH,
+            min_composite_score=0.65,
+            priority=30,
+            steps=[
+                PlaybookStepSpec(
+                    control_type=ContainmentControlType.FREEZE_CARD,
+                    description="Freeze card credit line against bust-out drawdowns",
+                    ttl_seconds=86400,
+                ),
+                PlaybookStepSpec(
+                    control_type=ContainmentControlType.HOLD_PAYOUTS,
+                    description="Hold instant refund and promotional disbursements",
+                    ttl_seconds=86400,
+                ),
+                PlaybookStepSpec(
+                    control_type=ContainmentControlType.REQUIRE_STEP_UP,
+                    description="Require step-up identity proofing on account actions",
+                    ttl_seconds=86400,
+                ),
+            ],
+        ),
+        ResponsePlaybook(
+            playbook_id="pb_multi_vector_syndicate",
+            name="Multi-Vector Syndicate Full Containment",
+            description="Applies full device, session, card, and account quarantine across 3+ domains",
+            trigger_patterns=[
+                CrossSignalPattern.MULTI_VECTOR_SYNDICATE,
+                CrossSignalPattern.ESCALATED_REPEAT_OFFENDER,
+            ],
+            min_risk_level=UnifiedRiskLevel.HIGH,
+            min_composite_score=0.70,
+            priority=5,
+            steps=[
+                PlaybookStepSpec(
+                    control_type=ContainmentControlType.QUARANTINE_DEVICE,
+                    description="Quarantine associated device and browser fingerprints",
+                    ttl_seconds=259200,
+                ),
+                PlaybookStepSpec(
+                    control_type=ContainmentControlType.REVOKE_SESSIONS,
+                    description="Revoke all active session tokens",
+                    ttl_seconds=259200,
+                ),
+                PlaybookStepSpec(
+                    control_type=ContainmentControlType.FREEZE_CARD,
+                    description="Freeze payment instruments",
+                    ttl_seconds=259200,
+                ),
+                PlaybookStepSpec(
+                    control_type=ContainmentControlType.LOCK_ACCOUNT,
+                    description="Lock entity account",
+                    ttl_seconds=259200,
+                ),
+                PlaybookStepSpec(
+                    control_type=ContainmentControlType.ESCALATE_CASE,
+                    description="Escalate multi-vector syndicate case",
+                    ttl_seconds=None,
+                ),
+            ],
+        ),
+        ResponsePlaybook(
+            playbook_id="pb_high_risk_step_up",
+            name="High-Risk Entity Step-Up & Payout Hold",
+            description="Fallback playbook for high/critical composite risk without specific pattern match",
+            trigger_patterns=[],
+            min_risk_level=UnifiedRiskLevel.HIGH,
+            min_composite_score=0.65,
+            priority=100,
+            steps=[
+                PlaybookStepSpec(
+                    control_type=ContainmentControlType.REQUIRE_STEP_UP,
+                    description="Enforce step-up MFA challenge on next transaction",
+                    ttl_seconds=43200,
+                ),
+                PlaybookStepSpec(
+                    control_type=ContainmentControlType.HOLD_PAYOUTS,
+                    description="Place temporary hold on high-risk disbursements",
+                    ttl_seconds=43200,
+                ),
+            ],
+        ),
+    ]
