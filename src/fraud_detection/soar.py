@@ -335,7 +335,9 @@ def build_default_playbooks() -> list[ResponsePlaybook]:
         ResponsePlaybook(
             playbook_id="pb_ato_mule_exfiltration",
             name="ATO to Mule Exfiltration Containment",
-            description="Locks compromised account, revokes sessions, holds payouts, and escalates case",
+            description=(
+                "Locks compromised account, revokes sessions, holds payouts, and escalates case"
+            ),
             trigger_patterns=[CrossSignalPattern.ATO_TO_MULE_EXFILTRATION],
             min_risk_level=UnifiedRiskLevel.HIGH,
             min_composite_score=0.65,
@@ -423,7 +425,9 @@ def build_default_playbooks() -> list[ResponsePlaybook]:
         ResponsePlaybook(
             playbook_id="pb_multi_vector_syndicate",
             name="Multi-Vector Syndicate Full Containment",
-            description="Applies full device, session, card, and account quarantine across 3+ domains",
+            description=(
+                "Applies full device, session, card, and account quarantine across 3+ domains"
+            ),
             trigger_patterns=[
                 CrossSignalPattern.MULTI_VECTOR_SYNDICATE,
                 CrossSignalPattern.ESCALATED_REPEAT_OFFENDER,
@@ -462,7 +466,9 @@ def build_default_playbooks() -> list[ResponsePlaybook]:
         ResponsePlaybook(
             playbook_id="pb_high_risk_step_up",
             name="High-Risk Entity Step-Up & Payout Hold",
-            description="Fallback playbook for high/critical composite risk without specific pattern match",
+            description=(
+                "Fallback playbook for high/critical composite risk without specific pattern match"
+            ),
             trigger_patterns=[],
             min_risk_level=UnifiedRiskLevel.HIGH,
             min_composite_score=0.65,
