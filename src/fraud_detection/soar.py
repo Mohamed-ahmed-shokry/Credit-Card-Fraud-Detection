@@ -13,6 +13,8 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 
+from fraud_detection.risk_orchestrator import CrossSignalPattern, UnifiedRiskLevel
+
 
 def _utc_now_iso() -> str:
     return datetime.now(UTC).isoformat()
@@ -87,3 +89,57 @@ class PlaybookStepSpec:
             parameters=dict(payload.get("parameters", {})),
         )
 
+
+@dataclass(slots=True)
+class ResponsePlaybook:
+    """Declarative SOAR response playbook triggered by compound risk patterns or scores."""
+
+    playbook_id: str
+    name: str
+    description: str
+    trigger_patterns: list[CrossSignalPattern] = field(default_factory=list)
+    min_risk_level: UnifiedRiskLevel = UnifiedRiskLevel.HIGH
+    min_composite_score: float = 0.65
+    steps: list[PlaybookStepSpec] = field(default_factory=list)
+    priority: int = 100
+    enabled: bool = True
+
+    def __post_init__(self) -> None:
+        self.playbook_id = self.playbook_id.strip()
+        if not self.playbook_id:
+            raise ValueError("playbook_id must not be empty")
+        self.trigger_patterns = [
+            p if isinstance(p, CrossSignalPattern) else CrossSignalPattern(str(p).lower())
+            for p in self.trigger_patterns
+        ]
+        if not isinstance(self.min_risk_level, UnifiedRiskLevel):
+            self.min_risk_level = UnifiedRiskLevel(str(self.min_risk_level).lower())
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "playbook_id": self.playbook_id,
+            "name": self.name,
+            "description": self.description,
+            "trigger_patterns": [p.value for p in self.trigger_patterns],
+            "min_risk_level": self.min_risk_level.value,
+            "min_composite_score": self.min_composite_score,
+            "steps": [step.to_dict() for step in self.steps],
+            "priority": self.priority,
+            "enabled": self.enabled,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> ResponsePlaybook:
+        return cls(
+            playbook_id=str(payload["playbook_id"]),
+            name=str(payload["name"]),
+            description=str(payload.get("description", "")),
+            trigger_patterns=[
+                CrossSignalPattern(str(p).lower()) for p in payload.get("trigger_patterns", [])
+            ],
+            min_risk_level=UnifiedRiskLevel(str(payload.get("min_risk_level", "high")).lower()),
+            min_composite_score=float(payload.get("min_composite_score", 0.65)),
+            steps=[PlaybookStepSpec.from_dict(s) for s in payload.get("steps", [])],
+            priority=int(payload.get("priority", 100)),
+            enabled=bool(payload.get("enabled", True)),
+        )
