@@ -8,9 +8,12 @@ expiration and full operator rollback.
 
 from __future__ import annotations
 
+import json
+import threading
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
@@ -535,3 +538,191 @@ class PlaybookCatalog:
                 continue
             return pb
         return None
+
+
+class SoarStore:
+    """Thread-safe in-memory store for SOAR playbook executions and entity containments."""
+
+    def __init__(
+        self,
+        *,
+        max_executions: int = 10000,
+        max_containments: int = 20000,
+    ) -> None:
+        self._lock = threading.RLock()
+        self.max_executions = max(1, max_executions)
+        self.max_containments = max(1, max_containments)
+        self._executions: dict[str, PlaybookExecutionRecord] = {}
+        self._execution_order: list[str] = []
+        self._containments: dict[str, ActiveContainmentRecord] = {}
+        self._containment_order: list[str] = []
+
+    def _evict_executions_if_needed(self) -> None:
+        while len(self._execution_order) > self.max_executions:
+            oldest_id = self._execution_order.pop(0)
+            self._executions.pop(oldest_id, None)
+
+    def _evict_containments_if_needed(self) -> None:
+        while len(self._containment_order) > self.max_containments:
+            oldest_id = self._containment_order.pop(0)
+            self._containments.pop(oldest_id, None)
+
+    def save_execution(self, record: PlaybookExecutionRecord) -> None:
+        with self._lock:
+            if record.execution_id not in self._executions:
+                self._execution_order.append(record.execution_id)
+            self._executions[record.execution_id] = record
+            self._evict_executions_if_needed()
+
+    def get_execution(self, execution_id: str) -> PlaybookExecutionRecord | None:
+        with self._lock:
+            return self._executions.get(execution_id)
+
+    def list_executions(
+        self,
+        *,
+        entity_id: str | None = None,
+        tenant_id: str | None = None,
+        status: PlaybookRunStatus | None = None,
+        limit: int = 100,
+    ) -> list[PlaybookExecutionRecord]:
+        with self._lock:
+            items = [
+                self._executions[eid]
+                for eid in reversed(self._execution_order)
+                if eid in self._executions
+            ]
+            if entity_id is not None:
+                items = [e for e in items if e.entity_id == entity_id]
+            if tenant_id is not None:
+                items = [e for e in items if e.tenant_id == tenant_id]
+            if status is not None:
+                items = [e for e in items if e.status is status]
+            return items[: max(1, limit)]
+
+    def save_containment(self, record: ActiveContainmentRecord) -> None:
+        with self._lock:
+            if record.containment_id not in self._containments:
+                self._containment_order.append(record.containment_id)
+            self._containments[record.containment_id] = record
+            self._evict_containments_if_needed()
+
+    def get_containment(self, containment_id: str) -> ActiveContainmentRecord | None:
+        with self._lock:
+            return self._containments.get(containment_id)
+
+    def list_containments(
+        self,
+        *,
+        entity_id: str | None = None,
+        tenant_id: str | None = None,
+        active_only: bool = False,
+        reference_time: datetime | None = None,
+    ) -> list[ActiveContainmentRecord]:
+        now = reference_time or datetime.now(UTC)
+        with self._lock:
+            results: list[ActiveContainmentRecord] = []
+            for cid in reversed(self._containment_order):
+                rec = self._containments.get(cid)
+                if rec is None:
+                    continue
+                if rec.state is ContainmentState.ACTIVE and rec.is_expired(now):
+                    rec.state = ContainmentState.EXPIRED
+                if entity_id is not None and rec.entity_id != entity_id:
+                    continue
+                if tenant_id is not None and rec.tenant_id != tenant_id:
+                    continue
+                if active_only and rec.state is not ContainmentState.ACTIVE:
+                    continue
+                results.append(rec)
+            return results
+
+    def find_active_control(
+        self,
+        entity_id: str,
+        control_type: ContainmentControlType,
+        *,
+        tenant_id: str = "default",
+        reference_time: datetime | None = None,
+    ) -> ActiveContainmentRecord | None:
+        for rec in self.list_containments(
+            entity_id=entity_id,
+            tenant_id=tenant_id,
+            active_only=True,
+            reference_time=reference_time,
+        ):
+            if rec.control_type is control_type:
+                return rec
+        return None
+
+    def summary(self, *, reference_time: datetime | None = None) -> dict[str, Any]:
+        now = reference_time or datetime.now(UTC)
+        with self._lock:
+            by_status: dict[str, int] = {st.value: 0 for st in PlaybookRunStatus}
+            for exe in self._executions.values():
+                status_key = PlaybookRunStatus(exe.status).value
+                by_status[status_key] = by_status.get(status_key, 0) + 1
+
+            by_control: dict[str, int] = {ct.value: 0 for ct in ContainmentControlType}
+            active_count = 0
+            for rec in self._containments.values():
+                if rec.state is ContainmentState.ACTIVE and rec.is_expired(now):
+                    rec.state = ContainmentState.EXPIRED
+                if rec.state is ContainmentState.ACTIVE:
+                    active_count += 1
+                    ctrl_key = ContainmentControlType(rec.control_type).value
+                    by_control[ctrl_key] = by_control.get(ctrl_key, 0) + 1
+
+            return {
+                "execution_count": len(self._executions),
+                "containment_count": len(self._containments),
+                "active_containments": active_count,
+                "by_status": by_status,
+                "active_by_control": by_control,
+            }
+
+    def to_dict(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "max_executions": self.max_executions,
+                "max_containments": self.max_containments,
+                "executions": [
+                    self._executions[eid].to_dict()
+                    for eid in self._execution_order
+                    if eid in self._executions
+                ],
+                "containments": [
+                    self._containments[cid].to_dict()
+                    for cid in self._containment_order
+                    if cid in self._containments
+                ],
+            }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> SoarStore:
+        store = cls(
+            max_executions=int(payload.get("max_executions", 10000)),
+            max_containments=int(payload.get("max_containments", 20000)),
+        )
+        for e_raw in payload.get("executions", []):
+            exe = PlaybookExecutionRecord.from_dict(e_raw)
+            store._executions[exe.execution_id] = exe
+            store._execution_order.append(exe.execution_id)
+        for c_raw in payload.get("containments", []):
+            cnt = ActiveContainmentRecord.from_dict(c_raw)
+            store._containments[cnt.containment_id] = cnt
+            store._containment_order.append(cnt.containment_id)
+        return store
+
+    def save_json(self, path: str | Path) -> Path:
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(self.to_dict(), indent=2), encoding="utf-8")
+        return target
+
+    @classmethod
+    def load_json(cls, path: str | Path) -> SoarStore:
+        source = Path(path)
+        if not source.exists():
+            return cls()
+        return cls.from_dict(json.loads(source.read_text(encoding="utf-8")))
