@@ -7,7 +7,7 @@
 
 ## Task Status
 - [x] Task 1: Define Phase 54 roadmap & initialize `docs/PROGRESS.md`.
-- [ ] Task 2: Create `src/fraud_detection/soar.py` domain enums and data models + unit tests in `tests/test_soar.py`.
+- [x] Task 2: Create `src/fraud_detection/soar.py` domain enums and data models + unit tests in `tests/test_soar.py`.
 - [ ] Task 3: Implement `PlaybookCatalog` and `build_default_playbooks` + unit tests.
 - [ ] Task 4: Implement `SoarStore` and `SoarEngine` (execution, TTL expiry, rollback, `CaseManager` escalation) + unit tests.
 - [ ] Task 5: Register `SOAR_PLAYBOOK_TRIGGERED` / `SOAR_CONTAINMENT_APPLIED` / `SOAR_PLAYBOOK_COMPLETED` / `SOAR_CONTAINMENT_ROLLED_BACK` events in `src/fraud_detection/events.py` and wire `EventBus` into `SoarEngine` + tests.
@@ -18,7 +18,7 @@
 ## Acceptance Criteria Status
 | Criterion | Status | Evidence |
 |-----------|--------|----------|
-| AC-1 (Domain Models & Taxonomies) | PENDING | |
+| AC-1 (Domain Models & Taxonomies) | PASSED | `ContainmentControlType`, `PlaybookRunStatus`, `ContainmentState`, `PlaybookStepSpec`, `ResponsePlaybook`, `ActiveContainmentRecord`, `PlaybookStepResult`, `PlaybookExecutionRecord` verified in `tests/test_soar.py` |
 | AC-2 (Playbook Catalog & Pattern Matching) | PENDING | |
 | AC-3 (SOAR Engine, Containment Store & Rollback) | PENDING | |
 | AC-4 (EventBus Streaming) | PENDING | |
