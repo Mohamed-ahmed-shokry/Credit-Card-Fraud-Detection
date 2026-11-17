@@ -98,7 +98,7 @@ class ResponsePlaybook:
     name: str
     description: str
     trigger_patterns: list[CrossSignalPattern] = field(default_factory=list)
-    min_risk_level: UnifiedRiskLevel = UnifiedRiskLevel.HIGH
+    min_risk_level: UnifiedRiskLevel | str = UnifiedRiskLevel.HIGH
     min_composite_score: float = 0.65
     steps: list[PlaybookStepSpec] = field(default_factory=list)
     priority: int = 100
@@ -108,10 +108,7 @@ class ResponsePlaybook:
         self.playbook_id = self.playbook_id.strip()
         if not self.playbook_id:
             raise ValueError("playbook_id must not be empty")
-        self.trigger_patterns = [
-            p if isinstance(p, CrossSignalPattern) else CrossSignalPattern(str(p).lower())
-            for p in self.trigger_patterns
-        ]
+        self.trigger_patterns = [CrossSignalPattern(str(p).lower()) for p in self.trigger_patterns]
         if not isinstance(self.min_risk_level, UnifiedRiskLevel):
             self.min_risk_level = UnifiedRiskLevel(str(self.min_risk_level).lower())
 
@@ -121,7 +118,7 @@ class ResponsePlaybook:
             "name": self.name,
             "description": self.description,
             "trigger_patterns": [p.value for p in self.trigger_patterns],
-            "min_risk_level": self.min_risk_level.value,
+            "min_risk_level": UnifiedRiskLevel(self.min_risk_level).value,
             "min_composite_score": self.min_composite_score,
             "steps": [step.to_dict() for step in self.steps],
             "priority": self.priority,
