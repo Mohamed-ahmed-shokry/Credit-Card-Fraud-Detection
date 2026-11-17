@@ -9,8 +9,8 @@
 - [x] Task 1: Define Phase 54 roadmap & initialize `docs/PROGRESS.md`.
 - [x] Task 2: Create `src/fraud_detection/soar.py` domain enums and data models + unit tests in `tests/test_soar.py`.
 - [x] Task 3: Implement `PlaybookCatalog` and `build_default_playbooks` + unit tests.
-- [ ] Task 4: Implement `SoarStore` and `SoarEngine` (execution, TTL expiry, rollback, `CaseManager` escalation) + unit tests.
-- [ ] Task 5: Register `SOAR_PLAYBOOK_TRIGGERED` / `SOAR_CONTAINMENT_APPLIED` / `SOAR_PLAYBOOK_COMPLETED` / `SOAR_CONTAINMENT_ROLLED_BACK` events in `src/fraud_detection/events.py` and wire `EventBus` into `SoarEngine` + tests.
+- [x] Task 4: Implement `SoarStore` and `SoarEngine` (execution, TTL expiry, rollback, `CaseManager` escalation) + unit tests.
+- [x] Task 5: Register `SOAR_PLAYBOOK_TRIGGERED` / `SOAR_CONTAINMENT_APPLIED` / `SOAR_PLAYBOOK_COMPLETED` / `SOAR_CONTAINMENT_ROLLED_BACK` events in `src/fraud_detection/events.py` and wire `EventBus` into `SoarEngine` + tests.
 - [ ] Task 6: Add `/v1/soar/*` REST endpoints and Prometheus metrics in `src/fraud_detection/api.py` + tests in `tests/test_api.py`.
 - [ ] Task 7: Add `soar-execute`, `soar-rollback`, `soar-inspect`, and `soar-summary` CLI commands in `src/fraud_detection/cli.py` + tests in `tests/test_cli.py`.
 - [ ] Task 8: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate with 100% Green CI.
@@ -20,8 +20,8 @@
 |-----------|--------|----------|
 | AC-1 (Domain Models & Taxonomies) | PASSED | `ContainmentControlType`, `PlaybookRunStatus`, `ContainmentState`, `PlaybookStepSpec`, `ResponsePlaybook`, `ActiveContainmentRecord`, `PlaybookStepResult`, `PlaybookExecutionRecord` verified in `tests/test_soar.py` |
 | AC-2 (Playbook Catalog & Pattern Matching) | PASSED | `PlaybookCatalog` and `build_default_playbooks` verified on pattern priority, fallback matching, and explicit overrides in `tests/test_soar.py` |
-| AC-3 (SOAR Engine, Containment Store & Rollback) | PENDING | |
-| AC-4 (EventBus Streaming) | PENDING | |
+| AC-3 (SOAR Engine, Containment Store & Rollback) | PASSED | `SoarEngine` and `SoarStore` verified with 100% branch coverage on idempotent execution, TTL expiry, capacity eviction, `CaseManager` correlation, and rollback in `tests/test_soar.py` |
+| AC-4 (EventBus Streaming) | PASSED | `SOAR_PLAYBOOK_TRIGGERED`, `SOAR_CONTAINMENT_APPLIED`, `SOAR_PLAYBOOK_COMPLETED`, and `SOAR_CONTAINMENT_ROLLED_BACK` registered in `events.py` and verified in `tests/test_soar.py` |
 | AC-5 (REST API & Metrics) | PENDING | |
 | AC-6 (CLI Workflows) | PENDING | |
 | AC-7 (All CI-Parity Checks & Remote CI Green) | PENDING | |
