@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
+from uuid import uuid4
 
 from fraud_detection.risk_orchestrator import CrossSignalPattern, UnifiedRiskLevel
 
@@ -139,4 +140,74 @@ class ResponsePlaybook:
             steps=[PlaybookStepSpec.from_dict(s) for s in payload.get("steps", [])],
             priority=int(payload.get("priority", 100)),
             enabled=bool(payload.get("enabled", True)),
+        )
+
+
+@dataclass(slots=True)
+class ActiveContainmentRecord:
+    """Tracks an active or released compensating control applied to an entity."""
+
+    entity_id: str
+    control_type: ContainmentControlType | str
+    tenant_id: str = "default"
+    containment_id: str = field(default_factory=lambda: f"cnt_{uuid4().hex[:12]}")
+    execution_id: str | None = None
+    playbook_id: str | None = None
+    state: ContainmentState | str = ContainmentState.ACTIVE
+    reason: str = ""
+    applied_at: str = field(default_factory=_utc_now_iso)
+    expires_at: str | None = None
+    released_at: str | None = None
+    release_reason: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.entity_id = self.entity_id.strip()
+        if not self.entity_id:
+            raise ValueError("entity_id must not be empty")
+        if not isinstance(self.control_type, ContainmentControlType):
+            self.control_type = ContainmentControlType(str(self.control_type).lower())
+        if not isinstance(self.state, ContainmentState):
+            self.state = ContainmentState(str(self.state).lower())
+        self.tenant_id = self.tenant_id.strip() or "default"
+
+    def is_expired(self, reference_time: datetime | None = None) -> bool:
+        if self.expires_at is None:
+            return False
+        now = reference_time or datetime.now(UTC)
+        return _parse_iso(self.expires_at) <= now
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "containment_id": self.containment_id,
+            "entity_id": self.entity_id,
+            "tenant_id": self.tenant_id,
+            "control_type": ContainmentControlType(self.control_type).value,
+            "execution_id": self.execution_id,
+            "playbook_id": self.playbook_id,
+            "state": ContainmentState(self.state).value,
+            "reason": self.reason,
+            "applied_at": self.applied_at,
+            "expires_at": self.expires_at,
+            "released_at": self.released_at,
+            "release_reason": self.release_reason,
+            "metadata": dict(self.metadata),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> ActiveContainmentRecord:
+        return cls(
+            containment_id=str(payload.get("containment_id") or f"cnt_{uuid4().hex[:12]}"),
+            entity_id=str(payload["entity_id"]),
+            tenant_id=str(payload.get("tenant_id") or "default"),
+            control_type=ContainmentControlType(str(payload["control_type"]).lower()),
+            execution_id=payload.get("execution_id"),
+            playbook_id=payload.get("playbook_id"),
+            state=ContainmentState(str(payload.get("state", "active")).lower()),
+            reason=str(payload.get("reason", "")),
+            applied_at=str(payload.get("applied_at") or _utc_now_iso()),
+            expires_at=payload.get("expires_at"),
+            released_at=payload.get("released_at"),
+            release_reason=payload.get("release_reason"),
+            metadata=dict(payload.get("metadata", {})),
         )
