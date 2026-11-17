@@ -125,6 +125,10 @@ class EventType(StrEnum):
     CROSS_SIGNAL_PATTERN_DETECTED = "fraud.orchestrator.cross_signal_pattern_detected"
     UNIFIED_CASE_CORRELATED = "fraud.orchestrator.unified_case_correlated"
     ENTITY_ESCALATION_TRIGGERED = "fraud.orchestrator.entity_escalation_triggered"
+    SOAR_PLAYBOOK_TRIGGERED = "fraud.soar.playbook_triggered"
+    SOAR_CONTAINMENT_APPLIED = "fraud.soar.containment_applied"
+    SOAR_PLAYBOOK_COMPLETED = "fraud.soar.playbook_completed"
+    SOAR_CONTAINMENT_ROLLED_BACK = "fraud.soar.containment_rolled_back"
 
 
 class EventDeliveryStatus(StrEnum):
