@@ -625,9 +625,7 @@ class SoarStore:
         with self._lock:
             results: list[ActiveContainmentRecord] = []
             for cid in reversed(self._containment_order):
-                rec = self._containments.get(cid)
-                if rec is None:
-                    continue
+                rec = self._containments[cid]
                 if rec.state is ContainmentState.ACTIVE and rec.is_expired(now):
                     rec.state = ContainmentState.EXPIRED
                 if entity_id is not None and rec.entity_id != entity_id:

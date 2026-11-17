@@ -334,6 +334,10 @@ def test_soar_engine_execution_idempotency_rollback_and_events() -> None:
     released_again = engine.release_containment(first_cnt_id)
     assert released_again.state is ContainmentState.RELEASED
 
+    # Re-rolling back an already rolled back execution is idempotent
+    rolled_again = engine.rollback_execution(run1.execution_id, reason="second_rollback")
+    assert rolled_again.metadata["released_containment_ids"] == []
+
     with pytest.raises(KeyError, match="not found"):
         engine.release_containment("cnt_missing")
     with pytest.raises(KeyError, match="not found"):
