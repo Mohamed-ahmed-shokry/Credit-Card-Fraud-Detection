@@ -10986,3 +10986,149 @@ def test_orchestrator_cli_error_branches(tmp_path: Path) -> None:
     nondict = tmp_path / "nondict_orch.json"
     nondict.write_text("[]", encoding="utf-8")
     assert runner.invoke(app, ["orchestrator-summary", "-s", str(nondict)]).exit_code == 2
+
+
+def test_soar_cli_workflows(tmp_path: Path) -> None:
+    """Verify soar-execute, soar-inspect, soar-rollback, and soar-summary CLI workflows."""
+    store_file = tmp_path / "soar_store.json"
+
+    ex_tbl = runner.invoke(
+        app,
+        [
+            "soar-execute",
+            "-e",
+            "ent-soar-cli-1",
+            "--score",
+            "0.88",
+            "-r",
+            "critical",
+            "-p",
+            "ato_to_mule_exfiltration",
+            "-s",
+            str(store_file),
+            "-f",
+            "table",
+        ],
+    )
+    assert ex_tbl.exit_code == 0, ex_tbl.stdout
+    assert "pb_ato_mule_exfiltration" in ex_tbl.stdout
+
+    ex_json = runner.invoke(
+        app,
+        [
+            "soar-execute",
+            "-e",
+            "ent-soar-cli-2",
+            "--score",
+            "0.75",
+            "-r",
+            "high",
+            "-s",
+            str(store_file),
+            "-f",
+            "json",
+        ],
+    )
+    assert ex_json.exit_code == 0, ex_json.stdout
+    exec_data = json.loads(ex_json.stdout)
+    assert exec_data["playbook_id"] == "pb_high_risk_step_up"
+    eid = exec_data["execution_id"]
+
+    insp_tbl = runner.invoke(
+        app,
+        ["soar-inspect", "-e", "ent-soar-cli-2", "-s", str(store_file), "-f", "table"],
+    )
+    assert insp_tbl.exit_code == 0
+    assert "ent-soar-cli-2" in insp_tbl.stdout
+
+    insp_json = runner.invoke(
+        app,
+        ["soar-inspect", "-e", "ent-soar-cli-2", "-s", str(store_file), "-f", "json"],
+    )
+    assert insp_json.exit_code == 0
+    assert len(json.loads(insp_json.stdout)) == 2
+
+    rb_tbl = runner.invoke(
+        app,
+        [
+            "soar-rollback",
+            "-x",
+            eid,
+            "--reason",
+            "analyst_cleared",
+            "-s",
+            str(store_file),
+            "-f",
+            "table",
+        ],
+    )
+    assert rb_tbl.exit_code == 0
+    assert "rolled_back" in rb_tbl.stdout
+
+    rb_json = runner.invoke(
+        app,
+        [
+            "soar-rollback",
+            "-x",
+            eid,
+            "--reason",
+            "repeat_rollback",
+            "-s",
+            str(store_file),
+            "-f",
+            "json",
+        ],
+    )
+    assert rb_json.exit_code == 0
+    assert json.loads(rb_json.stdout)["status"] == "rolled_back"
+
+    sum_tbl = runner.invoke(
+        app,
+        ["soar-summary", "-s", str(store_file), "-f", "table"],
+    )
+    assert sum_tbl.exit_code == 0
+    assert "SOAR Response Playbook Summary" in sum_tbl.stdout
+
+    sum_json = runner.invoke(
+        app,
+        ["soar-summary", "-s", str(store_file), "-f", "json"],
+    )
+    assert sum_json.exit_code == 0
+    assert json.loads(sum_json.stdout)["execution_count"] == 2
+
+
+def test_soar_cli_error_branches(tmp_path: Path) -> None:
+    """Validate error handling in soar-* CLI commands."""
+    store_file = tmp_path / "soar_err.json"
+    assert (
+        runner.invoke(
+            app,
+            [
+                "soar-execute",
+                "-e",
+                "ent-err",
+                "--score",
+                "0.9",
+                "--playbook-id",
+                "pb_missing",
+                "-s",
+                str(store_file),
+            ],
+        ).exit_code
+        == 2
+    )
+    assert (
+        runner.invoke(
+            app,
+            ["soar-rollback", "-x", "soar_missing", "-s", str(store_file)],
+        ).exit_code
+        == 2
+    )
+
+    bad_store = tmp_path / "bad_soar.json"
+    bad_store.write_text("{invalid", encoding="utf-8")
+    assert runner.invoke(app, ["soar-summary", "-s", str(bad_store)]).exit_code == 2
+
+    nondict = tmp_path / "nondict_soar.json"
+    nondict.write_text("[]", encoding="utf-8")
+    assert runner.invoke(app, ["soar-summary", "-s", str(nondict)]).exit_code == 2
