@@ -208,6 +208,7 @@ from fraud_detection.retraining import (
     verify_certified_candidate,
 )
 from fraud_detection.risk_orchestrator import (
+    CrossSignalPattern,
     DomainRiskSignal,
     EntityRiskProfile,
     OrchestratorAction,
@@ -226,6 +227,13 @@ from fraud_detection.routing import (
     TrafficSplitStrategy,
 )
 from fraud_detection.rules import RulePrecedence, RuleSet
+from fraud_detection.soar import (
+    ActiveContainmentRecord,
+    PlaybookExecutionRecord,
+    PlaybookRunStatus,
+    ResponsePlaybook,
+    SoarEngine,
+)
 from fraud_detection.synthetic_identity import (
     AuthorizedUserRecord,
     IdentityProfile,
@@ -2548,6 +2556,101 @@ def _orchestrator_profile_to_response(
     profile: EntityRiskProfile,
 ) -> OrchestratorEntityProfileResponse:
     return OrchestratorEntityProfileResponse(**profile.to_dict())
+
+
+class SoarExecuteRequest(BaseModel):
+    """Request payload for triggering SOAR containment playbook execution."""
+
+    entity_id: str = Field(..., min_length=1)
+    tenant_id: str = "default"
+    composite_score: float = Field(..., ge=0.0, le=1.0)
+    risk_level: UnifiedRiskLevel = UnifiedRiskLevel.HIGH
+    patterns_detected: list[CrossSignalPattern] = Field(default_factory=list)
+    source_assessment_id: str | None = None
+    correlated_case_id: str | None = None
+    playbook_id: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class SoarRollbackRequest(BaseModel):
+    """Request payload for rolling back a SOAR playbook execution."""
+
+    reason: str = "operator_rollback"
+
+
+class SoarExecutionResponse(BaseModel):
+    """Response payload for a SOAR playbook execution record."""
+
+    execution_id: str
+    playbook_id: str
+    entity_id: str
+    tenant_id: str
+    status: str
+    composite_score: float
+    risk_level: str
+    source_assessment_id: str | None = None
+    triggered_patterns: list[str]
+    step_results: list[dict[str, Any]]
+    correlated_case_id: str | None = None
+    executed_at: str
+    rolled_back_at: str | None = None
+    rollback_reason: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class SoarExecutionListResponse(BaseModel):
+    """Response payload for listing SOAR playbook executions."""
+
+    total_count: int
+    executions: list[SoarExecutionResponse]
+
+
+class SoarContainmentResponse(BaseModel):
+    """Response payload for a single compensating containment record."""
+
+    containment_id: str
+    entity_id: str
+    tenant_id: str
+    control_type: str
+    execution_id: str | None = None
+    playbook_id: str | None = None
+    state: str
+    reason: str
+    applied_at: str
+    expires_at: str | None = None
+    released_at: str | None = None
+    release_reason: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class SoarContainmentListResponse(BaseModel):
+    """Response payload for listing entity containments."""
+
+    entity_id: str
+    total_count: int
+    containments: list[SoarContainmentResponse]
+
+
+class SoarPlaybookListResponse(BaseModel):
+    """Response payload for listing registered SOAR playbooks."""
+
+    total_count: int
+    playbooks: list[dict[str, Any]]
+
+
+def _soar_execution_to_response(record: PlaybookExecutionRecord) -> SoarExecutionResponse:
+    return SoarExecutionResponse(**record.to_dict())
+
+
+def _soar_containment_to_response(record: ActiveContainmentRecord) -> SoarContainmentResponse:
+    return SoarContainmentResponse(**record.to_dict())
+
+
+def _soar_playbooks_to_response(playbooks: list[ResponsePlaybook]) -> SoarPlaybookListResponse:
+    return SoarPlaybookListResponse(
+        total_count=len(playbooks),
+        playbooks=[pb.to_dict() for pb in playbooks],
+    )
 
 
 def create_app(
