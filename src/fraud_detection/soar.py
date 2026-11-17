@@ -14,7 +14,11 @@ from enum import StrEnum
 from typing import Any
 from uuid import uuid4
 
-from fraud_detection.risk_orchestrator import CrossSignalPattern, UnifiedRiskLevel
+from fraud_detection.risk_orchestrator import (
+    CrossSignalPattern,
+    UnifiedRiskAssessment,
+    UnifiedRiskLevel,
+)
 
 
 def _utc_now_iso() -> str:
@@ -487,3 +491,47 @@ def build_default_playbooks() -> list[ResponsePlaybook]:
             ],
         ),
     ]
+
+
+class PlaybookCatalog:
+    """Registry and matcher for SOAR response playbooks."""
+
+    def __init__(self, playbooks: list[ResponsePlaybook] | None = None) -> None:
+        items = playbooks if playbooks is not None else build_default_playbooks()
+        self._playbooks: dict[str, ResponsePlaybook] = {p.playbook_id: p for p in items}
+
+    def register(self, playbook: ResponsePlaybook) -> None:
+        self._playbooks[playbook.playbook_id] = playbook
+
+    def get(self, playbook_id: str) -> ResponsePlaybook | None:
+        return self._playbooks.get(playbook_id)
+
+    def list_playbooks(self, *, enabled_only: bool = False) -> list[ResponsePlaybook]:
+        items = list(self._playbooks.values())
+        if enabled_only:
+            items = [p for p in items if p.enabled]
+        return sorted(items, key=lambda p: (p.priority, p.playbook_id))
+
+    def select_playbook(
+        self,
+        assessment: UnifiedRiskAssessment,
+        *,
+        playbook_id: str | None = None,
+    ) -> ResponsePlaybook | None:
+        if playbook_id:
+            explicit = self._playbooks.get(playbook_id)
+            if explicit is None:
+                raise KeyError(f"Playbook '{playbook_id}' not found in catalog")
+            return explicit if explicit.enabled else None
+
+        level_rank = _RISK_LEVEL_ORDER.get(assessment.risk_level, 0)
+        detected_set = set(assessment.patterns_detected)
+
+        for pb in self.list_playbooks(enabled_only=True):
+            min_rank = _RISK_LEVEL_ORDER.get(UnifiedRiskLevel(pb.min_risk_level), 0)
+            if level_rank < min_rank or assessment.composite_score < pb.min_composite_score:
+                continue
+            if pb.trigger_patterns and not (set(pb.trigger_patterns) & detected_set):
+                continue
+            return pb
+        return None
