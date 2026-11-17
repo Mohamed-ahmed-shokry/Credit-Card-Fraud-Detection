@@ -211,3 +211,111 @@ class ActiveContainmentRecord:
             release_reason=payload.get("release_reason"),
             metadata=dict(payload.get("metadata", {})),
         )
+
+
+@dataclass(slots=True)
+class PlaybookStepResult:
+    """Outcome of executing a single step within a SOAR playbook."""
+
+    control_type: ContainmentControlType | str
+    applied: bool
+    containment_id: str | None = None
+    case_id: str | None = None
+    message: str = ""
+    executed_at: str = field(default_factory=_utc_now_iso)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.control_type, ContainmentControlType):
+            self.control_type = ContainmentControlType(str(self.control_type).lower())
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "control_type": ContainmentControlType(self.control_type).value,
+            "applied": self.applied,
+            "containment_id": self.containment_id,
+            "case_id": self.case_id,
+            "message": self.message,
+            "executed_at": self.executed_at,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> PlaybookStepResult:
+        return cls(
+            control_type=ContainmentControlType(str(payload["control_type"]).lower()),
+            applied=bool(payload.get("applied", True)),
+            containment_id=payload.get("containment_id"),
+            case_id=payload.get("case_id"),
+            message=str(payload.get("message", "")),
+            executed_at=str(payload.get("executed_at") or _utc_now_iso()),
+        )
+
+
+@dataclass(slots=True)
+class PlaybookExecutionRecord:
+    """Audit record of a full SOAR playbook execution and optional rollback."""
+
+    execution_id: str
+    playbook_id: str
+    entity_id: str
+    tenant_id: str
+    status: PlaybookRunStatus | str
+    composite_score: float
+    risk_level: UnifiedRiskLevel | str
+    source_assessment_id: str | None = None
+    triggered_patterns: list[CrossSignalPattern] = field(default_factory=list)
+    step_results: list[PlaybookStepResult] = field(default_factory=list)
+    correlated_case_id: str | None = None
+    executed_at: str = field(default_factory=_utc_now_iso)
+    rolled_back_at: str | None = None
+    rollback_reason: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.status, PlaybookRunStatus):
+            self.status = PlaybookRunStatus(str(self.status).lower())
+        if not isinstance(self.risk_level, UnifiedRiskLevel):
+            self.risk_level = UnifiedRiskLevel(str(self.risk_level).lower())
+        self.triggered_patterns = [
+            CrossSignalPattern(str(p).lower()) for p in self.triggered_patterns
+        ]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "execution_id": self.execution_id,
+            "playbook_id": self.playbook_id,
+            "entity_id": self.entity_id,
+            "tenant_id": self.tenant_id,
+            "status": PlaybookRunStatus(self.status).value,
+            "composite_score": round(self.composite_score, 6),
+            "risk_level": UnifiedRiskLevel(self.risk_level).value,
+            "source_assessment_id": self.source_assessment_id,
+            "triggered_patterns": [p.value for p in self.triggered_patterns],
+            "step_results": [r.to_dict() for r in self.step_results],
+            "correlated_case_id": self.correlated_case_id,
+            "executed_at": self.executed_at,
+            "rolled_back_at": self.rolled_back_at,
+            "rollback_reason": self.rollback_reason,
+            "metadata": dict(self.metadata),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> PlaybookExecutionRecord:
+        return cls(
+            execution_id=str(payload["execution_id"]),
+            playbook_id=str(payload["playbook_id"]),
+            entity_id=str(payload["entity_id"]),
+            tenant_id=str(payload.get("tenant_id") or "default"),
+            status=PlaybookRunStatus(str(payload["status"]).lower()),
+            composite_score=float(payload.get("composite_score", 0.0)),
+            risk_level=UnifiedRiskLevel(str(payload.get("risk_level", "high")).lower()),
+            source_assessment_id=payload.get("source_assessment_id"),
+            triggered_patterns=[
+                CrossSignalPattern(str(p).lower()) for p in payload.get("triggered_patterns", [])
+            ],
+            step_results=[PlaybookStepResult.from_dict(r) for r in payload.get("step_results", [])],
+            correlated_case_id=payload.get("correlated_case_id"),
+            executed_at=str(payload.get("executed_at") or _utc_now_iso()),
+            rolled_back_at=payload.get("rolled_back_at"),
+            rollback_reason=payload.get("rollback_reason"),
+            metadata=dict(payload.get("metadata", {})),
+        )
