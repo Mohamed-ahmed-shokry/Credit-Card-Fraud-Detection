@@ -2962,7 +2962,7 @@ Provide deterministic cross-engine entity risk orchestration, compound pattern d
 - `0492397`..`6f6bf62`: Implemented `risk_orchestrator.py` (`RiskDomain`, `UnifiedRiskLevel`, `OrchestratorAction`, `CrossSignalPattern`, `CrossSignalAnalyzer`, `EntityCaseCorrelator`, `UnifiedRiskStore`, `UnifiedRiskOrchestrator`), registered `ENTITY_RISK_ORCHESTRATED` / `CROSS_SIGNAL_PATTERN_DETECTED` / `UNIFIED_CASE_CORRELATED` / `ENTITY_ESCALATION_TRIGGERED` events in `events.py`, added `/v1/orchestrator/*` endpoints and Prometheus metrics in `api.py`, added `orchestrator-*` CLI commands in `cli.py`, achieved 100% branch coverage on `risk_orchestrator.py` (`1232 passed`, `97.01%` total branch coverage), and documented architecture and usage.
 
 
-## Phase 54 — Automated SOAR Incident Response Playbooks & Compensating Control Containment Engine (In Progress)
+## Phase 54 — Automated SOAR Incident Response Playbooks & Compensating Control Containment Engine (Done)
 
 Phase 54 implements an in-process, zero-external-dependency Automated SOAR (Security Orchestration, Automation, and Response) Incident Response Playbooks & Compensating Control Containment Engine (`soar.py`). It converts high-severity cross-engine risk assessments (`UnifiedRiskAssessment`) and compound fraud patterns into deterministic, auditable, reversible containment playbooks—issuing active entity holds (`LOCK_ACCOUNT`, `FREEZE_CARD`, `HOLD_PAYOUTS`, `REVOKE_SESSIONS`, `REQUIRE_STEP_UP`, `QUARANTINE_DEVICE`, `ESCALATE_CASE`) with TTL expiration and full operator rollback.
 
@@ -3023,6 +3023,9 @@ Provide deterministic SOAR incident response playbook matching, automated compen
 - Task 6: Add `/v1/soar/*` REST endpoints and Prometheus metrics in `src/fraud_detection/api.py` + tests in `tests/test_api.py`.
 - Task 7: Add `soar-execute`, `soar-rollback`, `soar-inspect`, and `soar-summary` CLI commands in `src/fraud_detection/cli.py` + tests in `tests/test_cli.py`.
 - Task 8: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate with 100% Green CI.
+
+### Micro-Commits
+- `83a9f20`..`7267ed7`: Implemented `soar.py` (`ContainmentControlType`, `PlaybookRunStatus`, `ContainmentState`, `PlaybookStepSpec`, `ResponsePlaybook`, `ActiveContainmentRecord`, `PlaybookStepResult`, `PlaybookExecutionRecord`, `build_default_playbooks`, `PlaybookCatalog`, `SoarStore`, `SoarEngine`), registered `SOAR_PLAYBOOK_TRIGGERED` / `SOAR_CONTAINMENT_APPLIED` / `SOAR_PLAYBOOK_COMPLETED` / `SOAR_CONTAINMENT_ROLLED_BACK` events in `events.py`, added `/v1/soar/*` endpoints and Prometheus metrics in `api.py`, added `soar-*` CLI commands in `cli.py`, achieved 100% branch coverage on `soar.py` (`1241 passed`, `97.07%` total branch coverage), passed remote GitHub Actions CI (`44166162216`), and documented architecture and usage.
 
 
 ## Contributing to the roadmap
