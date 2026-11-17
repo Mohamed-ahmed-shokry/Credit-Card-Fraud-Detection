@@ -230,7 +230,6 @@ from fraud_detection.rules import RulePrecedence, RuleSet
 from fraud_detection.soar import (
     ActiveContainmentRecord,
     PlaybookExecutionRecord,
-    PlaybookRunStatus,
     ResponsePlaybook,
     SoarEngine,
 )
@@ -2743,6 +2742,7 @@ def create_app(
     mule_engine: MuleDetectionEngine | None = None,
     first_party_engine: FirstPartyFraudEngine | None = None,
     risk_orchestrator: UnifiedRiskOrchestrator | None = None,
+    soar_engine: SoarEngine | None = None,
 ) -> FastAPI:
     """Create an application using an injected model or a trusted artifact path.
 
@@ -3305,6 +3305,24 @@ def create_app(
     orchestrator_escalations_counter = Counter(
         "fraud_orchestrator_escalations_total",
         "Total entities restricted or escalated by the unified risk orchestrator.",
+        ["tenant_id"],
+        registry=metrics_registry,
+    )
+    soar_playbooks_executed_counter = Counter(
+        "fraud_soar_playbooks_executed_total",
+        "Total SOAR incident response playbooks executed.",
+        ["tenant_id", "playbook_id", "status"],
+        registry=metrics_registry,
+    )
+    soar_containments_applied_counter = Counter(
+        "fraud_soar_containments_applied_total",
+        "Total compensating containment controls applied by SOAR playbooks.",
+        ["tenant_id", "control_type"],
+        registry=metrics_registry,
+    )
+    soar_rollbacks_counter = Counter(
+        "fraud_soar_rollbacks_total",
+        "Total SOAR playbook executions rolled back by operators.",
         ["tenant_id"],
         registry=metrics_registry,
     )
@@ -3914,6 +3932,14 @@ def create_app(
         application.state.orchestrator_evaluations_counter = orchestrator_evaluations_counter
         application.state.orchestrator_patterns_counter = orchestrator_patterns_counter
         application.state.orchestrator_escalations_counter = orchestrator_escalations_counter
+        resolved_soar_engine = soar_engine or SoarEngine(
+            case_manager=application.state.case_manager,
+            event_bus=resolved_event_bus,
+        )
+        application.state.soar_engine = resolved_soar_engine
+        application.state.soar_playbooks_executed_counter = soar_playbooks_executed_counter
+        application.state.soar_containments_applied_counter = soar_containments_applied_counter
+        application.state.soar_rollbacks_counter = soar_rollbacks_counter
         application.state.audit_sink = resolved_audit_sink
         application.state.explanation_provider = explanation_provider
         application.state.fallback_mode = resolved_fallback_mode
