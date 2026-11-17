@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 
+from fraud_detection.cases import CaseManager, CaseStatus
+from fraud_detection.events import EventBus, EventType, FraudDomainEvent
 from fraud_detection.risk_orchestrator import (
     CrossSignalPattern,
     OrchestratorAction,
@@ -22,6 +25,8 @@ from fraud_detection.soar import (
     PlaybookStepResult,
     PlaybookStepSpec,
     ResponsePlaybook,
+    SoarEngine,
+    SoarStore,
     build_default_playbooks,
 )
 
@@ -186,3 +191,204 @@ def test_playbook_catalog_matching_and_registration() -> None:
     catalog.register(disabled_pb)
     assert catalog.get("pb_disabled") is disabled_pb
     assert catalog.select_playbook(fallback_assess, playbook_id="pb_disabled") is None
+
+
+def test_soar_store_eviction_filtering_expiry_and_persistence(tmp_path: Path) -> None:
+    store = SoarStore(max_executions=2, max_containments=2)
+    now = datetime.now(UTC)
+
+    for idx in range(3):
+        exe = PlaybookExecutionRecord(
+            execution_id=f"soar_{idx}",
+            playbook_id="pb_high_risk_step_up",
+            entity_id=f"ent_{idx}",
+            tenant_id="default" if idx < 2 else "acme",
+            status=PlaybookRunStatus.COMPLETED if idx < 2 else PlaybookRunStatus.SKIPPED,
+            composite_score=0.75,
+            risk_level=UnifiedRiskLevel.HIGH,
+        )
+        store.save_execution(exe)
+    # Re-saving existing execution_id does not duplicate order
+    store.save_execution(exe)
+    assert store.get_execution("soar_0") is None
+    assert len(store.list_executions(entity_id="ent_2")) == 1
+    assert len(store.list_executions(tenant_id="acme")) == 1
+    assert len(store.list_executions(status=PlaybookRunStatus.SKIPPED)) == 1
+
+    for idx in range(3):
+        cnt = ActiveContainmentRecord(
+            containment_id=f"cnt_{idx}",
+            entity_id=f"ent_{idx}",
+            tenant_id="default" if idx < 2 else "acme",
+            control_type=ContainmentControlType.LOCK_ACCOUNT,
+            expires_at=(now + timedelta(seconds=10 if idx == 2 else -10)).isoformat(),
+        )
+        store.save_containment(cnt)
+    store.save_containment(cnt)
+    assert store.get_containment("cnt_0") is None
+
+    # cnt_1 is expired, cnt_2 is active
+    all_cnt = store.list_containments(reference_time=now)
+    assert len(all_cnt) == 2
+    cnt_1 = store.get_containment("cnt_1")
+    assert cnt_1 is not None and cnt_1.state is ContainmentState.EXPIRED
+
+    active_acme = store.list_containments(
+        entity_id="ent_2", tenant_id="acme", active_only=True, reference_time=now
+    )
+    assert len(active_acme) == 1
+    assert store.list_containments(entity_id="other", reference_time=now) == []
+    assert store.list_containments(tenant_id="other", reference_time=now) == []
+
+    # Future reference time expires cnt_2 during summary()
+    future = now + timedelta(minutes=5)
+    summary = store.summary(reference_time=future)
+    assert summary["execution_count"] == 2
+    assert summary["active_containments"] == 0
+
+    json_path = store.save_json(tmp_path / "soar_store.json")
+    loaded = SoarStore.load_json(json_path)
+    assert loaded.summary()["execution_count"] == 2
+    assert SoarStore.load_json(tmp_path / "missing.json").summary()["execution_count"] == 0
+
+
+def test_soar_engine_execution_idempotency_rollback_and_events() -> None:
+    bus = EventBus()
+    case_mgr = CaseManager()
+    events: list[EventType] = []
+
+    def _on_event(ev: FraudDomainEvent) -> None:
+        events.append(ev.event_type)
+
+    bus.subscribe(_on_event)
+    engine = SoarEngine(case_manager=case_mgr, event_bus=bus)
+
+    # 1. Low risk -> SKIPPED, no events emitted
+    low_assess = UnifiedRiskAssessment(
+        assessment_id="ora_low",
+        entity_id="ent_low",
+        tenant_id="default",
+        composite_score=0.15,
+        risk_level=UnifiedRiskLevel.LOW,
+        action=OrchestratorAction.ALLOW,
+    )
+    skipped = engine.execute_for_assessment(low_assess)
+    assert skipped.status is PlaybookRunStatus.SKIPPED
+    assert events == []
+
+    # 2. High risk ATO -> Mule exfiltration -> executes pb_ato_mule_exfiltration & creates case
+    high_assess = UnifiedRiskAssessment(
+        assessment_id="ora_high_1",
+        entity_id="ent_victim",
+        tenant_id="t1",
+        composite_score=0.88,
+        risk_level=UnifiedRiskLevel.CRITICAL,
+        action=OrchestratorAction.BLOCK_AND_ESCALATE,
+        patterns_detected=[CrossSignalPattern.ATO_TO_MULE_EXFILTRATION],
+    )
+    run1 = engine.execute_for_assessment(high_assess)
+    assert run1.status is PlaybookRunStatus.COMPLETED
+    assert run1.playbook_id == "pb_ato_mule_exfiltration"
+    assert run1.correlated_case_id is not None
+    assert EventType.SOAR_PLAYBOOK_TRIGGERED in events
+    assert EventType.SOAR_CONTAINMENT_APPLIED in events
+    assert EventType.SOAR_PLAYBOOK_COMPLETED in events
+
+    # Active containments count for ent_victim should be 3 (revoke, lock, hold)
+    active = engine.store.list_containments(
+        entity_id="ent_victim", tenant_id="t1", active_only=True
+    )
+    assert len(active) == 3
+    summary = engine.store.summary()
+    assert summary["active_containments"] == 3
+
+    # 3. Re-running on same entity with existing correlated case -> containments already active,
+    #    case escalation still updates existing case -> PARTIAL status
+    high_assess_2 = UnifiedRiskAssessment(
+        assessment_id="ora_high_2",
+        entity_id="ent_victim",
+        tenant_id="t1",
+        composite_score=0.91,
+        risk_level=UnifiedRiskLevel.CRITICAL,
+        action=OrchestratorAction.BLOCK_AND_ESCALATE,
+        patterns_detected=[CrossSignalPattern.ATO_TO_MULE_EXFILTRATION],
+        correlated_case_id=run1.correlated_case_id,
+    )
+    run2 = engine.execute_for_assessment(high_assess_2)
+    assert run2.status is PlaybookRunStatus.PARTIAL
+    assert run2.correlated_case_id == run1.correlated_case_id
+
+    # 4. Rollback run1 -> releases all 3 containments and emits SOAR_CONTAINMENT_ROLLED_BACK
+    events.clear()
+    rolled = engine.rollback_execution(run1.execution_id, reason="false_alarm_verified")
+    assert rolled.status is PlaybookRunStatus.ROLLED_BACK
+    assert len(rolled.metadata["released_containment_ids"]) == 3
+    assert EventType.SOAR_CONTAINMENT_ROLLED_BACK in events
+    assert (
+        engine.store.list_containments(entity_id="ent_victim", tenant_id="t1", active_only=True)
+        == []
+    )
+
+    # Re-releasing an already released containment is a no-op
+    first_cnt_id = rolled.metadata["released_containment_ids"][0]
+    released_again = engine.release_containment(first_cnt_id)
+    assert released_again.state is ContainmentState.RELEASED
+
+    with pytest.raises(KeyError, match="not found"):
+        engine.release_containment("cnt_missing")
+    with pytest.raises(KeyError, match="not found"):
+        engine.rollback_execution("soar_missing")
+
+
+def test_soar_engine_edge_branches_without_case_manager_or_event_bus() -> None:
+    # Engine without CaseManager or EventBus
+    engine = SoarEngine()
+    assess = UnifiedRiskAssessment(
+        assessment_id="ora_no_cm",
+        entity_id="ent_nocm",
+        tenant_id="default",
+        composite_score=0.85,
+        risk_level=UnifiedRiskLevel.CRITICAL,
+        action=OrchestratorAction.BLOCK_AND_ESCALATE,
+        patterns_detected=[CrossSignalPattern.ATO_TO_MULE_EXFILTRATION],
+    )
+    # First run: 3 containments applied, ESCALATE_CASE skipped (no CaseManager) -> PARTIAL
+    run1 = engine.execute_for_assessment(assess)
+    assert run1.status is PlaybookRunStatus.PARTIAL
+    # Second run: all 3 containments already active + ESCALATE_CASE False -> SKIPPED
+    run2 = engine.execute_for_assessment(assess)
+    assert run2.status is PlaybookRunStatus.SKIPPED
+
+    # Engine with CaseManager where correlated_case_id is missing or closed
+    case_mgr = CaseManager()
+    engine_cm = SoarEngine(case_manager=case_mgr)
+    assess_missing_case = UnifiedRiskAssessment(
+        assessment_id="ora_mc",
+        entity_id="ent_mc",
+        tenant_id="default",
+        composite_score=0.85,
+        risk_level=UnifiedRiskLevel.CRITICAL,
+        action=OrchestratorAction.BLOCK_AND_ESCALATE,
+        patterns_detected=[CrossSignalPattern.SYNTHETIC_TO_AML_LAYERING],
+        correlated_case_id="nonexistent_case",
+    )
+    run_mc = engine_cm.execute_for_assessment(assess_missing_case)
+    assert run_mc.correlated_case_id is not None
+    assert run_mc.correlated_case_id != "nonexistent_case"
+
+    # Close that case, then run again -> creates a new case
+    closed_case = case_mgr.get_case(run_mc.correlated_case_id)
+    closed_case.status = CaseStatus.CLOSED
+    case_mgr.store.put(closed_case)
+    assess_closed = UnifiedRiskAssessment(
+        assessment_id="ora_closed",
+        entity_id="ent_mc",
+        tenant_id="default",
+        composite_score=0.89,
+        risk_level=UnifiedRiskLevel.CRITICAL,
+        action=OrchestratorAction.BLOCK_AND_ESCALATE,
+        patterns_detected=[CrossSignalPattern.SYNTHETIC_TO_AML_LAYERING],
+        correlated_case_id=closed_case.case_id,
+    )
+    run_closed = engine_cm.execute_for_assessment(assess_closed)
+    assert run_closed.correlated_case_id != closed_case.case_id
