@@ -7262,3 +7262,110 @@ def test_orchestrator_api_error_branches(api_context: tuple[Path, Any, Path]) ->
         metrics_uninit = client.get("/v1/orchestrator/metrics")
         assert metrics_uninit.status_code == 200
         assert metrics_uninit.json()["status"] == "uninitialized"
+
+
+def test_soar_api_lifecycle_and_metrics(api_context: tuple[Path, Any, Path]) -> None:
+    """Verify /v1/soar/* execution, containments, playbooks, rollback, and metrics."""
+    _, model, _ = api_context
+    app = create_app(model=model)
+
+    with TestClient(app) as client:
+        pb_resp = client.get("/v1/soar/playbooks?enabled_only=true")
+        assert pb_resp.status_code == 200
+        assert pb_resp.json()["total_count"] == 5
+
+        exec_resp = client.post(
+            "/v1/soar/execute",
+            json={
+                "entity_id": "ent-soar-1",
+                "tenant_id": "default",
+                "composite_score": 0.89,
+                "risk_level": "critical",
+                "patterns_detected": ["ato_to_mule_exfiltration"],
+            },
+        )
+        assert exec_resp.status_code == 200
+        exec_data = exec_resp.json()
+        assert exec_data["status"] == "completed"
+        assert exec_data["playbook_id"] == "pb_ato_mule_exfiltration"
+        assert exec_data["correlated_case_id"] is not None
+        eid = exec_data["execution_id"]
+
+        get_exec = client.get(f"/v1/soar/executions/{eid}")
+        assert get_exec.status_code == 200
+        assert get_exec.json()["execution_id"] == eid
+
+        list_exec = client.get("/v1/soar/executions?entity_id=ent-soar-1")
+        assert list_exec.status_code == 200
+        assert list_exec.json()["total_count"] == 1
+
+        cnt_resp = client.get("/v1/soar/containments/ent-soar-1?active_only=true")
+        assert cnt_resp.status_code == 200
+        assert cnt_resp.json()["total_count"] == 3
+
+        metrics_resp = client.get("/v1/soar/metrics")
+        assert metrics_resp.status_code == 200
+        assert metrics_resp.json()["status"] == "operational"
+        assert metrics_resp.json()["active_containments"] == 3
+
+        rb_resp = client.post(
+            f"/v1/soar/executions/{eid}/rollback",
+            json={"reason": "false_positive_cleared"},
+        )
+        assert rb_resp.status_code == 200
+        assert rb_resp.json()["status"] == "rolled_back"
+
+        cnt_after = client.get("/v1/soar/containments/ent-soar-1?active_only=true")
+        assert cnt_after.status_code == 200
+        assert cnt_after.json()["total_count"] == 0
+
+        prom = client.get("/metrics")
+        assert prom.status_code == 200
+        assert "fraud_soar_playbooks_executed_total" in prom.text
+        assert "fraud_soar_containments_applied_total" in prom.text
+        assert "fraud_soar_rollbacks_total" in prom.text
+
+
+def test_soar_api_error_branches(api_context: tuple[Path, Any, Path]) -> None:
+    """Validate 404 and 500 error branches on /v1/soar/* endpoints."""
+    _, model, _ = api_context
+    app = create_app(model=model)
+
+    with TestClient(app) as client:
+        assert client.get("/v1/soar/executions/missing").status_code == 404
+        assert (
+            client.post("/v1/soar/executions/missing/rollback", json={"reason": "x"}).status_code
+            == 404
+        )
+        assert (
+            client.post(
+                "/v1/soar/execute",
+                json={
+                    "entity_id": "ent-x",
+                    "composite_score": 0.9,
+                    "risk_level": "critical",
+                    "playbook_id": "pb_nonexistent",
+                },
+            ).status_code
+            == 404
+        )
+
+        app.state.soar_engine = None
+        assert (
+            client.post(
+                "/v1/soar/execute",
+                json={"entity_id": "ent-x", "composite_score": 0.8, "risk_level": "high"},
+            ).status_code
+            == 500
+        )
+        assert (
+            client.post("/v1/soar/executions/soar-1/rollback", json={"reason": "x"}).status_code
+            == 500
+        )
+        assert client.get("/v1/soar/executions/soar-1").status_code == 500
+        assert client.get("/v1/soar/executions").status_code == 500
+        assert client.get("/v1/soar/containments/ent-x").status_code == 500
+        assert client.get("/v1/soar/playbooks").status_code == 500
+        metrics_uninit = client.get("/v1/soar/metrics")
+        assert metrics_uninit.status_code == 200
+        assert metrics_uninit.json()["status"] == "uninitialized"
