@@ -236,8 +236,12 @@ from fraud_detection.retraining import (
     export_certified_candidate,
 )
 from fraud_detection.risk_orchestrator import (
+    CrossSignalPattern,
     DomainRiskSignal,
+    OrchestratorAction,
     RiskDomain,
+    UnifiedRiskAssessment,
+    UnifiedRiskLevel,
     UnifiedRiskOrchestrator,
     UnifiedRiskStore,
 )
@@ -254,6 +258,7 @@ from fraud_detection.signing import (
     verify_attestation_signature,
     write_keypair,
 )
+from fraud_detection.soar import PlaybookRunStatus, SoarEngine, SoarStore
 from fraud_detection.synthetic_identity import (
     IdentityProfile,
     SifAssessment,
@@ -11520,6 +11525,167 @@ def orchestrator_summary(
         typer.echo(f"  Correlated Cases:     {summary_data['correlated_assessments']}")
         for level, cnt in summary_data["by_risk_level"].items():
             typer.echo(f"    {level:22s}: {cnt}")
+    else:
+        typer.echo(json.dumps(summary_data, indent=2))
+
+
+def _load_soar_state(store_file: Path) -> tuple[SoarEngine, SoarStore]:
+    """Load persistent SOAR executions and containments from a JSON store file."""
+    if not store_file.exists():
+        store = SoarStore()
+        return SoarEngine(store=store), store
+    try:
+        data = json.loads(store_file.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            _abort("Invalid SOAR store file format: expected JSON object.")
+    except (OSError, json.JSONDecodeError) as exc:
+        _abort(f"Could not read SOAR store file: {exc}")
+    store = SoarStore.from_dict(data)
+    return SoarEngine(store=store), store
+
+
+def _save_soar_state(store: SoarStore, store_file: Path) -> None:
+    """Persist SOAR store atomically to disk."""
+    _atomic_write_text(json.dumps(store.to_dict(), indent=2), store_file)
+
+
+@app.command("soar-execute")
+def soar_execute(
+    entity_id: Annotated[str, typer.Option("--entity-id", "-e", help="Entity identifier.")],
+    score: Annotated[float, typer.Option("--score", help="Composite risk score (0-1).")],
+    risk_level: Annotated[
+        UnifiedRiskLevel, typer.Option("--risk-level", "-r", help="Unified risk level.")
+    ] = UnifiedRiskLevel.HIGH,
+    pattern: Annotated[
+        list[CrossSignalPattern] | None,
+        typer.Option("--pattern", "-p", help="Detected cross-signal pattern(s)."),
+    ] = None,
+    playbook_id: Annotated[
+        str | None,
+        typer.Option("--playbook-id", help="Optional explicit playbook ID override."),
+    ] = None,
+    tenant_id: Annotated[str, typer.Option("--tenant-id", "-t", help="Tenant identifier.")] = (
+        "default"
+    ),
+    store_file: Annotated[
+        Path,
+        typer.Option("--store-file", "-s", help="Path to SOAR state JSON file."),
+    ] = Path("soar_store.json"),
+    output_format: Annotated[
+        str, typer.Option("--format", "-f", help="Output format (table or json).")
+    ] = "table",
+) -> None:
+    """Execute a matching or explicit SOAR response playbook for an entity."""
+    engine, store = _load_soar_state(store_file)
+    assessment = UnifiedRiskAssessment(
+        assessment_id=f"ora_{uuid4().hex[:12]}",
+        entity_id=entity_id,
+        tenant_id=tenant_id,
+        composite_score=score,
+        risk_level=risk_level,
+        action=OrchestratorAction.BLOCK_AND_ESCALATE,
+        patterns_detected=list(pattern or []),
+    )
+    try:
+        record = engine.execute_for_assessment(assessment, playbook_id=playbook_id)
+    except KeyError as exc:
+        _abort(str(exc))
+    _save_soar_state(store, store_file)
+    if output_format.lower() == "table":
+        typer.echo(f"Execution ID:   {record.execution_id}")
+        typer.echo(f"Playbook ID:    {record.playbook_id}")
+        typer.echo(f"Entity:         {record.entity_id}")
+        typer.echo(f"Status:         {PlaybookRunStatus(record.status).value}")
+        typer.echo(f"Steps Applied:  {sum(1 for s in record.step_results if s.applied)}")
+    else:
+        typer.echo(json.dumps(record.to_dict(), indent=2))
+
+
+@app.command("soar-rollback")
+def soar_rollback(
+    execution_id: Annotated[str, typer.Option("--execution-id", "-x", help="Execution ID.")],
+    reason: Annotated[
+        str, typer.Option("--reason", help="Audit reason for rolling back containment.")
+    ] = "operator_rollback",
+    store_file: Annotated[
+        Path,
+        typer.Option("--store-file", "-s", help="Path to SOAR state JSON file."),
+    ] = Path("soar_store.json"),
+    output_format: Annotated[
+        str, typer.Option("--format", "-f", help="Output format (table or json).")
+    ] = "table",
+) -> None:
+    """Roll back a SOAR playbook execution and release its active containments."""
+    engine, store = _load_soar_state(store_file)
+    try:
+        record = engine.rollback_execution(execution_id, reason=reason)
+    except KeyError as exc:
+        _abort(str(exc))
+    _save_soar_state(store, store_file)
+    if output_format.lower() == "table":
+        typer.echo(f"Execution ID:   {record.execution_id}")
+        typer.echo(f"Status:         {PlaybookRunStatus(record.status).value}")
+        typer.echo(f"Rollback Reason:{record.rollback_reason}")
+        released = record.metadata.get("released_containment_ids", [])
+        typer.echo(f"Released Count: {len(released)}")
+    else:
+        typer.echo(json.dumps(record.to_dict(), indent=2))
+
+
+@app.command("soar-inspect")
+def soar_inspect(
+    entity_id: Annotated[str, typer.Option("--entity-id", "-e", help="Entity identifier.")],
+    tenant_id: Annotated[str, typer.Option("--tenant-id", "-t", help="Tenant identifier.")] = (
+        "default"
+    ),
+    active_only: Annotated[
+        bool, typer.Option("--active-only/--all", help="Filter to active containments only.")
+    ] = True,
+    store_file: Annotated[
+        Path,
+        typer.Option("--store-file", "-s", help="Path to SOAR state JSON file."),
+    ] = Path("soar_store.json"),
+    output_format: Annotated[
+        str, typer.Option("--format", "-f", help="Output format (table or json).")
+    ] = "table",
+) -> None:
+    """Inspect active or historical compensating containments for an entity."""
+    _, store = _load_soar_state(store_file)
+    items = store.list_containments(
+        entity_id=entity_id,
+        tenant_id=tenant_id,
+        active_only=active_only,
+    )
+    if output_format.lower() == "table":
+        typer.echo(f"Entity:        {entity_id}")
+        typer.echo(f"Tenant:        {tenant_id}")
+        typer.echo(f"Containments:  {len(items)}")
+        for item in items:
+            typer.echo(f"  - {item.containment_id} [{item.control_type}] ({item.state})")
+    else:
+        typer.echo(json.dumps([item.to_dict() for item in items], indent=2))
+
+
+@app.command("soar-summary")
+def soar_summary(
+    store_file: Annotated[
+        Path,
+        typer.Option("--store-file", "-s", help="Path to SOAR state JSON file."),
+    ] = Path("soar_store.json"),
+    output_format: Annotated[
+        str, typer.Option("--format", "-f", help="Output format (table or json).")
+    ] = "table",
+) -> None:
+    """Display summary metrics of SOAR playbook executions and active containments."""
+    _, store = _load_soar_state(store_file)
+    summary_data = store.summary()
+    if output_format.lower() == "table":
+        typer.echo("SOAR Response Playbook Summary:")
+        typer.echo(f"  Executions:           {summary_data['execution_count']}")
+        typer.echo(f"  Containments (Total): {summary_data['containment_count']}")
+        typer.echo(f"  Containments (Active):{summary_data['active_containments']}")
+        for status_key, cnt in summary_data["by_status"].items():
+            typer.echo(f"    {status_key:22s}: {cnt}")
     else:
         typer.echo(json.dumps(summary_data, indent=2))
 

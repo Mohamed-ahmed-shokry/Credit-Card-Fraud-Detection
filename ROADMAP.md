@@ -2962,6 +2962,72 @@ Provide deterministic cross-engine entity risk orchestration, compound pattern d
 - `0492397`..`6f6bf62`: Implemented `risk_orchestrator.py` (`RiskDomain`, `UnifiedRiskLevel`, `OrchestratorAction`, `CrossSignalPattern`, `CrossSignalAnalyzer`, `EntityCaseCorrelator`, `UnifiedRiskStore`, `UnifiedRiskOrchestrator`), registered `ENTITY_RISK_ORCHESTRATED` / `CROSS_SIGNAL_PATTERN_DETECTED` / `UNIFIED_CASE_CORRELATED` / `ENTITY_ESCALATION_TRIGGERED` events in `events.py`, added `/v1/orchestrator/*` endpoints and Prometheus metrics in `api.py`, added `orchestrator-*` CLI commands in `cli.py`, achieved 100% branch coverage on `risk_orchestrator.py` (`1232 passed`, `97.01%` total branch coverage), and documented architecture and usage.
 
 
+## Phase 54 — Automated SOAR Incident Response Playbooks & Compensating Control Containment Engine (Done)
+
+Phase 54 implements an in-process, zero-external-dependency Automated SOAR (Security Orchestration, Automation, and Response) Incident Response Playbooks & Compensating Control Containment Engine (`soar.py`). It converts high-severity cross-engine risk assessments (`UnifiedRiskAssessment`) and compound fraud patterns into deterministic, auditable, reversible containment playbooks—issuing active entity holds (`LOCK_ACCOUNT`, `FREEZE_CARD`, `HOLD_PAYOUTS`, `REVOKE_SESSIONS`, `REQUIRE_STEP_UP`, `QUARANTINE_DEVICE`, `ESCALATE_CASE`) with TTL expiration and full operator rollback.
+
+### Objective
+
+Provide deterministic SOAR incident response playbook matching, automated compensating control execution, active containment ledger management with TTL expiration and rollback, `CaseManager` & `EventBus` integration, REST API endpoints (`/v1/soar/*`), Prometheus observability, and CLI workflows (`soar-*`) with zero external service dependencies.
+
+### Scope
+
+1. **Domain Models & Taxonomies (`soar.py`)**:
+   - `ContainmentControlType`: `LOCK_ACCOUNT`, `FREEZE_CARD`, `HOLD_PAYOUTS`, `REVOKE_SESSIONS`, `REQUIRE_STEP_UP`, `QUARANTINE_DEVICE`, `ESCALATE_CASE`.
+   - `PlaybookRunStatus`: `COMPLETED`, `PARTIAL`, `ROLLED_BACK`, `SKIPPED`.
+   - `ContainmentState`: `ACTIVE`, `RELEASED`, `EXPIRED`.
+   - `PlaybookStepSpec`, `ResponsePlaybook`, `ActiveContainmentRecord`, `PlaybookStepResult`, `PlaybookExecutionRecord` with lossless dict/JSON serialization.
+2. **Default Playbook Catalog & Matcher (`PlaybookCatalog`, `build_default_playbooks`)**:
+   - Built-in deterministic playbooks for `ATO_TO_MULE_EXFILTRATION`, `SYNTHETIC_TO_AML_LAYERING`, `SYNTHETIC_BUST_OUT`, `MULTI_VECTOR_SYNDICATE`, and critical-score fallback containment.
+   - Matches assessments by risk level, composite score threshold, and detected `CrossSignalPattern`.
+3. **Containment Ledger & SOAR Engine (`SoarStore`, `SoarEngine`)**:
+   - Thread-safe store for playbooks, execution records, and active entity containments with capacity eviction and JSON persistence.
+   - Executes playbook steps idempotently, records active containments with optional TTL expiry, enriches or opens `CaseManager` cases on `ESCALATE_CASE`, and supports full playbook rollback (`rollback_execution`) and individual containment release (`release_containment`).
+   - Emits `SOAR_PLAYBOOK_TRIGGERED`, `SOAR_CONTAINMENT_APPLIED`, `SOAR_PLAYBOOK_COMPLETED`, and `SOAR_CONTAINMENT_ROLLED_BACK` events on `EventBus`.
+4. **REST API (`/v1/soar/*`) & Prometheus Metrics (`api.py`)**:
+   - `POST /v1/soar/execute`, `POST /v1/soar/executions/{execution_id}/rollback`, `GET /v1/soar/executions`, `GET /v1/soar/executions/{execution_id}`, `GET /v1/soar/containments/{entity_id}`, `GET /v1/soar/playbooks`, `GET /v1/soar/metrics`.
+   - Prometheus counters: `fraud_soar_playbooks_executed_total`, `fraud_soar_containments_applied_total`, `fraud_soar_rollbacks_total`.
+5. **CLI Workflows (`cli.py`)**:
+   - `soar-execute`, `soar-rollback`, `soar-inspect`, `soar-summary` with table/JSON formatting and store persistence.
+6. **Documentation**:
+   - `ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`.
+
+### Acceptance Criteria
+
+1. **AC-1 (Domain Models & Taxonomies)**: `ContainmentControlType`, `PlaybookRunStatus`, `ContainmentState`, `PlaybookStepSpec`, `ResponsePlaybook`, `ActiveContainmentRecord`, `PlaybookStepResult`, and `PlaybookExecutionRecord` serialize/deserialize cleanly with unit tests.
+2. **AC-2 (Playbook Catalog & Pattern Matching)**: `PlaybookCatalog` and `build_default_playbooks` deterministically match cross-signal patterns and risk thresholds.
+3. **AC-3 (SOAR Engine, Containment Store & Rollback)**: `SoarEngine` and `SoarStore` apply idempotent containments, enforce TTL expiry and capacity eviction, correlate `CaseManager` cases, and cleanly roll back executions.
+4. **AC-4 (EventBus Streaming)**: Lifecycle transitions emit `SOAR_PLAYBOOK_TRIGGERED`, `SOAR_CONTAINMENT_APPLIED`, `SOAR_PLAYBOOK_COMPLETED`, and `SOAR_CONTAINMENT_ROLLED_BACK`.
+5. **AC-5 (REST API & Metrics)**: `/v1/soar/*` endpoints and Prometheus metrics work end to end and are verified in `tests/test_api.py`.
+6. **AC-6 (CLI Workflows)**: `soar-execute`, `soar-rollback`, `soar-inspect`, and `soar-summary` work end to end and are verified in `tests/test_cli.py` and real CLI execution.
+7. **AC-7 (All CI-Parity Checks & Remote CI Green)**: All local CI-parity checks (`ruff format --check src tests`, `ruff check src tests`, `mypy src`, `pytest --cov=fraud_detection --cov-report=term-missing`, `python -m build`, `twine check dist/*`) and remote CI workflow runs pass 100%.
+
+### Validation & CI Plan
+
+- Focused unit tests: `python -m pytest tests/test_soar.py -v`
+- API & CLI & Event integration tests: `python -m pytest tests/test_api.py tests/test_cli.py -k "soar"`
+- Full local CI parity: `ruff format --check src tests`, `ruff check src tests`, `mypy src`, `pytest --cov=fraud_detection --cov-report=term-missing`, `python -m build`, `twine check dist/*`
+- Remote CI: GitHub Actions `CI` workflow on `phase/soar-response-playbooks` PR.
+
+### Exclusions
+
+- External third-party ticketing/SOAR SaaS connectors (ServiceNow, PagerDuty, Splunk SOAR) and distributed message brokers (out of scope for in-process zero-dependency reference engine).
+
+### Micro-Task Breakdown
+
+- Task 1: Define Phase 54 roadmap & initialize `docs/PROGRESS.md`.
+- Task 2: Create `src/fraud_detection/soar.py` domain enums and data models + unit tests in `tests/test_soar.py`.
+- Task 3: Implement `PlaybookCatalog` and `build_default_playbooks` + unit tests.
+- Task 4: Implement `SoarStore` and `SoarEngine` (execution, TTL expiry, rollback, `CaseManager` escalation) + unit tests.
+- Task 5: Register `SOAR_PLAYBOOK_TRIGGERED` / `SOAR_CONTAINMENT_APPLIED` / `SOAR_PLAYBOOK_COMPLETED` / `SOAR_CONTAINMENT_ROLLED_BACK` events in `src/fraud_detection/events.py` and wire `EventBus` into `SoarEngine` + tests.
+- Task 6: Add `/v1/soar/*` REST endpoints and Prometheus metrics in `src/fraud_detection/api.py` + tests in `tests/test_api.py`.
+- Task 7: Add `soar-execute`, `soar-rollback`, `soar-inspect`, and `soar-summary` CLI commands in `src/fraud_detection/cli.py` + tests in `tests/test_cli.py`.
+- Task 8: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate with 100% Green CI.
+
+### Micro-Commits
+- `83a9f20`..`7267ed7`: Implemented `soar.py` (`ContainmentControlType`, `PlaybookRunStatus`, `ContainmentState`, `PlaybookStepSpec`, `ResponsePlaybook`, `ActiveContainmentRecord`, `PlaybookStepResult`, `PlaybookExecutionRecord`, `build_default_playbooks`, `PlaybookCatalog`, `SoarStore`, `SoarEngine`), registered `SOAR_PLAYBOOK_TRIGGERED` / `SOAR_CONTAINMENT_APPLIED` / `SOAR_PLAYBOOK_COMPLETED` / `SOAR_CONTAINMENT_ROLLED_BACK` events in `events.py`, added `/v1/soar/*` endpoints and Prometheus metrics in `api.py`, added `soar-*` CLI commands in `cli.py`, achieved 100% branch coverage on `soar.py` (`1241 passed`, `97.07%` total branch coverage), passed remote GitHub Actions CI (`44166162216`), and documented architecture and usage.
+
+
 ## Contributing to the roadmap
 
 Open an issue or a pull request that references the relevant phase item.

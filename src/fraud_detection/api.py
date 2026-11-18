@@ -208,6 +208,7 @@ from fraud_detection.retraining import (
     verify_certified_candidate,
 )
 from fraud_detection.risk_orchestrator import (
+    CrossSignalPattern,
     DomainRiskSignal,
     EntityRiskProfile,
     OrchestratorAction,
@@ -226,6 +227,14 @@ from fraud_detection.routing import (
     TrafficSplitStrategy,
 )
 from fraud_detection.rules import RulePrecedence, RuleSet
+from fraud_detection.soar import (
+    ActiveContainmentRecord,
+    ContainmentControlType,
+    PlaybookExecutionRecord,
+    PlaybookRunStatus,
+    ResponsePlaybook,
+    SoarEngine,
+)
 from fraud_detection.synthetic_identity import (
     AuthorizedUserRecord,
     IdentityProfile,
@@ -2550,6 +2559,101 @@ def _orchestrator_profile_to_response(
     return OrchestratorEntityProfileResponse(**profile.to_dict())
 
 
+class SoarExecuteRequest(BaseModel):
+    """Request payload for triggering SOAR containment playbook execution."""
+
+    entity_id: str = Field(..., min_length=1)
+    tenant_id: str = "default"
+    composite_score: float = Field(..., ge=0.0, le=1.0)
+    risk_level: UnifiedRiskLevel = UnifiedRiskLevel.HIGH
+    patterns_detected: list[CrossSignalPattern] = Field(default_factory=list)
+    source_assessment_id: str | None = None
+    correlated_case_id: str | None = None
+    playbook_id: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class SoarRollbackRequest(BaseModel):
+    """Request payload for rolling back a SOAR playbook execution."""
+
+    reason: str = "operator_rollback"
+
+
+class SoarExecutionResponse(BaseModel):
+    """Response payload for a SOAR playbook execution record."""
+
+    execution_id: str
+    playbook_id: str
+    entity_id: str
+    tenant_id: str
+    status: str
+    composite_score: float
+    risk_level: str
+    source_assessment_id: str | None = None
+    triggered_patterns: list[str]
+    step_results: list[dict[str, Any]]
+    correlated_case_id: str | None = None
+    executed_at: str
+    rolled_back_at: str | None = None
+    rollback_reason: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class SoarExecutionListResponse(BaseModel):
+    """Response payload for listing SOAR playbook executions."""
+
+    total_count: int
+    executions: list[SoarExecutionResponse]
+
+
+class SoarContainmentResponse(BaseModel):
+    """Response payload for a single compensating containment record."""
+
+    containment_id: str
+    entity_id: str
+    tenant_id: str
+    control_type: str
+    execution_id: str | None = None
+    playbook_id: str | None = None
+    state: str
+    reason: str
+    applied_at: str
+    expires_at: str | None = None
+    released_at: str | None = None
+    release_reason: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class SoarContainmentListResponse(BaseModel):
+    """Response payload for listing entity containments."""
+
+    entity_id: str
+    total_count: int
+    containments: list[SoarContainmentResponse]
+
+
+class SoarPlaybookListResponse(BaseModel):
+    """Response payload for listing registered SOAR playbooks."""
+
+    total_count: int
+    playbooks: list[dict[str, Any]]
+
+
+def _soar_execution_to_response(record: PlaybookExecutionRecord) -> SoarExecutionResponse:
+    return SoarExecutionResponse(**record.to_dict())
+
+
+def _soar_containment_to_response(record: ActiveContainmentRecord) -> SoarContainmentResponse:
+    return SoarContainmentResponse(**record.to_dict())
+
+
+def _soar_playbooks_to_response(playbooks: list[ResponsePlaybook]) -> SoarPlaybookListResponse:
+    return SoarPlaybookListResponse(
+        total_count=len(playbooks),
+        playbooks=[pb.to_dict() for pb in playbooks],
+    )
+
+
 def create_app(
     *,
     model: FraudModel | None = None,
@@ -2640,6 +2744,7 @@ def create_app(
     mule_engine: MuleDetectionEngine | None = None,
     first_party_engine: FirstPartyFraudEngine | None = None,
     risk_orchestrator: UnifiedRiskOrchestrator | None = None,
+    soar_engine: SoarEngine | None = None,
 ) -> FastAPI:
     """Create an application using an injected model or a trusted artifact path.
 
@@ -3202,6 +3307,24 @@ def create_app(
     orchestrator_escalations_counter = Counter(
         "fraud_orchestrator_escalations_total",
         "Total entities restricted or escalated by the unified risk orchestrator.",
+        ["tenant_id"],
+        registry=metrics_registry,
+    )
+    soar_playbooks_executed_counter = Counter(
+        "fraud_soar_playbooks_executed_total",
+        "Total SOAR incident response playbooks executed.",
+        ["tenant_id", "playbook_id", "status"],
+        registry=metrics_registry,
+    )
+    soar_containments_applied_counter = Counter(
+        "fraud_soar_containments_applied_total",
+        "Total compensating containment controls applied by SOAR playbooks.",
+        ["tenant_id", "control_type"],
+        registry=metrics_registry,
+    )
+    soar_rollbacks_counter = Counter(
+        "fraud_soar_rollbacks_total",
+        "Total SOAR playbook executions rolled back by operators.",
         ["tenant_id"],
         registry=metrics_registry,
     )
@@ -3811,6 +3934,14 @@ def create_app(
         application.state.orchestrator_evaluations_counter = orchestrator_evaluations_counter
         application.state.orchestrator_patterns_counter = orchestrator_patterns_counter
         application.state.orchestrator_escalations_counter = orchestrator_escalations_counter
+        resolved_soar_engine = soar_engine or SoarEngine(
+            case_manager=application.state.case_manager,
+            event_bus=resolved_event_bus,
+        )
+        application.state.soar_engine = resolved_soar_engine
+        application.state.soar_playbooks_executed_counter = soar_playbooks_executed_counter
+        application.state.soar_containments_applied_counter = soar_containments_applied_counter
+        application.state.soar_rollbacks_counter = soar_rollbacks_counter
         application.state.audit_sink = resolved_audit_sink
         application.state.explanation_provider = explanation_provider
         application.state.fallback_mode = resolved_fallback_mode
@@ -8773,6 +8904,222 @@ def create_app(
                 "status": "uninitialized",
             }
         return {**orch.store.summary(), "status": "operational"}
+
+    def _record_soar_metrics(
+        request: Request,
+        record: PlaybookExecutionRecord,
+    ) -> None:
+        exec_c = getattr(request.app.state, "soar_playbooks_executed_counter", None)
+        if exec_c is not None:
+            exec_c.labels(
+                tenant_id=record.tenant_id,
+                playbook_id=record.playbook_id,
+                status=PlaybookRunStatus(record.status).value,
+            ).inc()
+        cnt_c = getattr(request.app.state, "soar_containments_applied_counter", None)
+        if cnt_c is not None:
+            for step in record.step_results:
+                if step.applied and step.containment_id:
+                    cnt_c.labels(
+                        tenant_id=record.tenant_id,
+                        control_type=ContainmentControlType(step.control_type).value,
+                    ).inc()
+
+    @application.post(
+        "/v1/soar/execute",
+        response_model=SoarExecutionResponse,
+        responses={
+            404: {"description": "Playbook not found."},
+            422: {"description": "Invalid execution payload."},
+            500: {"description": "SOAR engine not initialized."},
+        },
+        tags=["soar"],
+    )
+    async def soar_execute_endpoint(
+        payload: SoarExecuteRequest,
+        request: Request,
+    ) -> SoarExecutionResponse | JSONResponse:
+        """Execute a matching or explicit SOAR containment playbook for an entity."""
+        engine: SoarEngine | None = getattr(request.app.state, "soar_engine", None)
+        if engine is None:
+            return JSONResponse(
+                status_code=500,
+                content={"detail": "SOAR engine not initialized."},
+            )
+        assessment = UnifiedRiskAssessment(
+            assessment_id=payload.source_assessment_id or f"ora_{uuid4().hex[:12]}",
+            entity_id=payload.entity_id,
+            tenant_id=payload.tenant_id,
+            composite_score=payload.composite_score,
+            risk_level=payload.risk_level,
+            action=OrchestratorAction.BLOCK_AND_ESCALATE,
+            patterns_detected=list(payload.patterns_detected),
+            correlated_case_id=payload.correlated_case_id,
+        )
+        try:
+            record = engine.execute_for_assessment(
+                assessment,
+                playbook_id=payload.playbook_id,
+                metadata=payload.metadata,
+            )
+        except KeyError as exc:
+            return JSONResponse(status_code=404, content={"detail": str(exc)})
+        _record_soar_metrics(request, record)
+        return _soar_execution_to_response(record)
+
+    @application.post(
+        "/v1/soar/executions/{execution_id}/rollback",
+        response_model=SoarExecutionResponse,
+        responses={
+            404: {"description": "Execution not found."},
+            500: {"description": "SOAR engine not initialized."},
+        },
+        tags=["soar"],
+    )
+    async def soar_rollback_endpoint(
+        execution_id: str,
+        payload: SoarRollbackRequest,
+        request: Request,
+    ) -> SoarExecutionResponse | JSONResponse:
+        """Roll back a SOAR playbook execution and release its active containments."""
+        engine: SoarEngine | None = getattr(request.app.state, "soar_engine", None)
+        if engine is None:
+            return JSONResponse(
+                status_code=500,
+                content={"detail": "SOAR engine not initialized."},
+            )
+        try:
+            record = engine.rollback_execution(execution_id, reason=payload.reason)
+        except KeyError as exc:
+            return JSONResponse(status_code=404, content={"detail": str(exc)})
+        rb_c = getattr(request.app.state, "soar_rollbacks_counter", None)
+        if rb_c is not None:
+            rb_c.labels(tenant_id=record.tenant_id).inc()
+        return _soar_execution_to_response(record)
+
+    @application.get(
+        "/v1/soar/executions/{execution_id}",
+        response_model=SoarExecutionResponse,
+        responses={
+            404: {"description": "Execution not found."},
+            500: {"description": "SOAR engine not initialized."},
+        },
+        tags=["soar"],
+    )
+    async def soar_get_execution_endpoint(
+        execution_id: str,
+        request: Request,
+    ) -> SoarExecutionResponse | JSONResponse:
+        """Retrieve a specific SOAR playbook execution record by ID."""
+        engine: SoarEngine | None = getattr(request.app.state, "soar_engine", None)
+        if engine is None:
+            return JSONResponse(
+                status_code=500,
+                content={"detail": "SOAR engine not initialized."},
+            )
+        record = engine.store.get_execution(execution_id)
+        if record is None:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": f"SOAR execution '{execution_id}' not found."},
+            )
+        return _soar_execution_to_response(record)
+
+    @application.get(
+        "/v1/soar/executions",
+        response_model=SoarExecutionListResponse,
+        responses={500: {"description": "SOAR engine not initialized."}},
+        tags=["soar"],
+    )
+    async def soar_list_executions_endpoint(
+        request: Request,
+        entity_id: str | None = None,
+        tenant_id: str | None = None,
+        status: PlaybookRunStatus | None = None,
+        limit: int = Query(default=100, ge=1, le=1000),
+    ) -> SoarExecutionListResponse | JSONResponse:
+        """List SOAR playbook executions with optional filters."""
+        engine: SoarEngine | None = getattr(request.app.state, "soar_engine", None)
+        if engine is None:
+            return JSONResponse(
+                status_code=500,
+                content={"detail": "SOAR engine not initialized."},
+            )
+        items = engine.store.list_executions(
+            entity_id=entity_id,
+            tenant_id=tenant_id,
+            status=status,
+            limit=limit,
+        )
+        return SoarExecutionListResponse(
+            total_count=len(items),
+            executions=[_soar_execution_to_response(item) for item in items],
+        )
+
+    @application.get(
+        "/v1/soar/containments/{entity_id}",
+        response_model=SoarContainmentListResponse,
+        responses={500: {"description": "SOAR engine not initialized."}},
+        tags=["soar"],
+    )
+    async def soar_list_containments_endpoint(
+        entity_id: str,
+        request: Request,
+        tenant_id: str = "default",
+        active_only: bool = True,
+    ) -> SoarContainmentListResponse | JSONResponse:
+        """Inspect active or historical compensating containments for an entity."""
+        engine: SoarEngine | None = getattr(request.app.state, "soar_engine", None)
+        if engine is None:
+            return JSONResponse(
+                status_code=500,
+                content={"detail": "SOAR engine not initialized."},
+            )
+        items = engine.store.list_containments(
+            entity_id=entity_id,
+            tenant_id=tenant_id,
+            active_only=active_only,
+        )
+        return SoarContainmentListResponse(
+            entity_id=entity_id,
+            total_count=len(items),
+            containments=[_soar_containment_to_response(c) for c in items],
+        )
+
+    @application.get(
+        "/v1/soar/playbooks",
+        response_model=SoarPlaybookListResponse,
+        responses={500: {"description": "SOAR engine not initialized."}},
+        tags=["soar"],
+    )
+    async def soar_list_playbooks_endpoint(
+        request: Request,
+        enabled_only: bool = False,
+    ) -> SoarPlaybookListResponse | JSONResponse:
+        """List registered SOAR incident response playbooks."""
+        engine: SoarEngine | None = getattr(request.app.state, "soar_engine", None)
+        if engine is None:
+            return JSONResponse(
+                status_code=500,
+                content={"detail": "SOAR engine not initialized."},
+            )
+        return _soar_playbooks_to_response(engine.catalog.list_playbooks(enabled_only=enabled_only))
+
+    @application.get(
+        "/v1/soar/metrics",
+        response_model=dict[str, Any],
+        tags=["soar"],
+    )
+    async def soar_metrics_endpoint(request: Request) -> dict[str, Any]:
+        """Summary metrics of SOAR playbook executions and active containments."""
+        engine: SoarEngine | None = getattr(request.app.state, "soar_engine", None)
+        if engine is None:
+            return {
+                "execution_count": 0,
+                "active_containments": 0,
+                "status": "uninitialized",
+            }
+        return {**engine.store.summary(), "status": "operational"}
 
     @application.get(
         "/v1/routing/status",

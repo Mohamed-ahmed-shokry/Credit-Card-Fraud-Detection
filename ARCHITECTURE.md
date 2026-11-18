@@ -931,6 +931,35 @@ flowchart TD
 - **Store, EventBus, API & CLI**: `UnifiedRiskStore` tracks entity profiles and assessments with thread-safe capacity eviction and JSON persistence; `UnifiedRiskOrchestrator` emits `ENTITY_RISK_ORCHESTRATED`, `CROSS_SIGNAL_PATTERN_DETECTED`, `UNIFIED_CASE_CORRELATED`, and `ENTITY_ESCALATION_TRIGGERED`; FastAPI exposes `/v1/orchestrator/*` endpoints and Prometheus counters (`fraud_orchestrator_evaluations_total`, `fraud_orchestrator_patterns_total`, `fraud_orchestrator_escalations_total`); Typer CLI exposes `orchestrator-ingest`, `orchestrator-eval`, `orchestrator-inspect`, and `orchestrator-summary`.
 
 
+## Phase 54 — Automated SOAR Incident Response Playbooks & Compensating Control Containment Engine
+
+Phase 54 delivers an in-process, zero-external-dependency Automated SOAR (Security Orchestration, Automation, and Response) Incident Response Playbooks & Compensating Control Containment Engine (`soar.py`). It converts high-severity cross-engine risk assessments (`UnifiedRiskAssessment`) and compound patterns into deterministic, auditable, reversible containment playbooks with TTL expiration and full operator rollback.
+
+```mermaid
+flowchart TD
+    subgraph Trigger
+        Assess["UnifiedRiskAssessment\n(Score, Risk Level, CrossSignalPatterns)"] --> Catalog["PlaybookCatalog\n(Priority Pattern Matcher)"]
+    end
+
+    subgraph Execution
+        Catalog --> Engine["SoarEngine\n(Idempotent Step Runner)"]
+        Engine --> Controls["Compensating Controls\n(LOCK_ACCOUNT, FREEZE_CARD, HOLD_PAYOUTS,\nREVOKE_SESSIONS, REQUIRE_STEP_UP, QUARANTINE_DEVICE)"]
+        Engine --> Case["CaseManager\n(ESCALATE_CASE Audit & Creation)"]
+    end
+
+    subgraph LedgerAndObservability
+        Controls --> Store["SoarStore\n(Thread-Safe TTL Ledger & Rollback)"]
+        Engine --> Bus["EventBus\n(SOAR_PLAYBOOK_* & SOAR_CONTAINMENT_*)"]
+        Store --> API["FastAPI /v1/soar/* & Prometheus"]
+        Store --> CLI["Typer CLI: soar-execute, soar-rollback,\nsoar-inspect, soar-summary"]
+    end
+```
+
+- **Playbook Catalog (`PlaybookCatalog`, `build_default_playbooks`)**: Registers built-in containment playbooks for `ATO_TO_MULE_EXFILTRATION`, `SYNTHETIC_TO_AML_LAYERING`, `SYNTHETIC_BUST_OUT`, `MULTI_VECTOR_SYNDICATE`, and high-risk fallback step-up containment, matching by pattern, risk tier, and priority.
+- **Idempotent Execution & Rollback (`SoarEngine`, `SoarStore`)**: Applies compensating controls with optional TTL expiration, prevents duplicate active controls per entity, correlates/escalates `CaseManager` cases, and supports full execution rollback (`rollback_execution`) or individual containment release (`release_containment`).
+- **EventBus, API & CLI**: Emits `SOAR_PLAYBOOK_TRIGGERED`, `SOAR_CONTAINMENT_APPLIED`, `SOAR_PLAYBOOK_COMPLETED`, and `SOAR_CONTAINMENT_ROLLED_BACK`; FastAPI exposes `/v1/soar/*` endpoints and Prometheus counters (`fraud_soar_playbooks_executed_total`, `fraud_soar_containments_applied_total`, `fraud_soar_rollbacks_total`); Typer CLI exposes `soar-execute`, `soar-rollback`, `soar-inspect`, and `soar-summary`.
+
+
 ## Extension guidance
 
 
