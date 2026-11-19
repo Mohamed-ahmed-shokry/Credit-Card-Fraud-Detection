@@ -150,3 +150,74 @@ class WalletProvisioningRequest:
             requested_at=str(payload.get("requested_at") or _utc_now_iso()),
             metadata=dict(payload.get("metadata", {})),
         )
+
+
+@dataclass(slots=True)
+class WalletTokenRecord:
+    """Provisioned network payment token lifecycle record."""
+
+    card_hash: str
+    device_id: str
+    wallet_account_id: str
+    wallet_provider: WalletProvider | str
+    tenant_id: str = "default"
+    token_id: str = field(default_factory=lambda: f"tok_{uuid4().hex[:12]}")
+    status: TokenStatus | str = TokenStatus.ACTIVE
+    provisioned_at: str = field(default_factory=_utc_now_iso)
+    activated_at: str | None = None
+    updated_at: str = field(default_factory=_utc_now_iso)
+    total_spend_amount: float = 0.0
+    transaction_count: int = 0
+    suspension_reason: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.card_hash = self.card_hash.strip()
+        self.device_id = self.device_id.strip()
+        self.wallet_account_id = self.wallet_account_id.strip()
+        if not self.card_hash or not self.device_id or not self.wallet_account_id:
+            raise ValueError("card_hash, device_id, and wallet_account_id must not be empty")
+        if not isinstance(self.wallet_provider, WalletProvider):
+            self.wallet_provider = WalletProvider(str(self.wallet_provider).lower())
+        if not isinstance(self.status, TokenStatus):
+            self.status = TokenStatus(str(self.status).lower())
+        self.tenant_id = self.tenant_id.strip() or "default"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "token_id": self.token_id,
+            "card_hash": self.card_hash,
+            "device_id": self.device_id,
+            "wallet_account_id": self.wallet_account_id,
+            "wallet_provider": WalletProvider(self.wallet_provider).value,
+            "tenant_id": self.tenant_id,
+            "status": TokenStatus(self.status).value,
+            "provisioned_at": self.provisioned_at,
+            "activated_at": self.activated_at,
+            "updated_at": self.updated_at,
+            "total_spend_amount": round(self.total_spend_amount, 2),
+            "transaction_count": self.transaction_count,
+            "suspension_reason": self.suspension_reason,
+            "metadata": dict(self.metadata),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> WalletTokenRecord:
+        return cls(
+            token_id=str(payload.get("token_id") or f"tok_{uuid4().hex[:12]}"),
+            card_hash=str(payload["card_hash"]),
+            device_id=str(payload["device_id"]),
+            wallet_account_id=str(payload["wallet_account_id"]),
+            wallet_provider=WalletProvider(
+                str(payload.get("wallet_provider", "apple_pay")).lower()
+            ),
+            tenant_id=str(payload.get("tenant_id") or "default"),
+            status=TokenStatus(str(payload.get("status", "active")).lower()),
+            provisioned_at=str(payload.get("provisioned_at") or _utc_now_iso()),
+            activated_at=payload.get("activated_at"),
+            updated_at=str(payload.get("updated_at") or _utc_now_iso()),
+            total_spend_amount=float(payload.get("total_spend_amount", 0.0)),
+            transaction_count=int(payload.get("transaction_count", 0)),
+            suspension_reason=payload.get("suspension_reason"),
+            metadata=dict(payload.get("metadata", {})),
+        )
