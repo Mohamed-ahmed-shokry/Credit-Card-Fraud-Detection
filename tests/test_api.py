@@ -7369,3 +7369,146 @@ def test_soar_api_error_branches(api_context: tuple[Path, Any, Path]) -> None:
         metrics_uninit = client.get("/v1/soar/metrics")
         assert metrics_uninit.status_code == 200
         assert metrics_uninit.json()["status"] == "uninitialized"
+
+
+def test_wallet_api_lifecycle_and_metrics(api_context: tuple[Path, Any, Path]) -> None:
+    """Verify /v1/wallet/* provisioning, ID&V actions, spend burst, and Prometheus metrics."""
+    _, model, _ = api_context
+    app = create_app(model=model)
+
+    with TestClient(app) as client:
+        # 1. Yellow-path provisioning (phone mismatch + new account) -> PENDING_IDV
+        prov_resp = client.post(
+            "/v1/wallet/provision",
+            json={
+                "card_hash": "card-api-1",
+                "device_id": "dev-api-1",
+                "wallet_account_id": "wal-api-1",
+                "wallet_provider": "apple_pay",
+                "phone_match": False,
+                "wallet_account_age_days": 3,
+            },
+        )
+        assert prov_resp.status_code == 200
+        prov_data = prov_resp.json()
+        assert prov_data["provisioning_path"] == "yellow_path"
+        tid = prov_data["token_id"]
+        assert tid is not None
+
+        # 2. Verify ID&V -> ACTIVE
+        act_resp = client.post(
+            f"/v1/wallet/tokens/{tid}/action",
+            json={"action": "verify_idv", "reason": "otp_passed"},
+        )
+        assert act_resp.status_code == 200
+        assert act_resp.json()["status"] == "active"
+
+        # 3. Record high-value spend burst -> auto-suspended
+        spend_resp = client.post(
+            f"/v1/wallet/tokens/{tid}/spend",
+            json={"amount": 2500.0},
+        )
+        assert spend_resp.status_code == 200
+        assert "post_provisioning_high_value_burst" in spend_resp.json()["anomalies"]
+        assert spend_resp.json()["correlated_case_id"] is not None
+
+        # 4. Inspect token & list endpoints
+        tok_resp = client.get(f"/v1/wallet/tokens/{tid}")
+        assert tok_resp.status_code == 200
+        assert tok_resp.json()["status"] == "suspended"
+
+        list_tok = client.get("/v1/wallet/tokens?card_hash=card-api-1")
+        assert list_tok.status_code == 200
+        assert list_tok.json()["total_count"] == 1
+
+        list_ass = client.get("/v1/wallet/assessments?card_hash=card-api-1")
+        assert list_ass.status_code == 200
+        assert list_ass.json()["total_count"] == 2
+
+        # 5. Suspend / fail_idv / deactivate actions
+        assert (
+            client.post(
+                f"/v1/wallet/tokens/{tid}/action",
+                json={"action": "suspend", "reason": "review"},
+            ).status_code
+            == 200
+        )
+        assert (
+            client.post(
+                f"/v1/wallet/tokens/{tid}/action",
+                json={"action": "fail_idv", "reason": "idv_rejected"},
+            ).status_code
+            == 200
+        )
+        assert (
+            client.post(
+                f"/v1/wallet/tokens/{tid}/action",
+                json={"action": "deactivate", "reason": "card_reissued"},
+            ).status_code
+            == 200
+        )
+
+        # 6. Metrics & Prometheus
+        metrics_resp = client.get("/v1/wallet/metrics")
+        assert metrics_resp.status_code == 200
+        assert metrics_resp.json()["status"] == "operational"
+        assert metrics_resp.json()["token_count"] == 1
+
+        prom = client.get("/metrics")
+        assert prom.status_code == 200
+        assert "fraud_wallet_provisioning_evaluations_total" in prom.text
+        assert "fraud_wallet_anomalies_total" in prom.text
+        assert "fraud_wallet_token_suspensions_total" in prom.text
+
+
+def test_wallet_api_error_branches(api_context: tuple[Path, Any, Path]) -> None:
+    """Validate 400, 404, and 500 error branches on /v1/wallet/* endpoints."""
+    _, model, _ = api_context
+    app = create_app(model=model)
+
+    with TestClient(app) as client:
+        assert client.get("/v1/wallet/tokens/missing").status_code == 404
+        assert (
+            client.post(
+                "/v1/wallet/tokens/missing/action",
+                json={"action": "suspend"},
+            ).status_code
+            == 404
+        )
+        assert (
+            client.post(
+                "/v1/wallet/tokens/missing/action",
+                json={"action": "unknown_op"},
+            ).status_code
+            == 400
+        )
+        assert (
+            client.post("/v1/wallet/tokens/missing/spend", json={"amount": 100.0}).status_code
+            == 404
+        )
+
+        app.state.wallet_engine = None
+        assert (
+            client.post(
+                "/v1/wallet/provision",
+                json={
+                    "card_hash": "c1",
+                    "device_id": "d1",
+                    "wallet_account_id": "w1",
+                },
+            ).status_code
+            == 500
+        )
+        assert (
+            client.post("/v1/wallet/tokens/tok-1/action", json={"action": "suspend"}).status_code
+            == 500
+        )
+        assert (
+            client.post("/v1/wallet/tokens/tok-1/spend", json={"amount": 10.0}).status_code == 500
+        )
+        assert client.get("/v1/wallet/tokens/tok-1").status_code == 500
+        assert client.get("/v1/wallet/tokens").status_code == 500
+        assert client.get("/v1/wallet/assessments").status_code == 500
+        metrics_uninit = client.get("/v1/wallet/metrics")
+        assert metrics_uninit.status_code == 200
+        assert metrics_uninit.json()["status"] == "uninitialized"
