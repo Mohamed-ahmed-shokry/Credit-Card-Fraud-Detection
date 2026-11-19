@@ -298,3 +298,64 @@ class WalletRiskAssessment:
             evaluated_at=str(payload.get("evaluated_at") or _utc_now_iso()),
             metadata=dict(payload.get("metadata", {})),
         )
+
+
+class ProvisioningVelocityAnalyzer:
+    """Detects multi-card device velocity, card fan-out, and compromised device reuse."""
+
+    def __init__(
+        self,
+        *,
+        max_cards_per_device: int = 3,
+        max_wallets_per_card: int = 3,
+    ) -> None:
+        self.max_cards_per_device = max(1, max_cards_per_device)
+        self.max_wallets_per_card = max(1, max_wallets_per_card)
+
+    def analyze(
+        self,
+        request: WalletProvisioningRequest,
+        existing_tokens: list[WalletTokenRecord],
+    ) -> tuple[float, list[WalletAnomalyType], list[str]]:
+        score = 0.0
+        anomalies: list[WalletAnomalyType] = []
+        rationale: list[str] = []
+
+        device_tokens = [
+            t
+            for t in existing_tokens
+            if t.device_id == request.device_id and t.tenant_id == request.tenant_id
+        ]
+        distinct_cards_on_device = {t.card_hash for t in device_tokens} | {request.card_hash}
+        if len(distinct_cards_on_device) > self.max_cards_per_device:
+            score += 0.35
+            anomalies.append(WalletAnomalyType.DEVICE_PROVISIONING_VELOCITY)
+            rationale.append(
+                f"Device '{request.device_id}' provisioned {len(distinct_cards_on_device)} "
+                f"distinct cards (limit {self.max_cards_per_device})"
+            )
+
+        if any(t.status in {TokenStatus.SUSPENDED, TokenStatus.DEACTIVATED} for t in device_tokens):
+            score += 0.30
+            anomalies.append(WalletAnomalyType.COMPROMISED_DEVICE_REUSE)
+            rationale.append(
+                f"Device '{request.device_id}' has prior suspended or deactivated tokens"
+            )
+
+        card_tokens = [
+            t
+            for t in existing_tokens
+            if t.card_hash == request.card_hash and t.tenant_id == request.tenant_id
+        ]
+        distinct_wallets_for_card = {t.wallet_account_id for t in card_tokens} | {
+            request.wallet_account_id
+        }
+        if len(distinct_wallets_for_card) > self.max_wallets_per_card:
+            score += 0.30
+            anomalies.append(WalletAnomalyType.CARD_WALLET_FAN_OUT)
+            rationale.append(
+                f"Card provisioned across {len(distinct_wallets_for_card)} distinct wallets "
+                f"(limit {self.max_wallets_per_card})"
+            )
+
+        return _clamp(score), anomalies, rationale
