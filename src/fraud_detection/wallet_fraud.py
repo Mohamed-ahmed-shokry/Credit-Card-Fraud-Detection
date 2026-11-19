@@ -221,3 +221,80 @@ class WalletTokenRecord:
             suspension_reason=payload.get("suspension_reason"),
             metadata=dict(payload.get("metadata", {})),
         )
+
+
+@dataclass(slots=True)
+class WalletRiskAssessment:
+    """Output of a digital wallet provisioning or post-provisioning risk evaluation."""
+
+    assessment_id: str
+    request_id: str
+    card_hash: str
+    device_id: str
+    wallet_account_id: str
+    wallet_provider: WalletProvider | str
+    tenant_id: str
+    risk_score: float
+    risk_level: WalletRiskLevel | str
+    provisioning_path: ProvisioningPath | str
+    anomalies: list[WalletAnomalyType] = field(default_factory=list)
+    rationale: list[str] = field(default_factory=list)
+    token_id: str | None = None
+    correlated_case_id: str | None = None
+    evaluated_at: str = field(default_factory=_utc_now_iso)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.risk_score = round(_clamp(self.risk_score), 6)
+        if not isinstance(self.wallet_provider, WalletProvider):
+            self.wallet_provider = WalletProvider(str(self.wallet_provider).lower())
+        if not isinstance(self.risk_level, WalletRiskLevel):
+            self.risk_level = WalletRiskLevel(str(self.risk_level).lower())
+        if not isinstance(self.provisioning_path, ProvisioningPath):
+            self.provisioning_path = ProvisioningPath(str(self.provisioning_path).lower())
+        self.anomalies = [WalletAnomalyType(str(a).lower()) for a in self.anomalies]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "assessment_id": self.assessment_id,
+            "request_id": self.request_id,
+            "card_hash": self.card_hash,
+            "device_id": self.device_id,
+            "wallet_account_id": self.wallet_account_id,
+            "wallet_provider": WalletProvider(self.wallet_provider).value,
+            "tenant_id": self.tenant_id,
+            "risk_score": self.risk_score,
+            "risk_level": WalletRiskLevel(self.risk_level).value,
+            "provisioning_path": ProvisioningPath(self.provisioning_path).value,
+            "anomalies": [a.value for a in self.anomalies],
+            "rationale": list(self.rationale),
+            "token_id": self.token_id,
+            "correlated_case_id": self.correlated_case_id,
+            "evaluated_at": self.evaluated_at,
+            "metadata": dict(self.metadata),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> WalletRiskAssessment:
+        return cls(
+            assessment_id=str(payload["assessment_id"]),
+            request_id=str(payload["request_id"]),
+            card_hash=str(payload["card_hash"]),
+            device_id=str(payload["device_id"]),
+            wallet_account_id=str(payload["wallet_account_id"]),
+            wallet_provider=WalletProvider(
+                str(payload.get("wallet_provider", "apple_pay")).lower()
+            ),
+            tenant_id=str(payload.get("tenant_id") or "default"),
+            risk_score=float(payload.get("risk_score", 0.0)),
+            risk_level=WalletRiskLevel(str(payload.get("risk_level", "low")).lower()),
+            provisioning_path=ProvisioningPath(
+                str(payload.get("provisioning_path", "green_path")).lower()
+            ),
+            anomalies=[WalletAnomalyType(str(a).lower()) for a in payload.get("anomalies", [])],
+            rationale=[str(r) for r in payload.get("rationale", [])],
+            token_id=payload.get("token_id"),
+            correlated_case_id=payload.get("correlated_case_id"),
+            evaluated_at=str(payload.get("evaluated_at") or _utc_now_iso()),
+            metadata=dict(payload.get("metadata", {})),
+        )
