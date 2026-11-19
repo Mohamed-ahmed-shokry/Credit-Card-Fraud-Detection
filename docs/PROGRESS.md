@@ -7,7 +7,7 @@
 
 ## Task Status
 - [x] Task 1: Define Phase 55 roadmap & initialize `docs/PROGRESS.md`.
-- [ ] Task 2: Create `src/fraud_detection/wallet_fraud.py` domain enums and data models + unit tests in `tests/test_wallet_fraud.py`.
+- [x] Task 2: Create `src/fraud_detection/wallet_fraud.py` domain enums and data models + unit tests in `tests/test_wallet_fraud.py`.
 - [ ] Task 3: Implement `ProvisioningVelocityAnalyzer`, `IdentityTelemetryAnalyzer`, and `TokenLifecycleAnalyzer` + unit tests.
 - [ ] Task 4: Implement `WalletTokenStore` and `WalletFraudEngine` (provisioning, ID&V, suspend/deactivate, post-provisioning spend surveillance, `CaseManager` escalation) + unit tests.
 - [ ] Task 5: Register `WALLET_PROVISIONING_EVALUATED` / `WALLET_TOKEN_ACTIVATED` / `WALLET_TOKEN_SUSPENDED` / `WALLET_PROVISIONING_DECLINED` events in `src/fraud_detection/events.py` and wire `EventBus` into `WalletFraudEngine` + tests.
@@ -18,7 +18,7 @@
 ## Acceptance Criteria Status
 | Criterion | Status | Evidence |
 |-----------|--------|----------|
-| AC-1 (Domain Models & Taxonomies) | PENDING | |
+| AC-1 (Domain Models & Taxonomies) | PASSED | `WalletProvider`, `ProvisioningPath`, `WalletRiskLevel`, `TokenStatus`, `WalletAnomalyType`, `WalletProvisioningRequest`, `WalletTokenRecord`, `WalletRiskAssessment` verified in `tests/test_wallet_fraud.py` |
 | AC-2 (Provisioning & Identity Telemetry Analyzers) | PENDING | |
 | AC-3 (Wallet Engine, Store & Token Lifecycle) | PENDING | |
 | AC-4 (EventBus Streaming) | PENDING | |
