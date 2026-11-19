@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+
 import pytest
 
 from fraud_detection.wallet_fraud import (
+    IdentityTelemetryAnalyzer,
     ProvisioningPath,
+    ProvisioningVelocityAnalyzer,
+    TokenLifecycleAnalyzer,
     TokenStatus,
     WalletAnomalyType,
     WalletProvider,
@@ -89,3 +94,107 @@ def test_wallet_domain_models_round_trip_and_validation() -> None:
     assert assessment.provisioning_path is ProvisioningPath.RED_PATH
     restored_ass = WalletRiskAssessment.from_dict(assessment.to_dict())
     assert restored_ass.anomalies == [WalletAnomalyType.PHONE_MISMATCH_SIM_SWAP]
+
+
+def test_wallet_analyzers_detect_all_eight_anomalies() -> None:
+    vel = ProvisioningVelocityAnalyzer(max_cards_per_device=2, max_wallets_per_card=2)
+    existing = [
+        WalletTokenRecord(
+            card_hash="c1",
+            device_id="dev_bad",
+            wallet_account_id="w1",
+            wallet_provider=WalletProvider.APPLE_PAY,
+            status=TokenStatus.SUSPENDED,
+        ),
+        WalletTokenRecord(
+            card_hash="c2",
+            device_id="dev_bad",
+            wallet_account_id="w2",
+            wallet_provider=WalletProvider.GOOGLE_PAY,
+        ),
+        WalletTokenRecord(
+            card_hash="c3",
+            device_id="dev_other",
+            wallet_account_id="w3",
+            wallet_provider=WalletProvider.SAMSUNG_PAY,
+        ),
+        WalletTokenRecord(
+            card_hash="c3",
+            device_id="dev_other_2",
+            wallet_account_id="w4",
+            wallet_provider=WalletProvider.APPLE_PAY,
+        ),
+    ]
+    req = WalletProvisioningRequest(
+        card_hash="c3",
+        device_id="dev_bad",
+        wallet_account_id="w5",
+        wallet_account_age_days=2,
+        device_country="RU",
+        issuer_country="US",
+        phone_match=False,
+        sim_swap_detected=True,
+        otp_attempts=4,
+    )
+    v_score, v_anoms, v_rat = vel.analyze(req, existing)
+    assert v_score > 0.8
+    assert set(v_anoms) == {
+        WalletAnomalyType.DEVICE_PROVISIONING_VELOCITY,
+        WalletAnomalyType.COMPROMISED_DEVICE_REUSE,
+        WalletAnomalyType.CARD_WALLET_FAN_OUT,
+    }
+    assert len(v_rat) == 3
+
+    ident = IdentityTelemetryAnalyzer(min_account_age_days=14, otp_burst_threshold=3)
+    i_score, i_anoms, i_rat = ident.analyze(req)
+    assert i_score == 1.0
+    assert set(i_anoms) == {
+        WalletAnomalyType.PHONE_MISMATCH_SIM_SWAP,
+        WalletAnomalyType.OTP_INTERCEPTION_BURST,
+        WalletAnomalyType.GEO_ISSUER_MISMATCH,
+        WalletAnomalyType.LOW_WALLET_ACCOUNT_TENURE,
+    }
+    assert len(i_rat) == 4
+
+    # Clean request triggers zero identity anomalies
+    clean_req = WalletProvisioningRequest(
+        card_hash="c_ok",
+        device_id="dev_ok",
+        wallet_account_id="w_ok",
+    )
+    c_score, c_anoms, _ = ident.analyze(clean_req)
+    assert c_score == 0.0
+    assert c_anoms == []
+
+    # Phone mismatch without SIM swap
+    phone_only = WalletProvisioningRequest(
+        card_hash="c_p", device_id="dev_p", wallet_account_id="w_p", phone_match=False
+    )
+    p_score, p_anoms, _ = ident.analyze(phone_only)
+    assert p_score > 0.0
+    assert p_anoms == [WalletAnomalyType.PHONE_MISMATCH_SIM_SWAP]
+
+    # TokenLifecycleAnalyzer
+    now = datetime.now(UTC)
+    lifecycle = TokenLifecycleAnalyzer(burst_window_seconds=3600, high_value_threshold=1000.0)
+    fresh_token = WalletTokenRecord(
+        card_hash="c_ok",
+        device_id="dev_ok",
+        wallet_account_id="w_ok",
+        wallet_provider=WalletProvider.APPLE_PAY,
+        provisioned_at=(now - timedelta(minutes=10)).isoformat(),
+        activated_at="2026-11-19T20:00:00",  # naive timestamp
+    )
+    # Normal low spend -> 0.0
+    low_s, low_a, _ = lifecycle.analyze_spend(
+        fresh_token, 100.0, reference_time=datetime(2026, 11, 19, 20, 5, tzinfo=UTC)
+    )
+    assert low_s == 0.0 and low_a == []
+
+    # High-value spend within 5 minutes -> POST_PROVISIONING_HIGH_VALUE_BURST
+    high_s, high_a, high_r = lifecycle.analyze_spend(
+        fresh_token, 1500.0, reference_time=datetime(2026, 11, 19, 20, 5, tzinfo=UTC)
+    )
+    assert high_s == 0.85
+    assert high_a == [WalletAnomalyType.POST_PROVISIONING_HIGH_VALUE_BURST]
+    assert len(high_r) == 1
