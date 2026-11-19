@@ -359,3 +359,61 @@ class ProvisioningVelocityAnalyzer:
             )
 
         return _clamp(score), anomalies, rationale
+
+
+class IdentityTelemetryAnalyzer:
+    """Evaluates SIM-swap, phone mismatch, OTP retry bursts, geo mismatch, and account tenure."""
+
+    def __init__(
+        self,
+        *,
+        min_account_age_days: int = 14,
+        otp_burst_threshold: int = 3,
+    ) -> None:
+        self.min_account_age_days = max(1, min_account_age_days)
+        self.otp_burst_threshold = max(1, otp_burst_threshold)
+
+    def analyze(
+        self,
+        request: WalletProvisioningRequest,
+    ) -> tuple[float, list[WalletAnomalyType], list[str]]:
+        score = 0.0
+        anomalies: list[WalletAnomalyType] = []
+        rationale: list[str] = []
+
+        if request.sim_swap_detected or not request.phone_match:
+            delta = 0.45 if request.sim_swap_detected else 0.28
+            score += delta
+            anomalies.append(WalletAnomalyType.PHONE_MISMATCH_SIM_SWAP)
+            detail = (
+                "Carrier SIM swap detected"
+                if request.sim_swap_detected
+                else "Device phone does not match issuer cardholder phone on file"
+            )
+            rationale.append(detail)
+
+        if request.otp_attempts >= self.otp_burst_threshold:
+            score += 0.30
+            anomalies.append(WalletAnomalyType.OTP_INTERCEPTION_BURST)
+            rationale.append(
+                f"High OTP retry velocity ({request.otp_attempts} attempts >= "
+                f"{self.otp_burst_threshold})"
+            )
+
+        if request.device_country != request.issuer_country:
+            score += 0.22
+            anomalies.append(WalletAnomalyType.GEO_ISSUER_MISMATCH)
+            rationale.append(
+                f"Device country ({request.device_country}) mismatches issuer country "
+                f"({request.issuer_country})"
+            )
+
+        if request.wallet_account_age_days < self.min_account_age_days:
+            score += 0.18
+            anomalies.append(WalletAnomalyType.LOW_WALLET_ACCOUNT_TENURE)
+            rationale.append(
+                f"Newly created wallet account ({request.wallet_account_age_days} days < "
+                f"{self.min_account_age_days} days)"
+            )
+
+        return _clamp(score), anomalies, rationale
