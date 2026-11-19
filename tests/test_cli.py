@@ -11132,3 +11132,169 @@ def test_soar_cli_error_branches(tmp_path: Path) -> None:
     nondict = tmp_path / "nondict_soar.json"
     nondict.write_text("[]", encoding="utf-8")
     assert runner.invoke(app, ["soar-summary", "-s", str(nondict)]).exit_code == 2
+
+
+def test_wallet_cli_workflows(tmp_path: Path) -> None:
+    """Verify wallet-provision, wallet-token-action, wallet-inspect, and wallet-summary CLI."""
+    store_file = tmp_path / "wallet_store.json"
+
+    prov_tbl = runner.invoke(
+        app,
+        [
+            "wallet-provision",
+            "-c",
+            "card-cli-1",
+            "-d",
+            "dev-cli-1",
+            "-w",
+            "wal-cli-1",
+            "-p",
+            "apple_pay",
+            "--phone-mismatch",
+            "--account-age-days",
+            "3",
+            "-s",
+            str(store_file),
+            "-f",
+            "table",
+        ],
+    )
+    assert prov_tbl.exit_code == 0, prov_tbl.stdout
+    assert "yellow_path" in prov_tbl.stdout
+
+    prov_json = runner.invoke(
+        app,
+        [
+            "wallet-provision",
+            "-c",
+            "card-cli-2",
+            "-d",
+            "dev-cli-2",
+            "-w",
+            "wal-cli-2",
+            "-p",
+            "google_pay",
+            "--phone-mismatch",
+            "--account-age-days",
+            "3",
+            "-s",
+            str(store_file),
+            "-f",
+            "json",
+        ],
+    )
+    assert prov_json.exit_code == 0, prov_json.stdout
+    prov_data = json.loads(prov_json.stdout)
+    tid = prov_data["token_id"]
+    assert tid is not None
+
+    act_tbl = runner.invoke(
+        app,
+        [
+            "wallet-token-action",
+            "-k",
+            tid,
+            "-a",
+            "verify_idv",
+            "-s",
+            str(store_file),
+            "-f",
+            "table",
+        ],
+    )
+    assert act_tbl.exit_code == 0
+    assert "active" in act_tbl.stdout
+
+    act_susp = runner.invoke(
+        app,
+        [
+            "wallet-token-action",
+            "-k",
+            tid,
+            "-a",
+            "suspend",
+            "--reason",
+            "manual_hold",
+            "-s",
+            str(store_file),
+            "-f",
+            "json",
+        ],
+    )
+    assert act_susp.exit_code == 0
+    assert json.loads(act_susp.stdout)["status"] == "suspended"
+
+    act_fail = runner.invoke(
+        app,
+        ["wallet-token-action", "-k", tid, "-a", "fail_idv", "-s", str(store_file), "-f", "json"],
+    )
+    assert act_fail.exit_code == 0
+    assert json.loads(act_fail.stdout)["status"] == "deactivated"
+
+    act_deact = runner.invoke(
+        app,
+        ["wallet-token-action", "-k", tid, "-a", "deactivate", "-s", str(store_file), "-f", "json"],
+    )
+    assert act_deact.exit_code == 0
+
+    insp_tbl = runner.invoke(
+        app,
+        ["wallet-inspect", "-k", tid, "-s", str(store_file), "-f", "table"],
+    )
+    assert insp_tbl.exit_code == 0
+    assert "card-cli-2" in insp_tbl.stdout
+
+    insp_json = runner.invoke(
+        app,
+        ["wallet-inspect", "-k", tid, "-s", str(store_file), "-f", "json"],
+    )
+    assert insp_json.exit_code == 0
+    assert json.loads(insp_json.stdout)["token_id"] == tid
+
+    sum_tbl = runner.invoke(
+        app,
+        ["wallet-summary", "-s", str(store_file), "-f", "table"],
+    )
+    assert sum_tbl.exit_code == 0
+    assert "Digital Wallet & Network Token Summary" in sum_tbl.stdout
+
+    sum_json = runner.invoke(
+        app,
+        ["wallet-summary", "-s", str(store_file), "-f", "json"],
+    )
+    assert sum_json.exit_code == 0
+    assert json.loads(sum_json.stdout)["token_count"] == 2
+
+
+def test_wallet_cli_error_branches(tmp_path: Path) -> None:
+    """Validate error handling in wallet-* CLI commands."""
+    store_file = tmp_path / "wallet_err.json"
+    assert (
+        runner.invoke(
+            app,
+            ["wallet-token-action", "-k", "tok_missing", "-a", "suspend", "-s", str(store_file)],
+        ).exit_code
+        == 2
+    )
+    assert (
+        runner.invoke(
+            app,
+            ["wallet-token-action", "-k", "tok_missing", "-a", "invalid", "-s", str(store_file)],
+        ).exit_code
+        == 2
+    )
+    assert (
+        runner.invoke(
+            app,
+            ["wallet-inspect", "-k", "tok_missing", "-s", str(store_file)],
+        ).exit_code
+        == 2
+    )
+
+    bad_store = tmp_path / "bad_wallet.json"
+    bad_store.write_text("{invalid", encoding="utf-8")
+    assert runner.invoke(app, ["wallet-summary", "-s", str(bad_store)]).exit_code == 2
+
+    nondict = tmp_path / "nondict_wallet.json"
+    nondict.write_text("[]", encoding="utf-8")
+    assert runner.invoke(app, ["wallet-summary", "-s", str(nondict)]).exit_code == 2
