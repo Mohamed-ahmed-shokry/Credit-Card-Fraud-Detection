@@ -271,6 +271,7 @@ from fraud_detection.velocity import (
     enrich_record_velocity,
 )
 from fraud_detection.wallet_fraud import (
+    WalletFraudEngine,
     WalletProvider,
     WalletRiskAssessment,
     WalletTokenRecord,
@@ -2842,6 +2843,7 @@ def create_app(
     first_party_engine: FirstPartyFraudEngine | None = None,
     risk_orchestrator: UnifiedRiskOrchestrator | None = None,
     soar_engine: SoarEngine | None = None,
+    wallet_engine: WalletFraudEngine | None = None,
 ) -> FastAPI:
     """Create an application using an injected model or a trusted artifact path.
 
@@ -3422,6 +3424,24 @@ def create_app(
     soar_rollbacks_counter = Counter(
         "fraud_soar_rollbacks_total",
         "Total SOAR playbook executions rolled back by operators.",
+        ["tenant_id"],
+        registry=metrics_registry,
+    )
+    wallet_provisioning_evaluations_counter = Counter(
+        "fraud_wallet_provisioning_evaluations_total",
+        "Total digital wallet provisioning risk evaluations performed.",
+        ["tenant_id", "provider", "path"],
+        registry=metrics_registry,
+    )
+    wallet_anomalies_counter = Counter(
+        "fraud_wallet_anomalies_total",
+        "Total digital wallet provisioning and token anomalies detected.",
+        ["tenant_id", "anomaly_type"],
+        registry=metrics_registry,
+    )
+    wallet_token_suspensions_counter = Counter(
+        "fraud_wallet_token_suspensions_total",
+        "Total digital wallet network tokens suspended or deactivated.",
         ["tenant_id"],
         registry=metrics_registry,
     )
@@ -4039,6 +4059,16 @@ def create_app(
         application.state.soar_playbooks_executed_counter = soar_playbooks_executed_counter
         application.state.soar_containments_applied_counter = soar_containments_applied_counter
         application.state.soar_rollbacks_counter = soar_rollbacks_counter
+        resolved_wallet_engine = wallet_engine or WalletFraudEngine(
+            case_manager=application.state.case_manager,
+            event_bus=resolved_event_bus,
+        )
+        application.state.wallet_engine = resolved_wallet_engine
+        application.state.wallet_provisioning_evaluations_counter = (
+            wallet_provisioning_evaluations_counter
+        )
+        application.state.wallet_anomalies_counter = wallet_anomalies_counter
+        application.state.wallet_token_suspensions_counter = wallet_token_suspensions_counter
         application.state.audit_sink = resolved_audit_sink
         application.state.explanation_provider = explanation_provider
         application.state.fallback_mode = resolved_fallback_mode
