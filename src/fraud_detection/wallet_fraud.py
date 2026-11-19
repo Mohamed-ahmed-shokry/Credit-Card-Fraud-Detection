@@ -8,9 +8,12 @@ lifecycles, and detects post-provisioning high-value spend bursts.
 
 from __future__ import annotations
 
+import json
+import threading
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
@@ -453,3 +456,152 @@ class TokenLifecycleAnalyzer:
                 ],
             )
         return 0.0, [], []
+
+
+class WalletTokenStore:
+    """Thread-safe in-memory ledger for network tokens and provisioning assessments."""
+
+    def __init__(
+        self,
+        *,
+        max_tokens: int = 20000,
+        max_assessments: int = 20000,
+    ) -> None:
+        self._lock = threading.RLock()
+        self.max_tokens = max(1, max_tokens)
+        self.max_assessments = max(1, max_assessments)
+        self._tokens: dict[str, WalletTokenRecord] = {}
+        self._token_order: list[str] = []
+        self._assessments: dict[str, WalletRiskAssessment] = {}
+        self._assessment_order: list[str] = []
+
+    def _evict_tokens_if_needed(self) -> None:
+        while len(self._token_order) > self.max_tokens:
+            oldest_id = self._token_order.pop(0)
+            self._tokens.pop(oldest_id, None)
+
+    def _evict_assessments_if_needed(self) -> None:
+        while len(self._assessment_order) > self.max_assessments:
+            oldest_id = self._assessment_order.pop(0)
+            self._assessments.pop(oldest_id, None)
+
+    def save_token(self, token: WalletTokenRecord) -> None:
+        with self._lock:
+            if token.token_id not in self._tokens:
+                self._token_order.append(token.token_id)
+            self._tokens[token.token_id] = token
+            self._evict_tokens_if_needed()
+
+    def get_token(self, token_id: str) -> WalletTokenRecord | None:
+        with self._lock:
+            return self._tokens.get(token_id)
+
+    def list_tokens(
+        self,
+        *,
+        card_hash: str | None = None,
+        device_id: str | None = None,
+        tenant_id: str | None = None,
+        status: TokenStatus | None = None,
+        limit: int = 100,
+    ) -> list[WalletTokenRecord]:
+        with self._lock:
+            items = [self._tokens[tid] for tid in reversed(self._token_order)]
+            if card_hash is not None:
+                items = [t for t in items if t.card_hash == card_hash]
+            if device_id is not None:
+                items = [t for t in items if t.device_id == device_id]
+            if tenant_id is not None:
+                items = [t for t in items if t.tenant_id == tenant_id]
+            if status is not None:
+                items = [t for t in items if t.status is status]
+            return items[: max(1, limit)]
+
+    def save_assessment(self, assessment: WalletRiskAssessment) -> None:
+        with self._lock:
+            if assessment.assessment_id not in self._assessments:
+                self._assessment_order.append(assessment.assessment_id)
+            self._assessments[assessment.assessment_id] = assessment
+            self._evict_assessments_if_needed()
+
+    def get_assessment(self, assessment_id: str) -> WalletRiskAssessment | None:
+        with self._lock:
+            return self._assessments.get(assessment_id)
+
+    def list_assessments(
+        self,
+        *,
+        card_hash: str | None = None,
+        device_id: str | None = None,
+        tenant_id: str | None = None,
+        path: ProvisioningPath | None = None,
+        limit: int = 100,
+    ) -> list[WalletRiskAssessment]:
+        with self._lock:
+            items = [self._assessments[aid] for aid in reversed(self._assessment_order)]
+            if card_hash is not None:
+                items = [a for a in items if a.card_hash == card_hash]
+            if device_id is not None:
+                items = [a for a in items if a.device_id == device_id]
+            if tenant_id is not None:
+                items = [a for a in items if a.tenant_id == tenant_id]
+            if path is not None:
+                items = [a for a in items if a.provisioning_path is path]
+            return items[: max(1, limit)]
+
+    def summary(self) -> dict[str, Any]:
+        with self._lock:
+            by_status: dict[str, int] = {st.value: 0 for st in TokenStatus}
+            for tok in self._tokens.values():
+                key = TokenStatus(tok.status).value
+                by_status[key] = by_status.get(key, 0) + 1
+
+            by_path: dict[str, int] = {p.value: 0 for p in ProvisioningPath}
+            for ass in self._assessments.values():
+                pkey = ProvisioningPath(ass.provisioning_path).value
+                by_path[pkey] = by_path.get(pkey, 0) + 1
+
+            return {
+                "token_count": len(self._tokens),
+                "assessment_count": len(self._assessments),
+                "by_token_status": by_status,
+                "by_provisioning_path": by_path,
+            }
+
+    def to_dict(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "max_tokens": self.max_tokens,
+                "max_assessments": self.max_assessments,
+                "tokens": [self._tokens[tid].to_dict() for tid in self._token_order],
+                "assessments": [self._assessments[aid].to_dict() for aid in self._assessment_order],
+            }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> WalletTokenStore:
+        store = cls(
+            max_tokens=int(payload.get("max_tokens", 20000)),
+            max_assessments=int(payload.get("max_assessments", 20000)),
+        )
+        for t_raw in payload.get("tokens", []):
+            tok = WalletTokenRecord.from_dict(t_raw)
+            store._tokens[tok.token_id] = tok
+            store._token_order.append(tok.token_id)
+        for a_raw in payload.get("assessments", []):
+            ass = WalletRiskAssessment.from_dict(a_raw)
+            store._assessments[ass.assessment_id] = ass
+            store._assessment_order.append(ass.assessment_id)
+        return store
+
+    def save_json(self, path: str | Path) -> Path:
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(self.to_dict(), indent=2), encoding="utf-8")
+        return target
+
+    @classmethod
+    def load_json(cls, path: str | Path) -> WalletTokenStore:
+        source = Path(path)
+        if not source.exists():
+            return cls()
+        return cls.from_dict(json.loads(source.read_text(encoding="utf-8")))
