@@ -960,6 +960,38 @@ flowchart TD
 - **EventBus, API & CLI**: Emits `SOAR_PLAYBOOK_TRIGGERED`, `SOAR_CONTAINMENT_APPLIED`, `SOAR_PLAYBOOK_COMPLETED`, and `SOAR_CONTAINMENT_ROLLED_BACK`; FastAPI exposes `/v1/soar/*` endpoints and Prometheus counters (`fraud_soar_playbooks_executed_total`, `fraud_soar_containments_applied_total`, `fraud_soar_rollbacks_total`); Typer CLI exposes `soar-execute`, `soar-rollback`, `soar-inspect`, and `soar-summary`.
 
 
+## Phase 55 — Digital Wallet Provisioning & Network Token Fraud Defense Engine
+
+Phase 55 delivers an in-process, zero-external-dependency Digital Wallet Provisioning & Network Token Fraud Defense Engine (`wallet_fraud.py`). Modeled on Visa Token Service (VTS) and Mastercard Digital Enablement Service (MDES) issuer decisioning, it scores digital wallet tokenization requests (Apple Pay, Google Pay, Samsung Pay, Click-to-Pay, Merchant Tokens), routes provisioning into `GREEN_PATH`, `YELLOW_PATH`, or `RED_PATH`, manages network token lifecycles, and detects post-provisioning high-value spend bursts.
+
+```mermaid
+flowchart TD
+    subgraph Provisioning
+        Req["WalletProvisioningRequest\n(PAN Hash, Device, Wallet Account, Provider)"] --> Engine["WalletFraudEngine"]
+        Engine --> Vel["ProvisioningVelocityAnalyzer\n(Card Fan-Out, Device Velocity, Reuse)"]
+        Engine --> Ident["IdentityTelemetryAnalyzer\n(SIM Swap, Phone Match, OTP Burst, Geo, Tenure)"]
+    end
+
+    subgraph Routing
+        Vel & Ident --> Path{"VTS/MDES Path"}
+        Path -->|"< 0.30"| Green["GREEN_PATH\n(ACTIVE Token)"]
+        Path -->|"0.30 - 0.69"| Yellow["YELLOW_PATH\n(PENDING_IDV -> complete_idv)"]
+        Path -->|">= 0.70"| Red["RED_PATH\n(Decline + CaseManager)"]
+    end
+
+    subgraph PostProvisioning
+        Green & Yellow --> Life["TokenLifecycleAnalyzer\n(Post-Provisioning High-Value Burst)"]
+        Life --> Store["WalletTokenStore\n(Thread-Safe Ledger & JSON Persistence)"]
+        Engine --> Bus["EventBus\n(WALLET_PROVISIONING_* & WALLET_TOKEN_*)"]
+        Store --> API["FastAPI /v1/wallet/* & Prometheus"]
+        Store --> CLI["Typer CLI: wallet-provision, wallet-token-action,\nwallet-inspect, wallet-summary"]
+    end
+```
+
+- **Analyzers (`ProvisioningVelocityAnalyzer`, `IdentityTelemetryAnalyzer`, `TokenLifecycleAnalyzer`)**: Detect `DEVICE_PROVISIONING_VELOCITY`, `CARD_WALLET_FAN_OUT`, `COMPROMISED_DEVICE_REUSE`, `PHONE_MISMATCH_SIM_SWAP`, `OTP_INTERCEPTION_BURST`, `GEO_ISSUER_MISMATCH`, `LOW_WALLET_ACCOUNT_TENURE`, and `POST_PROVISIONING_HIGH_VALUE_BURST`.
+- **Store, EventBus, API & CLI**: `WalletTokenStore` maintains thread-safe token and assessment ledgers with capacity eviction and JSON persistence; `WalletFraudEngine` emits `WALLET_PROVISIONING_EVALUATED`, `WALLET_TOKEN_ACTIVATED`, `WALLET_TOKEN_SUSPENDED`, and `WALLET_PROVISIONING_DECLINED`; FastAPI exposes `/v1/wallet/*` endpoints and Prometheus counters (`fraud_wallet_provisioning_evaluations_total`, `fraud_wallet_anomalies_total`, `fraud_wallet_token_suspensions_total`); Typer CLI exposes `wallet-provision`, `wallet-token-action`, `wallet-inspect`, and `wallet-summary`.
+
+
 ## Extension guidance
 
 
