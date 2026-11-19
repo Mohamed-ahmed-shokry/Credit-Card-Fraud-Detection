@@ -270,6 +270,11 @@ from fraud_detection.velocity import (
     VelocityWindowBuffer,
     enrich_record_velocity,
 )
+from fraud_detection.wallet_fraud import (
+    WalletProvider,
+    WalletRiskAssessment,
+    WalletTokenRecord,
+)
 
 MODEL_PATH_ENVIRONMENT_VARIABLE = "FRAUD_MODEL_PATH"
 AUDIT_LOG_ENVIRONMENT_VARIABLE = "FRAUD_AUDIT_LOG_PATH"
@@ -2652,6 +2657,98 @@ def _soar_playbooks_to_response(playbooks: list[ResponsePlaybook]) -> SoarPlaybo
         total_count=len(playbooks),
         playbooks=[pb.to_dict() for pb in playbooks],
     )
+
+
+class WalletProvisionRequest(BaseModel):
+    """Request payload for digital wallet provisioning risk evaluation."""
+
+    card_hash: str = Field(..., min_length=1)
+    device_id: str = Field(..., min_length=1)
+    wallet_account_id: str = Field(..., min_length=1)
+    wallet_provider: WalletProvider = WalletProvider.APPLE_PAY
+    tenant_id: str = "default"
+    wallet_account_age_days: int = Field(default=365, ge=0)
+    device_country: str = "US"
+    issuer_country: str = "US"
+    phone_match: bool = True
+    sim_swap_detected: bool = False
+    otp_attempts: int = Field(default=0, ge=0)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class WalletTokenActionRequest(BaseModel):
+    """Request payload for token lifecycle actions (verify_idv, fail_idv, suspend, deactivate)."""
+
+    action: str = Field(..., min_length=1)
+    reason: str = "operator_action"
+
+
+class WalletTokenSpendRequest(BaseModel):
+    """Request payload for recording spend against a provisioned network token."""
+
+    amount: float = Field(..., ge=0.0)
+
+
+class WalletTokenResponse(BaseModel):
+    """Response payload for a provisioned network payment token."""
+
+    token_id: str
+    card_hash: str
+    device_id: str
+    wallet_account_id: str
+    wallet_provider: str
+    tenant_id: str
+    status: str
+    provisioned_at: str
+    activated_at: str | None = None
+    updated_at: str
+    total_spend_amount: float
+    transaction_count: int
+    suspension_reason: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class WalletTokenListResponse(BaseModel):
+    """Response payload for listing provisioned network tokens."""
+
+    total_count: int
+    tokens: list[WalletTokenResponse]
+
+
+class WalletAssessmentResponse(BaseModel):
+    """Response payload for a digital wallet provisioning or spend risk assessment."""
+
+    assessment_id: str
+    request_id: str
+    card_hash: str
+    device_id: str
+    wallet_account_id: str
+    wallet_provider: str
+    tenant_id: str
+    risk_score: float
+    risk_level: str
+    provisioning_path: str
+    anomalies: list[str]
+    rationale: list[str]
+    token_id: str | None = None
+    correlated_case_id: str | None = None
+    evaluated_at: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class WalletAssessmentListResponse(BaseModel):
+    """Response payload for listing wallet risk assessments."""
+
+    total_count: int
+    assessments: list[WalletAssessmentResponse]
+
+
+def _wallet_token_to_response(record: WalletTokenRecord) -> WalletTokenResponse:
+    return WalletTokenResponse(**record.to_dict())
+
+
+def _wallet_assessment_to_response(record: WalletRiskAssessment) -> WalletAssessmentResponse:
+    return WalletAssessmentResponse(**record.to_dict())
 
 
 def create_app(
