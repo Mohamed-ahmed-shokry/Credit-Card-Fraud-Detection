@@ -17,6 +17,9 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from fraud_detection.cases import CaseManager
+from fraud_detection.events import EventBus, EventType, FraudDomainEvent
+
 
 def _utc_now_iso() -> str:
     return datetime.now(UTC).isoformat()
@@ -605,3 +608,345 @@ class WalletTokenStore:
         if not source.exists():
             return cls()
         return cls.from_dict(json.loads(source.read_text(encoding="utf-8")))
+
+
+class WalletFraudEngine:
+    """Orchestrates VTS/MDES digital wallet provisioning, token lifecycle, and spend defense."""
+
+    def __init__(
+        self,
+        *,
+        store: WalletTokenStore | None = None,
+        velocity_analyzer: ProvisioningVelocityAnalyzer | None = None,
+        identity_analyzer: IdentityTelemetryAnalyzer | None = None,
+        lifecycle_analyzer: TokenLifecycleAnalyzer | None = None,
+        case_manager: CaseManager | None = None,
+        event_bus: EventBus | None = None,
+        yellow_path_threshold: float = 0.30,
+        red_path_threshold: float = 0.70,
+    ) -> None:
+        self.store = store or WalletTokenStore()
+        self.velocity_analyzer = velocity_analyzer or ProvisioningVelocityAnalyzer()
+        self.identity_analyzer = identity_analyzer or IdentityTelemetryAnalyzer()
+        self.lifecycle_analyzer = lifecycle_analyzer or TokenLifecycleAnalyzer()
+        self.case_manager = case_manager
+        self.event_bus = event_bus
+        self.yellow_path_threshold = float(yellow_path_threshold)
+        self.red_path_threshold = float(red_path_threshold)
+        self._lock = threading.RLock()
+
+    def _emit_event(
+        self,
+        event_type: EventType,
+        *,
+        tenant_id: str,
+        payload: dict[str, Any],
+    ) -> None:
+        if self.event_bus is None:
+            return
+        self.event_bus.publish(
+            FraudDomainEvent(
+                event_type=event_type,
+                tenant_id=tenant_id,
+                payload=payload,
+            )
+        )
+
+    def _route_score(self, score: float) -> tuple[WalletRiskLevel, ProvisioningPath]:
+        if score >= 0.85:
+            return WalletRiskLevel.CRITICAL, ProvisioningPath.RED_PATH
+        if score >= self.red_path_threshold:
+            return WalletRiskLevel.HIGH, ProvisioningPath.RED_PATH
+        if score >= self.yellow_path_threshold:
+            return WalletRiskLevel.MEDIUM, ProvisioningPath.YELLOW_PATH
+        return WalletRiskLevel.LOW, ProvisioningPath.GREEN_PATH
+
+    def _escalate_case(
+        self,
+        *,
+        card_hash: str,
+        device_id: str,
+        score: float,
+        tenant_id: str,
+        reason: str,
+        anomalies: list[WalletAnomalyType],
+    ) -> str | None:
+        if self.case_manager is None:
+            return None
+        created = self.case_manager.create_case(
+            transaction_id=f"wallet:{card_hash}:{device_id}",
+            fraud_score=score,
+            tenant_id=tenant_id,
+            metadata={
+                "source": "wallet_fraud_engine",
+                "card_hash": card_hash,
+                "device_id": device_id,
+                "reason": reason,
+                "anomalies": [a.value for a in anomalies],
+            },
+        )
+        return created.case_id
+
+    def evaluate_provisioning(
+        self,
+        request: WalletProvisioningRequest,
+        *,
+        reference_time: datetime | None = None,
+    ) -> WalletRiskAssessment:
+        now = reference_time or datetime.now(UTC)
+        with self._lock:
+            existing = self.store.list_tokens(tenant_id=request.tenant_id, limit=50000)
+            vel_score, vel_anoms, vel_rat = self.velocity_analyzer.analyze(request, existing)
+            id_score, id_anoms, id_rat = self.identity_analyzer.analyze(request)
+
+            composite = round(_clamp(vel_score + id_score), 6)
+            anomalies = list(dict.fromkeys([*vel_anoms, *id_anoms]))
+            rationale = [*vel_rat, *id_rat]
+            risk_level, path = self._route_score(composite)
+
+            token_id: str | None = None
+            case_id: str | None = None
+
+            if path is ProvisioningPath.GREEN_PATH:
+                tok = WalletTokenRecord(
+                    card_hash=request.card_hash,
+                    device_id=request.device_id,
+                    wallet_account_id=request.wallet_account_id,
+                    wallet_provider=request.wallet_provider,
+                    tenant_id=request.tenant_id,
+                    status=TokenStatus.ACTIVE,
+                    provisioned_at=now.isoformat(),
+                    activated_at=now.isoformat(),
+                    updated_at=now.isoformat(),
+                )
+                self.store.save_token(tok)
+                token_id = tok.token_id
+            elif path is ProvisioningPath.YELLOW_PATH:
+                tok = WalletTokenRecord(
+                    card_hash=request.card_hash,
+                    device_id=request.device_id,
+                    wallet_account_id=request.wallet_account_id,
+                    wallet_provider=request.wallet_provider,
+                    tenant_id=request.tenant_id,
+                    status=TokenStatus.PENDING_IDV,
+                    provisioned_at=now.isoformat(),
+                    activated_at=None,
+                    updated_at=now.isoformat(),
+                )
+                self.store.save_token(tok)
+                token_id = tok.token_id
+            else:
+                case_id = self._escalate_case(
+                    card_hash=request.card_hash,
+                    device_id=request.device_id,
+                    score=composite,
+                    tenant_id=request.tenant_id,
+                    reason="red_path_provisioning_declined",
+                    anomalies=anomalies,
+                )
+
+            assessment = WalletRiskAssessment(
+                assessment_id=f"wra_{uuid4().hex[:12]}",
+                request_id=request.request_id,
+                card_hash=request.card_hash,
+                device_id=request.device_id,
+                wallet_account_id=request.wallet_account_id,
+                wallet_provider=request.wallet_provider,
+                tenant_id=request.tenant_id,
+                risk_score=composite,
+                risk_level=risk_level,
+                provisioning_path=path,
+                anomalies=anomalies,
+                rationale=rationale,
+                token_id=token_id,
+                correlated_case_id=case_id,
+                evaluated_at=now.isoformat(),
+                metadata=dict(request.metadata),
+            )
+            self.store.save_assessment(assessment)
+
+            base_payload = {
+                "assessment_id": assessment.assessment_id,
+                "card_hash": assessment.card_hash,
+                "device_id": assessment.device_id,
+                "wallet_provider": WalletProvider(assessment.wallet_provider).value,
+                "risk_score": assessment.risk_score,
+                "provisioning_path": path.value,
+                "token_id": token_id,
+            }
+            self._emit_event(
+                EventType.WALLET_PROVISIONING_EVALUATED,
+                tenant_id=request.tenant_id,
+                payload=base_payload,
+            )
+            if path is ProvisioningPath.GREEN_PATH:
+                self._emit_event(
+                    EventType.WALLET_TOKEN_ACTIVATED,
+                    tenant_id=request.tenant_id,
+                    payload=base_payload,
+                )
+            elif path is ProvisioningPath.RED_PATH:
+                self._emit_event(
+                    EventType.WALLET_PROVISIONING_DECLINED,
+                    tenant_id=request.tenant_id,
+                    payload={**base_payload, "case_id": case_id},
+                )
+            return assessment
+
+    def complete_idv(
+        self,
+        token_id: str,
+        *,
+        verified: bool = True,
+        reference_time: datetime | None = None,
+    ) -> WalletTokenRecord:
+        now = reference_time or datetime.now(UTC)
+        with self._lock:
+            tok = self.store.get_token(token_id)
+            if tok is None:
+                raise KeyError(f"Wallet token '{token_id}' not found")
+            if verified:
+                tok.status = TokenStatus.ACTIVE
+                tok.activated_at = now.isoformat()
+                tok.updated_at = now.isoformat()
+                self.store.save_token(tok)
+                self._emit_event(
+                    EventType.WALLET_TOKEN_ACTIVATED,
+                    tenant_id=tok.tenant_id,
+                    payload={
+                        "token_id": tok.token_id,
+                        "card_hash": tok.card_hash,
+                        "device_id": tok.device_id,
+                        "source": "idv_verified",
+                    },
+                )
+            else:
+                tok.status = TokenStatus.DEACTIVATED
+                tok.suspension_reason = "idv_failed"
+                tok.updated_at = now.isoformat()
+                self.store.save_token(tok)
+                self._emit_event(
+                    EventType.WALLET_PROVISIONING_DECLINED,
+                    tenant_id=tok.tenant_id,
+                    payload={
+                        "token_id": tok.token_id,
+                        "card_hash": tok.card_hash,
+                        "reason": "idv_failed",
+                    },
+                )
+            return tok
+
+    def suspend_token(
+        self,
+        token_id: str,
+        *,
+        reason: str = "fraud_suspected",
+        reference_time: datetime | None = None,
+    ) -> WalletTokenRecord:
+        now = reference_time or datetime.now(UTC)
+        with self._lock:
+            tok = self.store.get_token(token_id)
+            if tok is None:
+                raise KeyError(f"Wallet token '{token_id}' not found")
+            tok.status = TokenStatus.SUSPENDED
+            tok.suspension_reason = reason
+            tok.updated_at = now.isoformat()
+            self.store.save_token(tok)
+            self._emit_event(
+                EventType.WALLET_TOKEN_SUSPENDED,
+                tenant_id=tok.tenant_id,
+                payload={
+                    "token_id": tok.token_id,
+                    "card_hash": tok.card_hash,
+                    "device_id": tok.device_id,
+                    "reason": reason,
+                },
+            )
+            return tok
+
+    def deactivate_token(
+        self,
+        token_id: str,
+        *,
+        reason: str = "operator_deactivated",
+        reference_time: datetime | None = None,
+    ) -> WalletTokenRecord:
+        now = reference_time or datetime.now(UTC)
+        with self._lock:
+            tok = self.store.get_token(token_id)
+            if tok is None:
+                raise KeyError(f"Wallet token '{token_id}' not found")
+            tok.status = TokenStatus.DEACTIVATED
+            tok.suspension_reason = reason
+            tok.updated_at = now.isoformat()
+            self.store.save_token(tok)
+            self._emit_event(
+                EventType.WALLET_TOKEN_SUSPENDED,
+                tenant_id=tok.tenant_id,
+                payload={
+                    "token_id": tok.token_id,
+                    "card_hash": tok.card_hash,
+                    "device_id": tok.device_id,
+                    "reason": reason,
+                    "permanent": True,
+                },
+            )
+            return tok
+
+    def record_token_spend(
+        self,
+        token_id: str,
+        amount: float,
+        *,
+        reference_time: datetime | None = None,
+    ) -> WalletRiskAssessment:
+        now = reference_time or datetime.now(UTC)
+        with self._lock:
+            tok = self.store.get_token(token_id)
+            if tok is None:
+                raise KeyError(f"Wallet token '{token_id}' not found")
+            score, anomalies, rationale = self.lifecycle_analyzer.analyze_spend(
+                tok, amount, reference_time=now
+            )
+            tok.total_spend_amount = round(tok.total_spend_amount + max(0.0, float(amount)), 2)
+            tok.transaction_count += 1
+            tok.updated_at = now.isoformat()
+            self.store.save_token(tok)
+
+            risk_level, path = self._route_score(score)
+            case_id: str | None = None
+            if anomalies:
+                self.suspend_token(
+                    tok.token_id,
+                    reason="post_provisioning_high_value_burst",
+                    reference_time=now,
+                )
+                case_id = self._escalate_case(
+                    card_hash=tok.card_hash,
+                    device_id=tok.device_id,
+                    score=score,
+                    tenant_id=tok.tenant_id,
+                    reason="post_provisioning_high_value_burst",
+                    anomalies=anomalies,
+                )
+
+            assessment = WalletRiskAssessment(
+                assessment_id=f"wra_{uuid4().hex[:12]}",
+                request_id=f"spend_{uuid4().hex[:10]}",
+                card_hash=tok.card_hash,
+                device_id=tok.device_id,
+                wallet_account_id=tok.wallet_account_id,
+                wallet_provider=tok.wallet_provider,
+                tenant_id=tok.tenant_id,
+                risk_score=score,
+                risk_level=risk_level,
+                provisioning_path=path,
+                anomalies=anomalies,
+                rationale=rationale,
+                token_id=tok.token_id,
+                correlated_case_id=case_id,
+                evaluated_at=now.isoformat(),
+                metadata={"spend_amount": float(amount)},
+            )
+            self.store.save_assessment(assessment)
+            return assessment
