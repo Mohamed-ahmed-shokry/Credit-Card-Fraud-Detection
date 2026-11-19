@@ -417,3 +417,39 @@ class IdentityTelemetryAnalyzer:
             )
 
         return _clamp(score), anomalies, rationale
+
+
+class TokenLifecycleAnalyzer:
+    """Detects post-provisioning high-value spend bursts immediately after activation."""
+
+    def __init__(
+        self,
+        *,
+        burst_window_seconds: int = 3600,
+        high_value_threshold: float = 1500.0,
+    ) -> None:
+        self.burst_window_seconds = max(60, burst_window_seconds)
+        self.high_value_threshold = max(1.0, float(high_value_threshold))
+
+    def analyze_spend(
+        self,
+        token: WalletTokenRecord,
+        amount: float,
+        *,
+        reference_time: datetime | None = None,
+    ) -> tuple[float, list[WalletAnomalyType], list[str]]:
+        now = reference_time or datetime.now(UTC)
+        anchor_ts = token.activated_at or token.provisioned_at
+        elapsed_seconds = max(0.0, (now - _parse_iso(anchor_ts)).total_seconds())
+        cumulative = token.total_spend_amount + max(0.0, float(amount))
+
+        if elapsed_seconds <= self.burst_window_seconds and cumulative >= self.high_value_threshold:
+            return (
+                0.85,
+                [WalletAnomalyType.POST_PROVISIONING_HIGH_VALUE_BURST],
+                [
+                    f"Rapid post-provisioning spend of ${cumulative:,.2f} within "
+                    f"{int(elapsed_seconds)}s of token activation"
+                ],
+            )
+        return 0.0, [], []
