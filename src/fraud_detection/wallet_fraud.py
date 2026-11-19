@@ -34,7 +34,7 @@ class WalletProvider(StrEnum):
     GOOGLE_PAY = "google_pay"
     SAMSUNG_PAY = "samsung_pay"
     CLICK_TO_PAY = "click_to_pay"
-    MERCHANT_TOKEN = "merchant_token"
+    MERCHANT_TOKEN = "merchant_token"  # noqa: S105
 
 
 class ProvisioningPath(StrEnum):
