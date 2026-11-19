@@ -2269,6 +2269,35 @@ FastAPI SOAR Response Playbooks REST endpoints:
 - `GET /v1/soar/metrics`: Summary metrics of playbook executions and active containments.
 - Prometheus metrics: `fraud_soar_playbooks_executed_total`, `fraud_soar_containments_applied_total`, `fraud_soar_rollbacks_total`.
 
+### Digital Wallet Provisioning & Network Token Fraud Defense (Phase 55)
+
+```bash
+# Evaluate a digital wallet provisioning request (VTS/MDES GREEN/YELLOW/RED path)
+fraud-detect wallet-provision \
+  --card-hash card_abc \
+  --device-id dev_100 \
+  --wallet-account-id wal_100 \
+  --provider apple_pay \
+  --phone-mismatch \
+  --account-age-days 3 \
+  --format json
+
+# Complete ID&V, suspend/deactivate a token, inspect token state, or view summary
+fraud-detect wallet-token-action --token-id tok_1234567890ab --action verify_idv
+fraud-detect wallet-inspect --token-id tok_1234567890ab
+fraud-detect wallet-summary --format table
+```
+
+FastAPI Digital Wallet & Network Token REST endpoints:
+- `POST /v1/wallet/provision`: Score a wallet tokenization request and route into `green_path`, `yellow_path`, or `red_path`.
+- `POST /v1/wallet/tokens/{token_id}/action`: Execute lifecycle transitions (`verify_idv`, `fail_idv`, `suspend`, `deactivate`).
+- `POST /v1/wallet/tokens/{token_id}/spend`: Record spend on a provisioned token and auto-suspend on post-provisioning high-value bursts.
+- `GET /v1/wallet/tokens/{token_id}`: Fetch a specific provisioned network token.
+- `GET /v1/wallet/tokens`: List provisioned tokens with optional card/device/tenant/status filters.
+- `GET /v1/wallet/assessments`: List wallet provisioning and spend risk assessments.
+- `GET /v1/wallet/metrics`: Summary metrics of network tokens and provisioning paths.
+- Prometheus metrics: `fraud_wallet_provisioning_evaluations_total`, `fraud_wallet_anomalies_total`, `fraud_wallet_token_suspensions_total`.
+
 ## Reference label-delay analysis
 
 

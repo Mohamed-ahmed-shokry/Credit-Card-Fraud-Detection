@@ -3028,6 +3028,73 @@ Provide deterministic SOAR incident response playbook matching, automated compen
 - `83a9f20`..`7267ed7`: Implemented `soar.py` (`ContainmentControlType`, `PlaybookRunStatus`, `ContainmentState`, `PlaybookStepSpec`, `ResponsePlaybook`, `ActiveContainmentRecord`, `PlaybookStepResult`, `PlaybookExecutionRecord`, `build_default_playbooks`, `PlaybookCatalog`, `SoarStore`, `SoarEngine`), registered `SOAR_PLAYBOOK_TRIGGERED` / `SOAR_CONTAINMENT_APPLIED` / `SOAR_PLAYBOOK_COMPLETED` / `SOAR_CONTAINMENT_ROLLED_BACK` events in `events.py`, added `/v1/soar/*` endpoints and Prometheus metrics in `api.py`, added `soar-*` CLI commands in `cli.py`, achieved 100% branch coverage on `soar.py` (`1241 passed`, `97.07%` total branch coverage), passed remote GitHub Actions CI (`44166162216`), and documented architecture and usage.
 
 
+## Phase 55 — Digital Wallet Provisioning & Network Token Fraud Defense Engine (Done)
+
+Phase 55 implements an in-process, zero-external-dependency Digital Wallet Provisioning & Network Token Fraud Defense Engine (`wallet_fraud.py`). Modeled on Visa Token Service (VTS) and Mastercard Digital Enablement Service (MDES) issuer decisioning, it scores digital wallet tokenization requests (Apple Pay, Google Pay, Samsung Pay, Click-to-Pay, Merchant Tokens), routes provisioning into `GREEN_PATH` / `YELLOW_PATH` / `RED_PATH`, manages network token lifecycles (`PENDING_IDV`, `ACTIVE`, `SUSPENDED`, `DEACTIVATED`), and detects post-provisioning high-value spend bursts.
+
+### Objective
+
+Provide deterministic digital wallet provisioning risk scoring, VTS/MDES path routing, token lifecycle management (ID&V completion, suspension, deactivation, post-provisioning spend surveillance), `CaseManager` & `EventBus` integration, REST API endpoints (`/v1/wallet/*`), Prometheus metrics, and CLI workflows (`wallet-*`) with zero external service dependencies.
+
+### Scope
+
+1. **Domain Models & Taxonomies (`wallet_fraud.py`)**:
+   - `WalletProvider`: `APPLE_PAY`, `GOOGLE_PAY`, `SAMSUNG_PAY`, `CLICK_TO_PAY`, `MERCHANT_TOKEN`.
+   - `ProvisioningPath`: `GREEN_PATH`, `YELLOW_PATH`, `RED_PATH`.
+   - `WalletRiskLevel`: `LOW`, `MEDIUM`, `HIGH`, `CRITICAL`.
+   - `TokenStatus`: `PENDING_IDV`, `ACTIVE`, `SUSPENDED`, `DEACTIVATED`.
+   - `WalletAnomalyType`: `DEVICE_PROVISIONING_VELOCITY`, `CARD_WALLET_FAN_OUT`, `PHONE_MISMATCH_SIM_SWAP`, `OTP_INTERCEPTION_BURST`, `GEO_ISSUER_MISMATCH`, `LOW_WALLET_ACCOUNT_TENURE`, `POST_PROVISIONING_HIGH_VALUE_BURST`, `COMPROMISED_DEVICE_REUSE`.
+   - `WalletProvisioningRequest`, `WalletTokenRecord`, `WalletRiskAssessment` with lossless dict/JSON serialization.
+2. **Analyzers (`ProvisioningVelocityAnalyzer`, `IdentityTelemetryAnalyzer`, `TokenLifecycleAnalyzer`)**:
+   - Detects multi-card provisioning onto a single device, single-card fan-out across excessive devices/wallets, prior suspended/compromised device reuse, phone/SIM-swap anomalies, OTP retry bursts, low wallet account tenure, geo/issuer country mismatches, and rapid post-provisioning high-value spend bursts.
+3. **Token Store & Defense Engine (`WalletTokenStore`, `WalletFraudEngine`)**:
+   - Thread-safe token and assessment ledger with capacity eviction and JSON persistence.
+   - Calibrated risk scoring (`0.0`–`1.0`), deterministic `GREEN_PATH` / `YELLOW_PATH` / `RED_PATH` decisioning, `complete_idv`, `suspend_token`, `deactivate_token`, and `record_token_spend`.
+   - Escalates `RED_PATH` and post-provisioning bursts to `CaseManager` and emits `WALLET_PROVISIONING_EVALUATED`, `WALLET_TOKEN_ACTIVATED`, `WALLET_TOKEN_SUSPENDED`, and `WALLET_PROVISIONING_DECLINED` events on `EventBus`.
+4. **REST API (`/v1/wallet/*`) & Prometheus Metrics (`api.py`)**:
+   - `POST /v1/wallet/provision`, `POST /v1/wallet/tokens/{token_id}/action`, `POST /v1/wallet/tokens/{token_id}/spend`, `GET /v1/wallet/tokens/{token_id}`, `GET /v1/wallet/tokens`, `GET /v1/wallet/assessments`, `GET /v1/wallet/metrics`.
+   - Prometheus counters: `fraud_wallet_provisioning_evaluations_total`, `fraud_wallet_anomalies_total`, `fraud_wallet_token_suspensions_total`.
+5. **CLI Workflows (`cli.py`)**:
+   - `wallet-provision`, `wallet-token-action`, `wallet-inspect`, `wallet-summary` with table/JSON formatting and store persistence.
+6. **Documentation**:
+   - `ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`.
+
+### Acceptance Criteria
+
+1. **AC-1 (Domain Models & Taxonomies)**: `WalletProvider`, `ProvisioningPath`, `WalletRiskLevel`, `TokenStatus`, `WalletAnomalyType`, `WalletProvisioningRequest`, `WalletTokenRecord`, and `WalletRiskAssessment` serialize/deserialize cleanly with unit tests.
+2. **AC-2 (Provisioning & Identity Telemetry Analyzers)**: `ProvisioningVelocityAnalyzer`, `IdentityTelemetryAnalyzer`, and `TokenLifecycleAnalyzer` accurately detect all 8 wallet fraud anomalies.
+3. **AC-3 (Wallet Engine, Store & Token Lifecycle)**: `WalletFraudEngine` and `WalletTokenStore` route `GREEN_PATH` / `YELLOW_PATH` / `RED_PATH`, enforce capacity eviction and JSON persistence, manage token lifecycle transitions, and escalate high-risk cases to `CaseManager`.
+4. **AC-4 (EventBus Streaming)**: Lifecycle transitions emit `WALLET_PROVISIONING_EVALUATED`, `WALLET_TOKEN_ACTIVATED`, `WALLET_TOKEN_SUSPENDED`, and `WALLET_PROVISIONING_DECLINED`.
+5. **AC-5 (REST API & Metrics)**: `/v1/wallet/*` endpoints and Prometheus metrics work end to end and are verified in `tests/test_api.py`.
+6. **AC-6 (CLI Workflows)**: `wallet-provision`, `wallet-token-action`, `wallet-inspect`, and `wallet-summary` work end to end and are verified in `tests/test_cli.py` and real CLI execution.
+7. **AC-7 (All CI-Parity Checks & Remote CI Green)**: All local CI-parity checks (`ruff format --check src tests`, `ruff check src tests`, `mypy src`, `pytest --cov=fraud_detection --cov-report=term-missing`, `python -m build`, `twine check dist/*`) and remote CI workflow runs pass 100%.
+
+### Validation & CI Plan
+
+- Focused unit tests: `python -m pytest tests/test_wallet_fraud.py -v`
+- API & CLI & Event integration tests: `python -m pytest tests/test_api.py tests/test_cli.py -k "wallet"`
+- Full local CI parity: `ruff format --check src tests`, `ruff check src tests`, `mypy src`, `pytest --cov=fraud_detection --cov-report=term-missing`, `python -m build`, `twine check dist/*`
+- Remote CI: GitHub Actions `CI` workflow on `phase/wallet-token-fraud-defense` PR.
+
+### Exclusions
+
+- Live Visa VTS / Mastercard MDES network TSP webhook connectivity and carrier HLR/SS7 SIM-swap lookup APIs (out of scope for in-process zero-dependency reference engine).
+
+### Micro-Task Breakdown
+
+- Task 1: Define Phase 55 roadmap & initialize `docs/PROGRESS.md`.
+- Task 2: Create `src/fraud_detection/wallet_fraud.py` domain enums and data models + unit tests in `tests/test_wallet_fraud.py`.
+- Task 3: Implement `ProvisioningVelocityAnalyzer`, `IdentityTelemetryAnalyzer`, and `TokenLifecycleAnalyzer` + unit tests.
+- Task 4: Implement `WalletTokenStore` and `WalletFraudEngine` (provisioning, ID&V, suspend/deactivate, post-provisioning spend surveillance, `CaseManager` escalation) + unit tests.
+- Task 5: Register `WALLET_PROVISIONING_EVALUATED` / `WALLET_TOKEN_ACTIVATED` / `WALLET_TOKEN_SUSPENDED` / `WALLET_PROVISIONING_DECLINED` events in `src/fraud_detection/events.py` and wire `EventBus` into `WalletFraudEngine` + tests.
+- Task 6: Add `/v1/wallet/*` REST endpoints and Prometheus metrics in `src/fraud_detection/api.py` + tests in `tests/test_api.py`.
+- Task 7: Add `wallet-provision`, `wallet-token-action`, `wallet-inspect`, and `wallet-summary` CLI commands in `src/fraud_detection/cli.py` + tests in `tests/test_cli.py`.
+- Task 8: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate with 100% Green CI.
+
+### Micro-Commits
+- `ae4e0b0`..`64e6ba0`: Implemented `wallet_fraud.py` (`WalletProvider`, `ProvisioningPath`, `WalletRiskLevel`, `TokenStatus`, `WalletAnomalyType`, `WalletProvisioningRequest`, `WalletTokenRecord`, `WalletRiskAssessment`, `ProvisioningVelocityAnalyzer`, `IdentityTelemetryAnalyzer`, `TokenLifecycleAnalyzer`, `WalletTokenStore`, `WalletFraudEngine`), registered `WALLET_PROVISIONING_EVALUATED` / `WALLET_TOKEN_ACTIVATED` / `WALLET_TOKEN_SUSPENDED` / `WALLET_PROVISIONING_DECLINED` events in `events.py`, added `/v1/wallet/*` endpoints and Prometheus metrics in `api.py`, added `wallet-*` CLI commands in `cli.py`, achieved 100% branch coverage on `wallet_fraud.py` (`1249 passed`, `97.13%` total branch coverage), passed remote GitHub Actions CI (`44624203720`), and documented architecture and usage.
+
+
 ## Contributing to the roadmap
 
 Open an issue or a pull request that references the relevant phase item.

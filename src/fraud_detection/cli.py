@@ -284,6 +284,15 @@ from fraud_detection.trust import (
     write_trust_bundle,
 )
 from fraud_detection.velocity import VelocityConfig, VelocityWindowBuffer
+from fraud_detection.wallet_fraud import (
+    ProvisioningPath,
+    TokenStatus,
+    WalletFraudEngine,
+    WalletProvider,
+    WalletProvisioningRequest,
+    WalletRiskLevel,
+    WalletTokenStore,
+)
 
 app = typer.Typer(
     name="fraud-detect",
@@ -11686,6 +11695,185 @@ def soar_summary(
         typer.echo(f"  Containments (Active):{summary_data['active_containments']}")
         for status_key, cnt in summary_data["by_status"].items():
             typer.echo(f"    {status_key:22s}: {cnt}")
+    else:
+        typer.echo(json.dumps(summary_data, indent=2))
+
+
+def _load_wallet_state(store_file: Path) -> tuple[WalletFraudEngine, WalletTokenStore]:
+    """Load persistent digital wallet tokens and assessments from a JSON store file."""
+    if not store_file.exists():
+        store = WalletTokenStore()
+        return WalletFraudEngine(store=store), store
+    try:
+        data = json.loads(store_file.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            _abort("Invalid wallet store file format: expected JSON object.")
+    except (OSError, json.JSONDecodeError) as exc:
+        _abort(f"Could not read wallet store file: {exc}")
+    store = WalletTokenStore.from_dict(data)
+    return WalletFraudEngine(store=store), store
+
+
+def _save_wallet_state(store: WalletTokenStore, store_file: Path) -> None:
+    """Persist digital wallet store atomically to disk."""
+    _atomic_write_text(json.dumps(store.to_dict(), indent=2), store_file)
+
+
+@app.command("wallet-provision")
+def wallet_provision(
+    card_hash: Annotated[str, typer.Option("--card-hash", "-c", help="Hashed card PAN.")],
+    device_id: Annotated[str, typer.Option("--device-id", "-d", help="Wallet device ID.")],
+    wallet_account_id: Annotated[
+        str, typer.Option("--wallet-account-id", "-w", help="Wallet account identifier.")
+    ],
+    provider: Annotated[
+        WalletProvider, typer.Option("--provider", "-p", help="Digital wallet provider.")
+    ] = WalletProvider.APPLE_PAY,
+    account_age_days: Annotated[
+        int, typer.Option("--account-age-days", help="Wallet account age in days.")
+    ] = 365,
+    device_country: Annotated[
+        str, typer.Option("--device-country", help="ISO country code of device.")
+    ] = "US",
+    issuer_country: Annotated[
+        str, typer.Option("--issuer-country", help="ISO country code of card issuer.")
+    ] = "US",
+    phone_match: Annotated[
+        bool, typer.Option("--phone-match/--phone-mismatch", help="Phone matches issuer file.")
+    ] = True,
+    sim_swap: Annotated[
+        bool, typer.Option("--sim-swap", help="Flag recent carrier SIM-swap signal.")
+    ] = False,
+    otp_attempts: Annotated[
+        int, typer.Option("--otp-attempts", help="Number of OTP verification attempts.")
+    ] = 0,
+    tenant_id: Annotated[str, typer.Option("--tenant-id", "-t", help="Tenant identifier.")] = (
+        "default"
+    ),
+    store_file: Annotated[
+        Path,
+        typer.Option("--store-file", "-s", help="Path to wallet state JSON file."),
+    ] = Path("wallet_store.json"),
+    output_format: Annotated[
+        str, typer.Option("--format", "-f", help="Output format (table or json).")
+    ] = "table",
+) -> None:
+    """Evaluate a digital wallet provisioning request and route VTS/MDES path."""
+    engine, store = _load_wallet_state(store_file)
+    req = WalletProvisioningRequest(
+        card_hash=card_hash,
+        device_id=device_id,
+        wallet_account_id=wallet_account_id,
+        wallet_provider=provider,
+        tenant_id=tenant_id,
+        wallet_account_age_days=account_age_days,
+        device_country=device_country,
+        issuer_country=issuer_country,
+        phone_match=phone_match,
+        sim_swap_detected=sim_swap,
+        otp_attempts=otp_attempts,
+    )
+    assessment = engine.evaluate_provisioning(req)
+    _save_wallet_state(store, store_file)
+    if output_format.lower() == "table":
+        typer.echo(f"Assessment ID:    {assessment.assessment_id}")
+        typer.echo(f"Path:             {ProvisioningPath(assessment.provisioning_path).value}")
+        typer.echo(f"Risk Level:       {WalletRiskLevel(assessment.risk_level).value}")
+        typer.echo(f"Risk Score:       {assessment.risk_score:.4f}")
+        typer.echo(f"Token ID:         {assessment.token_id or 'none'}")
+    else:
+        typer.echo(json.dumps(assessment.to_dict(), indent=2))
+
+
+@app.command("wallet-token-action")
+def wallet_token_action(
+    token_id: Annotated[str, typer.Option("--token-id", "-k", help="Network token ID.")],
+    action: Annotated[
+        str,
+        typer.Option("--action", "-a", help="Action: verify_idv, fail_idv, suspend, deactivate."),
+    ],
+    reason: Annotated[
+        str, typer.Option("--reason", help="Audit reason for lifecycle transition.")
+    ] = "operator_action",
+    store_file: Annotated[
+        Path,
+        typer.Option("--store-file", "-s", help="Path to wallet state JSON file."),
+    ] = Path("wallet_store.json"),
+    output_format: Annotated[
+        str, typer.Option("--format", "-f", help="Output format (table or json).")
+    ] = "table",
+) -> None:
+    """Apply a lifecycle transition to a provisioned digital wallet token."""
+    engine, store = _load_wallet_state(store_file)
+    norm_action = action.strip().lower()
+    try:
+        if norm_action == "verify_idv":
+            tok = engine.complete_idv(token_id, verified=True)
+        elif norm_action == "fail_idv":
+            tok = engine.complete_idv(token_id, verified=False)
+        elif norm_action == "suspend":
+            tok = engine.suspend_token(token_id, reason=reason)
+        elif norm_action == "deactivate":
+            tok = engine.deactivate_token(token_id, reason=reason)
+        else:
+            _abort(f"Unsupported wallet token action '{action}'.")
+    except KeyError as exc:
+        _abort(str(exc))
+    _save_wallet_state(store, store_file)
+    if output_format.lower() == "table":
+        typer.echo(f"Token ID:         {tok.token_id}")
+        typer.echo(f"Status:           {TokenStatus(tok.status).value}")
+        typer.echo(f"Reason:           {tok.suspension_reason or 'none'}")
+    else:
+        typer.echo(json.dumps(tok.to_dict(), indent=2))
+
+
+@app.command("wallet-inspect")
+def wallet_inspect(
+    token_id: Annotated[str, typer.Option("--token-id", "-k", help="Network token ID.")],
+    store_file: Annotated[
+        Path,
+        typer.Option("--store-file", "-s", help="Path to wallet state JSON file."),
+    ] = Path("wallet_store.json"),
+    output_format: Annotated[
+        str, typer.Option("--format", "-f", help="Output format (table or json).")
+    ] = "table",
+) -> None:
+    """Inspect a provisioned digital wallet token record."""
+    _, store = _load_wallet_state(store_file)
+    tok = store.get_token(token_id)
+    if tok is None:
+        _abort(f"Wallet token '{token_id}' not found in store.")
+    if output_format.lower() == "table":
+        typer.echo(f"Token ID:         {tok.token_id}")
+        typer.echo(f"Card Hash:        {tok.card_hash}")
+        typer.echo(f"Device ID:        {tok.device_id}")
+        typer.echo(f"Provider:         {WalletProvider(tok.wallet_provider).value}")
+        typer.echo(f"Status:           {TokenStatus(tok.status).value}")
+        typer.echo(f"Total Spend:      ${tok.total_spend_amount:,.2f}")
+    else:
+        typer.echo(json.dumps(tok.to_dict(), indent=2))
+
+
+@app.command("wallet-summary")
+def wallet_summary(
+    store_file: Annotated[
+        Path,
+        typer.Option("--store-file", "-s", help="Path to wallet state JSON file."),
+    ] = Path("wallet_store.json"),
+    output_format: Annotated[
+        str, typer.Option("--format", "-f", help="Output format (table or json).")
+    ] = "table",
+) -> None:
+    """Display summary metrics of digital wallet tokens and provisioning paths."""
+    _, store = _load_wallet_state(store_file)
+    summary_data = store.summary()
+    if output_format.lower() == "table":
+        typer.echo("Digital Wallet & Network Token Summary:")
+        typer.echo(f"  Tokens:               {summary_data['token_count']}")
+        typer.echo(f"  Assessments:          {summary_data['assessment_count']}")
+        for path_key, cnt in summary_data["by_provisioning_path"].items():
+            typer.echo(f"    {path_key:22s}: {cnt}")
     else:
         typer.echo(json.dumps(summary_data, indent=2))
 

@@ -129,6 +129,10 @@ class EventType(StrEnum):
     SOAR_CONTAINMENT_APPLIED = "fraud.soar.containment_applied"
     SOAR_PLAYBOOK_COMPLETED = "fraud.soar.playbook_completed"
     SOAR_CONTAINMENT_ROLLED_BACK = "fraud.soar.containment_rolled_back"
+    WALLET_PROVISIONING_EVALUATED = "fraud.wallet.provisioning_evaluated"
+    WALLET_TOKEN_ACTIVATED = "fraud.wallet.token_activated"  # noqa: S105
+    WALLET_TOKEN_SUSPENDED = "fraud.wallet.token_suspended"  # noqa: S105
+    WALLET_PROVISIONING_DECLINED = "fraud.wallet.provisioning_declined"
 
 
 class EventDeliveryStatus(StrEnum):

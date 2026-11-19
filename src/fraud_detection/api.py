@@ -270,6 +270,15 @@ from fraud_detection.velocity import (
     VelocityWindowBuffer,
     enrich_record_velocity,
 )
+from fraud_detection.wallet_fraud import (
+    ProvisioningPath,
+    TokenStatus,
+    WalletFraudEngine,
+    WalletProvider,
+    WalletProvisioningRequest,
+    WalletRiskAssessment,
+    WalletTokenRecord,
+)
 
 MODEL_PATH_ENVIRONMENT_VARIABLE = "FRAUD_MODEL_PATH"
 AUDIT_LOG_ENVIRONMENT_VARIABLE = "FRAUD_AUDIT_LOG_PATH"
@@ -2654,6 +2663,98 @@ def _soar_playbooks_to_response(playbooks: list[ResponsePlaybook]) -> SoarPlaybo
     )
 
 
+class WalletProvisionRequest(BaseModel):
+    """Request payload for digital wallet provisioning risk evaluation."""
+
+    card_hash: str = Field(..., min_length=1)
+    device_id: str = Field(..., min_length=1)
+    wallet_account_id: str = Field(..., min_length=1)
+    wallet_provider: WalletProvider = WalletProvider.APPLE_PAY
+    tenant_id: str = "default"
+    wallet_account_age_days: int = Field(default=365, ge=0)
+    device_country: str = "US"
+    issuer_country: str = "US"
+    phone_match: bool = True
+    sim_swap_detected: bool = False
+    otp_attempts: int = Field(default=0, ge=0)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class WalletTokenActionRequest(BaseModel):
+    """Request payload for token lifecycle actions (verify_idv, fail_idv, suspend, deactivate)."""
+
+    action: str = Field(..., min_length=1)
+    reason: str = "operator_action"
+
+
+class WalletTokenSpendRequest(BaseModel):
+    """Request payload for recording spend against a provisioned network token."""
+
+    amount: float = Field(..., ge=0.0)
+
+
+class WalletTokenResponse(BaseModel):
+    """Response payload for a provisioned network payment token."""
+
+    token_id: str
+    card_hash: str
+    device_id: str
+    wallet_account_id: str
+    wallet_provider: str
+    tenant_id: str
+    status: str
+    provisioned_at: str
+    activated_at: str | None = None
+    updated_at: str
+    total_spend_amount: float
+    transaction_count: int
+    suspension_reason: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class WalletTokenListResponse(BaseModel):
+    """Response payload for listing provisioned network tokens."""
+
+    total_count: int
+    tokens: list[WalletTokenResponse]
+
+
+class WalletAssessmentResponse(BaseModel):
+    """Response payload for a digital wallet provisioning or spend risk assessment."""
+
+    assessment_id: str
+    request_id: str
+    card_hash: str
+    device_id: str
+    wallet_account_id: str
+    wallet_provider: str
+    tenant_id: str
+    risk_score: float
+    risk_level: str
+    provisioning_path: str
+    anomalies: list[str]
+    rationale: list[str]
+    token_id: str | None = None
+    correlated_case_id: str | None = None
+    evaluated_at: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class WalletAssessmentListResponse(BaseModel):
+    """Response payload for listing wallet risk assessments."""
+
+    total_count: int
+    assessments: list[WalletAssessmentResponse]
+
+
+def _wallet_token_to_response(record: WalletTokenRecord) -> WalletTokenResponse:
+    return WalletTokenResponse(**record.to_dict())
+
+
+def _wallet_assessment_to_response(record: WalletRiskAssessment) -> WalletAssessmentResponse:
+    return WalletAssessmentResponse(**record.to_dict())
+
+
 def create_app(
     *,
     model: FraudModel | None = None,
@@ -2745,6 +2846,7 @@ def create_app(
     first_party_engine: FirstPartyFraudEngine | None = None,
     risk_orchestrator: UnifiedRiskOrchestrator | None = None,
     soar_engine: SoarEngine | None = None,
+    wallet_engine: WalletFraudEngine | None = None,
 ) -> FastAPI:
     """Create an application using an injected model or a trusted artifact path.
 
@@ -3325,6 +3427,24 @@ def create_app(
     soar_rollbacks_counter = Counter(
         "fraud_soar_rollbacks_total",
         "Total SOAR playbook executions rolled back by operators.",
+        ["tenant_id"],
+        registry=metrics_registry,
+    )
+    wallet_provisioning_evaluations_counter = Counter(
+        "fraud_wallet_provisioning_evaluations_total",
+        "Total digital wallet provisioning risk evaluations performed.",
+        ["tenant_id", "provider", "path"],
+        registry=metrics_registry,
+    )
+    wallet_anomalies_counter = Counter(
+        "fraud_wallet_anomalies_total",
+        "Total digital wallet provisioning and token anomalies detected.",
+        ["tenant_id", "anomaly_type"],
+        registry=metrics_registry,
+    )
+    wallet_token_suspensions_counter = Counter(
+        "fraud_wallet_token_suspensions_total",
+        "Total digital wallet network tokens suspended or deactivated.",
         ["tenant_id"],
         registry=metrics_registry,
     )
@@ -3942,6 +4062,16 @@ def create_app(
         application.state.soar_playbooks_executed_counter = soar_playbooks_executed_counter
         application.state.soar_containments_applied_counter = soar_containments_applied_counter
         application.state.soar_rollbacks_counter = soar_rollbacks_counter
+        resolved_wallet_engine = wallet_engine or WalletFraudEngine(
+            case_manager=application.state.case_manager,
+            event_bus=resolved_event_bus,
+        )
+        application.state.wallet_engine = resolved_wallet_engine
+        application.state.wallet_provisioning_evaluations_counter = (
+            wallet_provisioning_evaluations_counter
+        )
+        application.state.wallet_anomalies_counter = wallet_anomalies_counter
+        application.state.wallet_token_suspensions_counter = wallet_token_suspensions_counter
         application.state.audit_sink = resolved_audit_sink
         application.state.explanation_provider = explanation_provider
         application.state.fallback_mode = resolved_fallback_mode
@@ -9117,6 +9247,238 @@ def create_app(
             return {
                 "execution_count": 0,
                 "active_containments": 0,
+                "status": "uninitialized",
+            }
+        return {**engine.store.summary(), "status": "operational"}
+
+    def _record_wallet_metrics(
+        request: Request,
+        assessment: WalletRiskAssessment,
+    ) -> None:
+        eval_c = getattr(request.app.state, "wallet_provisioning_evaluations_counter", None)
+        if eval_c is not None:
+            eval_c.labels(
+                tenant_id=assessment.tenant_id,
+                provider=WalletProvider(assessment.wallet_provider).value,
+                path=ProvisioningPath(assessment.provisioning_path).value,
+            ).inc()
+        anom_c = getattr(request.app.state, "wallet_anomalies_counter", None)
+        if anom_c is not None:
+            for anom in assessment.anomalies:
+                anom_c.labels(
+                    tenant_id=assessment.tenant_id,
+                    anomaly_type=anom.value,
+                ).inc()
+
+    @application.post(
+        "/v1/wallet/provision",
+        response_model=WalletAssessmentResponse,
+        responses={
+            422: {"description": "Invalid provisioning request."},
+            500: {"description": "Wallet fraud engine not initialized."},
+        },
+        tags=["wallet_fraud"],
+    )
+    async def wallet_provision_endpoint(
+        payload: WalletProvisionRequest,
+        request: Request,
+    ) -> WalletAssessmentResponse | JSONResponse:
+        """Evaluate a digital wallet tokenization request and route VTS/MDES path."""
+        engine: WalletFraudEngine | None = getattr(request.app.state, "wallet_engine", None)
+        if engine is None:
+            return JSONResponse(
+                status_code=500,
+                content={"detail": "Wallet fraud engine not initialized."},
+            )
+        req_obj = WalletProvisioningRequest.from_dict(payload.model_dump())
+        assessment = engine.evaluate_provisioning(req_obj)
+        _record_wallet_metrics(request, assessment)
+        return _wallet_assessment_to_response(assessment)
+
+    @application.post(
+        "/v1/wallet/tokens/{token_id}/action",
+        response_model=WalletTokenResponse,
+        responses={
+            400: {"description": "Invalid token lifecycle action."},
+            404: {"description": "Token not found."},
+            500: {"description": "Wallet fraud engine not initialized."},
+        },
+        tags=["wallet_fraud"],
+    )
+    async def wallet_token_action_endpoint(
+        token_id: str,
+        payload: WalletTokenActionRequest,
+        request: Request,
+    ) -> WalletTokenResponse | JSONResponse:
+        """Apply a lifecycle action (verify_idv, fail_idv, suspend, deactivate) to a token."""
+        engine: WalletFraudEngine | None = getattr(request.app.state, "wallet_engine", None)
+        if engine is None:
+            return JSONResponse(
+                status_code=500,
+                content={"detail": "Wallet fraud engine not initialized."},
+            )
+        action = payload.action.strip().lower()
+        try:
+            if action == "verify_idv":
+                tok = engine.complete_idv(token_id, verified=True)
+            elif action == "fail_idv":
+                tok = engine.complete_idv(token_id, verified=False)
+            elif action == "suspend":
+                tok = engine.suspend_token(token_id, reason=payload.reason)
+            elif action == "deactivate":
+                tok = engine.deactivate_token(token_id, reason=payload.reason)
+            else:
+                return JSONResponse(
+                    status_code=400,
+                    content={"detail": f"Unsupported wallet token action '{payload.action}'."},
+                )
+        except KeyError as exc:
+            return JSONResponse(status_code=404, content={"detail": str(exc)})
+
+        if action in {"fail_idv", "suspend", "deactivate"}:
+            susp_c = getattr(request.app.state, "wallet_token_suspensions_counter", None)
+            if susp_c is not None:
+                susp_c.labels(tenant_id=tok.tenant_id).inc()
+        return _wallet_token_to_response(tok)
+
+    @application.post(
+        "/v1/wallet/tokens/{token_id}/spend",
+        response_model=WalletAssessmentResponse,
+        responses={
+            404: {"description": "Token not found."},
+            500: {"description": "Wallet fraud engine not initialized."},
+        },
+        tags=["wallet_fraud"],
+    )
+    async def wallet_token_spend_endpoint(
+        token_id: str,
+        payload: WalletTokenSpendRequest,
+        request: Request,
+    ) -> WalletAssessmentResponse | JSONResponse:
+        """Record spend against a provisioned token and detect post-provisioning bursts."""
+        engine: WalletFraudEngine | None = getattr(request.app.state, "wallet_engine", None)
+        if engine is None:
+            return JSONResponse(
+                status_code=500,
+                content={"detail": "Wallet fraud engine not initialized."},
+            )
+        try:
+            assessment = engine.record_token_spend(token_id, payload.amount)
+        except KeyError as exc:
+            return JSONResponse(status_code=404, content={"detail": str(exc)})
+        _record_wallet_metrics(request, assessment)
+        if assessment.anomalies:
+            susp_c = getattr(request.app.state, "wallet_token_suspensions_counter", None)
+            if susp_c is not None:
+                susp_c.labels(tenant_id=assessment.tenant_id).inc()
+        return _wallet_assessment_to_response(assessment)
+
+    @application.get(
+        "/v1/wallet/tokens/{token_id}",
+        response_model=WalletTokenResponse,
+        responses={
+            404: {"description": "Token not found."},
+            500: {"description": "Wallet fraud engine not initialized."},
+        },
+        tags=["wallet_fraud"],
+    )
+    async def wallet_get_token_endpoint(
+        token_id: str,
+        request: Request,
+    ) -> WalletTokenResponse | JSONResponse:
+        """Retrieve a provisioned network payment token by ID."""
+        engine: WalletFraudEngine | None = getattr(request.app.state, "wallet_engine", None)
+        if engine is None:
+            return JSONResponse(
+                status_code=500,
+                content={"detail": "Wallet fraud engine not initialized."},
+            )
+        tok = engine.store.get_token(token_id)
+        if tok is None:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": f"Wallet token '{token_id}' not found."},
+            )
+        return _wallet_token_to_response(tok)
+
+    @application.get(
+        "/v1/wallet/tokens",
+        response_model=WalletTokenListResponse,
+        responses={500: {"description": "Wallet fraud engine not initialized."}},
+        tags=["wallet_fraud"],
+    )
+    async def wallet_list_tokens_endpoint(
+        request: Request,
+        card_hash: str | None = None,
+        device_id: str | None = None,
+        tenant_id: str | None = None,
+        status: TokenStatus | None = None,
+        limit: int = Query(default=100, ge=1, le=1000),
+    ) -> WalletTokenListResponse | JSONResponse:
+        """List provisioned network payment tokens with optional filters."""
+        engine: WalletFraudEngine | None = getattr(request.app.state, "wallet_engine", None)
+        if engine is None:
+            return JSONResponse(
+                status_code=500,
+                content={"detail": "Wallet fraud engine not initialized."},
+            )
+        items = engine.store.list_tokens(
+            card_hash=card_hash,
+            device_id=device_id,
+            tenant_id=tenant_id,
+            status=status,
+            limit=limit,
+        )
+        return WalletTokenListResponse(
+            total_count=len(items),
+            tokens=[_wallet_token_to_response(item) for item in items],
+        )
+
+    @application.get(
+        "/v1/wallet/assessments",
+        response_model=WalletAssessmentListResponse,
+        responses={500: {"description": "Wallet fraud engine not initialized."}},
+        tags=["wallet_fraud"],
+    )
+    async def wallet_list_assessments_endpoint(
+        request: Request,
+        card_hash: str | None = None,
+        device_id: str | None = None,
+        tenant_id: str | None = None,
+        path: ProvisioningPath | None = None,
+        limit: int = Query(default=100, ge=1, le=1000),
+    ) -> WalletAssessmentListResponse | JSONResponse:
+        """List digital wallet provisioning and spend risk assessments."""
+        engine: WalletFraudEngine | None = getattr(request.app.state, "wallet_engine", None)
+        if engine is None:
+            return JSONResponse(
+                status_code=500,
+                content={"detail": "Wallet fraud engine not initialized."},
+            )
+        items = engine.store.list_assessments(
+            card_hash=card_hash,
+            device_id=device_id,
+            tenant_id=tenant_id,
+            path=path,
+            limit=limit,
+        )
+        return WalletAssessmentListResponse(
+            total_count=len(items),
+            assessments=[_wallet_assessment_to_response(item) for item in items],
+        )
+
+    @application.get(
+        "/v1/wallet/metrics",
+        response_model=dict[str, Any],
+        tags=["wallet_fraud"],
+    )
+    async def wallet_metrics_endpoint(request: Request) -> dict[str, Any]:
+        """Summary metrics of digital wallet provisioning and network token lifecycle."""
+        engine: WalletFraudEngine | None = getattr(request.app.state, "wallet_engine", None)
+        if engine is None:
+            return {
+                "token_count": 0,
+                "assessment_count": 0,
                 "status": "uninitialized",
             }
         return {**engine.store.summary(), "status": "operational"}
