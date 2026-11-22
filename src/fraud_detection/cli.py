@@ -56,6 +56,12 @@ from fraud_detection.audit import (
     build_scoring_audit_event,
     replay_audit_log,
 )
+from fraud_detection.automation_bridge import (
+    AutomationBridgeStore,
+    BridgeDispatchStatus,
+    BridgeRuleAction,
+    CrossEngineAutomationBridge,
+)
 from fraud_detection.cases import (
     CaseDisposition,
     CaseError,
@@ -11874,6 +11880,136 @@ def wallet_summary(
         typer.echo(f"  Assessments:          {summary_data['assessment_count']}")
         for path_key, cnt in summary_data["by_provisioning_path"].items():
             typer.echo(f"    {path_key:22s}: {cnt}")
+    else:
+        typer.echo(json.dumps(summary_data, indent=2))
+
+
+def _load_automation_state(
+    store_file: Path,
+) -> tuple[CrossEngineAutomationBridge, AutomationBridgeStore]:
+    """Load persistent automation bridge dispatches from a JSON store file."""
+    soar = SoarEngine()
+    wallet = WalletFraudEngine()
+    if not store_file.exists():
+        store = AutomationBridgeStore()
+        return (
+            CrossEngineAutomationBridge(store=store, soar_engine=soar, wallet_engine=wallet),
+            store,
+        )
+    try:
+        data = json.loads(store_file.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            _abort("Invalid automation bridge store file format: expected JSON object.")
+    except (OSError, json.JSONDecodeError) as exc:
+        _abort(f"Could not read automation bridge store file: {exc}")
+    store = AutomationBridgeStore.from_dict(data)
+    return (
+        CrossEngineAutomationBridge(store=store, soar_engine=soar, wallet_engine=wallet),
+        store,
+    )
+
+
+def _save_automation_state(store: AutomationBridgeStore, store_file: Path) -> None:
+    """Persist automation bridge store atomically to disk."""
+    _atomic_write_text(json.dumps(store.to_dict(), indent=2), store_file)
+
+
+@app.command("automation-cascade")
+def automation_cascade(
+    entity_id: Annotated[str, typer.Option("--entity-id", "-e", help="Entity or card identifier.")],
+    score: Annotated[float, typer.Option("--score", help="Composite risk score (0-1).")],
+    risk_level: Annotated[
+        UnifiedRiskLevel, typer.Option("--risk-level", "-r", help="Unified risk level.")
+    ] = UnifiedRiskLevel.HIGH,
+    pattern: Annotated[
+        list[CrossSignalPattern] | None,
+        typer.Option("--pattern", "-p", help="Detected cross-signal pattern(s)."),
+    ] = None,
+    tenant_id: Annotated[str, typer.Option("--tenant-id", "-t", help="Tenant identifier.")] = (
+        "default"
+    ),
+    store_file: Annotated[
+        Path,
+        typer.Option("--store-file", "-s", help="Path to automation bridge state JSON file."),
+    ] = Path("automation_bridge_store.json"),
+    output_format: Annotated[
+        str, typer.Option("--format", "-f", help="Output format (table or json).")
+    ] = "table",
+) -> None:
+    """Trigger a cross-engine SOAR + Wallet containment cascade for an entity."""
+    bridge, store = _load_automation_state(store_file)
+    record = bridge.trigger_cascade(
+        entity_id=entity_id,
+        composite_score=score,
+        risk_level=risk_level,
+        patterns=list(pattern or []),
+        tenant_id=tenant_id,
+        source_event_type="cli.automation_cascade",
+    )
+    _save_automation_state(store, store_file)
+    if output_format.lower() == "table":
+        typer.echo(f"Dispatch ID:      {record.dispatch_id}")
+        typer.echo(f"Entity:           {record.entity_id}")
+        typer.echo(f"Action:           {BridgeRuleAction(record.action).value}")
+        typer.echo(f"Status:           {BridgeDispatchStatus(record.status).value}")
+        typer.echo(f"SOAR Execution:   {record.soar_execution_id or 'none'}")
+        typer.echo(f"Suspended Tokens: {len(record.suspended_token_ids)}")
+    else:
+        typer.echo(json.dumps(record.to_dict(), indent=2))
+
+
+@app.command("automation-dispatches")
+def automation_dispatches(
+    entity_id: Annotated[
+        str | None, typer.Option("--entity-id", "-e", help="Optional entity filter.")
+    ] = None,
+    tenant_id: Annotated[
+        str | None, typer.Option("--tenant-id", "-t", help="Optional tenant filter.")
+    ] = None,
+    limit: Annotated[int, typer.Option("--limit", "-l", help="Maximum dispatches to show.")] = 50,
+    store_file: Annotated[
+        Path,
+        typer.Option("--store-file", "-s", help="Path to automation bridge state JSON file."),
+    ] = Path("automation_bridge_store.json"),
+    output_format: Annotated[
+        str, typer.Option("--format", "-f", help="Output format (table or json).")
+    ] = "table",
+) -> None:
+    """List recorded cross-engine automation bridge dispatches."""
+    _, store = _load_automation_state(store_file)
+    items = store.list_dispatches(entity_id=entity_id, tenant_id=tenant_id, limit=limit)
+    if output_format.lower() == "table":
+        typer.echo(f"Automation Dispatches ({len(items)}):")
+        for item in items:
+            typer.echo(
+                f"  - {item.dispatch_id} | {item.entity_id} | "
+                f"{BridgeRuleAction(item.action).value} | "
+                f"{BridgeDispatchStatus(item.status).value}"
+            )
+    else:
+        typer.echo(json.dumps([item.to_dict() for item in items], indent=2))
+
+
+@app.command("automation-summary")
+def automation_summary(
+    store_file: Annotated[
+        Path,
+        typer.Option("--store-file", "-s", help="Path to automation bridge state JSON file."),
+    ] = Path("automation_bridge_store.json"),
+    output_format: Annotated[
+        str, typer.Option("--format", "-f", help="Output format (table or json).")
+    ] = "table",
+) -> None:
+    """Display summary metrics of cross-engine automation bridge dispatches."""
+    _, store = _load_automation_state(store_file)
+    summary_data = store.summary()
+    if output_format.lower() == "table":
+        typer.echo("Cross-Engine Automation Bridge Summary:")
+        typer.echo(f"  Dispatches:           {summary_data['dispatch_count']}")
+        typer.echo(f"  SOAR Triggers:        {summary_data['soar_triggered_count']}")
+        typer.echo(f"  Tokens Suspended:     {summary_data['tokens_suspended_count']}")
+        for status_key, cnt in summary_data["by_status"].items():
+            typer.echo(f"    {status_key:22s}: {cnt}")
     else:
         typer.echo(json.dumps(summary_data, indent=2))
 
