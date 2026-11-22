@@ -9,10 +9,11 @@ and zero-recursion guarantees.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
+from uuid import uuid4
 
 from fraud_detection.risk_orchestrator import UnifiedRiskLevel
 
@@ -83,4 +84,68 @@ class BridgePolicy:
                 str(payload.get("min_soar_risk_level", "high")).lower()
             ),
             cooldown_seconds=int(payload.get("cooldown_seconds", 300)),
+        )
+
+
+@dataclass(slots=True)
+class BridgeDispatchRecord:
+    """Audit record of an automated cross-engine cascade or signal-forwarding dispatch."""
+
+    entity_id: str
+    action: BridgeRuleAction | str
+    status: BridgeDispatchStatus | str
+    tenant_id: str = "default"
+    dispatch_id: str = field(default_factory=lambda: f"ab_{uuid4().hex[:12]}")
+    source_event_id: str | None = None
+    source_event_type: str = "manual"
+    soar_execution_id: str | None = None
+    suspended_token_ids: list[str] = field(default_factory=list)
+    orchestrator_signal_id: str | None = None
+    detail: str = ""
+    dispatched_at: str = field(default_factory=_utc_now_iso)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.entity_id = self.entity_id.strip()
+        if not self.entity_id:
+            raise ValueError("entity_id must not be empty")
+        if not isinstance(self.action, BridgeRuleAction):
+            self.action = BridgeRuleAction(str(self.action).lower())
+        if not isinstance(self.status, BridgeDispatchStatus):
+            self.status = BridgeDispatchStatus(str(self.status).lower())
+        self.tenant_id = self.tenant_id.strip() or "default"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "dispatch_id": self.dispatch_id,
+            "entity_id": self.entity_id,
+            "tenant_id": self.tenant_id,
+            "action": BridgeRuleAction(self.action).value,
+            "status": BridgeDispatchStatus(self.status).value,
+            "source_event_id": self.source_event_id,
+            "source_event_type": self.source_event_type,
+            "soar_execution_id": self.soar_execution_id,
+            "suspended_token_ids": list(self.suspended_token_ids),
+            "orchestrator_signal_id": self.orchestrator_signal_id,
+            "detail": self.detail,
+            "dispatched_at": self.dispatched_at,
+            "metadata": dict(self.metadata),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> BridgeDispatchRecord:
+        return cls(
+            dispatch_id=str(payload.get("dispatch_id") or f"ab_{uuid4().hex[:12]}"),
+            entity_id=str(payload["entity_id"]),
+            tenant_id=str(payload.get("tenant_id") or "default"),
+            action=BridgeRuleAction(str(payload["action"]).lower()),
+            status=BridgeDispatchStatus(str(payload["status"]).lower()),
+            source_event_id=payload.get("source_event_id"),
+            source_event_type=str(payload.get("source_event_type", "manual")),
+            soar_execution_id=payload.get("soar_execution_id"),
+            suspended_token_ids=[str(t) for t in payload.get("suspended_token_ids", [])],
+            orchestrator_signal_id=payload.get("orchestrator_signal_id"),
+            detail=str(payload.get("detail", "")),
+            dispatched_at=str(payload.get("dispatched_at") or _utc_now_iso()),
+            metadata=dict(payload.get("metadata", {})),
         )
