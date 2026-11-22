@@ -133,6 +133,8 @@ class EventType(StrEnum):
     WALLET_TOKEN_ACTIVATED = "fraud.wallet.token_activated"  # noqa: S105
     WALLET_TOKEN_SUSPENDED = "fraud.wallet.token_suspended"  # noqa: S105
     WALLET_PROVISIONING_DECLINED = "fraud.wallet.provisioning_declined"
+    AUTOMATION_BRIDGE_EXECUTED = "fraud.automation.bridge_executed"
+    AUTOMATION_BRIDGE_SKIPPED = "fraud.automation.bridge_skipped"
 
 
 class EventDeliveryStatus(StrEnum):
