@@ -11,7 +11,7 @@
 - [x] Task 3: Implement `AutomationBridgeStore` + unit tests.
 - [x] Task 4: Register `AUTOMATION_BRIDGE_EXECUTED` / `AUTOMATION_BRIDGE_SKIPPED` events in `src/fraud_detection/events.py` and implement `CrossEngineAutomationBridge` + unit tests (100% branch coverage).
 - [x] Task 5: Wire `CrossEngineAutomationBridge` into `create_app`, add `/v1/automation/*` REST endpoints and Prometheus metrics in `src/fraud_detection/api.py` + tests in `tests/test_api.py`.
-- [ ] Task 6: Add `automation-cascade`, `automation-dispatches`, and `automation-summary` CLI commands in `src/fraud_detection/cli.py` + tests in `tests/test_cli.py`.
+- [x] Task 6: Add `automation-cascade`, `automation-dispatches`, and `automation-summary` CLI commands in `src/fraud_detection/cli.py` + tests in `tests/test_cli.py`.
 - [ ] Task 7: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate with 100% Green CI.
 
 ## Acceptance Criteria Status
@@ -22,7 +22,7 @@
 | AC-3 (Event-Driven Cascade & Loop Prevention) | PASSED | `CrossEngineAutomationBridge` achieved 100.00% branch coverage (294 stmts, 74 branches) on live Orchestrator ↔ SOAR ↔ Wallet EventBus cascades, cooldowns, pause/resume, and re-entrancy guards in `tests/test_automation_bridge.py` |
 | AC-4 (EventBus Streaming) | PASSED | `AUTOMATION_BRIDGE_EXECUTED` and `AUTOMATION_BRIDGE_SKIPPED` registered in `events.py` and verified in `tests/test_automation_bridge.py` |
 | AC-5 (REST API & Metrics) | PASSED | `/v1/automation/*` endpoints and Prometheus counters (`fraud_automation_bridge_dispatches_total`, `fraud_automation_bridge_tokens_suspended_total`, `fraud_automation_bridge_soar_triggers_total`) verified in `tests/test_api.py` |
-| AC-6 (CLI Workflows) | PENDING | |
+| AC-6 (CLI Workflows) | PASSED | `automation-cascade`, `automation-dispatches`, and `automation-summary` verified in `tests/test_cli.py` and live `fraud-detect automation-*` E2E execution |
 | AC-7 (All CI-Parity Checks & Remote CI Green) | PENDING | |
 
 ## Decision Log
