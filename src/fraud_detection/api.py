@@ -76,7 +76,10 @@ from fraud_detection.audit import (
     build_scoring_audit_event,
     build_shadow_scoring_audit_event,
 )
-from fraud_detection.automation_bridge import BridgeDispatchRecord
+from fraud_detection.automation_bridge import (
+    BridgeDispatchRecord,
+    CrossEngineAutomationBridge,
+)
 from fraud_detection.cases import (
     CaseAssignmentError,
     CaseDisposition,
@@ -2898,6 +2901,7 @@ def create_app(
     risk_orchestrator: UnifiedRiskOrchestrator | None = None,
     soar_engine: SoarEngine | None = None,
     wallet_engine: WalletFraudEngine | None = None,
+    automation_bridge: CrossEngineAutomationBridge | None = None,
 ) -> FastAPI:
     """Create an application using an injected model or a trusted artifact path.
 
@@ -3496,6 +3500,24 @@ def create_app(
     wallet_token_suspensions_counter = Counter(
         "fraud_wallet_token_suspensions_total",
         "Total digital wallet network tokens suspended or deactivated.",
+        ["tenant_id"],
+        registry=metrics_registry,
+    )
+    automation_bridge_dispatches_counter = Counter(
+        "fraud_automation_bridge_dispatches_total",
+        "Total cross-engine automation bridge dispatches recorded.",
+        ["tenant_id", "action", "status"],
+        registry=metrics_registry,
+    )
+    automation_bridge_tokens_suspended_counter = Counter(
+        "fraud_automation_bridge_tokens_suspended_total",
+        "Total digital wallet tokens auto-suspended by the automation bridge.",
+        ["tenant_id"],
+        registry=metrics_registry,
+    )
+    automation_bridge_soar_triggers_counter = Counter(
+        "fraud_automation_bridge_soar_triggers_total",
+        "Total SOAR playbooks auto-triggered by the automation bridge.",
         ["tenant_id"],
         registry=metrics_registry,
     )
@@ -4123,6 +4145,23 @@ def create_app(
         )
         application.state.wallet_anomalies_counter = wallet_anomalies_counter
         application.state.wallet_token_suspensions_counter = wallet_token_suspensions_counter
+        resolved_automation_bridge = automation_bridge or CrossEngineAutomationBridge(
+            event_bus=resolved_event_bus,
+            orchestrator=resolved_risk_orchestrator,
+            soar_engine=resolved_soar_engine,
+            wallet_engine=resolved_wallet_engine,
+        )
+        resolved_automation_bridge.attach()
+        application.state.automation_bridge = resolved_automation_bridge
+        application.state.automation_bridge_dispatches_counter = (
+            automation_bridge_dispatches_counter
+        )
+        application.state.automation_bridge_tokens_suspended_counter = (
+            automation_bridge_tokens_suspended_counter
+        )
+        application.state.automation_bridge_soar_triggers_counter = (
+            automation_bridge_soar_triggers_counter
+        )
         application.state.audit_sink = resolved_audit_sink
         application.state.explanation_provider = explanation_provider
         application.state.fallback_mode = resolved_fallback_mode
