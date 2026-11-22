@@ -18,7 +18,18 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from fraud_detection.risk_orchestrator import UnifiedRiskLevel
+from fraud_detection.events import EventBus, EventType, FraudDomainEvent
+from fraud_detection.risk_orchestrator import (
+    CrossSignalPattern,
+    DomainRiskSignal,
+    OrchestratorAction,
+    RiskDomain,
+    UnifiedRiskAssessment,
+    UnifiedRiskLevel,
+    UnifiedRiskOrchestrator,
+)
+from fraud_detection.soar import SoarEngine
+from fraud_detection.wallet_fraud import TokenStatus, WalletFraudEngine
 
 
 def _utc_now_iso() -> str:
@@ -284,3 +295,340 @@ class AutomationBridgeStore:
         if not source.exists():
             return cls()
         return cls.from_dict(json.loads(source.read_text(encoding="utf-8")))
+
+
+_RISK_ORDER: dict[UnifiedRiskLevel, int] = {
+    UnifiedRiskLevel.LOW: 0,
+    UnifiedRiskLevel.MEDIUM: 1,
+    UnifiedRiskLevel.HIGH: 2,
+    UnifiedRiskLevel.CRITICAL: 3,
+}
+
+
+class CrossEngineAutomationBridge:
+    """Bridges UnifiedRiskOrchestrator, SoarEngine, and WalletFraudEngine over EventBus."""
+
+    def __init__(
+        self,
+        *,
+        event_bus: EventBus | None = None,
+        orchestrator: UnifiedRiskOrchestrator | None = None,
+        soar_engine: SoarEngine | None = None,
+        wallet_engine: WalletFraudEngine | None = None,
+        policy: BridgePolicy | None = None,
+        store: AutomationBridgeStore | None = None,
+    ) -> None:
+        self.event_bus = event_bus
+        self.orchestrator = orchestrator
+        self.soar_engine = soar_engine
+        self.wallet_engine = wallet_engine
+        self.policy = policy or BridgePolicy()
+        self.store = store or AutomationBridgeStore()
+        self._lock = threading.RLock()
+        self._subscription_tokens: list[str] = []
+        self._reentrancy_depth = 0
+
+    @property
+    def is_attached(self) -> bool:
+        with self._lock:
+            return bool(self._subscription_tokens)
+
+    def attach(self) -> bool:
+        """Subscribe to cross-engine domain events on EventBus (idempotent)."""
+        with self._lock:
+            if self.event_bus is None or self._subscription_tokens:
+                return False
+            watched = (
+                EventType.ENTITY_ESCALATION_TRIGGERED,
+                EventType.CROSS_SIGNAL_PATTERN_DETECTED,
+                EventType.WALLET_PROVISIONING_DECLINED,
+                EventType.WALLET_TOKEN_SUSPENDED,
+            )
+            for ev_type in watched:
+                tok = self.event_bus.subscribe(self._on_event, event_type=ev_type)
+                self._subscription_tokens.append(tok)
+            return True
+
+    def _on_event(self, event: FraudDomainEvent) -> None:
+        self.handle_event(event)
+
+    def detach(self) -> int:
+        """Unsubscribe all EventBus listeners and return count removed."""
+        with self._lock:
+            if self.event_bus is None or not self._subscription_tokens:
+                return 0
+            removed = 0
+            for tok in self._subscription_tokens:
+                if self.event_bus.unsubscribe(tok):
+                    removed += 1
+            self._subscription_tokens.clear()
+            return removed
+
+    def update_policy(self, policy: BridgePolicy) -> BridgePolicy:
+        with self._lock:
+            self.policy = policy
+            return self.policy
+
+    def pause(self) -> None:
+        with self._lock:
+            self.policy.enabled = False
+
+    def resume(self) -> None:
+        with self._lock:
+            self.policy.enabled = True
+
+    def _emit_bridge_event(self, record: BridgeDispatchRecord) -> None:
+        if self.event_bus is None:
+            return
+        ev_type = (
+            EventType.AUTOMATION_BRIDGE_EXECUTED
+            if record.status is BridgeDispatchStatus.EXECUTED
+            else EventType.AUTOMATION_BRIDGE_SKIPPED
+        )
+        self.event_bus.publish(
+            FraudDomainEvent(
+                event_type=ev_type,
+                tenant_id=record.tenant_id,
+                payload=record.to_dict(),
+            )
+        )
+
+    def _suspend_entity_tokens(
+        self,
+        *,
+        entity_id: str,
+        tenant_id: str,
+        reason: str,
+        reference_time: datetime,
+    ) -> list[str]:
+        if self.wallet_engine is None:
+            return []
+        active_by_card = self.wallet_engine.store.list_tokens(
+            card_hash=entity_id,
+            tenant_id=tenant_id,
+            status=TokenStatus.ACTIVE,
+            limit=1000,
+        )
+        active_by_device = self.wallet_engine.store.list_tokens(
+            device_id=entity_id,
+            tenant_id=tenant_id,
+            status=TokenStatus.ACTIVE,
+            limit=1000,
+        )
+        seen: dict[str, str] = {}
+        for tok in [*active_by_card, *active_by_device]:
+            seen[tok.token_id] = tok.token_id
+        suspended: list[str] = []
+        for token_id in seen:
+            self.wallet_engine.suspend_token(
+                token_id,
+                reason=reason,
+                reference_time=reference_time,
+            )
+            suspended.append(token_id)
+        return suspended
+
+    def trigger_cascade(
+        self,
+        *,
+        entity_id: str,
+        composite_score: float,
+        risk_level: UnifiedRiskLevel = UnifiedRiskLevel.HIGH,
+        patterns: list[CrossSignalPattern] | None = None,
+        tenant_id: str = "default",
+        source_event_id: str | None = None,
+        source_event_type: str = "manual",
+        reference_time: datetime | None = None,
+    ) -> BridgeDispatchRecord:
+        """Execute a cooldown-guarded SOAR + Wallet containment cascade for an entity."""
+        now = reference_time or datetime.now(UTC)
+        with self._lock:
+            action = BridgeRuleAction.FULL_CONTAINMENT_CASCADE
+            if not self.policy.enabled:
+                skipped = BridgeDispatchRecord(
+                    entity_id=entity_id,
+                    tenant_id=tenant_id,
+                    action=action,
+                    status=BridgeDispatchStatus.SKIPPED_DISABLED,
+                    source_event_id=source_event_id,
+                    source_event_type=source_event_type,
+                    detail="Automation bridge is currently paused/disabled",
+                    dispatched_at=now.isoformat(),
+                )
+                self.store.save_dispatch(skipped)
+                self._emit_bridge_event(skipped)
+                return skipped
+
+            if self.store.is_in_cooldown(
+                tenant_id=tenant_id,
+                entity_id=entity_id,
+                action=action,
+                cooldown_seconds=self.policy.cooldown_seconds,
+                reference_time=now,
+            ):
+                cooled = BridgeDispatchRecord(
+                    entity_id=entity_id,
+                    tenant_id=tenant_id,
+                    action=action,
+                    status=BridgeDispatchStatus.SKIPPED_COOLDOWN,
+                    source_event_id=source_event_id,
+                    source_event_type=source_event_type,
+                    detail=(
+                        f"Entity '{entity_id}' is within {self.policy.cooldown_seconds}s cooldown"
+                    ),
+                    dispatched_at=now.isoformat(),
+                )
+                self.store.save_dispatch(cooled)
+                self._emit_bridge_event(cooled)
+                return cooled
+
+            self._reentrancy_depth += 1
+            try:
+                soar_exec_id: str | None = None
+                suspended_ids: list[str] = []
+
+                min_rank = _RISK_ORDER[UnifiedRiskLevel(self.policy.min_soar_risk_level)]
+                if (
+                    self.policy.auto_trigger_soar
+                    and self.soar_engine is not None
+                    and _RISK_ORDER[risk_level] >= min_rank
+                ):
+                    assessment = UnifiedRiskAssessment(
+                        assessment_id=source_event_id or f"ora_{uuid4().hex[:12]}",
+                        entity_id=entity_id,
+                        tenant_id=tenant_id,
+                        composite_score=composite_score,
+                        risk_level=risk_level,
+                        action=OrchestratorAction.BLOCK_AND_ESCALATE,
+                        patterns_detected=list(patterns or []),
+                    )
+                    soar_rec = self.soar_engine.execute_for_assessment(
+                        assessment,
+                        reference_time=now,
+                    )
+                    soar_exec_id = soar_rec.execution_id
+
+                if self.policy.auto_suspend_wallet_tokens:
+                    suspended_ids = self._suspend_entity_tokens(
+                        entity_id=entity_id,
+                        tenant_id=tenant_id,
+                        reason=f"automation_bridge:{source_event_type}",
+                        reference_time=now,
+                    )
+
+                self.store.record_cooldown(
+                    tenant_id=tenant_id,
+                    entity_id=entity_id,
+                    action=action,
+                    reference_time=now,
+                )
+                record = BridgeDispatchRecord(
+                    entity_id=entity_id,
+                    tenant_id=tenant_id,
+                    action=action,
+                    status=BridgeDispatchStatus.EXECUTED,
+                    source_event_id=source_event_id,
+                    source_event_type=source_event_type,
+                    soar_execution_id=soar_exec_id,
+                    suspended_token_ids=suspended_ids,
+                    detail=(
+                        f"SOAR={soar_exec_id or 'none'}, suspended_tokens={len(suspended_ids)}"
+                    ),
+                    dispatched_at=now.isoformat(),
+                )
+                self.store.save_dispatch(record)
+                self._emit_bridge_event(record)
+                return record
+            finally:
+                self._reentrancy_depth -= 1
+
+    def _forward_wallet_signal(
+        self,
+        event: FraudDomainEvent,
+        *,
+        reference_time: datetime,
+    ) -> BridgeDispatchRecord | None:
+        if not self.policy.auto_forward_wallet_signals or self.orchestrator is None:
+            return None
+        entity_id = str(
+            event.payload.get("card_hash") or event.payload.get("device_id") or ""
+        ).strip()
+        if not entity_id:
+            return None
+        action = BridgeRuleAction.INGEST_ORCHESTRATOR_SIGNAL
+        if not self.policy.enabled:
+            skipped = BridgeDispatchRecord(
+                entity_id=entity_id,
+                tenant_id=event.tenant_id,
+                action=action,
+                status=BridgeDispatchStatus.SKIPPED_DISABLED,
+                source_event_id=event.event_id,
+                source_event_type=event.event_type.value,
+                detail="Automation bridge is currently paused/disabled",
+                dispatched_at=reference_time.isoformat(),
+            )
+            self.store.save_dispatch(skipped)
+            self._emit_bridge_event(skipped)
+            return skipped
+
+        raw_score = event.payload.get("risk_score")
+        score = float(raw_score) if isinstance(raw_score, (int, float)) else 0.85
+        signal = DomainRiskSignal(
+            entity_id=entity_id,
+            domain=RiskDomain.TRANSACTION,
+            score=score,
+            tenant_id=event.tenant_id,
+            reason_codes=[event.event_type.value],
+            metadata={"source_event_id": event.event_id},
+        )
+        self.orchestrator.ingest_signal(signal)
+        rec = BridgeDispatchRecord(
+            entity_id=entity_id,
+            tenant_id=event.tenant_id,
+            action=action,
+            status=BridgeDispatchStatus.EXECUTED,
+            source_event_id=event.event_id,
+            source_event_type=event.event_type.value,
+            orchestrator_signal_id=signal.signal_id,
+            detail=f"Forwarded wallet risk signal ({score:.2f}) to UnifiedRiskOrchestrator",
+            dispatched_at=reference_time.isoformat(),
+        )
+        self.store.save_dispatch(rec)
+        self._emit_bridge_event(rec)
+        return rec
+
+    def handle_event(self, event: FraudDomainEvent) -> BridgeDispatchRecord | None:
+        """Process an EventBus domain event without recursive re-entry."""
+        with self._lock:
+            if self._reentrancy_depth > 0:
+                return None
+            now = datetime.now(UTC)
+            if event.event_type in {
+                EventType.ENTITY_ESCALATION_TRIGGERED,
+                EventType.CROSS_SIGNAL_PATTERN_DETECTED,
+            }:
+                entity_id = str(event.payload.get("entity_id", "")).strip()
+                if not entity_id:
+                    return None
+                score = float(event.payload.get("composite_score", 0.85))
+                level_raw = str(event.payload.get("risk_level", "high")).lower()
+                risk_level = UnifiedRiskLevel(level_raw)
+                patterns = [
+                    CrossSignalPattern(str(p).lower()) for p in event.payload.get("patterns", [])
+                ]
+                return self.trigger_cascade(
+                    entity_id=entity_id,
+                    composite_score=score,
+                    risk_level=risk_level,
+                    patterns=patterns,
+                    tenant_id=event.tenant_id,
+                    source_event_id=event.event_id,
+                    source_event_type=event.event_type.value,
+                    reference_time=now,
+                )
+            if event.event_type in {
+                EventType.WALLET_PROVISIONING_DECLINED,
+                EventType.WALLET_TOKEN_SUSPENDED,
+            }:
+                return self._forward_wallet_signal(event, reference_time=now)
+            return None
