@@ -78,6 +78,9 @@ from fraud_detection.audit import (
 )
 from fraud_detection.automation_bridge import (
     BridgeDispatchRecord,
+    BridgeDispatchStatus,
+    BridgePolicy,
+    BridgeRuleAction,
     CrossEngineAutomationBridge,
 )
 from fraud_detection.cases import (
@@ -9572,6 +9575,166 @@ def create_app(
                 "status": "uninitialized",
             }
         return {**engine.store.summary(), "status": "operational"}
+
+    def _record_automation_metrics(
+        request: Request,
+        record: BridgeDispatchRecord,
+    ) -> None:
+        disp_c = getattr(request.app.state, "automation_bridge_dispatches_counter", None)
+        if disp_c is not None:
+            disp_c.labels(
+                tenant_id=record.tenant_id,
+                action=BridgeRuleAction(record.action).value,
+                status=BridgeDispatchStatus(record.status).value,
+            ).inc()
+        if record.suspended_token_ids:
+            tok_c = getattr(request.app.state, "automation_bridge_tokens_suspended_counter", None)
+            if tok_c is not None:
+                tok_c.labels(tenant_id=record.tenant_id).inc(len(record.suspended_token_ids))
+        if record.soar_execution_id:
+            soar_c = getattr(request.app.state, "automation_bridge_soar_triggers_counter", None)
+            if soar_c is not None:
+                soar_c.labels(tenant_id=record.tenant_id).inc()
+
+    @application.get(
+        "/v1/automation/status",
+        response_model=dict[str, Any],
+        tags=["automation_bridge"],
+    )
+    async def automation_status_endpoint(request: Request) -> dict[str, Any]:
+        """Inspect CrossEngineAutomationBridge attachment state, policy, and summary."""
+        bridge: CrossEngineAutomationBridge | None = getattr(
+            request.app.state, "automation_bridge", None
+        )
+        if bridge is None:
+            return {
+                "status": "uninitialized",
+                "attached": False,
+                "dispatch_count": 0,
+            }
+        return {
+            "status": "operational",
+            "attached": bridge.is_attached,
+            "policy": bridge.policy.to_dict(),
+            **bridge.store.summary(),
+        }
+
+    @application.post(
+        "/v1/automation/policy",
+        response_model=dict[str, Any],
+        responses={500: {"description": "Automation bridge not initialized."}},
+        tags=["automation_bridge"],
+    )
+    async def automation_update_policy_endpoint(
+        payload: AutomationPolicyRequest,
+        request: Request,
+    ) -> dict[str, Any] | JSONResponse:
+        """Update CrossEngineAutomationBridge toggles, risk floor, and cooldown."""
+        bridge: CrossEngineAutomationBridge | None = getattr(
+            request.app.state, "automation_bridge", None
+        )
+        if bridge is None:
+            return JSONResponse(
+                status_code=500,
+                content={"detail": "Automation bridge not initialized."},
+            )
+        updated = bridge.update_policy(BridgePolicy.from_dict(payload.model_dump()))
+        return {"status": "updated", "policy": updated.to_dict()}
+
+    @application.post(
+        "/v1/automation/trigger",
+        response_model=AutomationDispatchResponse,
+        responses={500: {"description": "Automation bridge not initialized."}},
+        tags=["automation_bridge"],
+    )
+    async def automation_trigger_endpoint(
+        payload: AutomationTriggerRequest,
+        request: Request,
+    ) -> AutomationDispatchResponse | JSONResponse:
+        """Manually trigger a cross-engine SOAR + Wallet containment cascade."""
+        bridge: CrossEngineAutomationBridge | None = getattr(
+            request.app.state, "automation_bridge", None
+        )
+        if bridge is None:
+            return JSONResponse(
+                status_code=500,
+                content={"detail": "Automation bridge not initialized."},
+            )
+        record = bridge.trigger_cascade(
+            entity_id=payload.entity_id,
+            composite_score=payload.composite_score,
+            risk_level=payload.risk_level,
+            patterns=list(payload.patterns),
+            tenant_id=payload.tenant_id,
+            source_event_type="api.manual_trigger",
+        )
+        _record_automation_metrics(request, record)
+        return _automation_dispatch_to_response(record)
+
+    @application.get(
+        "/v1/automation/dispatches/{dispatch_id}",
+        response_model=AutomationDispatchResponse,
+        responses={
+            404: {"description": "Dispatch not found."},
+            500: {"description": "Automation bridge not initialized."},
+        },
+        tags=["automation_bridge"],
+    )
+    async def automation_get_dispatch_endpoint(
+        dispatch_id: str,
+        request: Request,
+    ) -> AutomationDispatchResponse | JSONResponse:
+        """Retrieve a specific automated bridge dispatch audit record."""
+        bridge: CrossEngineAutomationBridge | None = getattr(
+            request.app.state, "automation_bridge", None
+        )
+        if bridge is None:
+            return JSONResponse(
+                status_code=500,
+                content={"detail": "Automation bridge not initialized."},
+            )
+        rec = bridge.store.get_dispatch(dispatch_id)
+        if rec is None:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": f"Automation dispatch '{dispatch_id}' not found."},
+            )
+        return _automation_dispatch_to_response(rec)
+
+    @application.get(
+        "/v1/automation/dispatches",
+        response_model=AutomationDispatchListResponse,
+        responses={500: {"description": "Automation bridge not initialized."}},
+        tags=["automation_bridge"],
+    )
+    async def automation_list_dispatches_endpoint(
+        request: Request,
+        entity_id: str | None = None,
+        tenant_id: str | None = None,
+        action: BridgeRuleAction | None = None,
+        status: BridgeDispatchStatus | None = None,
+        limit: int = Query(default=100, ge=1, le=1000),
+    ) -> AutomationDispatchListResponse | JSONResponse:
+        """List automated cross-engine bridge dispatches with optional filters."""
+        bridge: CrossEngineAutomationBridge | None = getattr(
+            request.app.state, "automation_bridge", None
+        )
+        if bridge is None:
+            return JSONResponse(
+                status_code=500,
+                content={"detail": "Automation bridge not initialized."},
+            )
+        items = bridge.store.list_dispatches(
+            entity_id=entity_id,
+            tenant_id=tenant_id,
+            action=action,
+            status=status,
+            limit=limit,
+        )
+        return AutomationDispatchListResponse(
+            total_count=len(items),
+            dispatches=[_automation_dispatch_to_response(item) for item in items],
+        )
 
     @application.get(
         "/v1/routing/status",
