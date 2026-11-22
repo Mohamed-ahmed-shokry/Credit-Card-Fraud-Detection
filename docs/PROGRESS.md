@@ -9,7 +9,7 @@
 - [x] Task 1: Define Phase 56 roadmap & initialize `docs/PROGRESS.md`.
 - [x] Task 2: Create `src/fraud_detection/automation_bridge.py` domain enums and data models + unit tests in `tests/test_automation_bridge.py`.
 - [x] Task 3: Implement `AutomationBridgeStore` + unit tests.
-- [ ] Task 4: Register `AUTOMATION_BRIDGE_EXECUTED` / `AUTOMATION_BRIDGE_SKIPPED` events in `src/fraud_detection/events.py` and implement `CrossEngineAutomationBridge` + unit tests (100% branch coverage).
+- [x] Task 4: Register `AUTOMATION_BRIDGE_EXECUTED` / `AUTOMATION_BRIDGE_SKIPPED` events in `src/fraud_detection/events.py` and implement `CrossEngineAutomationBridge` + unit tests (100% branch coverage).
 - [ ] Task 5: Wire `CrossEngineAutomationBridge` into `create_app`, add `/v1/automation/*` REST endpoints and Prometheus metrics in `src/fraud_detection/api.py` + tests in `tests/test_api.py`.
 - [ ] Task 6: Add `automation-cascade`, `automation-dispatches`, and `automation-summary` CLI commands in `src/fraud_detection/cli.py` + tests in `tests/test_cli.py`.
 - [ ] Task 7: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate with 100% Green CI.
@@ -19,8 +19,8 @@
 |-----------|--------|----------|
 | AC-1 (Domain Models & Taxonomies) | PASSED | `BridgeRuleAction`, `BridgeDispatchStatus`, `BridgePolicy`, `BridgeDispatchRecord` verified in `tests/test_automation_bridge.py` |
 | AC-2 (Audit Store & Cooldown Ledger) | PASSED | `AutomationBridgeStore` verified on capacity eviction, per-entity cooldowns, filtering, summary metrics, and JSON persistence in `tests/test_automation_bridge.py` |
-| AC-3 (Event-Driven Cascade & Loop Prevention) | PENDING | |
-| AC-4 (EventBus Streaming) | PENDING | |
+| AC-3 (Event-Driven Cascade & Loop Prevention) | PASSED | `CrossEngineAutomationBridge` achieved 100.00% branch coverage (294 stmts, 74 branches) on live Orchestrator ↔ SOAR ↔ Wallet EventBus cascades, cooldowns, pause/resume, and re-entrancy guards in `tests/test_automation_bridge.py` |
+| AC-4 (EventBus Streaming) | PASSED | `AUTOMATION_BRIDGE_EXECUTED` and `AUTOMATION_BRIDGE_SKIPPED` registered in `events.py` and verified in `tests/test_automation_bridge.py` |
 | AC-5 (REST API & Metrics) | PENDING | |
 | AC-6 (CLI Workflows) | PENDING | |
 | AC-7 (All CI-Parity Checks & Remote CI Green) | PENDING | |
