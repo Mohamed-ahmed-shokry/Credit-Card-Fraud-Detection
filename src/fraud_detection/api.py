@@ -76,6 +76,7 @@ from fraud_detection.audit import (
     build_scoring_audit_event,
     build_shadow_scoring_audit_event,
 )
+from fraud_detection.automation_bridge import BridgeDispatchRecord
 from fraud_detection.cases import (
     CaseAssignmentError,
     CaseDisposition,
@@ -2753,6 +2754,56 @@ def _wallet_token_to_response(record: WalletTokenRecord) -> WalletTokenResponse:
 
 def _wallet_assessment_to_response(record: WalletRiskAssessment) -> WalletAssessmentResponse:
     return WalletAssessmentResponse(**record.to_dict())
+
+
+class AutomationPolicyRequest(BaseModel):
+    """Request payload for updating CrossEngineAutomationBridge policy settings."""
+
+    enabled: bool = True
+    auto_trigger_soar: bool = True
+    auto_suspend_wallet_tokens: bool = True
+    auto_forward_wallet_signals: bool = True
+    min_soar_risk_level: UnifiedRiskLevel = UnifiedRiskLevel.HIGH
+    cooldown_seconds: int = Field(default=300, ge=0)
+
+
+class AutomationTriggerRequest(BaseModel):
+    """Request payload for manually triggering a cross-engine containment cascade."""
+
+    entity_id: str = Field(..., min_length=1)
+    composite_score: float = Field(..., ge=0.0, le=1.0)
+    risk_level: UnifiedRiskLevel = UnifiedRiskLevel.HIGH
+    patterns: list[CrossSignalPattern] = Field(default_factory=list)
+    tenant_id: str = "default"
+
+
+class AutomationDispatchResponse(BaseModel):
+    """Response payload for an automated cross-engine bridge dispatch audit record."""
+
+    dispatch_id: str
+    entity_id: str
+    tenant_id: str
+    action: str
+    status: str
+    source_event_id: str | None = None
+    source_event_type: str
+    soar_execution_id: str | None = None
+    suspended_token_ids: list[str]
+    orchestrator_signal_id: str | None = None
+    detail: str
+    dispatched_at: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class AutomationDispatchListResponse(BaseModel):
+    """Response payload for listing automated cross-engine dispatch records."""
+
+    total_count: int
+    dispatches: list[AutomationDispatchResponse]
+
+
+def _automation_dispatch_to_response(record: BridgeDispatchRecord) -> AutomationDispatchResponse:
+    return AutomationDispatchResponse(**record.to_dict())
 
 
 def create_app(
