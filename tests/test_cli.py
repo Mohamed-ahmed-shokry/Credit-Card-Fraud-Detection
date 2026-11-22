@@ -11298,3 +11298,87 @@ def test_wallet_cli_error_branches(tmp_path: Path) -> None:
     nondict = tmp_path / "nondict_wallet.json"
     nondict.write_text("[]", encoding="utf-8")
     assert runner.invoke(app, ["wallet-summary", "-s", str(nondict)]).exit_code == 2
+
+
+def test_automation_bridge_cli_workflows(tmp_path: Path) -> None:
+    """Verify automation-cascade, automation-dispatches, and automation-summary CLI."""
+    store_file = tmp_path / "automation_store.json"
+
+    cas_tbl = runner.invoke(
+        app,
+        [
+            "automation-cascade",
+            "-e",
+            "ent-auto-1",
+            "--score",
+            "0.91",
+            "-r",
+            "critical",
+            "-p",
+            "ato_to_mule_exfiltration",
+            "-s",
+            str(store_file),
+            "-f",
+            "table",
+        ],
+    )
+    assert cas_tbl.exit_code == 0, cas_tbl.stdout
+    assert "full_containment_cascade" in cas_tbl.stdout
+
+    cas_json = runner.invoke(
+        app,
+        [
+            "automation-cascade",
+            "-e",
+            "ent-auto-2",
+            "--score",
+            "0.80",
+            "-r",
+            "high",
+            "-s",
+            str(store_file),
+            "-f",
+            "json",
+        ],
+    )
+    assert cas_json.exit_code == 0, cas_json.stdout
+    assert json.loads(cas_json.stdout)["status"] == "executed"
+
+    disp_tbl = runner.invoke(
+        app,
+        ["automation-dispatches", "-s", str(store_file), "-f", "table"],
+    )
+    assert disp_tbl.exit_code == 0
+    assert "Automation Dispatches (2):" in disp_tbl.stdout
+
+    disp_json = runner.invoke(
+        app,
+        ["automation-dispatches", "-e", "ent-auto-1", "-s", str(store_file), "-f", "json"],
+    )
+    assert disp_json.exit_code == 0
+    assert len(json.loads(disp_json.stdout)) == 1
+
+    sum_tbl = runner.invoke(
+        app,
+        ["automation-summary", "-s", str(store_file), "-f", "table"],
+    )
+    assert sum_tbl.exit_code == 0
+    assert "Cross-Engine Automation Bridge Summary" in sum_tbl.stdout
+
+    sum_json = runner.invoke(
+        app,
+        ["automation-summary", "-s", str(store_file), "-f", "json"],
+    )
+    assert sum_json.exit_code == 0
+    assert json.loads(sum_json.stdout)["dispatch_count"] == 2
+
+
+def test_automation_bridge_cli_error_branches(tmp_path: Path) -> None:
+    """Validate error handling in automation-* CLI commands."""
+    bad_store = tmp_path / "bad_auto.json"
+    bad_store.write_text("{invalid", encoding="utf-8")
+    assert runner.invoke(app, ["automation-summary", "-s", str(bad_store)]).exit_code == 2
+
+    nondict = tmp_path / "nondict_auto.json"
+    nondict.write_text("[]", encoding="utf-8")
+    assert runner.invoke(app, ["automation-summary", "-s", str(nondict)]).exit_code == 2
