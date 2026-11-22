@@ -2298,6 +2298,30 @@ FastAPI Digital Wallet & Network Token REST endpoints:
 - `GET /v1/wallet/metrics`: Summary metrics of network tokens and provisioning paths.
 - Prometheus metrics: `fraud_wallet_provisioning_evaluations_total`, `fraud_wallet_anomalies_total`, `fraud_wallet_token_suspensions_total`.
 
+### Event-Driven Cross-Engine Automation Bridge (Phase 56)
+
+```bash
+# Trigger a cross-engine SOAR + Wallet containment cascade for a high-risk entity
+fraud-detect automation-cascade \
+  --entity-id card_100 \
+  --score 0.92 \
+  --risk-level critical \
+  --pattern ato_to_mule_exfiltration \
+  --format json
+
+# Inspect recorded cross-engine dispatches or view bridge summary
+fraud-detect automation-dispatches --entity-id card_100 --format table
+fraud-detect automation-summary --format table
+```
+
+FastAPI Cross-Engine Automation Bridge REST endpoints:
+- `GET /v1/automation/status`: Inspect bridge attachment state, active `BridgePolicy`, and summary counts.
+- `POST /v1/automation/policy`: Dynamically toggle automation rules (`enabled`, `auto_trigger_soar`, `auto_suspend_wallet_tokens`, `auto_forward_wallet_signals`) and cooldown windows.
+- `POST /v1/automation/trigger`: Manually trigger a cooldown-guarded SOAR + Wallet containment cascade.
+- `GET /v1/automation/dispatches`: List automated cross-engine dispatch audit records with optional entity/tenant/action/status filters.
+- `GET /v1/automation/dispatches/{dispatch_id}`: Fetch a specific bridge dispatch audit record.
+- Prometheus metrics: `fraud_automation_bridge_dispatches_total`, `fraud_automation_bridge_tokens_suspended_total`, `fraud_automation_bridge_soar_triggers_total`.
+
 ## Reference label-delay analysis
 
 
