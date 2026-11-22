@@ -3095,6 +3095,70 @@ Provide deterministic digital wallet provisioning risk scoring, VTS/MDES path ro
 - `ae4e0b0`..`64e6ba0`: Implemented `wallet_fraud.py` (`WalletProvider`, `ProvisioningPath`, `WalletRiskLevel`, `TokenStatus`, `WalletAnomalyType`, `WalletProvisioningRequest`, `WalletTokenRecord`, `WalletRiskAssessment`, `ProvisioningVelocityAnalyzer`, `IdentityTelemetryAnalyzer`, `TokenLifecycleAnalyzer`, `WalletTokenStore`, `WalletFraudEngine`), registered `WALLET_PROVISIONING_EVALUATED` / `WALLET_TOKEN_ACTIVATED` / `WALLET_TOKEN_SUSPENDED` / `WALLET_PROVISIONING_DECLINED` events in `events.py`, added `/v1/wallet/*` endpoints and Prometheus metrics in `api.py`, added `wallet-*` CLI commands in `cli.py`, achieved 100% branch coverage on `wallet_fraud.py` (`1249 passed`, `97.13%` total branch coverage), passed remote GitHub Actions CI (`44624203720`), and documented architecture and usage.
 
 
+## Phase 56 — Event-Driven Cross-Engine Automation Bridge (Orchestrator ↔ SOAR ↔ Wallet Cascade) (Done)
+
+Phase 56 implements an in-process, zero-external-dependency Event-Driven Cross-Engine Automation Bridge (`automation_bridge.py`) that connects `UnifiedRiskOrchestrator` (Phase 53), `SoarEngine` (Phase 54), and `WalletFraudEngine` (Phase 55) over `EventBus`. High-severity entity escalations and compound patterns automatically trigger reversible SOAR containment playbooks and suspend active digital wallet tokens, while declined wallet provisioning and post-provisioning bursts feed normalized risk signals back into `UnifiedRiskOrchestrator`—all protected by per-entity cooldown guards and zero-recursion guarantees.
+
+### Objective
+
+Close the autonomous detection-to-containment loop across specialized fraud engines via deterministic `EventBus` subscriptions, cooldown-protected cascade execution, auditable dispatch persistence, `/v1/automation/*` REST endpoints, Prometheus metrics, and `automation-*` CLI workflows with zero external services.
+
+### Scope
+
+1. **Domain Models & Taxonomies (`automation_bridge.py`)**:
+   - `BridgeRuleAction`: `TRIGGER_SOAR_PLAYBOOK`, `SUSPEND_ENTITY_WALLET_TOKENS`, `INGEST_ORCHESTRATOR_SIGNAL`, `FULL_CONTAINMENT_CASCADE`.
+   - `BridgeDispatchStatus`: `EXECUTED`, `SKIPPED_COOLDOWN`, `SKIPPED_DISABLED`, `FAILED`.
+   - `BridgePolicy` and `BridgeDispatchRecord` with lossless dict/JSON serialization.
+2. **Audit Store & Cooldown Ledger (`AutomationBridgeStore`)**:
+   - Thread-safe bounded ledger of automated cross-engine dispatches with per-entity/action cooldown tracking, capacity eviction, filtering, summary metrics, and JSON persistence.
+3. **Event-Driven Bridge Engine (`CrossEngineAutomationBridge`)**:
+   - Idempotent `attach()` / `detach()` lifecycle on `EventBus`, plus `pause()` / `resume()` and `update_policy()`.
+   - Reacts to `ENTITY_ESCALATION_TRIGGERED` / `CROSS_SIGNAL_PATTERN_DETECTED` by executing matching SOAR playbooks and suspending active wallet tokens for the target entity/card.
+   - Reacts to `WALLET_PROVISIONING_DECLINED` / `WALLET_TOKEN_SUSPENDED` by ingesting normalized `DomainRiskSignal` records into `UnifiedRiskOrchestrator`.
+   - Supports manual operator cascade via `trigger_cascade(...)` and emits `AUTOMATION_BRIDGE_EXECUTED` / `AUTOMATION_BRIDGE_SKIPPED` events with strict loop prevention.
+4. **REST API (`/v1/automation/*`) & Prometheus Metrics (`api.py`)**:
+   - `GET /v1/automation/status`, `POST /v1/automation/policy`, `POST /v1/automation/trigger`, `GET /v1/automation/dispatches`, `GET /v1/automation/dispatches/{dispatch_id}`.
+   - Prometheus counters: `fraud_automation_bridge_dispatches_total`, `fraud_automation_bridge_tokens_suspended_total`, `fraud_automation_bridge_soar_triggers_total`.
+5. **CLI Workflows (`cli.py`)**:
+   - `automation-cascade`, `automation-dispatches`, `automation-summary` with table/JSON formatting and store persistence.
+6. **Documentation**:
+   - `ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`.
+
+### Acceptance Criteria
+
+1. **AC-1 (Domain Models & Taxonomies)**: `BridgeRuleAction`, `BridgeDispatchStatus`, `BridgePolicy`, and `BridgeDispatchRecord` serialize/deserialize cleanly with unit tests.
+2. **AC-2 (Audit Store & Cooldown Ledger)**: `AutomationBridgeStore` enforces capacity eviction, cooldown windows, filtering, summary metrics, and JSON persistence.
+3. **AC-3 (Event-Driven Cascade & Loop Prevention)**: `CrossEngineAutomationBridge` bridges `UnifiedRiskOrchestrator`, `SoarEngine`, and `WalletFraudEngine` via `EventBus` without infinite recursion, supporting `attach`/`detach`, `pause`/`resume`, and manual `trigger_cascade`.
+4. **AC-4 (EventBus Streaming)**: Bridge dispatches emit `AUTOMATION_BRIDGE_EXECUTED` and `AUTOMATION_BRIDGE_SKIPPED` events registered in `events.py`.
+5. **AC-5 (REST API & Metrics)**: `/v1/automation/*` endpoints and Prometheus metrics work end to end and are verified in `tests/test_api.py`.
+6. **AC-6 (CLI Workflows)**: `automation-cascade`, `automation-dispatches`, and `automation-summary` work end to end and are verified in `tests/test_cli.py` and real CLI execution.
+7. **AC-7 (All CI-Parity Checks & Remote CI Green)**: All local CI-parity checks (`ruff format --check src tests`, `ruff check src tests`, `mypy src`, `pytest --cov=fraud_detection --cov-report=term-missing`, `python -m build`, `twine check dist/*`) and remote CI workflow runs pass 100%.
+
+### Validation & CI Plan
+
+- Focused unit tests: `python -m pytest tests/test_automation_bridge.py -v`
+- API & CLI & Event integration tests: `python -m pytest tests/test_api.py tests/test_cli.py -k "automation"`
+- Full local CI parity: `ruff format --check src tests`, `ruff check src tests`, `mypy src`, `pytest --cov=fraud_detection --cov-report=term-missing`, `python -m build`, `twine check dist/*`
+- Remote CI: GitHub Actions `CI` workflow on `phase/cross-engine-automation-bridge` PR.
+
+### Exclusions
+
+- External Kafka/RabbitMQ distributed event brokers and multi-region consensus locks (out of scope for in-process zero-dependency reference bridge).
+
+### Micro-Task Breakdown
+
+- Task 1: Define Phase 56 roadmap & initialize `docs/PROGRESS.md`.
+- Task 2: Create `src/fraud_detection/automation_bridge.py` domain enums and data models + unit tests in `tests/test_automation_bridge.py`.
+- Task 3: Implement `AutomationBridgeStore` + unit tests.
+- Task 4: Register `AUTOMATION_BRIDGE_EXECUTED` / `AUTOMATION_BRIDGE_SKIPPED` events in `src/fraud_detection/events.py` and implement `CrossEngineAutomationBridge` + unit tests (100% branch coverage).
+- Task 5: Wire `CrossEngineAutomationBridge` into `create_app`, add `/v1/automation/*` REST endpoints and Prometheus metrics in `src/fraud_detection/api.py` + tests in `tests/test_api.py`.
+- Task 6: Add `automation-cascade`, `automation-dispatches`, and `automation-summary` CLI commands in `src/fraud_detection/cli.py` + tests in `tests/test_cli.py`.
+- Task 7: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate with 100% Green CI.
+
+### Micro-Commits
+- `459e8a0`..`ce44d91`: Implemented `automation_bridge.py` (`BridgeRuleAction`, `BridgeDispatchStatus`, `BridgePolicy`, `BridgeDispatchRecord`, `AutomationBridgeStore`, `CrossEngineAutomationBridge`), registered `AUTOMATION_BRIDGE_EXECUTED` / `AUTOMATION_BRIDGE_SKIPPED` events in `events.py`, wired `CrossEngineAutomationBridge` into `create_app` with `/v1/automation/*` REST endpoints and Prometheus metrics in `api.py`, added `automation-*` CLI commands in `cli.py`, achieved 100% branch coverage on `automation_bridge.py` (`1257 passed`, `97.17%` total branch coverage), passed remote GitHub Actions CI (`45031257239`), and documented architecture and usage.
+
+
 ## Contributing to the roadmap
 
 Open an issue or a pull request that references the relevant phase item.

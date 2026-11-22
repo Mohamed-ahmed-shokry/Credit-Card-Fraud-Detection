@@ -7512,3 +7512,104 @@ def test_wallet_api_error_branches(api_context: tuple[Path, Any, Path]) -> None:
         metrics_uninit = client.get("/v1/wallet/metrics")
         assert metrics_uninit.status_code == 200
         assert metrics_uninit.json()["status"] == "uninitialized"
+
+
+def test_automation_bridge_api_lifecycle_and_metrics(api_context: tuple[Path, Any, Path]) -> None:
+    """Verify /v1/automation/* status, policy update, manual cascade, live EventBus, and metrics."""
+    _, model, _ = api_context
+    app = create_app(model=model)
+
+    with TestClient(app) as client:
+        st = client.get("/v1/automation/status")
+        assert st.status_code == 200
+        assert st.json()["status"] == "operational"
+        assert st.json()["attached"] is True
+
+        # 1. Provision an active wallet token for card-auto-1
+        prov = client.post(
+            "/v1/wallet/provision",
+            json={
+                "card_hash": "card-auto-1",
+                "device_id": "dev-auto-1",
+                "wallet_account_id": "wal-auto-1",
+            },
+        )
+        assert prov.status_code == 200
+        tid = prov.json()["token_id"]
+
+        # 2. Trigger cross-engine cascade -> runs SOAR playbook + auto-suspends card-auto-1 token
+        trig = client.post(
+            "/v1/automation/trigger",
+            json={
+                "entity_id": "card-auto-1",
+                "composite_score": 0.91,
+                "risk_level": "critical",
+                "patterns": ["ato_to_mule_exfiltration"],
+            },
+        )
+        assert trig.status_code == 200
+        data = trig.json()
+        assert data["status"] == "executed"
+        assert data["soar_execution_id"] is not None
+        assert tid in data["suspended_token_ids"]
+        did = data["dispatch_id"]
+
+        # Verify token was actually suspended in WalletFraudEngine
+        tok = client.get(f"/v1/wallet/tokens/{tid}")
+        assert tok.status_code == 200
+        assert tok.json()["status"] == "suspended"
+
+        # 3. Get & list dispatches
+        get_d = client.get(f"/v1/automation/dispatches/{did}")
+        assert get_d.status_code == 200
+        assert get_d.json()["dispatch_id"] == did
+
+        list_d = client.get("/v1/automation/dispatches?entity_id=card-auto-1")
+        assert list_d.status_code == 200
+        assert list_d.json()["total_count"] == 1
+
+        # 4. Update policy (pause bridge) -> next trigger is skipped_disabled
+        pol = client.post(
+            "/v1/automation/policy",
+            json={
+                "enabled": False,
+                "auto_trigger_soar": True,
+                "auto_suspend_wallet_tokens": True,
+                "auto_forward_wallet_signals": True,
+                "min_soar_risk_level": "high",
+                "cooldown_seconds": 60,
+            },
+        )
+        assert pol.status_code == 200
+        assert pol.json()["policy"]["enabled"] is False
+
+        # 5. Prometheus metrics
+        prom = client.get("/metrics")
+        assert prom.status_code == 200
+        assert "fraud_automation_bridge_dispatches_total" in prom.text
+        assert "fraud_automation_bridge_tokens_suspended_total" in prom.text
+        assert "fraud_automation_bridge_soar_triggers_total" in prom.text
+
+
+def test_automation_bridge_api_error_branches(api_context: tuple[Path, Any, Path]) -> None:
+    """Validate 404 and 500 error branches on /v1/automation/* endpoints."""
+    _, model, _ = api_context
+    app = create_app(model=model)
+
+    with TestClient(app) as client:
+        assert client.get("/v1/automation/dispatches/missing").status_code == 404
+
+        app.state.automation_bridge = None
+        assert client.post("/v1/automation/policy", json={"enabled": True}).status_code == 500
+        assert (
+            client.post(
+                "/v1/automation/trigger",
+                json={"entity_id": "ent-x", "composite_score": 0.9},
+            ).status_code
+            == 500
+        )
+        assert client.get("/v1/automation/dispatches/ab-1").status_code == 500
+        assert client.get("/v1/automation/dispatches").status_code == 500
+        st_uninit = client.get("/v1/automation/status")
+        assert st_uninit.status_code == 200
+        assert st_uninit.json()["status"] == "uninitialized"
