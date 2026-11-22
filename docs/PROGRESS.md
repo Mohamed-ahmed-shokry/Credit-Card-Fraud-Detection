@@ -7,7 +7,7 @@
 
 ## Task Status
 - [x] Task 1: Define Phase 56 roadmap & initialize `docs/PROGRESS.md`.
-- [ ] Task 2: Create `src/fraud_detection/automation_bridge.py` domain enums and data models + unit tests in `tests/test_automation_bridge.py`.
+- [x] Task 2: Create `src/fraud_detection/automation_bridge.py` domain enums and data models + unit tests in `tests/test_automation_bridge.py`.
 - [ ] Task 3: Implement `AutomationBridgeStore` + unit tests.
 - [ ] Task 4: Register `AUTOMATION_BRIDGE_EXECUTED` / `AUTOMATION_BRIDGE_SKIPPED` events in `src/fraud_detection/events.py` and implement `CrossEngineAutomationBridge` + unit tests (100% branch coverage).
 - [ ] Task 5: Wire `CrossEngineAutomationBridge` into `create_app`, add `/v1/automation/*` REST endpoints and Prometheus metrics in `src/fraud_detection/api.py` + tests in `tests/test_api.py`.
@@ -17,7 +17,7 @@
 ## Acceptance Criteria Status
 | Criterion | Status | Evidence |
 |-----------|--------|----------|
-| AC-1 (Domain Models & Taxonomies) | PENDING | |
+| AC-1 (Domain Models & Taxonomies) | PASSED | `BridgeRuleAction`, `BridgeDispatchStatus`, `BridgePolicy`, `BridgeDispatchRecord` verified in `tests/test_automation_bridge.py` |
 | AC-2 (Audit Store & Cooldown Ledger) | PENDING | |
 | AC-3 (Event-Driven Cascade & Loop Prevention) | PENDING | |
 | AC-4 (EventBus Streaming) | PENDING | |
