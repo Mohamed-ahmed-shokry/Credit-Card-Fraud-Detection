@@ -992,6 +992,25 @@ flowchart TD
 - **Store, EventBus, API & CLI**: `WalletTokenStore` maintains thread-safe token and assessment ledgers with capacity eviction and JSON persistence; `WalletFraudEngine` emits `WALLET_PROVISIONING_EVALUATED`, `WALLET_TOKEN_ACTIVATED`, `WALLET_TOKEN_SUSPENDED`, and `WALLET_PROVISIONING_DECLINED`; FastAPI exposes `/v1/wallet/*` endpoints and Prometheus counters (`fraud_wallet_provisioning_evaluations_total`, `fraud_wallet_anomalies_total`, `fraud_wallet_token_suspensions_total`); Typer CLI exposes `wallet-provision`, `wallet-token-action`, `wallet-inspect`, and `wallet-summary`.
 
 
+## Phase 56 — Event-Driven Cross-Engine Automation Bridge (Orchestrator ↔ SOAR ↔ Wallet Cascade)
+
+Phase 56 delivers an in-process, zero-external-dependency Event-Driven Cross-Engine Automation Bridge (`automation_bridge.py`) that connects `UnifiedRiskOrchestrator` (Phase 53), `SoarEngine` (Phase 54), and `WalletFraudEngine` (Phase 55) over `EventBus` with per-entity cooldown protection and strict re-entrancy guards.
+
+```mermaid
+flowchart LR
+    Orch["UnifiedRiskOrchestrator\n(Phase 53)"] -->|"ENTITY_ESCALATION_TRIGGERED\nCROSS_SIGNAL_PATTERN_DETECTED"| Bus["EventBus"]
+    Wallet["WalletFraudEngine\n(Phase 55)"] -->|"WALLET_PROVISIONING_DECLINED\nWALLET_TOKEN_SUSPENDED"| Bus
+    Bus --> Bridge["CrossEngineAutomationBridge\n(Cooldowns + Zero-Recursion Guard)"]
+    Bridge -->|"Auto-Trigger Playbook"| Soar["SoarEngine\n(Phase 54)"]
+    Bridge -->|"Auto-Suspend Active Tokens"| Wallet
+    Bridge -->|"Ingest DomainRiskSignal"| Orch
+    Bridge --> Store["AutomationBridgeStore\n(/v1/automation/* & CLI)"]
+```
+
+- **Autonomous Containment Cascades (`CrossEngineAutomationBridge`)**: Subscribes idempotently to `EventBus` (`attach()` / `detach()`), triggering matching SOAR containment playbooks and auto-suspending active wallet tokens on high-severity orchestrator escalations, while feeding declined/suspended wallet events back into `UnifiedRiskOrchestrator`.
+- **Cooldowns, Loop Prevention & Observability (`AutomationBridgeStore`)**: Enforces per-entity/action cooldown windows, prevents recursive event loops via a re-entrancy depth guard, emits `AUTOMATION_BRIDGE_EXECUTED` / `AUTOMATION_BRIDGE_SKIPPED`, exposes `/v1/automation/*` REST endpoints and Prometheus counters (`fraud_automation_bridge_dispatches_total`, `fraud_automation_bridge_tokens_suspended_total`, `fraud_automation_bridge_soar_triggers_total`), and provides `automation-cascade`, `automation-dispatches`, and `automation-summary` CLI commands.
+
+
 ## Extension guidance
 
 
