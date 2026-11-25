@@ -181,3 +181,98 @@ class AppPaymentContext:
             initiated_at=str(payload.get("initiated_at", _utc_now_iso())),
             metadata=dict(payload.get("metadata", {})),
         )
+
+
+@dataclass(slots=True)
+class ScamSignal:
+    """Individual social engineering or beneficiary risk signal."""
+
+    signal_type: ScamSignalType | str
+    severity: float
+    detail: str
+    evidence: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.signal_type, ScamSignalType):
+            self.signal_type = ScamSignalType(str(self.signal_type).lower())
+        self.severity = round(_clamp(self.severity), 4)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "signal_type": ScamSignalType(self.signal_type).value,
+            "severity": self.severity,
+            "detail": self.detail,
+            "evidence": dict(self.evidence),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> ScamSignal:
+        return cls(
+            signal_type=ScamSignalType(str(payload["signal_type"]).lower()),
+            severity=float(payload.get("severity", 0.0)),
+            detail=str(payload.get("detail", "")),
+            evidence=dict(payload.get("evidence", {})),
+        )
+
+
+@dataclass(slots=True)
+class ScamCoolingOffHold:
+    """Reversible cooling-off hold placed on a suspected APP scam payment."""
+
+    payment_id: str
+    sender_account_id: str
+    payee_account_id: str
+    amount: float
+    typology: ScamTypology | str
+    tenant_id: str = "default"
+    hold_id: str = field(default_factory=lambda: f"hold_{uuid4().hex[:12]}")
+    status: CoolingOffHoldStatus | str = CoolingOffHoldStatus.ACTIVE
+    hold_duration_minutes: int = 120
+    reason: str = ""
+    created_at: str = field(default_factory=_utc_now_iso)
+    resolved_at: str | None = None
+    resolution_note: str = ""
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.typology, ScamTypology):
+            self.typology = ScamTypology(str(self.typology).lower())
+        if not isinstance(self.status, CoolingOffHoldStatus):
+            self.status = CoolingOffHoldStatus(str(self.status).lower())
+        self.hold_duration_minutes = max(1, int(self.hold_duration_minutes))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "hold_id": self.hold_id,
+            "payment_id": self.payment_id,
+            "sender_account_id": self.sender_account_id,
+            "payee_account_id": self.payee_account_id,
+            "amount": self.amount,
+            "typology": ScamTypology(self.typology).value,
+            "tenant_id": self.tenant_id,
+            "status": CoolingOffHoldStatus(self.status).value,
+            "hold_duration_minutes": self.hold_duration_minutes,
+            "reason": self.reason,
+            "created_at": self.created_at,
+            "resolved_at": self.resolved_at,
+            "resolution_note": self.resolution_note,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> ScamCoolingOffHold:
+        return cls(
+            hold_id=str(payload.get("hold_id", f"hold_{uuid4().hex[:12]}")),
+            payment_id=str(payload["payment_id"]),
+            sender_account_id=str(payload["sender_account_id"]),
+            payee_account_id=str(payload["payee_account_id"]),
+            amount=float(payload["amount"]),
+            typology=ScamTypology(str(payload.get("typology", "unknown")).lower()),
+            tenant_id=str(payload.get("tenant_id", "default")),
+            status=CoolingOffHoldStatus(str(payload.get("status", "active")).lower()),
+            hold_duration_minutes=int(payload.get("hold_duration_minutes", 120)),
+            reason=str(payload.get("reason", "")),
+            created_at=str(payload.get("created_at", _utc_now_iso())),
+            resolved_at=(
+                str(payload["resolved_at"]) if payload.get("resolved_at") is not None else None
+            ),
+            resolution_note=str(payload.get("resolution_note", "")),
+        )
