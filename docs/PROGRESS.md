@@ -7,8 +7,8 @@
 
 ## Task Status
 - [x] Task 1: Define Phase 57 roadmap & initialize `docs/PROGRESS.md`.
-- [ ] Task 2: Create `src/fraud_detection/app_scam.py` domain enums and data models + unit tests in `tests/test_app_scam.py`.
-- [ ] Task 3: Implement `BehavioralCoachingAnalyzer`, `PayeeBeneficiaryAnalyzer`, and `TransferEscalationAnalyzer` + unit tests.
+- [x] Task 2: Create `src/fraud_detection/app_scam.py` domain enums and data models + unit tests in `tests/test_app_scam.py`.
+- [x] Task 3: Implement `BehavioralCoachingAnalyzer`, `PayeeBeneficiaryAnalyzer`, and `TransferEscalationAnalyzer` + unit tests.
 - [ ] Task 4: Implement `AppScamStore` and `AppScamDefenseEngine` (assessment, typology classification, cooling-off holds, `CaseManager` escalation) + unit tests.
 - [ ] Task 5: Register `APP_SCAM_ASSESSED`, `APP_SCAM_HOLD_PLACED`, `APP_SCAM_BLOCKED`, and `APP_SCAM_HOLD_RESOLVED` events in `src/fraud_detection/events.py` and wire `EventBus` into `AppScamDefenseEngine` + tests.
 - [ ] Task 6: Wire `AppScamDefenseEngine` into `create_app`, add `/v1/app-scam/*` REST endpoints and Prometheus metrics in `src/fraud_detection/api.py` + tests in `tests/test_api.py`.
@@ -18,8 +18,8 @@
 ## Acceptance Criteria Status
 | Criterion | Status | Evidence |
 |-----------|--------|----------|
-| AC-1 (Domain Models & Taxonomies) | PENDING | — |
-| AC-2 (Social Engineering & Payee Analyzers) | PENDING | — |
+| AC-1 (Domain Models & Taxonomies) | PASSED | `ScamTypology`, `ScamRiskLevel`, `ScamInterventionAction`, `ScamSignalType`, `CoolingOffHoldStatus`, `AppPaymentContext`, `ScamSignal`, `ScamCoolingOffHold`, `AppScamAssessment` verified in `tests/test_app_scam.py` |
+| AC-2 (Social Engineering & Payee Analyzers) | PASSED | `BehavioralCoachingAnalyzer`, `PayeeBeneficiaryAnalyzer`, `TransferEscalationAnalyzer` verified across all 8 signal types in `tests/test_app_scam.py` |
 | AC-3 (Store, Cooling-Off Holds & Defense Engine) | PENDING | — |
 | AC-4 (EventBus Streaming) | PENDING | — |
 | AC-5 (REST API & Metrics) | PENDING | — |
