@@ -1,0 +1,553 @@
+"""Unit tests for Phase 57 APP Scam & Social Engineering Defense Engine."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from fraud_detection.app_scam import (
+    AppPaymentContext,
+    AppScamAssessment,
+    AppScamDefenseEngine,
+    AppScamStore,
+    BehavioralCoachingAnalyzer,
+    CoolingOffHoldStatus,
+    PayeeBeneficiaryAnalyzer,
+    ScamCoolingOffHold,
+    ScamInterventionAction,
+    ScamRiskLevel,
+    ScamSignal,
+    ScamSignalType,
+    ScamTypology,
+    TransferEscalationAnalyzer,
+    _clamp,
+    _parse_iso,
+    classify_scam_typology,
+)
+from fraud_detection.cases import CaseManager
+from fraud_detection.events import EventBus, EventType, FraudDomainEvent
+
+
+def test_app_scam_helpers_and_enums() -> None:
+    assert _clamp(-0.5) == 0.0
+    assert _clamp(1.5) == 1.0
+    assert _clamp(0.42) == 0.42
+    naive = _parse_iso("2026-11-25T10:00:00")
+    assert naive.tzinfo is not None
+    aware = _parse_iso("2026-11-25T10:00:00+00:00")
+    assert aware == naive
+    assert ScamTypology.IMPERSONATION_BANK == "impersonation_bank"
+    assert ScamRiskLevel.CRITICAL == "critical"
+    assert ScamInterventionAction.COOLING_OFF_HOLD == "cooling_off_hold"
+    assert ScamSignalType.ACTIVE_CALL_OR_SCREEN_SHARE == "active_call_or_screen_share"
+    assert CoolingOffHoldStatus.ACTIVE == "active"
+
+
+def test_app_payment_context_validation_and_roundtrip() -> None:
+    ctx = AppPaymentContext(
+        sender_account_id=" acct_sender_1 ",
+        payee_account_id=" acct_payee_9 ",
+        amount=4500.0,
+        currency=" gbp ",
+        payment_rail=" Faster_Payments ",
+        tenant_id=" ",
+        cop_name_match=" NO_MATCH ",
+        active_phone_call=True,
+        session_hesitation_seconds=-5.0,
+        stated_purpose=" ",
+        sender_age_years=74,
+        sender_balance_before=5000.0,
+        metadata={"channel": "mobile"},
+    )
+    assert ctx.sender_account_id == "acct_sender_1"
+    assert ctx.payee_account_id == "acct_payee_9"
+    assert ctx.currency == "GBP"
+    assert ctx.payment_rail == "faster_payments"
+    assert ctx.tenant_id == "default"
+    assert ctx.cop_name_match == "no_match"
+    assert ctx.session_hesitation_seconds == 0.0
+    assert ctx.stated_purpose == "general"
+
+    restored = AppPaymentContext.from_dict(ctx.to_dict())
+    assert restored == ctx
+
+    with pytest.raises(ValueError, match="must not be empty"):
+        AppPaymentContext(sender_account_id=" ", payee_account_id="p1", amount=100.0)
+    with pytest.raises(ValueError, match="greater than zero"):
+        AppPaymentContext(sender_account_id="s1", payee_account_id="p1", amount=0.0)
+
+
+def test_scam_signal_hold_and_assessment_roundtrip() -> None:
+    sig = ScamSignal(
+        signal_type="active_call_or_screen_share",
+        severity=1.4,
+        detail="Active voice call during transfer",
+        evidence={"active_phone_call": True},
+    )
+    assert sig.signal_type is ScamSignalType.ACTIVE_CALL_OR_SCREEN_SHARE
+    assert sig.severity == 1.0
+    assert ScamSignal.from_dict(sig.to_dict()) == sig
+
+    hold = ScamCoolingOffHold(
+        payment_id="app_123",
+        sender_account_id="s1",
+        payee_account_id="p1",
+        amount=3000.0,
+        typology="impersonation_bank",
+        status="active",
+        hold_duration_minutes=0,
+        reason="Coached transfer",
+    )
+    assert hold.typology is ScamTypology.IMPERSONATION_BANK
+    assert hold.status is CoolingOffHoldStatus.ACTIVE
+    assert hold.hold_duration_minutes == 1
+    assert ScamCoolingOffHold.from_dict(hold.to_dict()) == hold
+
+    assessment = AppScamAssessment(
+        payment_id="app_123",
+        sender_account_id="s1",
+        payee_account_id="p1",
+        amount=3000.0,
+        risk_score=0.82,
+        risk_level="high",
+        typology="impersonation_bank",
+        action="cooling_off_hold",
+        signals=[sig],
+        customer_warning="Pause and verify.",
+        hold_id=hold.hold_id,
+        case_id="case_1",
+    )
+    assert assessment.risk_level is ScamRiskLevel.HIGH
+    assert assessment.typology is ScamTypology.IMPERSONATION_BANK
+    assert assessment.action is ScamInterventionAction.COOLING_OFF_HOLD
+    assert AppScamAssessment.from_dict(assessment.to_dict()) == assessment
+
+
+def test_behavioral_coaching_analyzer_detects_all_branches() -> None:
+    analyzer = BehavioralCoachingAnalyzer()
+
+    # Clean low-risk payment
+    clean = AppPaymentContext(
+        sender_account_id="s1",
+        payee_account_id="p1",
+        amount=120.0,
+        is_new_payee=False,
+        sender_age_years=40,
+    )
+    assert analyzer.analyze(clean) == []
+
+    # Active call only + extreme hesitation without copy-paste
+    call_only = AppPaymentContext(
+        sender_account_id="s1",
+        payee_account_id="p1",
+        amount=200.0,
+        active_phone_call=True,
+        session_hesitation_seconds=135.0,
+    )
+    sigs = analyzer.analyze(call_only)
+    types = {s.signal_type for s in sigs}
+    assert ScamSignalType.ACTIVE_CALL_OR_SCREEN_SHARE in types
+    assert ScamSignalType.BEHAVIORAL_HESITATION_OR_COPY_PASTE in types
+
+    # RAT only
+    rat_only = AppPaymentContext(
+        sender_account_id="s1",
+        payee_account_id="p1",
+        amount=200.0,
+        screen_share_or_rat_detected=True,
+    )
+    rat_sigs = analyzer.analyze(rat_only)
+    assert rat_sigs[0].severity == 0.85
+
+    # Combined call + RAT + urgency + safe_account + copy-paste + elder
+    severe = AppPaymentContext(
+        sender_account_id="s1",
+        payee_account_id="p1",
+        amount=5000.0,
+        active_phone_call=True,
+        screen_share_or_rat_detected=True,
+        urgency_keywords_detected=True,
+        stated_purpose="safe_account",
+        payee_details_pasted=True,
+        session_hesitation_seconds=60.0,
+        sender_age_years=72,
+    )
+    severe_sigs = analyzer.analyze(severe)
+    assert {s.signal_type for s in severe_sigs} == {
+        ScamSignalType.ACTIVE_CALL_OR_SCREEN_SHARE,
+        ScamSignalType.URGENCY_OR_SCRIPTED_COACHING,
+        ScamSignalType.BEHAVIORAL_HESITATION_OR_COPY_PASTE,
+        ScamSignalType.ELDER_OR_VULNERABLE_ANOMALY,
+    }
+
+
+def test_payee_beneficiary_analyzer_detects_all_branches() -> None:
+    analyzer = PayeeBeneficiaryAnalyzer()
+
+    clean = AppPaymentContext(
+        sender_account_id="s1",
+        payee_account_id="p1",
+        amount=300.0,
+        is_new_payee=False,
+        cop_name_match="match",
+        payment_rail="faster_payments",
+    )
+    assert analyzer.analyze(clean) == []
+
+    risky = AppPaymentContext(
+        sender_account_id="s1",
+        payee_account_id="p2",
+        amount=6500.0,
+        is_new_payee=True,
+        cop_name_match="no_match",
+        payment_rail="crypto_exchange",
+        stated_purpose="bitcoin_investment",
+    )
+    sigs = analyzer.analyze(risky)
+    assert {s.signal_type for s in sigs} == {
+        ScamSignalType.NEW_PAYEE_HIGH_VALUE,
+        ScamSignalType.BENEFICIARY_NAME_MISMATCH,
+        ScamSignalType.CRYPTO_OR_HIGH_RISK_RAIL,
+    }
+    by_type = {s.signal_type: s for s in sigs}
+    assert by_type[ScamSignalType.NEW_PAYEE_HIGH_VALUE].severity == 0.75
+    assert by_type[ScamSignalType.BENEFICIARY_NAME_MISMATCH].severity == 0.8
+    assert by_type[ScamSignalType.CRYPTO_OR_HIGH_RISK_RAIL].severity == 0.75
+
+    moderate = AppPaymentContext(
+        sender_account_id="s1",
+        payee_account_id="p3",
+        amount=2000.0,
+        is_new_payee=True,
+        cop_name_match="close_match",
+        payment_rail="faster_payments",
+        stated_purpose="crypto",
+    )
+    mod_by_type = {s.signal_type: s for s in analyzer.analyze(moderate)}
+    assert mod_by_type[ScamSignalType.NEW_PAYEE_HIGH_VALUE].severity == 0.5
+    assert mod_by_type[ScamSignalType.BENEFICIARY_NAME_MISMATCH].severity == 0.45
+    assert mod_by_type[ScamSignalType.CRYPTO_OR_HIGH_RISK_RAIL].severity == 0.55
+
+
+def test_transfer_escalation_analyzer_detects_all_branches() -> None:
+    analyzer = TransferEscalationAnalyzer(window_minutes=60, escalation_multiplier=3.0)
+    t0 = "2026-11-25T10:00:00+00:00"
+    t1 = "2026-11-25T10:15:00+00:00"
+    old_t = "2026-11-25T07:00:00+00:00"
+
+    prior_small = AppPaymentContext(
+        payment_id="app_prior",
+        sender_account_id="s1",
+        payee_account_id="p1",
+        amount=100.0,
+        initiated_at=t0,
+    )
+    stale = AppPaymentContext(
+        payment_id="app_stale",
+        sender_account_id="s1",
+        payee_account_id="p1",
+        amount=50.0,
+        initiated_at=old_t,
+    )
+
+    # No escalation, no drain
+    normal = AppPaymentContext(
+        payment_id="app_norm",
+        sender_account_id="s1",
+        payee_account_id="p1",
+        amount=150.0,
+        sender_balance_before=5000.0,
+        initiated_at=t1,
+    )
+    assert analyzer.analyze(normal, [normal, prior_small, stale]) == []
+
+    # Escalation only (500 >= 100 * 3)
+    escalated_only = AppPaymentContext(
+        payment_id="app_esc",
+        sender_account_id="s1",
+        payee_account_id="p1",
+        amount=500.0,
+        sender_balance_before=5000.0,
+        initiated_at=t1,
+    )
+    esc_sigs = analyzer.analyze(escalated_only, [prior_small])
+    assert len(esc_sigs) == 1
+    assert esc_sigs[0].severity == 0.75
+
+    # Balance drain only (new payee, 90% of balance)
+    drain_only = AppPaymentContext(
+        payment_id="app_drain",
+        sender_account_id="s1",
+        payee_account_id="p_new",
+        amount=4500.0,
+        is_new_payee=True,
+        sender_balance_before=5000.0,
+        initiated_at=t1,
+    )
+    drain_sigs = analyzer.analyze(drain_only, [])
+    assert len(drain_sigs) == 1
+    assert drain_sigs[0].severity == 0.7
+
+    # Both escalation and balance drain
+    both = AppPaymentContext(
+        payment_id="app_both",
+        sender_account_id="s1",
+        payee_account_id="p1",
+        amount=4800.0,
+        sender_balance_before=5000.0,
+        initiated_at=t1,
+    )
+    both_sigs = analyzer.analyze(both, [prior_small])
+    assert len(both_sigs) == 1
+    assert both_sigs[0].severity == 0.9
+
+
+def test_app_scam_store_eviction_filtering_and_persistence(tmp_path: Path) -> None:
+    store = AppScamStore(max_records=2)
+    for idx in range(3):
+        ctx = AppPaymentContext(
+            payment_id=f"p_{idx}",
+            sender_account_id="s1",
+            payee_account_id=f"payee_{idx}",
+            amount=100.0 * (idx + 1),
+            tenant_id="t1" if idx < 2 else "t2",
+        )
+        store.record_payment(ctx)
+        assessment = AppScamAssessment(
+            assessment_id=f"a_{idx}",
+            payment_id=ctx.payment_id,
+            sender_account_id="s1",
+            payee_account_id=ctx.payee_account_id,
+            amount=ctx.amount,
+            risk_score=0.3 * idx,
+            risk_level=ScamRiskLevel.HIGH if idx == 2 else ScamRiskLevel.LOW,
+            typology=ScamTypology.INVESTMENT_CRYPTO if idx == 2 else ScamTypology.UNKNOWN,
+            action=(
+                ScamInterventionAction.COOLING_OFF_HOLD
+                if idx == 2
+                else ScamInterventionAction.ALLOW
+            ),
+            tenant_id=ctx.tenant_id,
+        )
+        store.record_assessment(assessment)
+        hold = ScamCoolingOffHold(
+            hold_id=f"h_{idx}",
+            payment_id=ctx.payment_id,
+            sender_account_id="s1",
+            payee_account_id=ctx.payee_account_id,
+            amount=ctx.amount,
+            typology=assessment.typology,
+            tenant_id=ctx.tenant_id,
+        )
+        store.record_hold(hold)
+
+    # Capacity eviction keeps last 2
+    assert len(store.recent_sender_payments("s1")) == 2
+    assert store.get_assessment("a_0") is None
+    assert store.get_assessment("a_2") is not None
+    assert store.get_hold("h_0") is None
+    assert store.get_hold("h_2") is not None
+
+    # Filtering
+    assert (
+        len(store.list_assessments(tenant_id="t2", risk_level="high", typology="investment_crypto"))
+        == 1
+    )
+    assert len(store.list_holds(tenant_id="t2", sender_account_id="s1", status="active")) == 1
+
+    # Summary & persistence
+    summary = store.summary()
+    assert summary["total_assessments"] == 2
+    assert summary["total_holds"] == 2
+    assert summary["protected_amount"] == 300.0
+
+    saved = store.save(tmp_path / "app_scam_store.json")
+    loaded = AppScamStore.load(saved)
+    assert loaded.summary() == summary
+    assert loaded.get_assessment("a_2") is not None
+    assert loaded.get_hold("h_2") is not None
+
+
+def test_classify_scam_typology_all_branches() -> None:
+    def _ctx(**kwargs: object) -> AppPaymentContext:
+        return AppPaymentContext(
+            sender_account_id="s1",
+            payee_account_id="p1",
+            amount=float(kwargs.pop("amount", 2000.0)),  # type: ignore[arg-type]
+            **kwargs,  # type: ignore[arg-type]
+        )
+
+    assert (
+        classify_scam_typology(_ctx(screen_share_or_rat_detected=True), [])
+        is ScamTypology.REMOTE_ACCESS_COACHING
+    )
+    assert (
+        classify_scam_typology(_ctx(stated_purpose="hmrc_tax_fine"), [])
+        is ScamTypology.IMPERSONATION_GOVERNMENT
+    )
+    assert (
+        classify_scam_typology(_ctx(stated_purpose="safe_account"), [])
+        is ScamTypology.IMPERSONATION_BANK
+    )
+    assert (
+        classify_scam_typology(
+            _ctx(),
+            [ScamSignal(ScamSignalType.CRYPTO_OR_HIGH_RISK_RAIL, 0.7, "crypto")],
+        )
+        is ScamTypology.INVESTMENT_CRYPTO
+    )
+    assert (
+        classify_scam_typology(
+            _ctx(),
+            [ScamSignal(ScamSignalType.RAPID_ESCALATING_TRANSFERS, 0.8, "esc")],
+        )
+        is ScamTypology.ROMANCE_PIG_BUTCHERING
+    )
+    assert (
+        classify_scam_typology(
+            _ctx(amount=2500.0),
+            [ScamSignal(ScamSignalType.BENEFICIARY_NAME_MISMATCH, 0.8, "cop")],
+        )
+        is ScamTypology.INVOICE_REDIRECTION_BEC
+    )
+    assert (
+        classify_scam_typology(_ctx(stated_purpose="marketplace_goods"), [])
+        is ScamTypology.PURCHASE_MARKETPLACE
+    )
+    assert (
+        classify_scam_typology(
+            _ctx(),
+            [ScamSignal(ScamSignalType.ACTIVE_CALL_OR_SCREEN_SHARE, 0.65, "call")],
+        )
+        is ScamTypology.IMPERSONATION_BANK
+    )
+    assert classify_scam_typology(_ctx(amount=200.0), []) is ScamTypology.UNKNOWN
+
+
+def test_app_scam_engine_end_to_end_holds_cases_and_events() -> None:
+    events: list[FraudDomainEvent] = []
+    bus = EventBus()
+    for et in (
+        EventType.APP_SCAM_ASSESSED,
+        EventType.APP_SCAM_HOLD_PLACED,
+        EventType.APP_SCAM_BLOCKED,
+        EventType.APP_SCAM_HOLD_RESOLVED,
+    ):
+        bus.subscribe(events.append, event_type=et)
+
+    case_mgr = CaseManager()
+    engine = AppScamDefenseEngine(case_manager=case_mgr, event_bus=bus)
+
+    # 1. LOW / ALLOW
+    low = engine.evaluate_payment(
+        AppPaymentContext(
+            sender_account_id="s_clean",
+            payee_account_id="p_known",
+            amount=100.0,
+            is_new_payee=False,
+        )
+    )
+    assert low.risk_level is ScamRiskLevel.LOW
+    assert low.action is ScamInterventionAction.ALLOW
+    assert low.customer_warning == ""
+    assert low.hold_id is None
+    assert low.case_id is None
+
+    # 2. MEDIUM / DYNAMIC_WARNING (close_match CoP -> severity 0.45)
+    med = engine.evaluate_payment(
+        AppPaymentContext(
+            sender_account_id="s_med",
+            payee_account_id="p_med",
+            amount=500.0,
+            is_new_payee=False,
+            cop_name_match="close_match",
+        )
+    )
+    assert med.risk_level is ScamRiskLevel.MEDIUM
+    assert med.action is ScamInterventionAction.DYNAMIC_WARNING
+    assert med.customer_warning != ""
+    assert med.hold_id is None
+
+    # 3. HIGH / COOLING_OFF_HOLD (active phone call -> severity 0.65)
+    held = engine.evaluate_payment(
+        AppPaymentContext(
+            sender_account_id="s_hold",
+            payee_account_id="p_hold",
+            amount=400.0,
+            is_new_payee=False,
+            active_phone_call=True,
+        )
+    )
+    assert held.risk_level is ScamRiskLevel.HIGH
+    assert held.action is ScamInterventionAction.COOLING_OFF_HOLD
+    assert held.hold_id is not None
+    assert held.case_id is not None
+
+    # 4. HIGH / CALLBACK_VERIFICATION (no_match CoP -> severity 0.80)
+    cb = engine.evaluate_payment(
+        AppPaymentContext(
+            sender_account_id="s_cb",
+            payee_account_id="p_cb",
+            amount=400.0,
+            is_new_payee=False,
+            cop_name_match="no_match",
+        )
+    )
+    assert cb.risk_level is ScamRiskLevel.HIGH
+    assert cb.action is ScamInterventionAction.CALLBACK_VERIFICATION
+    assert cb.hold_id is not None
+
+    # 5. CRITICAL / BLOCK_AND_ESCALATE (RAT + active call + safe_account)
+    blocked = engine.evaluate_payment(
+        AppPaymentContext(
+            sender_account_id="s_crit",
+            payee_account_id="p_crit",
+            amount=9000.0,
+            active_phone_call=True,
+            screen_share_or_rat_detected=True,
+            stated_purpose="safe_account",
+        )
+    )
+    assert blocked.risk_level is ScamRiskLevel.CRITICAL
+    assert blocked.action is ScamInterventionAction.BLOCK_AND_ESCALATE
+    assert blocked.hold_id is None
+    assert blocked.case_id is not None
+
+    # Resolve cooling-off hold & error paths
+    resolved = engine.resolve_hold(
+        held.hold_id,
+        outcome=CoolingOffHoldStatus.CONFIRMED_SCAM_CANCELLED,
+        note="Customer confirmed impersonation call",
+    )
+    assert resolved.status is CoolingOffHoldStatus.CONFIRMED_SCAM_CANCELLED
+    assert resolved.resolved_at is not None
+
+    with pytest.raises(ValueError, match="already"):
+        engine.resolve_hold(held.hold_id, outcome="released")
+    with pytest.raises(ValueError, match="outcome must be"):
+        engine.resolve_hold(cb.hold_id, outcome="active")
+    with pytest.raises(KeyError, match="not found"):
+        engine.resolve_hold("hold_missing", outcome="released")
+
+    # Verify all 4 EventBus event types fired
+    emitted_types = {e.event_type for e in events}
+    assert emitted_types == {
+        EventType.APP_SCAM_ASSESSED,
+        EventType.APP_SCAM_HOLD_PLACED,
+        EventType.APP_SCAM_BLOCKED,
+        EventType.APP_SCAM_HOLD_RESOLVED,
+    }
+
+    # Verify engine without case_manager or event_bus works cleanly
+    bare_engine = AppScamDefenseEngine()
+    bare_res = bare_engine.evaluate_payment(
+        AppPaymentContext(
+            sender_account_id="s_bare",
+            payee_account_id="p_bare",
+            amount=5000.0,
+            screen_share_or_rat_detected=True,
+        )
+    )
+    assert bare_res.case_id is None
+    assert bare_res.risk_level is ScamRiskLevel.CRITICAL

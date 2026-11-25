@@ -1011,6 +1011,30 @@ flowchart LR
 - **Cooldowns, Loop Prevention & Observability (`AutomationBridgeStore`)**: Enforces per-entity/action cooldown windows, prevents recursive event loops via a re-entrancy depth guard, emits `AUTOMATION_BRIDGE_EXECUTED` / `AUTOMATION_BRIDGE_SKIPPED`, exposes `/v1/automation/*` REST endpoints and Prometheus counters (`fraud_automation_bridge_dispatches_total`, `fraud_automation_bridge_tokens_suspended_total`, `fraud_automation_bridge_soar_triggers_total`), and provides `automation-cascade`, `automation-dispatches`, and `automation-summary` CLI commands.
 
 
+## Phase 57 — Authorized Push Payment (APP) Scam & Social Engineering Defense Engine
+
+Phase 57 delivers an in-process, zero-external-dependency Authorized Push Payment (APP) Scam & Social Engineering Defense Engine (`app_scam.py`) that detects genuine-customer payments initiated under social engineering coercion or deception (bank/government impersonation, investment/crypto scams, romance/pig-butchering, invoice redirection / BEC, and remote-access-tool coaching).
+
+```mermaid
+flowchart LR
+    Ctx["AppPaymentContext\n(Call/RAT, CoP, Rail, Balance)"] --> Beh["BehavioralCoachingAnalyzer"]
+    Ctx --> Pay["PayeeBeneficiaryAnalyzer"]
+    Ctx --> Esc["TransferEscalationAnalyzer"]
+    Beh --> Eng["AppScamDefenseEngine\n(Noisy-OR Scoring + Typology)"]
+    Pay --> Eng
+    Esc --> Eng
+    Eng -->|"MEDIUM"| Warn["DYNAMIC_WARNING"]
+    Eng -->|"HIGH"| Hold["COOLING_OFF_HOLD /\nCALLBACK_VERIFICATION"]
+    Eng -->|"CRITICAL"| Block["BLOCK_AND_ESCALATE"]
+    Eng --> Cases["CaseManager"]
+    Eng --> Bus["EventBus\n(APP_SCAM_*)"]
+    Eng --> Store["AppScamStore\n(/v1/app-scam/* & CLI)"]
+```
+
+- **Analyzers (`BehavioralCoachingAnalyzer`, `PayeeBeneficiaryAnalyzer`, `TransferEscalationAnalyzer`)**: Detect `ACTIVE_CALL_OR_SCREEN_SHARE`, `URGENCY_OR_SCRIPTED_COACHING`, `BEHAVIORAL_HESITATION_OR_COPY_PASTE`, `ELDER_OR_VULNERABLE_ANOMALY`, `NEW_PAYEE_HIGH_VALUE`, `BENEFICIARY_NAME_MISMATCH`, `CRYPTO_OR_HIGH_RISK_RAIL`, and `RAPID_ESCALATING_TRANSFERS`.
+- **Store, EventBus, API & CLI**: `AppScamStore` maintains thread-safe payment, assessment, and cooling-off hold ledgers with capacity eviction and JSON persistence; `AppScamDefenseEngine` escalates `HIGH`/`CRITICAL` scams to `CaseManager` and emits `APP_SCAM_ASSESSED`, `APP_SCAM_HOLD_PLACED`, `APP_SCAM_BLOCKED`, and `APP_SCAM_HOLD_RESOLVED`; FastAPI exposes `/v1/app-scam/*` endpoints and Prometheus counters (`fraud_app_scam_evaluations_total`, `fraud_app_scam_signals_total`, `fraud_app_scam_holds_total`); Typer CLI exposes `app-scam-evaluate`, `app-scam-hold-resolve`, and `app-scam-summary`.
+
+
 ## Extension guidance
 
 

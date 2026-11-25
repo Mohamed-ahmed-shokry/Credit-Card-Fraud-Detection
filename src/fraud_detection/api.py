@@ -51,6 +51,17 @@ from fraud_detection.aml import (
     WatchlistEntry,
     WatchlistType,
 )
+from fraud_detection.app_scam import (
+    AppPaymentContext,
+    AppScamAssessment,
+    AppScamDefenseEngine,
+    CoolingOffHoldStatus,
+    ScamCoolingOffHold,
+    ScamInterventionAction,
+    ScamRiskLevel,
+    ScamSignalType,
+    ScamTypology,
+)
 from fraud_detection.ato import (
     AccountMutationRecord,
     AccountMutationType,
@@ -2812,6 +2823,100 @@ def _automation_dispatch_to_response(record: BridgeDispatchRecord) -> Automation
     return AutomationDispatchResponse(**record.to_dict())
 
 
+class AppScamEvaluateRequest(BaseModel):
+    """Request payload for evaluating an authorized push payment for APP scam risk."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    sender_account_id: str = Field(..., min_length=1)
+    payee_account_id: str = Field(..., min_length=1)
+    amount: float = Field(..., gt=0.0)
+    currency: str = Field(default="USD", min_length=1)
+    payment_rail: str = Field(default="faster_payments", min_length=1)
+    tenant_id: str = Field(default="default", min_length=1)
+    is_new_payee: bool = Field(default=True)
+    cop_name_match: str = Field(default="match")
+    active_phone_call: bool = Field(default=False)
+    screen_share_or_rat_detected: bool = Field(default=False)
+    payee_details_pasted: bool = Field(default=False)
+    session_hesitation_seconds: float = Field(default=0.0, ge=0.0)
+    urgency_keywords_detected: bool = Field(default=False)
+    stated_purpose: str = Field(default="general")
+    sender_age_years: int | None = Field(default=None, ge=0)
+    sender_balance_before: float | None = Field(default=None, ge=0.0)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class AppScamAssessmentResponse(BaseModel):
+    """Response model for an APP scam evaluation."""
+
+    assessment_id: str
+    payment_id: str
+    sender_account_id: str
+    payee_account_id: str
+    amount: float
+    risk_score: float
+    risk_level: str
+    typology: str
+    action: str
+    tenant_id: str
+    signals: list[dict[str, Any]]
+    customer_warning: str
+    hold_id: str | None = None
+    case_id: str | None = None
+    assessed_at: str
+    metadata: dict[str, Any]
+
+
+class AppScamAssessmentListResponse(BaseModel):
+    """Paginated list of APP scam assessments."""
+
+    total_count: int
+    assessments: list[AppScamAssessmentResponse]
+
+
+class AppScamHoldResponse(BaseModel):
+    """Response model for a cooling-off hold."""
+
+    hold_id: str
+    payment_id: str
+    sender_account_id: str
+    payee_account_id: str
+    amount: float
+    typology: str
+    tenant_id: str
+    status: str
+    hold_duration_minutes: int
+    reason: str
+    created_at: str
+    resolved_at: str | None = None
+    resolution_note: str
+
+
+class AppScamHoldListResponse(BaseModel):
+    """Paginated list of cooling-off holds."""
+
+    total_count: int
+    holds: list[AppScamHoldResponse]
+
+
+class AppScamHoldResolveRequest(BaseModel):
+    """Request payload for resolving an active APP scam cooling-off hold."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    outcome: CoolingOffHoldStatus
+    note: str = Field(default="")
+
+
+def _app_scam_assessment_to_response(assessment: AppScamAssessment) -> AppScamAssessmentResponse:
+    return AppScamAssessmentResponse(**assessment.to_dict())
+
+
+def _app_scam_hold_to_response(hold: ScamCoolingOffHold) -> AppScamHoldResponse:
+    return AppScamHoldResponse(**hold.to_dict())
+
+
 def create_app(
     *,
     model: FraudModel | None = None,
@@ -2905,6 +3010,7 @@ def create_app(
     soar_engine: SoarEngine | None = None,
     wallet_engine: WalletFraudEngine | None = None,
     automation_bridge: CrossEngineAutomationBridge | None = None,
+    app_scam_engine: AppScamDefenseEngine | None = None,
 ) -> FastAPI:
     """Create an application using an injected model or a trusted artifact path.
 
@@ -3522,6 +3628,24 @@ def create_app(
         "fraud_automation_bridge_soar_triggers_total",
         "Total SOAR playbooks auto-triggered by the automation bridge.",
         ["tenant_id"],
+        registry=metrics_registry,
+    )
+    app_scam_evaluations_counter = Counter(
+        "fraud_app_scam_evaluations_total",
+        "Total Authorized Push Payment (APP) scam evaluations performed.",
+        ["tenant_id", "risk_level", "action", "typology"],
+        registry=metrics_registry,
+    )
+    app_scam_signals_counter = Counter(
+        "fraud_app_scam_signals_total",
+        "Total APP scam social engineering signals detected by type.",
+        ["tenant_id", "signal_type"],
+        registry=metrics_registry,
+    )
+    app_scam_holds_counter = Counter(
+        "fraud_app_scam_holds_total",
+        "Total APP scam cooling-off holds placed or resolved.",
+        ["tenant_id", "status"],
         registry=metrics_registry,
     )
     merchant_anomalies_counter = Counter(
@@ -4165,6 +4289,14 @@ def create_app(
         application.state.automation_bridge_soar_triggers_counter = (
             automation_bridge_soar_triggers_counter
         )
+        resolved_app_scam_engine = app_scam_engine or AppScamDefenseEngine(
+            case_manager=application.state.case_manager,
+            event_bus=resolved_event_bus,
+        )
+        application.state.app_scam_engine = resolved_app_scam_engine
+        application.state.app_scam_evaluations_counter = app_scam_evaluations_counter
+        application.state.app_scam_signals_counter = app_scam_signals_counter
+        application.state.app_scam_holds_counter = app_scam_holds_counter
         application.state.audit_sink = resolved_audit_sink
         application.state.explanation_provider = explanation_provider
         application.state.fallback_mode = resolved_fallback_mode
@@ -9735,6 +9867,198 @@ def create_app(
             total_count=len(items),
             dispatches=[_automation_dispatch_to_response(item) for item in items],
         )
+
+    def _record_app_scam_metrics(
+        request: Request,
+        assessment: AppScamAssessment,
+    ) -> None:
+        eval_c = getattr(request.app.state, "app_scam_evaluations_counter", None)
+        if eval_c is not None:
+            eval_c.labels(
+                tenant_id=assessment.tenant_id,
+                risk_level=ScamRiskLevel(assessment.risk_level).value,
+                action=ScamInterventionAction(assessment.action).value,
+                typology=ScamTypology(assessment.typology).value,
+            ).inc()
+        sig_c = getattr(request.app.state, "app_scam_signals_counter", None)
+        if sig_c is not None:
+            for sig in assessment.signals:
+                sig_c.labels(
+                    tenant_id=assessment.tenant_id,
+                    signal_type=ScamSignalType(sig.signal_type).value,
+                ).inc()
+        if assessment.hold_id is not None:
+            hold_c = getattr(request.app.state, "app_scam_holds_counter", None)
+            if hold_c is not None:
+                hold_c.labels(
+                    tenant_id=assessment.tenant_id,
+                    status=CoolingOffHoldStatus.ACTIVE.value,
+                ).inc()
+
+    @application.post(
+        "/v1/app-scam/evaluate",
+        response_model=AppScamAssessmentResponse,
+        responses={500: {"description": "APP scam engine not initialized."}},
+        tags=["app_scam"],
+    )
+    async def app_scam_evaluate_endpoint(
+        payload: AppScamEvaluateRequest,
+        request: Request,
+    ) -> AppScamAssessmentResponse | JSONResponse:
+        """Evaluate an authorized push payment for social engineering scam risk."""
+        engine: AppScamDefenseEngine | None = getattr(request.app.state, "app_scam_engine", None)
+        if engine is None:
+            return JSONResponse(
+                status_code=500,
+                content={"detail": "APP scam engine not initialized."},
+            )
+        context = AppPaymentContext(**payload.model_dump())
+        assessment = engine.evaluate_payment(context)
+        _record_app_scam_metrics(request, assessment)
+        return _app_scam_assessment_to_response(assessment)
+
+    @application.get(
+        "/v1/app-scam/assessments",
+        response_model=AppScamAssessmentListResponse,
+        responses={500: {"description": "APP scam engine not initialized."}},
+        tags=["app_scam"],
+    )
+    async def app_scam_list_assessments_endpoint(
+        request: Request,
+        tenant_id: str | None = None,
+        sender_account_id: str | None = None,
+        risk_level: ScamRiskLevel | None = None,
+        typology: ScamTypology | None = None,
+        limit: int = Query(default=100, ge=1, le=1000),
+    ) -> AppScamAssessmentListResponse | JSONResponse:
+        """List APP scam assessments with optional tenant, sender, risk, and typology filters."""
+        engine: AppScamDefenseEngine | None = getattr(request.app.state, "app_scam_engine", None)
+        if engine is None:
+            return JSONResponse(
+                status_code=500,
+                content={"detail": "APP scam engine not initialized."},
+            )
+        items = engine.store.list_assessments(
+            tenant_id=tenant_id,
+            sender_account_id=sender_account_id,
+            risk_level=risk_level,
+            typology=typology,
+            limit=limit,
+        )
+        return AppScamAssessmentListResponse(
+            total_count=len(items),
+            assessments=[_app_scam_assessment_to_response(item) for item in items],
+        )
+
+    @application.get(
+        "/v1/app-scam/assessments/{assessment_id}",
+        response_model=AppScamAssessmentResponse,
+        responses={
+            404: {"description": "Assessment not found."},
+            500: {"description": "APP scam engine not initialized."},
+        },
+        tags=["app_scam"],
+    )
+    async def app_scam_get_assessment_endpoint(
+        assessment_id: str,
+        request: Request,
+    ) -> AppScamAssessmentResponse | JSONResponse:
+        """Retrieve a specific APP scam risk assessment."""
+        engine: AppScamDefenseEngine | None = getattr(request.app.state, "app_scam_engine", None)
+        if engine is None:
+            return JSONResponse(
+                status_code=500,
+                content={"detail": "APP scam engine not initialized."},
+            )
+        rec = engine.store.get_assessment(assessment_id)
+        if rec is None:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": f"APP scam assessment '{assessment_id}' not found."},
+            )
+        return _app_scam_assessment_to_response(rec)
+
+    @application.get(
+        "/v1/app-scam/holds",
+        response_model=AppScamHoldListResponse,
+        responses={500: {"description": "APP scam engine not initialized."}},
+        tags=["app_scam"],
+    )
+    async def app_scam_list_holds_endpoint(
+        request: Request,
+        tenant_id: str | None = None,
+        sender_account_id: str | None = None,
+        status: CoolingOffHoldStatus | None = None,
+        limit: int = Query(default=100, ge=1, le=1000),
+    ) -> AppScamHoldListResponse | JSONResponse:
+        """List APP scam cooling-off payment holds."""
+        engine: AppScamDefenseEngine | None = getattr(request.app.state, "app_scam_engine", None)
+        if engine is None:
+            return JSONResponse(
+                status_code=500,
+                content={"detail": "APP scam engine not initialized."},
+            )
+        items = engine.store.list_holds(
+            tenant_id=tenant_id,
+            sender_account_id=sender_account_id,
+            status=status,
+            limit=limit,
+        )
+        return AppScamHoldListResponse(
+            total_count=len(items),
+            holds=[_app_scam_hold_to_response(item) for item in items],
+        )
+
+    @application.post(
+        "/v1/app-scam/holds/{hold_id}/resolve",
+        response_model=AppScamHoldResponse,
+        responses={
+            400: {"description": "Invalid hold resolution request."},
+            404: {"description": "Cooling-off hold not found."},
+            500: {"description": "APP scam engine not initialized."},
+        },
+        tags=["app_scam"],
+    )
+    async def app_scam_resolve_hold_endpoint(
+        hold_id: str,
+        payload: AppScamHoldResolveRequest,
+        request: Request,
+    ) -> AppScamHoldResponse | JSONResponse:
+        """Resolve an active APP scam cooling-off hold."""
+        engine: AppScamDefenseEngine | None = getattr(request.app.state, "app_scam_engine", None)
+        if engine is None:
+            return JSONResponse(
+                status_code=500,
+                content={"detail": "APP scam engine not initialized."},
+            )
+        try:
+            hold = engine.resolve_hold(hold_id, outcome=payload.outcome, note=payload.note)
+        except KeyError as exc:
+            return JSONResponse(status_code=404, content={"detail": str(exc)})
+        except ValueError as exc:
+            return JSONResponse(status_code=400, content={"detail": str(exc)})
+        hold_c = getattr(request.app.state, "app_scam_holds_counter", None)
+        if hold_c is not None:
+            hold_c.labels(
+                tenant_id=hold.tenant_id,
+                status=CoolingOffHoldStatus(hold.status).value,
+            ).inc()
+        return _app_scam_hold_to_response(hold)
+
+    @application.get(
+        "/v1/app-scam/metrics",
+        response_model=dict[str, Any],
+        tags=["app_scam"],
+    )
+    async def app_scam_metrics_endpoint(
+        request: Request,
+        tenant_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Return operational summary metrics for the APP scam defense engine."""
+        engine: AppScamDefenseEngine | None = getattr(request.app.state, "app_scam_engine", None)
+        if engine is None:
+            return {"status": "uninitialized", "total_assessments": 0, "total_holds": 0}
+        return {**engine.store.summary(tenant_id=tenant_id), "status": "operational"}
 
     @application.get(
         "/v1/routing/status",

@@ -11382,3 +11382,168 @@ def test_automation_bridge_cli_error_branches(tmp_path: Path) -> None:
     nondict = tmp_path / "nondict_auto.json"
     nondict.write_text("[]", encoding="utf-8")
     assert runner.invoke(app, ["automation-summary", "-s", str(nondict)]).exit_code == 2
+
+
+def test_app_scam_cli_workflows(tmp_path: Path) -> None:
+    """Validate app-scam-evaluate, app-scam-hold-resolve, and app-scam-summary CLI commands."""
+    store_file = tmp_path / "app_scam_store.json"
+
+    ev_tbl = runner.invoke(
+        app,
+        [
+            "app-scam-evaluate",
+            "--sender",
+            "acct-cli-1",
+            "--payee",
+            "payee-cli-1",
+            "--amount",
+            "600",
+            "--known-payee",
+            "--active-call",
+            "-s",
+            str(store_file),
+            "-f",
+            "table",
+        ],
+    )
+    assert ev_tbl.exit_code == 0, ev_tbl.stdout
+    assert "cooling_off_hold" in ev_tbl.stdout
+    assert "Hold ID:" in ev_tbl.stdout
+
+    ev_json = runner.invoke(
+        app,
+        [
+            "app-scam-evaluate",
+            "--sender",
+            "acct-cli-2",
+            "--payee",
+            "payee-cli-2",
+            "--amount",
+            "500",
+            "--known-payee",
+            "--active-call",
+            "-s",
+            str(store_file),
+            "-f",
+            "json",
+        ],
+    )
+    assert ev_json.exit_code == 0, ev_json.stdout
+    ev_data = json.loads(ev_json.stdout)
+    hold_id = ev_data["hold_id"]
+    assert hold_id is not None
+
+    res_tbl = runner.invoke(
+        app,
+        [
+            "app-scam-hold-resolve",
+            "--hold-id",
+            hold_id,
+            "--outcome",
+            "confirmed_scam_cancelled",
+            "--note",
+            "Customer confirmed impersonation",
+            "-s",
+            str(store_file),
+            "-f",
+            "table",
+        ],
+    )
+    assert res_tbl.exit_code == 0, res_tbl.stdout
+    assert "confirmed_scam_cancelled" in res_tbl.stdout
+
+    # Evaluate a second hold and resolve in JSON format
+    ev2 = runner.invoke(
+        app,
+        [
+            "app-scam-evaluate",
+            "--sender",
+            "acct-cli-3",
+            "--payee",
+            "payee-cli-3",
+            "--amount",
+            "500",
+            "--known-payee",
+            "--active-call",
+            "-s",
+            str(store_file),
+            "-f",
+            "json",
+        ],
+    )
+    hold_id_2 = json.loads(ev2.stdout)["hold_id"]
+    res_json = runner.invoke(
+        app,
+        [
+            "app-scam-hold-resolve",
+            "--hold-id",
+            hold_id_2,
+            "--outcome",
+            "released",
+            "-s",
+            str(store_file),
+            "-f",
+            "json",
+        ],
+    )
+    assert res_json.exit_code == 0, res_json.stdout
+    assert json.loads(res_json.stdout)["status"] == "released"
+
+    sum_tbl = runner.invoke(
+        app,
+        ["app-scam-summary", "-s", str(store_file), "-f", "table"],
+    )
+    assert sum_tbl.exit_code == 0
+    assert "APP Scam Defense Summary:" in sum_tbl.stdout
+
+    sum_json = runner.invoke(
+        app,
+        ["app-scam-summary", "-s", str(store_file), "-f", "json"],
+    )
+    assert sum_json.exit_code == 0
+    assert json.loads(sum_json.stdout)["total_assessments"] == 3
+
+
+def test_app_scam_cli_error_branches(tmp_path: Path) -> None:
+    """Validate error handling in app-scam-* CLI commands."""
+    store_file = tmp_path / "app_scam_err.json"
+    assert (
+        runner.invoke(
+            app,
+            [
+                "app-scam-evaluate",
+                "--sender",
+                "s1",
+                "--payee",
+                "p1",
+                "--amount",
+                "0",
+                "-s",
+                str(store_file),
+            ],
+        ).exit_code
+        == 2
+    )
+    assert (
+        runner.invoke(
+            app,
+            [
+                "app-scam-hold-resolve",
+                "--hold-id",
+                "missing",
+                "--outcome",
+                "released",
+                "-s",
+                str(store_file),
+            ],
+        ).exit_code
+        == 2
+    )
+
+    bad_store = tmp_path / "bad_app_scam.json"
+    bad_store.write_text("{invalid", encoding="utf-8")
+    assert runner.invoke(app, ["app-scam-summary", "-s", str(bad_store)]).exit_code == 2
+
+    nondict = tmp_path / "nondict_app_scam.json"
+    nondict.write_text("[]", encoding="utf-8")
+    assert runner.invoke(app, ["app-scam-summary", "-s", str(nondict)]).exit_code == 2

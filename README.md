@@ -2322,6 +2322,36 @@ FastAPI Cross-Engine Automation Bridge REST endpoints:
 - `GET /v1/automation/dispatches/{dispatch_id}`: Fetch a specific bridge dispatch audit record.
 - Prometheus metrics: `fraud_automation_bridge_dispatches_total`, `fraud_automation_bridge_tokens_suspended_total`, `fraud_automation_bridge_soar_triggers_total`.
 
+### Authorized Push Payment (APP) Scam & Social Engineering Defense (Phase 57)
+
+```bash
+# Evaluate an authorized push payment for social engineering coaching and payee scam cues
+fraud-detect app-scam-evaluate \
+  --sender acct_101 \
+  --payee payee_909 \
+  --amount 4500 \
+  --active-call \
+  --cop-match no_match \
+  --purpose safe_account \
+  --format json
+
+# Resolve an active cooling-off hold or inspect APP scam defense summary metrics
+fraud-detect app-scam-hold-resolve \
+  --hold-id hold_1234567890ab \
+  --outcome confirmed_scam_cancelled \
+  --note "Customer confirmed bank impersonation call"
+fraud-detect app-scam-summary --format table
+```
+
+FastAPI APP Scam Defense REST endpoints:
+- `POST /v1/app-scam/evaluate`: Evaluate an authorized push payment for behavioral coaching, CoP mismatch, high-risk rail, and transfer escalation signals.
+- `GET /v1/app-scam/assessments`: List APP scam assessments with optional tenant, sender, risk-level, and typology filters.
+- `GET /v1/app-scam/assessments/{assessment_id}`: Retrieve a specific APP scam assessment record.
+- `GET /v1/app-scam/holds`: List APP scam cooling-off payment holds.
+- `POST /v1/app-scam/holds/{hold_id}/resolve`: Resolve an active cooling-off hold (`released` or `confirmed_scam_cancelled`).
+- `GET /v1/app-scam/metrics`: Inspect operational APP scam counts and protected-amount metrics.
+- Prometheus metrics: `fraud_app_scam_evaluations_total`, `fraud_app_scam_signals_total`, `fraud_app_scam_holds_total`.
+
 ## Reference label-delay analysis
 
 

@@ -135,6 +135,10 @@ class EventType(StrEnum):
     WALLET_PROVISIONING_DECLINED = "fraud.wallet.provisioning_declined"
     AUTOMATION_BRIDGE_EXECUTED = "fraud.automation.bridge_executed"
     AUTOMATION_BRIDGE_SKIPPED = "fraud.automation.bridge_skipped"
+    APP_SCAM_ASSESSED = "fraud.app_scam.assessed"
+    APP_SCAM_HOLD_PLACED = "fraud.app_scam.hold_placed"
+    APP_SCAM_BLOCKED = "fraud.app_scam.blocked"
+    APP_SCAM_HOLD_RESOLVED = "fraud.app_scam.hold_resolved"
 
 
 class EventDeliveryStatus(StrEnum):
