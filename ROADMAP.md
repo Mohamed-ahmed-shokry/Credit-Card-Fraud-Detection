@@ -3159,9 +3159,9 @@ Close the autonomous detection-to-containment loop across specialized fraud engi
 - `459e8a0`..`ce44d91`: Implemented `automation_bridge.py` (`BridgeRuleAction`, `BridgeDispatchStatus`, `BridgePolicy`, `BridgeDispatchRecord`, `AutomationBridgeStore`, `CrossEngineAutomationBridge`), registered `AUTOMATION_BRIDGE_EXECUTED` / `AUTOMATION_BRIDGE_SKIPPED` events in `events.py`, wired `CrossEngineAutomationBridge` into `create_app` with `/v1/automation/*` REST endpoints and Prometheus metrics in `api.py`, added `automation-*` CLI commands in `cli.py`, achieved 100% branch coverage on `automation_bridge.py` (`1257 passed`, `97.17%` total branch coverage), passed remote GitHub Actions CI (`45031257239`), and documented architecture and usage.
 
 
-## Phase 57 — Authorized Push Payment (APP) Scam & Social Engineering Defense Engine (In Progress)
+## Phase 57 — Authorized Push Payment (APP) Scam & Social Engineering Defense Engine (Done)
 
-Status: In Progress.
+Status: Done.
 
 ### Objective
 
@@ -3218,6 +3218,9 @@ Deliver an in-process, zero-dependency **Authorized Push Payment (APP) Scam & So
 - Task 6: Wire `AppScamDefenseEngine` into `create_app`, add `/v1/app-scam/*` REST endpoints and Prometheus metrics in `src/fraud_detection/api.py` + tests in `tests/test_api.py`.
 - Task 7: Add `app-scam-evaluate`, `app-scam-hold-resolve`, and `app-scam-summary` CLI commands in `src/fraud_detection/cli.py` + tests in `tests/test_cli.py`.
 - Task 8: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate with 100% Green CI.
+
+### Micro-Commits
+- `7ab6a35`..`b67fdbc`: Implemented `app_scam.py` (`ScamTypology`, `ScamRiskLevel`, `ScamInterventionAction`, `ScamSignalType`, `CoolingOffHoldStatus`, `AppPaymentContext`, `ScamSignal`, `ScamCoolingOffHold`, `AppScamAssessment`, `BehavioralCoachingAnalyzer`, `PayeeBeneficiaryAnalyzer`, `TransferEscalationAnalyzer`, `AppScamStore`, `classify_scam_typology`, `AppScamDefenseEngine`), registered `APP_SCAM_ASSESSED` / `APP_SCAM_HOLD_PLACED` / `APP_SCAM_BLOCKED` / `APP_SCAM_HOLD_RESOLVED` events in `events.py`, wired `AppScamDefenseEngine` into `create_app` with `/v1/app-scam/*` REST endpoints and Prometheus counters in `api.py`, added `app-scam-*` CLI commands in `cli.py`, achieved 100% branch coverage on `app_scam.py` (`1270 passed`, `97.21%` total branch coverage), passed remote GitHub Actions CI (`45668200521`), and documented architecture and usage.
 
 
 ## Contributing to the roadmap
