@@ -3159,6 +3159,67 @@ Close the autonomous detection-to-containment loop across specialized fraud engi
 - `459e8a0`..`ce44d91`: Implemented `automation_bridge.py` (`BridgeRuleAction`, `BridgeDispatchStatus`, `BridgePolicy`, `BridgeDispatchRecord`, `AutomationBridgeStore`, `CrossEngineAutomationBridge`), registered `AUTOMATION_BRIDGE_EXECUTED` / `AUTOMATION_BRIDGE_SKIPPED` events in `events.py`, wired `CrossEngineAutomationBridge` into `create_app` with `/v1/automation/*` REST endpoints and Prometheus metrics in `api.py`, added `automation-*` CLI commands in `cli.py`, achieved 100% branch coverage on `automation_bridge.py` (`1257 passed`, `97.17%` total branch coverage), passed remote GitHub Actions CI (`45031257239`), and documented architecture and usage.
 
 
+## Phase 57 — Authorized Push Payment (APP) Scam & Social Engineering Defense Engine (In Progress)
+
+Status: In Progress.
+
+### Objective
+
+Deliver an in-process, zero-dependency **Authorized Push Payment (APP) Scam & Social Engineering Defense Engine** (`src/fraud_detection/app_scam.py`) that detects genuine-customer payments initiated under social engineering coercion or deception (impersonation, investment/crypto, romance/pig-butchering, invoice redirection/BEC, remote-access coaching), applies graduated behavioral friction and cooling-off holds, escalates high-risk scams to `CaseManager`, streams lifecycle events to `EventBus`, and exposes full REST API (`/v1/app-scam/*`), Prometheus metrics, and CLI (`app-scam-*`) workflows.
+
+### Scope
+
+1. **Domain Models & Taxonomies (`src/fraud_detection/app_scam.py`)**:
+   - `ScamTypology`, `ScamRiskLevel`, `ScamInterventionAction`, `ScamSignalType`, `CoolingOffHoldStatus`.
+   - `AppPaymentContext`, `ScamSignal`, `ScamCoolingOffHold`, `AppScamAssessment` with strict validation and JSON serialization/deserialization.
+2. **Specialized Social Engineering & Payee Analyzers**:
+   - `BehavioralCoachingAnalyzer`: detects active voice call / remote-access tool (RAT) / screen-sharing during payment initiation, copy-paste payee entry, session hesitation/scripted velocity, and elder/vulnerable account anomalies.
+   - `PayeeBeneficiaryAnalyzer`: detects first-time payee high-value transfers, Confirmation of Payee (CoP) name mismatch, crypto/high-risk rail usage, and invoice redirection / BEC signals.
+   - `TransferEscalationAnalyzer`: detects pig-butchering / investment test-then-escalate transfer sequences and rapid balance-drain sequences to newly added payees.
+3. **Store & Defense Engine (`AppScamStore`, `AppScamDefenseEngine`)**:
+   - Thread-safe ledger with capacity eviction, cooling-off hold lifecycle (`resolve_hold`: `RELEASED` or `CONFIRMED_SCAM_CANCELLED`), per-sender transfer history, summary metrics, and JSON persistence.
+   - Calibrated risk scoring (`0.0`–`1.0`), deterministic typology classification, graduated intervention routing (`ALLOW`, `DYNAMIC_WARNING`, `COOLING_OFF_HOLD`, `CALLBACK_VERIFICATION`, `BLOCK_AND_ESCALATE`), tailored customer warning messages, `CaseManager` escalation, and `EventBus` streaming (`APP_SCAM_ASSESSED`, `APP_SCAM_HOLD_PLACED`, `APP_SCAM_BLOCKED`, `APP_SCAM_HOLD_RESOLVED`).
+4. **REST API (`/v1/app-scam/*`) & Prometheus Metrics (`api.py`)**:
+   - `POST /v1/app-scam/evaluate`, `GET /v1/app-scam/assessments`, `GET /v1/app-scam/assessments/{assessment_id}`, `GET /v1/app-scam/holds`, `POST /v1/app-scam/holds/{hold_id}/resolve`, `GET /v1/app-scam/metrics`.
+   - Prometheus counters: `fraud_app_scam_evaluations_total`, `fraud_app_scam_signals_total`, `fraud_app_scam_holds_total`.
+5. **CLI Workflows (`cli.py`)**:
+   - `app-scam-evaluate`, `app-scam-hold-resolve`, `app-scam-summary` with table/JSON formatting and store persistence.
+6. **Documentation**:
+   - `ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`.
+
+### Acceptance Criteria
+
+1. **AC-1 (Domain Models & Taxonomies)**: `ScamTypology`, `ScamRiskLevel`, `ScamInterventionAction`, `ScamSignalType`, `CoolingOffHoldStatus`, `AppPaymentContext`, `ScamSignal`, `ScamCoolingOffHold`, and `AppScamAssessment` serialize/deserialize cleanly with unit tests.
+2. **AC-2 (Social Engineering & Payee Analyzers)**: `BehavioralCoachingAnalyzer`, `PayeeBeneficiaryAnalyzer`, and `TransferEscalationAnalyzer` accurately detect all 8 APP scam signal types.
+3. **AC-3 (Store, Cooling-Off Holds & Defense Engine)**: `AppScamStore` and `AppScamDefenseEngine` enforce capacity eviction, JSON persistence, calibrated scoring, typology classification, cooling-off hold resolution, and `CaseManager` escalation.
+4. **AC-4 (EventBus Streaming)**: Lifecycle transitions emit `APP_SCAM_ASSESSED`, `APP_SCAM_HOLD_PLACED`, `APP_SCAM_BLOCKED`, and `APP_SCAM_HOLD_RESOLVED` registered in `events.py`.
+5. **AC-5 (REST API & Metrics)**: `/v1/app-scam/*` endpoints and Prometheus metrics work end to end and are verified in `tests/test_api.py`.
+6. **AC-6 (CLI Workflows)**: `app-scam-evaluate`, `app-scam-hold-resolve`, and `app-scam-summary` work end to end and are verified in `tests/test_cli.py` and real CLI execution.
+7. **AC-7 (All CI-Parity Checks & Remote CI Green)**: All local CI-parity checks (`ruff format --check src tests`, `ruff check src tests`, `mypy src`, `pip_audit --skip-editable`, `pytest --cov=fraud_detection --cov-report=term-missing`, `python -m build`, `twine check dist/*`) and remote CI workflow runs pass 100%.
+
+### Validation & CI Plan
+
+- Focused unit tests: `python -m pytest tests/test_app_scam.py -v`
+- API & CLI integration tests: `python -m pytest tests/test_api.py tests/test_cli.py -k "app_scam"`
+- Full local CI parity: `ruff format --check src tests`, `ruff check src tests`, `mypy src`, `pip_audit --skip-editable`, `pytest --cov=fraud_detection --cov-report=term-missing`, `python -m build`, `twine check dist/*`
+- Remote CI: GitHub Actions `CI` workflow on `phase/app-scam-defense` PR.
+
+### Exclusions
+
+- Live UK Confirmation of Payee (CoP) / Open Banking directory APIs and telco real-time call-state webhooks (out of scope for in-process zero-dependency reference engine).
+
+### Micro-Task Breakdown
+
+- Task 1: Define Phase 57 roadmap & initialize `docs/PROGRESS.md`.
+- Task 2: Create `src/fraud_detection/app_scam.py` domain enums and data models + unit tests in `tests/test_app_scam.py`.
+- Task 3: Implement `BehavioralCoachingAnalyzer`, `PayeeBeneficiaryAnalyzer`, and `TransferEscalationAnalyzer` + unit tests.
+- Task 4: Implement `AppScamStore` and `AppScamDefenseEngine` (assessment, typology classification, cooling-off holds, `CaseManager` escalation) + unit tests.
+- Task 5: Register `APP_SCAM_ASSESSED`, `APP_SCAM_HOLD_PLACED`, `APP_SCAM_BLOCKED`, and `APP_SCAM_HOLD_RESOLVED` events in `src/fraud_detection/events.py` and wire `EventBus` into `AppScamDefenseEngine` + tests.
+- Task 6: Wire `AppScamDefenseEngine` into `create_app`, add `/v1/app-scam/*` REST endpoints and Prometheus metrics in `src/fraud_detection/api.py` + tests in `tests/test_api.py`.
+- Task 7: Add `app-scam-evaluate`, `app-scam-hold-resolve`, and `app-scam-summary` CLI commands in `src/fraud_detection/cli.py` + tests in `tests/test_cli.py`.
+- Task 8: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate with 100% Green CI.
+
+
 ## Contributing to the roadmap
 
 Open an issue or a pull request that references the relevant phase item.
