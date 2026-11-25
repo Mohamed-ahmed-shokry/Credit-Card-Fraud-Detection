@@ -36,6 +36,14 @@ from fraud_detection.aml import (
     WatchlistEntry,
     WatchlistScreeningEngine,
 )
+from fraud_detection.app_scam import (
+    AppPaymentContext,
+    AppScamDefenseEngine,
+    AppScamStore,
+    ScamInterventionAction,
+    ScamRiskLevel,
+    ScamTypology,
+)
 from fraud_detection.ato import (
     AccountMutationRecord,
     AccountMutationType,
@@ -12010,6 +12018,149 @@ def automation_summary(
         typer.echo(f"  Tokens Suspended:     {summary_data['tokens_suspended_count']}")
         for status_key, cnt in summary_data["by_status"].items():
             typer.echo(f"    {status_key:22s}: {cnt}")
+    else:
+        typer.echo(json.dumps(summary_data, indent=2))
+
+
+def _load_app_scam_state(store_file: Path) -> tuple[AppScamDefenseEngine, AppScamStore]:
+    if store_file.exists():
+        try:
+            raw = json.loads(store_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            _abort(f"Failed to read APP scam store '{store_file}': {exc}")
+        if not isinstance(raw, dict):
+            _abort(f"APP scam store '{store_file}' must contain a JSON object.")
+        store = AppScamStore.load(store_file)
+    else:
+        store = AppScamStore()
+    return AppScamDefenseEngine(store=store), store
+
+
+@app.command("app-scam-evaluate")
+def app_scam_evaluate(
+    sender_account_id: Annotated[str, typer.Option("--sender", help="Sender account identifier.")],
+    payee_account_id: Annotated[str, typer.Option("--payee", help="Payee account identifier.")],
+    amount: Annotated[float, typer.Option("--amount", help="Transfer amount.")],
+    currency: Annotated[str, typer.Option("--currency", help="ISO currency code.")] = "USD",
+    payment_rail: Annotated[str, typer.Option("--rail", help="Payment rail.")] = "faster_payments",
+    tenant_id: Annotated[
+        str, typer.Option("--tenant", "-t", help="Tenant identifier.")
+    ] = "default",
+    new_payee: Annotated[
+        bool, typer.Option("--new-payee/--known-payee", help="Whether payee is first-time.")
+    ] = True,
+    cop_match: Annotated[
+        str, typer.Option("--cop-match", help="CoP result (match, close_match, no_match).")
+    ] = "match",
+    active_call: Annotated[
+        bool, typer.Option("--active-call", help="Sender is on an active voice call.")
+    ] = False,
+    screen_share: Annotated[
+        bool, typer.Option("--screen-share", help="Remote-access/screen-share detected.")
+    ] = False,
+    urgency: Annotated[
+        bool, typer.Option("--urgency", help="Urgency/coercion keywords detected.")
+    ] = False,
+    purpose: Annotated[str, typer.Option("--purpose", help="Stated payment purpose.")] = "general",
+    store_file: Annotated[
+        Path,
+        typer.Option("--store-file", "-s", help="Path to APP scam state JSON file."),
+    ] = Path("app_scam_store.json"),
+    output_format: Annotated[
+        str, typer.Option("--format", "-f", help="Output format (table or json).")
+    ] = "table",
+) -> None:
+    """Evaluate an authorized push payment for APP scam and social engineering risk."""
+    engine, store = _load_app_scam_state(store_file)
+    try:
+        context = AppPaymentContext(
+            sender_account_id=sender_account_id,
+            payee_account_id=payee_account_id,
+            amount=amount,
+            currency=currency,
+            payment_rail=payment_rail,
+            tenant_id=tenant_id,
+            is_new_payee=new_payee,
+            cop_name_match=cop_match,
+            active_phone_call=active_call,
+            screen_share_or_rat_detected=screen_share,
+            urgency_keywords_detected=urgency,
+            stated_purpose=purpose,
+        )
+    except ValueError as exc:
+        _abort(str(exc))
+    assessment = engine.evaluate_payment(context)
+    store.save(store_file)
+    if output_format.lower() == "table":
+        typer.echo(f"APP Scam Assessment {assessment.assessment_id}:")
+        typer.echo(f"  Risk Score:  {assessment.risk_score:.4f}")
+        typer.echo(f"  Risk Level:  {ScamRiskLevel(assessment.risk_level).value}")
+        typer.echo(f"  Typology:    {ScamTypology(assessment.typology).value}")
+        typer.echo(f"  Action:      {ScamInterventionAction(assessment.action).value}")
+        if assessment.hold_id:
+            typer.echo(f"  Hold ID:     {assessment.hold_id}")
+        if assessment.customer_warning:
+            typer.echo(f"  Warning:     {assessment.customer_warning}")
+    else:
+        typer.echo(json.dumps(assessment.to_dict(), indent=2))
+
+
+@app.command("app-scam-hold-resolve")
+def app_scam_hold_resolve(
+    hold_id: Annotated[str, typer.Option("--hold-id", help="Cooling-off hold identifier.")],
+    outcome: Annotated[
+        str,
+        typer.Option(
+            "--outcome", help="Resolution outcome (released or confirmed_scam_cancelled)."
+        ),
+    ],
+    note: Annotated[str, typer.Option("--note", help="Resolution audit note.")] = "",
+    store_file: Annotated[
+        Path,
+        typer.Option("--store-file", "-s", help="Path to APP scam state JSON file."),
+    ] = Path("app_scam_store.json"),
+    output_format: Annotated[
+        str, typer.Option("--format", "-f", help="Output format (table or json).")
+    ] = "table",
+) -> None:
+    """Resolve an active APP scam cooling-off payment hold."""
+    engine, store = _load_app_scam_state(store_file)
+    try:
+        hold = engine.resolve_hold(hold_id, outcome=outcome, note=note)
+    except (KeyError, ValueError) as exc:
+        _abort(str(exc))
+    store.save(store_file)
+    if output_format.lower() == "table":
+        typer.echo(f"Cooling-Off Hold {hold.hold_id}: {hold.status}")
+        if hold.resolution_note:
+            typer.echo(f"  Note: {hold.resolution_note}")
+    else:
+        typer.echo(json.dumps(hold.to_dict(), indent=2))
+
+
+@app.command("app-scam-summary")
+def app_scam_summary(
+    tenant_id: Annotated[
+        str | None, typer.Option("--tenant", "-t", help="Optional tenant filter.")
+    ] = None,
+    store_file: Annotated[
+        Path,
+        typer.Option("--store-file", "-s", help="Path to APP scam state JSON file."),
+    ] = Path("app_scam_store.json"),
+    output_format: Annotated[
+        str, typer.Option("--format", "-f", help="Output format (table or json).")
+    ] = "table",
+) -> None:
+    """Display summary metrics of APP scam evaluations and cooling-off holds."""
+    _, store = _load_app_scam_state(store_file)
+    summary_data = store.summary(tenant_id=tenant_id)
+    if output_format.lower() == "table":
+        typer.echo("APP Scam Defense Summary:")
+        typer.echo(f"  Assessments:       {summary_data['total_assessments']}")
+        typer.echo(f"  Cooling-Off Holds: {summary_data['total_holds']}")
+        typer.echo(f"  Protected Amount:  {summary_data['protected_amount']:.2f}")
+        for level_key, cnt in summary_data["by_risk_level"].items():
+            typer.echo(f"    {level_key:16s}: {cnt}")
     else:
         typer.echo(json.dumps(summary_data, indent=2))
 
