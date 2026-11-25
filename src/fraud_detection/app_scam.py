@@ -18,6 +18,9 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from fraud_detection.cases import CaseManager
+from fraud_detection.events import EventBus, EventType, FraudDomainEvent
+
 
 def _utc_now_iso() -> str:
     return datetime.now(UTC).isoformat()
@@ -782,3 +785,280 @@ class AppScamStore:
         for item in data.get("holds", []):
             store.record_hold(ScamCoolingOffHold.from_dict(item))
         return store
+
+
+_WARNING_PROMPTS: dict[ScamTypology, str] = {
+    ScamTypology.REMOTE_ACCESS_COACHING: (
+        "Stop: Never send money while sharing your screen or following instructions on a call."
+    ),
+    ScamTypology.IMPERSONATION_BANK: (
+        "Stop: Your bank will never ask you to move money to a 'safe account' to protect funds."
+    ),
+    ScamTypology.IMPERSONATION_GOVERNMENT: (
+        "Stop: Tax authorities and police never demand immediate bank transfers or threaten arrest."
+    ),
+    ScamTypology.INVESTMENT_CRYPTO: (
+        "Warning: High-return crypto and investment offers via social media are frequently scams."
+    ),
+    ScamTypology.ROMANCE_PIG_BUTCHERING: (
+        "Warning: Escalating transfers to a new contact often indicate romance or investment scams."
+    ),
+    ScamTypology.INVOICE_REDIRECTION_BEC: (
+        "Warning: Verify changed bank details directly with the supplier via a trusted number."
+    ),
+    ScamTypology.PURCHASE_MARKETPLACE: (
+        "Warning: Paying a new seller by bank transfer offers no buyer protection if scammed."
+    ),
+    ScamTypology.UNKNOWN: (
+        "Warning: Pause and verify the beneficiary independently before authorizing this transfer."
+    ),
+}
+
+
+def classify_scam_typology(
+    context: AppPaymentContext,
+    signals: list[ScamSignal],
+) -> ScamTypology:
+    """Deterministically classify the most likely APP scam typology from context and signals."""
+    sig_types = {ScamSignalType(sig.signal_type) for sig in signals}
+    purpose = context.stated_purpose
+
+    if context.screen_share_or_rat_detected:
+        return ScamTypology.REMOTE_ACCESS_COACHING
+    if any(tok in purpose for tok in ("hmrc", "irs", "police", "tax_fine", "arrest", "court")):
+        return ScamTypology.IMPERSONATION_GOVERNMENT
+    if any(tok in purpose for tok in ("safe_account", "fraud_department", "bank_security")):
+        return ScamTypology.IMPERSONATION_BANK
+    if ScamSignalType.CRYPTO_OR_HIGH_RISK_RAIL in sig_types:
+        return ScamTypology.INVESTMENT_CRYPTO
+    if ScamSignalType.RAPID_ESCALATING_TRANSFERS in sig_types or "romance" in purpose:
+        return ScamTypology.ROMANCE_PIG_BUTCHERING
+    if (
+        "invoice" in purpose
+        or "supplier" in purpose
+        or (ScamSignalType.BENEFICIARY_NAME_MISMATCH in sig_types and context.amount >= 1500.0)
+    ):
+        return ScamTypology.INVOICE_REDIRECTION_BEC
+    if "purchase" in purpose or "marketplace" in purpose or "goods" in purpose:
+        return ScamTypology.PURCHASE_MARKETPLACE
+    if ScamSignalType.ACTIVE_CALL_OR_SCREEN_SHARE in sig_types:
+        return ScamTypology.IMPERSONATION_BANK
+    return ScamTypology.UNKNOWN
+
+
+class AppScamDefenseEngine:
+    """Orchestrates APP scam detection, graduated friction, holds, cases, and EventBus events."""
+
+    def __init__(
+        self,
+        *,
+        store: AppScamStore | None = None,
+        behavioral_analyzer: BehavioralCoachingAnalyzer | None = None,
+        payee_analyzer: PayeeBeneficiaryAnalyzer | None = None,
+        escalation_analyzer: TransferEscalationAnalyzer | None = None,
+        case_manager: CaseManager | None = None,
+        event_bus: EventBus | None = None,
+        warning_threshold: float = 0.25,
+        hold_threshold: float = 0.55,
+        callback_threshold: float = 0.72,
+        block_threshold: float = 0.85,
+        default_hold_minutes: int = 120,
+    ) -> None:
+        self.store = store or AppScamStore()
+        self.behavioral_analyzer = behavioral_analyzer or BehavioralCoachingAnalyzer()
+        self.payee_analyzer = payee_analyzer or PayeeBeneficiaryAnalyzer()
+        self.escalation_analyzer = escalation_analyzer or TransferEscalationAnalyzer()
+        self.case_manager = case_manager
+        self.event_bus = event_bus
+        self.warning_threshold = _clamp(warning_threshold)
+        self.hold_threshold = _clamp(hold_threshold)
+        self.callback_threshold = _clamp(callback_threshold)
+        self.block_threshold = _clamp(block_threshold)
+        self.default_hold_minutes = max(5, int(default_hold_minutes))
+        self._lock = threading.RLock()
+
+    def _emit_event(
+        self,
+        event_type: EventType,
+        *,
+        tenant_id: str,
+        payload: dict[str, Any],
+    ) -> None:
+        if self.event_bus is None:
+            return
+        self.event_bus.publish(
+            FraudDomainEvent(
+                event_type=event_type,
+                tenant_id=tenant_id,
+                payload=payload,
+            )
+        )
+
+    def _score_signals(self, signals: list[ScamSignal]) -> float:
+        if not signals:
+            return 0.0
+        # Noisy-OR fusion so multiple independent scam cues compound smoothly toward 1.0
+        residual = 1.0
+        for sig in signals:
+            residual *= 1.0 - _clamp(sig.severity)
+        return round(_clamp(1.0 - residual), 4)
+
+    def _route_score(self, score: float) -> tuple[ScamRiskLevel, ScamInterventionAction]:
+        if score >= self.block_threshold:
+            return ScamRiskLevel.CRITICAL, ScamInterventionAction.BLOCK_AND_ESCALATE
+        if score >= self.callback_threshold:
+            return ScamRiskLevel.HIGH, ScamInterventionAction.CALLBACK_VERIFICATION
+        if score >= self.hold_threshold:
+            return ScamRiskLevel.HIGH, ScamInterventionAction.COOLING_OFF_HOLD
+        if score >= self.warning_threshold:
+            return ScamRiskLevel.MEDIUM, ScamInterventionAction.DYNAMIC_WARNING
+        return ScamRiskLevel.LOW, ScamInterventionAction.ALLOW
+
+    def _escalate_case(
+        self,
+        *,
+        context: AppPaymentContext,
+        score: float,
+        typology: ScamTypology,
+        signals: list[ScamSignal],
+    ) -> str | None:
+        if self.case_manager is None:
+            return None
+        created = self.case_manager.create_case(
+            transaction_id=f"app_scam:{context.payment_id}",
+            fraud_score=score,
+            tenant_id=context.tenant_id,
+            metadata={
+                "source": "app_scam_defense_engine",
+                "sender_account_id": context.sender_account_id,
+                "payee_account_id": context.payee_account_id,
+                "amount": context.amount,
+                "typology": typology.value,
+                "signals": [ScamSignalType(s.signal_type).value for s in signals],
+            },
+        )
+        return created.case_id
+
+    def evaluate_payment(self, context: AppPaymentContext) -> AppScamAssessment:
+        """Evaluate an authorized push payment for social engineering scam indicators."""
+        with self._lock:
+            recent = self.store.recent_sender_payments(
+                context.sender_account_id, tenant_id=context.tenant_id
+            )
+            signals = [
+                *self.behavioral_analyzer.analyze(context),
+                *self.payee_analyzer.analyze(context),
+                *self.escalation_analyzer.analyze(context, recent),
+            ]
+            score = self._score_signals(signals)
+            risk_level, action = self._route_score(score)
+            typology = classify_scam_typology(context, signals) if signals else ScamTypology.UNKNOWN
+            warning = _WARNING_PROMPTS[typology] if action != ScamInterventionAction.ALLOW else ""
+
+            hold_id: str | None = None
+            if action in {
+                ScamInterventionAction.COOLING_OFF_HOLD,
+                ScamInterventionAction.CALLBACK_VERIFICATION,
+            }:
+                hold = ScamCoolingOffHold(
+                    payment_id=context.payment_id,
+                    sender_account_id=context.sender_account_id,
+                    payee_account_id=context.payee_account_id,
+                    amount=context.amount,
+                    typology=typology,
+                    tenant_id=context.tenant_id,
+                    hold_duration_minutes=self.default_hold_minutes,
+                    reason=f"APP scam {action.value} ({typology.value}, score={score:.2f})",
+                )
+                self.store.record_hold(hold)
+                hold_id = hold.hold_id
+
+            case_id: str | None = None
+            if risk_level in {ScamRiskLevel.HIGH, ScamRiskLevel.CRITICAL}:
+                case_id = self._escalate_case(
+                    context=context,
+                    score=score,
+                    typology=typology,
+                    signals=signals,
+                )
+
+            assessment = AppScamAssessment(
+                payment_id=context.payment_id,
+                sender_account_id=context.sender_account_id,
+                payee_account_id=context.payee_account_id,
+                amount=context.amount,
+                risk_score=score,
+                risk_level=risk_level,
+                typology=typology,
+                action=action,
+                tenant_id=context.tenant_id,
+                signals=signals,
+                customer_warning=warning,
+                hold_id=hold_id,
+                case_id=case_id,
+                metadata=dict(context.metadata),
+            )
+            self.store.record_payment(context)
+            self.store.record_assessment(assessment)
+
+        self._emit_event(
+            EventType.APP_SCAM_ASSESSED,
+            tenant_id=context.tenant_id,
+            payload=assessment.to_dict(),
+        )
+        if hold_id is not None:
+            self._emit_event(
+                EventType.APP_SCAM_HOLD_PLACED,
+                tenant_id=context.tenant_id,
+                payload={
+                    "hold_id": hold_id,
+                    "assessment_id": assessment.assessment_id,
+                    "payment_id": context.payment_id,
+                    "sender_account_id": context.sender_account_id,
+                    "amount": context.amount,
+                    "typology": typology.value,
+                },
+            )
+        elif action == ScamInterventionAction.BLOCK_AND_ESCALATE:
+            self._emit_event(
+                EventType.APP_SCAM_BLOCKED,
+                tenant_id=context.tenant_id,
+                payload=assessment.to_dict(),
+            )
+        return assessment
+
+    def resolve_hold(
+        self,
+        hold_id: str,
+        *,
+        outcome: CoolingOffHoldStatus | str,
+        note: str = "",
+    ) -> ScamCoolingOffHold:
+        """Resolve an active cooling-off hold as RELEASED or CONFIRMED_SCAM_CANCELLED."""
+        resolved_status = (
+            outcome
+            if isinstance(outcome, CoolingOffHoldStatus)
+            else CoolingOffHoldStatus(str(outcome).lower())
+        )
+        if resolved_status == CoolingOffHoldStatus.ACTIVE:
+            raise ValueError(
+                "Hold resolution outcome must be 'released' or 'confirmed_scam_cancelled'"
+            )
+
+        with self._lock:
+            hold = self.store.get_hold(hold_id)
+            if hold is None:
+                raise KeyError(f"Cooling-off hold '{hold_id}' not found")
+            if hold.status != CoolingOffHoldStatus.ACTIVE:
+                raise ValueError(f"Cooling-off hold '{hold_id}' is already {hold.status}")
+            hold.status = resolved_status
+            hold.resolved_at = _utc_now_iso()
+            hold.resolution_note = note.strip()
+            self.store.record_hold(hold)
+
+        self._emit_event(
+            EventType.APP_SCAM_HOLD_RESOLVED,
+            tenant_id=hold.tenant_id,
+            payload=hold.to_dict(),
+        )
+        return hold
