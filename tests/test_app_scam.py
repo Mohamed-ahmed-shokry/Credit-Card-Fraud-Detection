@@ -9,6 +9,7 @@ from fraud_detection.app_scam import (
     AppScamAssessment,
     BehavioralCoachingAnalyzer,
     CoolingOffHoldStatus,
+    PayeeBeneficiaryAnalyzer,
     ScamCoolingOffHold,
     ScamInterventionAction,
     ScamRiskLevel,
@@ -171,3 +172,51 @@ def test_behavioral_coaching_analyzer_detects_all_branches() -> None:
         ScamSignalType.BEHAVIORAL_HESITATION_OR_COPY_PASTE,
         ScamSignalType.ELDER_OR_VULNERABLE_ANOMALY,
     }
+
+
+def test_payee_beneficiary_analyzer_detects_all_branches() -> None:
+    analyzer = PayeeBeneficiaryAnalyzer()
+
+    clean = AppPaymentContext(
+        sender_account_id="s1",
+        payee_account_id="p1",
+        amount=300.0,
+        is_new_payee=False,
+        cop_name_match="match",
+        payment_rail="faster_payments",
+    )
+    assert analyzer.analyze(clean) == []
+
+    risky = AppPaymentContext(
+        sender_account_id="s1",
+        payee_account_id="p2",
+        amount=6500.0,
+        is_new_payee=True,
+        cop_name_match="no_match",
+        payment_rail="crypto_exchange",
+        stated_purpose="bitcoin_investment",
+    )
+    sigs = analyzer.analyze(risky)
+    assert {s.signal_type for s in sigs} == {
+        ScamSignalType.NEW_PAYEE_HIGH_VALUE,
+        ScamSignalType.BENEFICIARY_NAME_MISMATCH,
+        ScamSignalType.CRYPTO_OR_HIGH_RISK_RAIL,
+    }
+    by_type = {s.signal_type: s for s in sigs}
+    assert by_type[ScamSignalType.NEW_PAYEE_HIGH_VALUE].severity == 0.75
+    assert by_type[ScamSignalType.BENEFICIARY_NAME_MISMATCH].severity == 0.8
+    assert by_type[ScamSignalType.CRYPTO_OR_HIGH_RISK_RAIL].severity == 0.75
+
+    moderate = AppPaymentContext(
+        sender_account_id="s1",
+        payee_account_id="p3",
+        amount=2000.0,
+        is_new_payee=True,
+        cop_name_match="close_match",
+        payment_rail="faster_payments",
+        stated_purpose="crypto",
+    )
+    mod_by_type = {s.signal_type: s for s in analyzer.analyze(moderate)}
+    assert mod_by_type[ScamSignalType.NEW_PAYEE_HIGH_VALUE].severity == 0.5
+    assert mod_by_type[ScamSignalType.BENEFICIARY_NAME_MISMATCH].severity == 0.45
+    assert mod_by_type[ScamSignalType.CRYPTO_OR_HIGH_RISK_RAIL].severity == 0.55
