@@ -7613,3 +7613,112 @@ def test_automation_bridge_api_error_branches(api_context: tuple[Path, Any, Path
         st_uninit = client.get("/v1/automation/status")
         assert st_uninit.status_code == 200
         assert st_uninit.json()["status"] == "uninitialized"
+
+
+def test_app_scam_api_end_to_end_and_metrics(api_context: tuple[Path, Any, Path]) -> None:
+    """Validate /v1/app-scam/* evaluation, holds, resolution, metrics, and Prometheus counters."""
+    _, model, _ = api_context
+    app = create_app(model=model)
+
+    with TestClient(app) as client:
+        # 1. Evaluate a coached payment that triggers a cooling-off hold
+        ev = client.post(
+            "/v1/app-scam/evaluate",
+            json={
+                "sender_account_id": "acct-scam-1",
+                "payee_account_id": "payee-new-1",
+                "amount": 600.0,
+                "is_new_payee": False,
+                "active_phone_call": True,
+                "tenant_id": "tenant-a",
+            },
+        )
+        assert ev.status_code == 200
+        data = ev.json()
+        assert data["action"] == "cooling_off_hold"
+        assert data["hold_id"] is not None
+        assert data["case_id"] is not None
+        aid = data["assessment_id"]
+        hid = data["hold_id"]
+
+        # 2. Get and list assessments
+        get_a = client.get(f"/v1/app-scam/assessments/{aid}")
+        assert get_a.status_code == 200
+        assert get_a.json()["assessment_id"] == aid
+
+        list_a = client.get("/v1/app-scam/assessments?tenant_id=tenant-a&risk_level=high")
+        assert list_a.status_code == 200
+        assert list_a.json()["total_count"] == 1
+
+        # 3. List and resolve cooling-off hold
+        list_h = client.get("/v1/app-scam/holds?status=active")
+        assert list_h.status_code == 200
+        assert list_h.json()["total_count"] == 1
+
+        res = client.post(
+            f"/v1/app-scam/holds/{hid}/resolve",
+            json={
+                "outcome": "confirmed_scam_cancelled",
+                "note": "Confirmed bank impersonation",
+            },
+        )
+        assert res.status_code == 200
+        assert res.json()["status"] == "confirmed_scam_cancelled"
+
+        # 4. Summary metrics & Prometheus /metrics
+        met = client.get("/v1/app-scam/metrics?tenant_id=tenant-a")
+        assert met.status_code == 200
+        assert met.json()["status"] == "operational"
+        assert met.json()["total_assessments"] == 1
+        assert met.json()["holds_by_status"]["confirmed_scam_cancelled"] == 1
+
+        prom = client.get("/metrics")
+        assert prom.status_code == 200
+        assert "fraud_app_scam_evaluations_total" in prom.text
+        assert "fraud_app_scam_signals_total" in prom.text
+        assert "fraud_app_scam_holds_total" in prom.text
+
+
+def test_app_scam_api_error_branches(api_context: tuple[Path, Any, Path]) -> None:
+    """Validate 400, 404, and 500 error branches on /v1/app-scam/* endpoints."""
+    _, model, _ = api_context
+    app = create_app(model=model)
+
+    with TestClient(app) as client:
+        assert client.get("/v1/app-scam/assessments/missing").status_code == 404
+        assert (
+            client.post(
+                "/v1/app-scam/holds/missing/resolve",
+                json={"outcome": "released"},
+            ).status_code
+            == 404
+        )
+        assert (
+            client.post(
+                "/v1/app-scam/holds/any/resolve",
+                json={"outcome": "active"},
+            ).status_code
+            == 400
+        )
+
+        app.state.app_scam_engine = None
+        assert (
+            client.post(
+                "/v1/app-scam/evaluate",
+                json={"sender_account_id": "s1", "payee_account_id": "p1", "amount": 100.0},
+            ).status_code
+            == 500
+        )
+        assert client.get("/v1/app-scam/assessments").status_code == 500
+        assert client.get("/v1/app-scam/assessments/a1").status_code == 500
+        assert client.get("/v1/app-scam/holds").status_code == 500
+        assert (
+            client.post(
+                "/v1/app-scam/holds/h1/resolve",
+                json={"outcome": "released"},
+            ).status_code
+            == 500
+        )
+        uninit = client.get("/v1/app-scam/metrics")
+        assert uninit.status_code == 200
+        assert uninit.json()["status"] == "uninitialized"
