@@ -7,6 +7,7 @@ import pytest
 from fraud_detection.app_scam import (
     AppPaymentContext,
     AppScamAssessment,
+    BehavioralCoachingAnalyzer,
     CoolingOffHoldStatus,
     ScamCoolingOffHold,
     ScamInterventionAction,
@@ -112,3 +113,61 @@ def test_scam_signal_hold_and_assessment_roundtrip() -> None:
     assert assessment.typology is ScamTypology.IMPERSONATION_BANK
     assert assessment.action is ScamInterventionAction.COOLING_OFF_HOLD
     assert AppScamAssessment.from_dict(assessment.to_dict()) == assessment
+
+
+def test_behavioral_coaching_analyzer_detects_all_branches() -> None:
+    analyzer = BehavioralCoachingAnalyzer()
+
+    # Clean low-risk payment
+    clean = AppPaymentContext(
+        sender_account_id="s1",
+        payee_account_id="p1",
+        amount=120.0,
+        is_new_payee=False,
+        sender_age_years=40,
+    )
+    assert analyzer.analyze(clean) == []
+
+    # Active call only + extreme hesitation without copy-paste
+    call_only = AppPaymentContext(
+        sender_account_id="s1",
+        payee_account_id="p1",
+        amount=200.0,
+        active_phone_call=True,
+        session_hesitation_seconds=135.0,
+    )
+    sigs = analyzer.analyze(call_only)
+    types = {s.signal_type for s in sigs}
+    assert ScamSignalType.ACTIVE_CALL_OR_SCREEN_SHARE in types
+    assert ScamSignalType.BEHAVIORAL_HESITATION_OR_COPY_PASTE in types
+
+    # RAT only
+    rat_only = AppPaymentContext(
+        sender_account_id="s1",
+        payee_account_id="p1",
+        amount=200.0,
+        screen_share_or_rat_detected=True,
+    )
+    rat_sigs = analyzer.analyze(rat_only)
+    assert rat_sigs[0].severity == 0.85
+
+    # Combined call + RAT + urgency + safe_account + copy-paste + elder
+    severe = AppPaymentContext(
+        sender_account_id="s1",
+        payee_account_id="p1",
+        amount=5000.0,
+        active_phone_call=True,
+        screen_share_or_rat_detected=True,
+        urgency_keywords_detected=True,
+        stated_purpose="safe_account",
+        payee_details_pasted=True,
+        session_hesitation_seconds=60.0,
+        sender_age_years=72,
+    )
+    severe_sigs = analyzer.analyze(severe)
+    assert {s.signal_type for s in severe_sigs} == {
+        ScamSignalType.ACTIVE_CALL_OR_SCREEN_SHARE,
+        ScamSignalType.URGENCY_OR_SCRIPTED_COACHING,
+        ScamSignalType.BEHAVIORAL_HESITATION_OR_COPY_PASTE,
+        ScamSignalType.ELDER_OR_VULNERABLE_ANOMALY,
+    }
