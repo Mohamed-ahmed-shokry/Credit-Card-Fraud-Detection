@@ -276,3 +276,75 @@ class ScamCoolingOffHold:
             ),
             resolution_note=str(payload.get("resolution_note", "")),
         )
+
+
+@dataclass(slots=True)
+class AppScamAssessment:
+    """Calibrated APP scam risk assessment and intervention recommendation."""
+
+    payment_id: str
+    sender_account_id: str
+    payee_account_id: str
+    amount: float
+    risk_score: float
+    risk_level: ScamRiskLevel | str
+    typology: ScamTypology | str
+    action: ScamInterventionAction | str
+    tenant_id: str = "default"
+    assessment_id: str = field(default_factory=lambda: f"asa_{uuid4().hex[:12]}")
+    signals: list[ScamSignal] = field(default_factory=list)
+    customer_warning: str = ""
+    hold_id: str | None = None
+    case_id: str | None = None
+    assessed_at: str = field(default_factory=_utc_now_iso)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.risk_score = round(_clamp(self.risk_score), 4)
+        if not isinstance(self.risk_level, ScamRiskLevel):
+            self.risk_level = ScamRiskLevel(str(self.risk_level).lower())
+        if not isinstance(self.typology, ScamTypology):
+            self.typology = ScamTypology(str(self.typology).lower())
+        if not isinstance(self.action, ScamInterventionAction):
+            self.action = ScamInterventionAction(str(self.action).lower())
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "assessment_id": self.assessment_id,
+            "payment_id": self.payment_id,
+            "sender_account_id": self.sender_account_id,
+            "payee_account_id": self.payee_account_id,
+            "amount": self.amount,
+            "risk_score": self.risk_score,
+            "risk_level": ScamRiskLevel(self.risk_level).value,
+            "typology": ScamTypology(self.typology).value,
+            "action": ScamInterventionAction(self.action).value,
+            "tenant_id": self.tenant_id,
+            "signals": [sig.to_dict() for sig in self.signals],
+            "customer_warning": self.customer_warning,
+            "hold_id": self.hold_id,
+            "case_id": self.case_id,
+            "assessed_at": self.assessed_at,
+            "metadata": dict(self.metadata),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> AppScamAssessment:
+        return cls(
+            assessment_id=str(payload.get("assessment_id", f"asa_{uuid4().hex[:12]}")),
+            payment_id=str(payload["payment_id"]),
+            sender_account_id=str(payload["sender_account_id"]),
+            payee_account_id=str(payload["payee_account_id"]),
+            amount=float(payload["amount"]),
+            risk_score=float(payload["risk_score"]),
+            risk_level=ScamRiskLevel(str(payload["risk_level"]).lower()),
+            typology=ScamTypology(str(payload.get("typology", "unknown")).lower()),
+            action=ScamInterventionAction(str(payload["action"]).lower()),
+            tenant_id=str(payload.get("tenant_id", "default")),
+            signals=[ScamSignal.from_dict(item) for item in payload.get("signals", [])],
+            customer_warning=str(payload.get("customer_warning", "")),
+            hold_id=str(payload["hold_id"]) if payload.get("hold_id") is not None else None,
+            case_id=str(payload["case_id"]) if payload.get("case_id") is not None else None,
+            assessed_at=str(payload.get("assessed_at", _utc_now_iso())),
+            metadata=dict(payload.get("metadata", {})),
+        )
