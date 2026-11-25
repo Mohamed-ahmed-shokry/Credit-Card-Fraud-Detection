@@ -9,9 +9,12 @@ and escalates high-risk cases to CaseManager and EventBus.
 
 from __future__ import annotations
 
+import json
+import threading
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
@@ -609,3 +612,173 @@ class TransferEscalationAnalyzer:
                 },
             )
         ]
+
+
+class AppScamStore:
+    """Thread-safe ledger of APP payments, scam assessments, and cooling-off holds."""
+
+    def __init__(self, *, max_records: int = 5000) -> None:
+        self.max_records = max(1, int(max_records))
+        self._lock = threading.RLock()
+        self._payments: list[AppPaymentContext] = []
+        self._assessments: dict[str, AppScamAssessment] = {}
+        self._assessment_order: list[str] = []
+        self._holds: dict[str, ScamCoolingOffHold] = {}
+        self._hold_order: list[str] = []
+
+    def record_payment(self, context: AppPaymentContext) -> None:
+        with self._lock:
+            self._payments.append(context)
+            if len(self._payments) > self.max_records:
+                self._payments = self._payments[-self.max_records :]
+
+    def recent_sender_payments(
+        self,
+        sender_account_id: str,
+        *,
+        tenant_id: str | None = None,
+    ) -> list[AppPaymentContext]:
+        with self._lock:
+            return [
+                item
+                for item in self._payments
+                if item.sender_account_id == sender_account_id
+                and (tenant_id is None or item.tenant_id == tenant_id)
+            ]
+
+    def record_assessment(self, assessment: AppScamAssessment) -> None:
+        with self._lock:
+            if assessment.assessment_id not in self._assessments:
+                self._assessment_order.append(assessment.assessment_id)
+            self._assessments[assessment.assessment_id] = assessment
+            while len(self._assessment_order) > self.max_records:
+                evicted = self._assessment_order.pop(0)
+                self._assessments.pop(evicted, None)
+
+    def get_assessment(self, assessment_id: str) -> AppScamAssessment | None:
+        with self._lock:
+            return self._assessments.get(assessment_id)
+
+    def list_assessments(
+        self,
+        *,
+        tenant_id: str | None = None,
+        sender_account_id: str | None = None,
+        risk_level: ScamRiskLevel | str | None = None,
+        typology: ScamTypology | str | None = None,
+        limit: int = 100,
+    ) -> list[AppScamAssessment]:
+        level_filter = ScamRiskLevel(str(risk_level).lower()) if risk_level is not None else None
+        typology_filter = ScamTypology(str(typology).lower()) if typology is not None else None
+        with self._lock:
+            items = [self._assessments[aid] for aid in reversed(self._assessment_order)]
+        filtered = [
+            item
+            for item in items
+            if (tenant_id is None or item.tenant_id == tenant_id)
+            and (sender_account_id is None or item.sender_account_id == sender_account_id)
+            and (level_filter is None or item.risk_level == level_filter)
+            and (typology_filter is None or item.typology == typology_filter)
+        ]
+        return filtered[: max(1, int(limit))]
+
+    def record_hold(self, hold: ScamCoolingOffHold) -> None:
+        with self._lock:
+            if hold.hold_id not in self._holds:
+                self._hold_order.append(hold.hold_id)
+            self._holds[hold.hold_id] = hold
+            while len(self._hold_order) > self.max_records:
+                evicted = self._hold_order.pop(0)
+                self._holds.pop(evicted, None)
+
+    def get_hold(self, hold_id: str) -> ScamCoolingOffHold | None:
+        with self._lock:
+            return self._holds.get(hold_id)
+
+    def list_holds(
+        self,
+        *,
+        tenant_id: str | None = None,
+        sender_account_id: str | None = None,
+        status: CoolingOffHoldStatus | str | None = None,
+        limit: int = 100,
+    ) -> list[ScamCoolingOffHold]:
+        status_filter = CoolingOffHoldStatus(str(status).lower()) if status is not None else None
+        with self._lock:
+            items = [self._holds[hid] for hid in reversed(self._hold_order)]
+        filtered = [
+            item
+            for item in items
+            if (tenant_id is None or item.tenant_id == tenant_id)
+            and (sender_account_id is None or item.sender_account_id == sender_account_id)
+            and (status_filter is None or item.status == status_filter)
+        ]
+        return filtered[: max(1, int(limit))]
+
+    def summary(self, *, tenant_id: str | None = None) -> dict[str, Any]:
+        with self._lock:
+            assessments = [
+                self._assessments[aid]
+                for aid in self._assessment_order
+                if tenant_id is None or self._assessments[aid].tenant_id == tenant_id
+            ]
+            holds = [
+                self._holds[hid]
+                for hid in self._hold_order
+                if tenant_id is None or self._holds[hid].tenant_id == tenant_id
+            ]
+
+        by_level: dict[str, int] = {level.value: 0 for level in ScamRiskLevel}
+        by_action: dict[str, int] = {act.value: 0 for act in ScamInterventionAction}
+        by_typology: dict[str, int] = {}
+        protected_amount = 0.0
+        for item in assessments:
+            by_level[ScamRiskLevel(item.risk_level).value] += 1
+            by_action[ScamInterventionAction(item.action).value] += 1
+            t_key = ScamTypology(item.typology).value
+            by_typology[t_key] = by_typology.get(t_key, 0) + 1
+            if item.action in {
+                ScamInterventionAction.COOLING_OFF_HOLD,
+                ScamInterventionAction.CALLBACK_VERIFICATION,
+                ScamInterventionAction.BLOCK_AND_ESCALATE,
+            }:
+                protected_amount += item.amount
+
+        holds_by_status: dict[str, int] = {st.value: 0 for st in CoolingOffHoldStatus}
+        for hold in holds:
+            holds_by_status[CoolingOffHoldStatus(hold.status).value] += 1
+
+        return {
+            "total_assessments": len(assessments),
+            "by_risk_level": by_level,
+            "by_action": by_action,
+            "by_typology": by_typology,
+            "total_holds": len(holds),
+            "holds_by_status": holds_by_status,
+            "protected_amount": round(protected_amount, 2),
+        }
+
+    def save(self, path: str | Path) -> Path:
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with self._lock:
+            payload = {
+                "max_records": self.max_records,
+                "payments": [p.to_dict() for p in self._payments],
+                "assessments": [self._assessments[aid].to_dict() for aid in self._assessment_order],
+                "holds": [self._holds[hid].to_dict() for hid in self._hold_order],
+            }
+        target.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        return target
+
+    @classmethod
+    def load(cls, path: str | Path) -> AppScamStore:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        store = cls(max_records=int(data.get("max_records", 5000)))
+        for item in data.get("payments", []):
+            store.record_payment(AppPaymentContext.from_dict(item))
+        for item in data.get("assessments", []):
+            store.record_assessment(AppScamAssessment.from_dict(item))
+        for item in data.get("holds", []):
+            store.record_hold(ScamCoolingOffHold.from_dict(item))
+        return store
