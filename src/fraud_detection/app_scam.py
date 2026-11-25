@@ -530,3 +530,82 @@ class PayeeBeneficiaryAnalyzer:
             )
 
         return signals
+
+
+class TransferEscalationAnalyzer:
+    """Detects pig-butchering test-then-escalate transfers and rapid balance drains."""
+
+    def __init__(
+        self,
+        *,
+        window_minutes: int = 60,
+        escalation_multiplier: float = 3.0,
+        balance_drain_ratio: float = 0.75,
+    ) -> None:
+        self.window_minutes = max(1, int(window_minutes))
+        self.escalation_multiplier = max(1.5, float(escalation_multiplier))
+        self.balance_drain_ratio = _clamp(balance_drain_ratio, 0.1, 1.0)
+
+    def analyze(
+        self,
+        context: AppPaymentContext,
+        recent_sender_payments: list[AppPaymentContext],
+    ) -> list[ScamSignal]:
+        now_dt = _parse_iso(context.initiated_at)
+        window_seconds = self.window_minutes * 60
+        in_window: list[AppPaymentContext] = []
+        for prev in recent_sender_payments:
+            if prev.payment_id == context.payment_id:
+                continue
+            delta = (now_dt - _parse_iso(prev.initiated_at)).total_seconds()
+            if 0.0 <= delta <= window_seconds:
+                in_window.append(prev)
+
+        same_payee = [p for p in in_window if p.payee_account_id == context.payee_account_id]
+        escalated = False
+        min_prior_amount = 0.0
+        if same_payee:
+            min_prior_amount = min(p.amount for p in same_payee)
+            if (
+                min_prior_amount > 0
+                and context.amount >= min_prior_amount * self.escalation_multiplier
+            ):
+                escalated = True
+
+        balance_drained = False
+        drain_ratio = 0.0
+        if context.sender_balance_before is not None and context.sender_balance_before > 0:
+            cumulative = context.amount + sum(p.amount for p in in_window)
+            drain_ratio = cumulative / context.sender_balance_before
+            if drain_ratio >= self.balance_drain_ratio and (
+                context.is_new_payee or bool(in_window)
+            ):
+                balance_drained = True
+
+        if not escalated and not balance_drained:
+            return []
+
+        if escalated and balance_drained:
+            severity = 0.9
+            detail = "Test-then-escalate transfer sequence draining sender account balance."
+        elif escalated:
+            severity = 0.75
+            detail = "Rapidly escalating transfer amount to the same beneficiary."
+        else:
+            severity = 0.7
+            detail = "Single or burst push transfer draining a large share of account balance."
+
+        return [
+            ScamSignal(
+                signal_type=ScamSignalType.RAPID_ESCALATING_TRANSFERS,
+                severity=severity,
+                detail=detail,
+                evidence={
+                    "escalated": escalated,
+                    "min_prior_amount": min_prior_amount,
+                    "recent_window_count": len(in_window),
+                    "balance_drained": balance_drained,
+                    "drain_ratio": round(drain_ratio, 4),
+                },
+            )
+        ]
