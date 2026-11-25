@@ -16,6 +16,7 @@ from fraud_detection.app_scam import (
     ScamSignal,
     ScamSignalType,
     ScamTypology,
+    TransferEscalationAnalyzer,
     _clamp,
     _parse_iso,
 )
@@ -220,3 +221,76 @@ def test_payee_beneficiary_analyzer_detects_all_branches() -> None:
     assert mod_by_type[ScamSignalType.NEW_PAYEE_HIGH_VALUE].severity == 0.5
     assert mod_by_type[ScamSignalType.BENEFICIARY_NAME_MISMATCH].severity == 0.45
     assert mod_by_type[ScamSignalType.CRYPTO_OR_HIGH_RISK_RAIL].severity == 0.55
+
+
+def test_transfer_escalation_analyzer_detects_all_branches() -> None:
+    analyzer = TransferEscalationAnalyzer(window_minutes=60, escalation_multiplier=3.0)
+    t0 = "2026-11-25T10:00:00+00:00"
+    t1 = "2026-11-25T10:15:00+00:00"
+    old_t = "2026-11-25T07:00:00+00:00"
+
+    prior_small = AppPaymentContext(
+        payment_id="app_prior",
+        sender_account_id="s1",
+        payee_account_id="p1",
+        amount=100.0,
+        initiated_at=t0,
+    )
+    stale = AppPaymentContext(
+        payment_id="app_stale",
+        sender_account_id="s1",
+        payee_account_id="p1",
+        amount=50.0,
+        initiated_at=old_t,
+    )
+
+    # No escalation, no drain
+    normal = AppPaymentContext(
+        payment_id="app_norm",
+        sender_account_id="s1",
+        payee_account_id="p1",
+        amount=150.0,
+        sender_balance_before=5000.0,
+        initiated_at=t1,
+    )
+    assert analyzer.analyze(normal, [normal, prior_small, stale]) == []
+
+    # Escalation only (500 >= 100 * 3)
+    escalated_only = AppPaymentContext(
+        payment_id="app_esc",
+        sender_account_id="s1",
+        payee_account_id="p1",
+        amount=500.0,
+        sender_balance_before=5000.0,
+        initiated_at=t1,
+    )
+    esc_sigs = analyzer.analyze(escalated_only, [prior_small])
+    assert len(esc_sigs) == 1
+    assert esc_sigs[0].severity == 0.75
+
+    # Balance drain only (new payee, 90% of balance)
+    drain_only = AppPaymentContext(
+        payment_id="app_drain",
+        sender_account_id="s1",
+        payee_account_id="p_new",
+        amount=4500.0,
+        is_new_payee=True,
+        sender_balance_before=5000.0,
+        initiated_at=t1,
+    )
+    drain_sigs = analyzer.analyze(drain_only, [])
+    assert len(drain_sigs) == 1
+    assert drain_sigs[0].severity == 0.7
+
+    # Both escalation and balance drain
+    both = AppPaymentContext(
+        payment_id="app_both",
+        sender_account_id="s1",
+        payee_account_id="p1",
+        amount=4800.0,
+        sender_balance_before=5000.0,
+        initiated_at=t1,
+    )
+    both_sigs = analyzer.analyze(both, [prior_small])
+    assert len(both_sigs) == 1
+    assert both_sigs[0].severity == 0.9
