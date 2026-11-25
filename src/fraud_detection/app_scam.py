@@ -9,8 +9,11 @@ and escalates high-risk cases to CaseManager and EventBus.
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
+from typing import Any
+from uuid import uuid4
 
 
 def _utc_now_iso() -> str:
@@ -79,3 +82,102 @@ class CoolingOffHoldStatus(StrEnum):
     ACTIVE = "active"
     RELEASED = "released"
     CONFIRMED_SCAM_CANCELLED = "confirmed_scam_cancelled"
+
+
+@dataclass(slots=True)
+class AppPaymentContext:
+    """Inbound authorized push payment context for social engineering evaluation."""
+
+    sender_account_id: str
+    payee_account_id: str
+    amount: float
+    currency: str = "USD"
+    payment_rail: str = "faster_payments"
+    tenant_id: str = "default"
+    payment_id: str = field(default_factory=lambda: f"app_{uuid4().hex[:12]}")
+    is_new_payee: bool = True
+    cop_name_match: str = "match"
+    active_phone_call: bool = False
+    screen_share_or_rat_detected: bool = False
+    payee_details_pasted: bool = False
+    session_hesitation_seconds: float = 0.0
+    urgency_keywords_detected: bool = False
+    stated_purpose: str = "general"
+    sender_age_years: int | None = None
+    sender_balance_before: float | None = None
+    initiated_at: str = field(default_factory=_utc_now_iso)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.sender_account_id = self.sender_account_id.strip()
+        self.payee_account_id = self.payee_account_id.strip()
+        if not self.sender_account_id or not self.payee_account_id:
+            raise ValueError("sender_account_id and payee_account_id must not be empty")
+        self.amount = float(self.amount)
+        if self.amount <= 0:
+            raise ValueError("amount must be greater than zero")
+        self.currency = self.currency.strip().upper() or "USD"
+        self.payment_rail = self.payment_rail.strip().lower() or "faster_payments"
+        self.tenant_id = self.tenant_id.strip() or "default"
+        self.cop_name_match = self.cop_name_match.strip().lower() or "match"
+        self.session_hesitation_seconds = max(0.0, float(self.session_hesitation_seconds))
+        self.stated_purpose = self.stated_purpose.strip().lower() or "general"
+        if self.sender_age_years is not None:
+            self.sender_age_years = max(0, int(self.sender_age_years))
+        if self.sender_balance_before is not None:
+            self.sender_balance_before = max(0.0, float(self.sender_balance_before))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "payment_id": self.payment_id,
+            "sender_account_id": self.sender_account_id,
+            "payee_account_id": self.payee_account_id,
+            "amount": self.amount,
+            "currency": self.currency,
+            "payment_rail": self.payment_rail,
+            "tenant_id": self.tenant_id,
+            "is_new_payee": self.is_new_payee,
+            "cop_name_match": self.cop_name_match,
+            "active_phone_call": self.active_phone_call,
+            "screen_share_or_rat_detected": self.screen_share_or_rat_detected,
+            "payee_details_pasted": self.payee_details_pasted,
+            "session_hesitation_seconds": self.session_hesitation_seconds,
+            "urgency_keywords_detected": self.urgency_keywords_detected,
+            "stated_purpose": self.stated_purpose,
+            "sender_age_years": self.sender_age_years,
+            "sender_balance_before": self.sender_balance_before,
+            "initiated_at": self.initiated_at,
+            "metadata": dict(self.metadata),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> AppPaymentContext:
+        return cls(
+            payment_id=str(payload.get("payment_id", f"app_{uuid4().hex[:12]}")),
+            sender_account_id=str(payload["sender_account_id"]),
+            payee_account_id=str(payload["payee_account_id"]),
+            amount=float(payload["amount"]),
+            currency=str(payload.get("currency", "USD")),
+            payment_rail=str(payload.get("payment_rail", "faster_payments")),
+            tenant_id=str(payload.get("tenant_id", "default")),
+            is_new_payee=bool(payload.get("is_new_payee", True)),
+            cop_name_match=str(payload.get("cop_name_match", "match")),
+            active_phone_call=bool(payload.get("active_phone_call", False)),
+            screen_share_or_rat_detected=bool(payload.get("screen_share_or_rat_detected", False)),
+            payee_details_pasted=bool(payload.get("payee_details_pasted", False)),
+            session_hesitation_seconds=float(payload.get("session_hesitation_seconds", 0.0)),
+            urgency_keywords_detected=bool(payload.get("urgency_keywords_detected", False)),
+            stated_purpose=str(payload.get("stated_purpose", "general")),
+            sender_age_years=(
+                int(payload["sender_age_years"])
+                if payload.get("sender_age_years") is not None
+                else None
+            ),
+            sender_balance_before=(
+                float(payload["sender_balance_before"])
+                if payload.get("sender_balance_before") is not None
+                else None
+            ),
+            initiated_at=str(payload.get("initiated_at", _utc_now_iso())),
+            metadata=dict(payload.get("metadata", {})),
+        )
