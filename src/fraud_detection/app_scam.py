@@ -348,3 +348,117 @@ class AppScamAssessment:
             assessed_at=str(payload.get("assessed_at", _utc_now_iso())),
             metadata=dict(payload.get("metadata", {})),
         )
+
+
+_COERCION_PURPOSE_KEYWORDS = frozenset(
+    {"safe_account", "fraud_department", "hmrc", "irs", "police", "tax_fine", "arrest", "court"}
+)
+
+
+class BehavioralCoachingAnalyzer:
+    """Detects live social engineering coaching, screen-sharing, and vulnerability cues."""
+
+    def __init__(
+        self,
+        *,
+        hesitation_threshold_seconds: float = 45.0,
+        extreme_hesitation_seconds: float = 120.0,
+        vulnerable_age_years: int = 65,
+        vulnerable_amount_threshold: float = 1000.0,
+    ) -> None:
+        self.hesitation_threshold_seconds = max(1.0, float(hesitation_threshold_seconds))
+        self.extreme_hesitation_seconds = max(
+            self.hesitation_threshold_seconds, float(extreme_hesitation_seconds)
+        )
+        self.vulnerable_age_years = max(18, int(vulnerable_age_years))
+        self.vulnerable_amount_threshold = max(1.0, float(vulnerable_amount_threshold))
+
+    def analyze(self, context: AppPaymentContext) -> list[ScamSignal]:
+        signals: list[ScamSignal] = []
+
+        if context.screen_share_or_rat_detected or context.active_phone_call:
+            if context.screen_share_or_rat_detected and context.active_phone_call:
+                severity = 0.95
+                detail = "Active voice call combined with remote-access/screen-share session."
+            elif context.screen_share_or_rat_detected:
+                severity = 0.85
+                detail = "Remote-access tool or screen-sharing detected during payment setup."
+            else:
+                severity = 0.65
+                detail = "Customer initiated payment while on an active phone call."
+            signals.append(
+                ScamSignal(
+                    signal_type=ScamSignalType.ACTIVE_CALL_OR_SCREEN_SHARE,
+                    severity=severity,
+                    detail=detail,
+                    evidence={
+                        "active_phone_call": context.active_phone_call,
+                        "screen_share_or_rat_detected": context.screen_share_or_rat_detected,
+                    },
+                )
+            )
+
+        coercion_purpose = any(
+            token in context.stated_purpose for token in _COERCION_PURPOSE_KEYWORDS
+        )
+        if context.urgency_keywords_detected or coercion_purpose:
+            severity = 0.85 if (context.urgency_keywords_detected and coercion_purpose) else 0.6
+            signals.append(
+                ScamSignal(
+                    signal_type=ScamSignalType.URGENCY_OR_SCRIPTED_COACHING,
+                    severity=severity,
+                    detail="Urgency pressure or scripted safe-account/authority coercion cues.",
+                    evidence={
+                        "urgency_keywords_detected": context.urgency_keywords_detected,
+                        "stated_purpose": context.stated_purpose,
+                    },
+                )
+            )
+
+        if (
+            context.payee_details_pasted
+            and context.session_hesitation_seconds >= self.hesitation_threshold_seconds
+        ) or context.session_hesitation_seconds >= self.extreme_hesitation_seconds:
+            severity = (
+                0.7
+                if (
+                    context.payee_details_pasted
+                    and context.session_hesitation_seconds >= self.hesitation_threshold_seconds
+                )
+                else 0.45
+            )
+            signals.append(
+                ScamSignal(
+                    signal_type=ScamSignalType.BEHAVIORAL_HESITATION_OR_COPY_PASTE,
+                    severity=severity,
+                    detail="Copy-pasted beneficiary details or prolonged session hesitation.",
+                    evidence={
+                        "payee_details_pasted": context.payee_details_pasted,
+                        "session_hesitation_seconds": context.session_hesitation_seconds,
+                    },
+                )
+            )
+
+        if (
+            context.sender_age_years is not None
+            and context.sender_age_years >= self.vulnerable_age_years
+            and context.amount >= self.vulnerable_amount_threshold
+            and (
+                context.is_new_payee
+                or context.active_phone_call
+                or context.screen_share_or_rat_detected
+            )
+        ):
+            signals.append(
+                ScamSignal(
+                    signal_type=ScamSignalType.ELDER_OR_VULNERABLE_ANOMALY,
+                    severity=0.6,
+                    detail="High-value transfer from vulnerable age cohort with scam cues.",
+                    evidence={
+                        "sender_age_years": context.sender_age_years,
+                        "amount": context.amount,
+                    },
+                )
+            )
+
+        return signals
