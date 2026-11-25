@@ -462,3 +462,71 @@ class BehavioralCoachingAnalyzer:
             )
 
         return signals
+
+
+_HIGH_RISK_RAILS = frozenset({"crypto", "crypto_exchange", "wire_international", "instant_crypto"})
+_CRYPTO_PURPOSE_KEYWORDS = frozenset(
+    {"crypto", "bitcoin", "usdt", "trading", "investment", "forex"}
+)
+
+
+class PayeeBeneficiaryAnalyzer:
+    """Detects first-time high-value payees, CoP name mismatches, and high-risk rails."""
+
+    def __init__(
+        self,
+        *,
+        new_payee_high_value_threshold: float = 1500.0,
+        very_high_value_threshold: float = 5000.0,
+    ) -> None:
+        self.new_payee_high_value_threshold = max(1.0, float(new_payee_high_value_threshold))
+        self.very_high_value_threshold = max(
+            self.new_payee_high_value_threshold, float(very_high_value_threshold)
+        )
+
+    def analyze(self, context: AppPaymentContext) -> list[ScamSignal]:
+        signals: list[ScamSignal] = []
+
+        if context.is_new_payee and context.amount >= self.new_payee_high_value_threshold:
+            severity = 0.75 if context.amount >= self.very_high_value_threshold else 0.5
+            signals.append(
+                ScamSignal(
+                    signal_type=ScamSignalType.NEW_PAYEE_HIGH_VALUE,
+                    severity=severity,
+                    detail="First-time beneficiary receiving a high-value push payment.",
+                    evidence={
+                        "is_new_payee": context.is_new_payee,
+                        "amount": context.amount,
+                    },
+                )
+            )
+
+        if context.cop_name_match in {"no_match", "close_match", "unavailable"}:
+            severity = 0.8 if context.cop_name_match == "no_match" else 0.45
+            signals.append(
+                ScamSignal(
+                    signal_type=ScamSignalType.BENEFICIARY_NAME_MISMATCH,
+                    severity=severity,
+                    detail=f"Confirmation of Payee returned '{context.cop_name_match}'.",
+                    evidence={"cop_name_match": context.cop_name_match},
+                )
+            )
+
+        crypto_purpose = any(token in context.stated_purpose for token in _CRYPTO_PURPOSE_KEYWORDS)
+        if context.payment_rail in _HIGH_RISK_RAILS or crypto_purpose:
+            severity = (
+                0.75 if (context.payment_rail in _HIGH_RISK_RAILS and crypto_purpose) else 0.55
+            )
+            signals.append(
+                ScamSignal(
+                    signal_type=ScamSignalType.CRYPTO_OR_HIGH_RISK_RAIL,
+                    severity=severity,
+                    detail="Payment targets a crypto/high-risk rail or investment scheme.",
+                    evidence={
+                        "payment_rail": context.payment_rail,
+                        "stated_purpose": context.stated_purpose,
+                    },
+                )
+            )
+
+        return signals
