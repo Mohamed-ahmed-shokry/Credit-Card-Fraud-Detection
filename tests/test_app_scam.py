@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from fraud_detection.app_scam import (
     AppPaymentContext,
     AppScamAssessment,
+    AppScamStore,
     BehavioralCoachingAnalyzer,
     CoolingOffHoldStatus,
     PayeeBeneficiaryAnalyzer,
@@ -294,3 +297,69 @@ def test_transfer_escalation_analyzer_detects_all_branches() -> None:
     both_sigs = analyzer.analyze(both, [prior_small])
     assert len(both_sigs) == 1
     assert both_sigs[0].severity == 0.9
+
+
+def test_app_scam_store_eviction_filtering_and_persistence(tmp_path: Path) -> None:
+    store = AppScamStore(max_records=2)
+    for idx in range(3):
+        ctx = AppPaymentContext(
+            payment_id=f"p_{idx}",
+            sender_account_id="s1",
+            payee_account_id=f"payee_{idx}",
+            amount=100.0 * (idx + 1),
+            tenant_id="t1" if idx < 2 else "t2",
+        )
+        store.record_payment(ctx)
+        assessment = AppScamAssessment(
+            assessment_id=f"a_{idx}",
+            payment_id=ctx.payment_id,
+            sender_account_id="s1",
+            payee_account_id=ctx.payee_account_id,
+            amount=ctx.amount,
+            risk_score=0.3 * idx,
+            risk_level=ScamRiskLevel.HIGH if idx == 2 else ScamRiskLevel.LOW,
+            typology=ScamTypology.INVESTMENT_CRYPTO if idx == 2 else ScamTypology.UNKNOWN,
+            action=(
+                ScamInterventionAction.COOLING_OFF_HOLD
+                if idx == 2
+                else ScamInterventionAction.ALLOW
+            ),
+            tenant_id=ctx.tenant_id,
+        )
+        store.record_assessment(assessment)
+        hold = ScamCoolingOffHold(
+            hold_id=f"h_{idx}",
+            payment_id=ctx.payment_id,
+            sender_account_id="s1",
+            payee_account_id=ctx.payee_account_id,
+            amount=ctx.amount,
+            typology=assessment.typology,
+            tenant_id=ctx.tenant_id,
+        )
+        store.record_hold(hold)
+
+    # Capacity eviction keeps last 2
+    assert len(store.recent_sender_payments("s1")) == 2
+    assert store.get_assessment("a_0") is None
+    assert store.get_assessment("a_2") is not None
+    assert store.get_hold("h_0") is None
+    assert store.get_hold("h_2") is not None
+
+    # Filtering
+    assert (
+        len(store.list_assessments(tenant_id="t2", risk_level="high", typology="investment_crypto"))
+        == 1
+    )
+    assert len(store.list_holds(tenant_id="t2", sender_account_id="s1", status="active")) == 1
+
+    # Summary & persistence
+    summary = store.summary()
+    assert summary["total_assessments"] == 2
+    assert summary["total_holds"] == 2
+    assert summary["protected_amount"] == 300.0
+
+    saved = store.save(tmp_path / "app_scam_store.json")
+    loaded = AppScamStore.load(saved)
+    assert loaded.summary() == summary
+    assert loaded.get_assessment("a_2") is not None
+    assert loaded.get_hold("h_2") is not None
