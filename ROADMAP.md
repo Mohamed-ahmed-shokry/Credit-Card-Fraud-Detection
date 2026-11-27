@@ -3223,6 +3223,62 @@ Deliver an in-process, zero-dependency **Authorized Push Payment (APP) Scam & So
 - `7ab6a35`..`b67fdbc`: Implemented `app_scam.py` (`ScamTypology`, `ScamRiskLevel`, `ScamInterventionAction`, `ScamSignalType`, `CoolingOffHoldStatus`, `AppPaymentContext`, `ScamSignal`, `ScamCoolingOffHold`, `AppScamAssessment`, `BehavioralCoachingAnalyzer`, `PayeeBeneficiaryAnalyzer`, `TransferEscalationAnalyzer`, `AppScamStore`, `classify_scam_typology`, `AppScamDefenseEngine`), registered `APP_SCAM_ASSESSED` / `APP_SCAM_HOLD_PLACED` / `APP_SCAM_BLOCKED` / `APP_SCAM_HOLD_RESOLVED` events in `events.py`, wired `AppScamDefenseEngine` into `create_app` with `/v1/app-scam/*` REST endpoints and Prometheus counters in `api.py`, added `app-scam-*` CLI commands in `cli.py`, achieved 100% branch coverage on `app_scam.py` (`1270 passed`, `97.21%` total branch coverage), passed remote GitHub Actions CI (`45668200521`), and documented architecture and usage.
 
 
+## Phase 58 — APP Scam ↔ Mule Beneficiary Correlation & Cross-Engine Automation Bridge Integration (In Progress)
+
+Status: In Progress.
+
+### Objective
+
+Connect `AppScamDefenseEngine` (Phase 57) with `MuleDetectionEngine` (Phase 50), `UnifiedRiskOrchestrator` (Phase 53), `SoarEngine` (Phase 54), and `CrossEngineAutomationBridge` (Phase 56) so confirmed APP scam blocks and cancelled cooling-off holds automatically feed `APP_SCAM` domain signals into `UnifiedRiskOrchestrator`, evaluate beneficiary mule risk, detect the compound `APP_SCAM_TO_MULE_BENEFICIARY` cross-signal pattern, and trigger cooldown-guarded reversible SOAR containment.
+
+### Scope
+
+1. **UnifiedRiskOrchestrator Extension (`src/fraud_detection/risk_orchestrator.py`)**:
+   - Add `RiskDomain.APP_SCAM = "app_scam"` with default weight `1.15`.
+   - Add `CrossSignalPattern.APP_SCAM_TO_MULE_BENEFICIARY = "app_scam_to_mule_beneficiary"` detected in `CrossSignalAnalyzer` when `APP_SCAM` co-occurs with elevated `MULE` or `AML` risk.
+2. **Cross-Engine Automation Bridge Extension (`src/fraud_detection/automation_bridge.py`)**:
+   - Add `BridgeRuleAction.CORRELATE_APP_SCAM_MULE` and additive policy flags `BridgePolicy.auto_forward_app_scam_signals` and `BridgePolicy.auto_correlate_mule_beneficiaries`.
+   - Subscribe `CrossEngineAutomationBridge` to `APP_SCAM_BLOCKED` and `APP_SCAM_HOLD_RESOLVED` (confirmed scam cancellations) with zero-recursion and cooldown guards.
+   - Add `correlate_app_scam_incident(...)` method that ingests `APP_SCAM` signals into `UnifiedRiskOrchestrator`, evaluates beneficiary inbound transfer risk via `MuleDetectionEngine` (when attached), triggers SOAR containment when beneficiary risk exceeds threshold, and tracks `app_scam_correlations_count` in `AutomationBridgeStore.summary()`.
+3. **REST API & Prometheus Metrics (`src/fraud_detection/api.py`)**:
+   - Wire `mule_engine` into `CrossEngineAutomationBridge` inside `create_app`.
+   - Extend `AutomationPolicyRequest` with optional `auto_forward_app_scam_signals` and `auto_correlate_mule_beneficiaries`.
+   - Add `POST /v1/automation/correlate-app-scam` endpoint and `fraud_automation_bridge_app_scam_correlations_total` Prometheus counter.
+4. **CLI Workflows (`src/fraud_detection/cli.py`)**:
+   - Add `automation-correlate-app-scam` CLI command (table & JSON output, store persistence) and display `APP Scam Correlations` in `automation-summary`.
+5. **Documentation**:
+   - `ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`.
+
+### Acceptance Criteria
+
+1. **AC-1 (Orchestrator APP_SCAM Domain & Cross-Signal Pattern)**: `RiskDomain.APP_SCAM` and `CrossSignalPattern.APP_SCAM_TO_MULE_BENEFICIARY` serialize/deserialize cleanly and trigger in `CrossSignalAnalyzer` with unit tests in `tests/test_risk_orchestrator.py`.
+2. **AC-2 (Automation Bridge Policy, Action & Summary)**: `BridgeRuleAction.CORRELATE_APP_SCAM_MULE`, `BridgePolicy` APP scam toggles, and `AutomationBridgeStore.summary()["app_scam_correlations_count"]` work with backward-compatible defaults in `tests/test_automation_bridge.py`.
+3. **AC-3 (Event-Driven & Manual APP Scam ↔ Mule ↔ SOAR Correlation)**: `CrossEngineAutomationBridge` handles `APP_SCAM_BLOCKED` and confirmed `APP_SCAM_HOLD_RESOLVED` events and manual `correlate_app_scam_incident(...)` calls without recursion loops, correlating `MuleDetectionEngine`, `UnifiedRiskOrchestrator`, and `SoarEngine`.
+4. **AC-4 (REST API & Prometheus Metrics)**: `POST /v1/automation/correlate-app-scam`, updated `POST /v1/automation/policy`, and `fraud_automation_bridge_app_scam_correlations_total` work end to end and are verified in `tests/test_api.py`.
+5. **AC-5 (CLI Workflow)**: `automation-correlate-app-scam` and updated `automation-summary` work end to end and are verified in `tests/test_cli.py` and live CLI execution.
+6. **AC-6 (All CI-Parity Checks & Remote CI Green)**: All local CI-parity checks (`ruff format --check src tests`, `ruff check src tests`, `mypy src`, `pip_audit --skip-editable`, `pytest --cov=fraud_detection --cov-report=term-missing`, `python -m build`, `twine check dist/*`) and remote CI workflow runs pass 100%.
+
+### Validation & CI Plan
+
+- Focused unit tests: `python -m pytest tests/test_risk_orchestrator.py tests/test_automation_bridge.py -v`
+- API & CLI integration tests: `python -m pytest tests/test_api.py tests/test_cli.py -k "automation"`
+- Full local CI parity: `ruff format --check src tests`, `ruff check src tests`, `mypy src`, `pip_audit --skip-editable`, `pytest --cov=fraud_detection --cov-report=term-missing`, `python -m build`, `twine check dist/*`
+- Remote CI: GitHub Actions `CI` workflow on `phase/app-scam-bridge-correlation` PR.
+
+### Exclusions
+
+- External inter-bank mule registry APIs and real-time Confirmation of Payee (CoP) directory writes (out of scope for in-process reference engine).
+
+### Micro-Task Breakdown
+
+- Task 1: Define Phase 58 roadmap & initialize `docs/PROGRESS.md`.
+- Task 2: Add `RiskDomain.APP_SCAM` and `CrossSignalPattern.APP_SCAM_TO_MULE_BENEFICIARY` in `src/fraud_detection/risk_orchestrator.py` + unit tests in `tests/test_risk_orchestrator.py`.
+- Task 3: Extend `BridgeRuleAction`, `BridgePolicy`, `AutomationBridgeStore`, and `CrossEngineAutomationBridge` in `src/fraud_detection/automation_bridge.py` for APP Scam ↔ Mule ↔ SOAR correlation + unit tests in `tests/test_automation_bridge.py`.
+- Task 4: Wire `mule_engine` into `CrossEngineAutomationBridge`, add `POST /v1/automation/correlate-app-scam`, policy flags, and Prometheus counter in `src/fraud_detection/api.py` + tests in `tests/test_api.py`.
+- Task 5: Add `automation-correlate-app-scam` CLI command and `automation-summary` correlation output in `src/fraud_detection/cli.py` + tests in `tests/test_cli.py`.
+- Task 6: Update documentation (`ARCHITECTURE.md`, `README.md`, `ROADMAP.md`, `docs/PROGRESS.md`) and verify Completion Gate with 100% Green CI.
+
+
 ## Contributing to the roadmap
 
 Open an issue or a pull request that references the relevant phase item.
