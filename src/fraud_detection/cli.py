@@ -11898,10 +11898,18 @@ def _load_automation_state(
     """Load persistent automation bridge dispatches from a JSON store file."""
     soar = SoarEngine()
     wallet = WalletFraudEngine()
+    orchestrator = UnifiedRiskOrchestrator()
+    mule = MuleDetectionEngine()
     if not store_file.exists():
         store = AutomationBridgeStore()
         return (
-            CrossEngineAutomationBridge(store=store, soar_engine=soar, wallet_engine=wallet),
+            CrossEngineAutomationBridge(
+                store=store,
+                orchestrator=orchestrator,
+                soar_engine=soar,
+                wallet_engine=wallet,
+                mule_engine=mule,
+            ),
             store,
         )
     try:
@@ -11914,10 +11922,10 @@ def _load_automation_state(
     return (
         CrossEngineAutomationBridge(
             store=store,
-            orchestrator=UnifiedRiskOrchestrator(),
+            orchestrator=orchestrator,
             soar_engine=soar,
             wallet_engine=wallet,
-            mule_engine=MuleDetectionEngine(),
+            mule_engine=mule,
         ),
         store,
     )
