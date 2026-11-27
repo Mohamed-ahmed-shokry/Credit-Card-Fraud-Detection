@@ -283,7 +283,7 @@ def test_cross_engine_bridge_live_event_bus_cascade_and_wallet_feedback() -> Non
     assert noop_rec.soar_execution_id is None
     assert noop_rec.suspended_token_ids == []
 
-    assert bridge.detach() == 4
+    assert bridge.detach() == 6
     assert bridge.is_attached is False
     assert bridge.detach() == 0
 
