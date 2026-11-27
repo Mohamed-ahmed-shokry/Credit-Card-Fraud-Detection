@@ -2780,8 +2780,23 @@ class AutomationPolicyRequest(BaseModel):
     auto_trigger_soar: bool = True
     auto_suspend_wallet_tokens: bool = True
     auto_forward_wallet_signals: bool = True
+    auto_forward_app_scam_signals: bool = True
+    auto_correlate_mule_beneficiaries: bool = True
     min_soar_risk_level: UnifiedRiskLevel = UnifiedRiskLevel.HIGH
     cooldown_seconds: int = Field(default=300, ge=0)
+
+
+class AutomationAppScamCorrelateRequest(BaseModel):
+    """Request payload for manually correlating an APP scam with Mule/Orchestrator/SOAR."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    sender_account_id: str = Field(..., min_length=1)
+    payee_account_id: str = Field(..., min_length=1)
+    amount: float = Field(..., gt=0.0)
+    risk_score: float = Field(default=0.88, ge=0.0, le=1.0)
+    typology: str = Field(default="unknown", min_length=1)
+    tenant_id: str = Field(default="default", min_length=1)
 
 
 class AutomationTriggerRequest(BaseModel):
@@ -3630,6 +3645,12 @@ def create_app(
         ["tenant_id"],
         registry=metrics_registry,
     )
+    automation_bridge_app_scam_correlations_counter = Counter(
+        "fraud_automation_bridge_app_scam_correlations_total",
+        "Total APP scam to mule beneficiary correlations executed by the automation bridge.",
+        ["tenant_id"],
+        registry=metrics_registry,
+    )
     app_scam_evaluations_counter = Counter(
         "fraud_app_scam_evaluations_total",
         "Total Authorized Push Payment (APP) scam evaluations performed.",
@@ -4277,6 +4298,7 @@ def create_app(
             orchestrator=resolved_risk_orchestrator,
             soar_engine=resolved_soar_engine,
             wallet_engine=resolved_wallet_engine,
+            mule_engine=resolved_mule_engine,
         )
         resolved_automation_bridge.attach()
         application.state.automation_bridge = resolved_automation_bridge
@@ -4288,6 +4310,9 @@ def create_app(
         )
         application.state.automation_bridge_soar_triggers_counter = (
             automation_bridge_soar_triggers_counter
+        )
+        application.state.automation_bridge_app_scam_correlations_counter = (
+            automation_bridge_app_scam_correlations_counter
         )
         resolved_app_scam_engine = app_scam_engine or AppScamDefenseEngine(
             case_manager=application.state.case_manager,
@@ -9727,6 +9752,17 @@ def create_app(
             soar_c = getattr(request.app.state, "automation_bridge_soar_triggers_counter", None)
             if soar_c is not None:
                 soar_c.labels(tenant_id=record.tenant_id).inc()
+        if (
+            BridgeRuleAction(record.action) is BridgeRuleAction.CORRELATE_APP_SCAM_MULE
+            and BridgeDispatchStatus(record.status) is BridgeDispatchStatus.EXECUTED
+        ):
+            corr_c = getattr(
+                request.app.state,
+                "automation_bridge_app_scam_correlations_counter",
+                None,
+            )
+            if corr_c is not None:
+                corr_c.labels(tenant_id=record.tenant_id).inc()
 
     @application.get(
         "/v1/automation/status",
