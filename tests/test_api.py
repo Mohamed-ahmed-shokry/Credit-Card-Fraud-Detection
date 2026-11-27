@@ -7722,3 +7722,74 @@ def test_app_scam_api_error_branches(api_context: tuple[Path, Any, Path]) -> Non
         uninit = client.get("/v1/app-scam/metrics")
         assert uninit.status_code == 200
         assert uninit.json()["status"] == "uninitialized"
+
+
+def test_automation_bridge_app_scam_mule_correlation_api(
+    api_context: tuple[Path, Any, Path],
+) -> None:
+    """Validate /v1/automation/correlate-app-scam, live APP scam cascade, and Prometheus metric."""
+    _, model, _ = api_context
+    app = create_app(model=model)
+
+    with TestClient(app) as client:
+        # 1. Manual correlation via POST /v1/automation/correlate-app-scam
+        corr = client.post(
+            "/v1/automation/correlate-app-scam",
+            json={
+                "sender_account_id": "victim-api-1",
+                "payee_account_id": "mule-api-1",
+                "amount": 6500.0,
+                "risk_score": 0.91,
+                "typology": "impersonation_bank",
+                "tenant_id": "tenant-bridge",
+            },
+        )
+        assert corr.status_code == 200
+        body = corr.json()
+        assert body["action"] == "correlate_app_scam_mule"
+        assert body["status"] == "executed"
+        assert body["soar_execution_id"] is not None
+        assert "app_scam_to_mule_beneficiary" in body["metadata"]["patterns_detected"]
+
+        # 2. Live critical APP scam block via /v1/app-scam/evaluate auto-correlates via EventBus
+        ev = client.post(
+            "/v1/app-scam/evaluate",
+            json={
+                "sender_account_id": "victim-api-2",
+                "payee_account_id": "mule-api-2",
+                "amount": 9200.0,
+                "active_phone_call": True,
+                "screen_share_or_rat_detected": True,
+                "stated_purpose": "safe_account",
+                "tenant_id": "tenant-bridge",
+            },
+        )
+        assert ev.status_code == 200
+        assert ev.json()["action"] == "block_and_escalate"
+
+        disps = client.get(
+            "/v1/automation/dispatches?entity_id=mule-api-2&action=correlate_app_scam_mule"
+        )
+        assert disps.status_code == 200
+        assert disps.json()["total_count"] == 1
+
+        # 3. Summary & Prometheus metric
+        st = client.get("/v1/automation/status")
+        assert st.status_code == 200
+        assert st.json()["app_scam_correlations_count"] == 2
+
+        prom = client.get("/metrics")
+        assert prom.status_code == 200
+        assert "fraud_automation_bridge_app_scam_correlations_total" in prom.text
+
+        # 4. 500 error branch when automation_bridge is uninitialized
+        app.state.automation_bridge = None
+        err = client.post(
+            "/v1/automation/correlate-app-scam",
+            json={
+                "sender_account_id": "v1",
+                "payee_account_id": "m1",
+                "amount": 100.0,
+            },
+        )
+        assert err.status_code == 500
