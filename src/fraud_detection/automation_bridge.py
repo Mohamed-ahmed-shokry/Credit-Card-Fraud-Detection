@@ -50,6 +50,7 @@ class BridgeRuleAction(StrEnum):
     SUSPEND_ENTITY_WALLET_TOKENS = "suspend_entity_wallet_tokens"
     INGEST_ORCHESTRATOR_SIGNAL = "ingest_orchestrator_signal"
     FULL_CONTAINMENT_CASCADE = "full_containment_cascade"
+    CORRELATE_APP_SCAM_MULE = "correlate_app_scam_mule"
 
 
 class BridgeDispatchStatus(StrEnum):
@@ -69,6 +70,8 @@ class BridgePolicy:
     auto_trigger_soar: bool = True
     auto_suspend_wallet_tokens: bool = True
     auto_forward_wallet_signals: bool = True
+    auto_forward_app_scam_signals: bool = True
+    auto_correlate_mule_beneficiaries: bool = True
     min_soar_risk_level: UnifiedRiskLevel | str = UnifiedRiskLevel.HIGH
     cooldown_seconds: int = 300
 
@@ -83,6 +86,8 @@ class BridgePolicy:
             "auto_trigger_soar": self.auto_trigger_soar,
             "auto_suspend_wallet_tokens": self.auto_suspend_wallet_tokens,
             "auto_forward_wallet_signals": self.auto_forward_wallet_signals,
+            "auto_forward_app_scam_signals": self.auto_forward_app_scam_signals,
+            "auto_correlate_mule_beneficiaries": self.auto_correlate_mule_beneficiaries,
             "min_soar_risk_level": UnifiedRiskLevel(self.min_soar_risk_level).value,
             "cooldown_seconds": self.cooldown_seconds,
         }
@@ -94,6 +99,12 @@ class BridgePolicy:
             auto_trigger_soar=bool(payload.get("auto_trigger_soar", True)),
             auto_suspend_wallet_tokens=bool(payload.get("auto_suspend_wallet_tokens", True)),
             auto_forward_wallet_signals=bool(payload.get("auto_forward_wallet_signals", True)),
+            auto_forward_app_scam_signals=bool(
+                payload.get("auto_forward_app_scam_signals", True)
+            ),
+            auto_correlate_mule_beneficiaries=bool(
+                payload.get("auto_correlate_mule_beneficiaries", True)
+            ),
             min_soar_risk_level=UnifiedRiskLevel(
                 str(payload.get("min_soar_risk_level", "high")).lower()
             ),
