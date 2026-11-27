@@ -9839,6 +9839,37 @@ def create_app(
         _record_automation_metrics(request, record)
         return _automation_dispatch_to_response(record)
 
+    @application.post(
+        "/v1/automation/correlate-app-scam",
+        response_model=AutomationDispatchResponse,
+        responses={500: {"description": "Automation bridge not initialized."}},
+        tags=["automation_bridge"],
+    )
+    async def automation_correlate_app_scam_endpoint(
+        payload: AutomationAppScamCorrelateRequest,
+        request: Request,
+    ) -> AutomationDispatchResponse | JSONResponse:
+        """Correlate a confirmed APP scam with MuleDetectionEngine, Orchestrator, and SOAR."""
+        bridge: CrossEngineAutomationBridge | None = getattr(
+            request.app.state, "automation_bridge", None
+        )
+        if bridge is None:
+            return JSONResponse(
+                status_code=500,
+                content={"detail": "Automation bridge not initialized."},
+            )
+        record = bridge.correlate_app_scam_incident(
+            sender_account_id=payload.sender_account_id,
+            payee_account_id=payload.payee_account_id,
+            amount=payload.amount,
+            risk_score=payload.risk_score,
+            typology=payload.typology,
+            tenant_id=payload.tenant_id,
+            source_event_type="api.manual_app_scam_correlation",
+        )
+        _record_automation_metrics(request, record)
+        return _automation_dispatch_to_response(record)
+
     @application.get(
         "/v1/automation/dispatches/{dispatch_id}",
         response_model=AutomationDispatchResponse,
