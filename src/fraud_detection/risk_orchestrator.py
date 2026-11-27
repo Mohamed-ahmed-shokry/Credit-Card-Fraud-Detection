@@ -44,6 +44,7 @@ class RiskDomain(StrEnum):
     SYNTHETIC_IDENTITY = "synthetic_identity"
     MULE = "mule"
     FIRST_PARTY = "first_party"
+    APP_SCAM = "app_scam"
     TRANSACTION = "transaction"
     CUSTOM = "custom"
 
@@ -83,6 +84,7 @@ DEFAULT_DOMAIN_WEIGHTS: dict[str, float] = {
     RiskDomain.SYNTHETIC_IDENTITY.value: 1.10,
     RiskDomain.MULE.value: 1.15,
     RiskDomain.FIRST_PARTY.value: 0.95,
+    RiskDomain.APP_SCAM.value: 1.15,
     RiskDomain.TRANSACTION.value: 1.00,
     RiskDomain.CUSTOM.value: 0.90,
 }
