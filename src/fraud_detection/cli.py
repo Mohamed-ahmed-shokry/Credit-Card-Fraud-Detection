@@ -11912,7 +11912,13 @@ def _load_automation_state(
         _abort(f"Could not read automation bridge store file: {exc}")
     store = AutomationBridgeStore.from_dict(data)
     return (
-        CrossEngineAutomationBridge(store=store, soar_engine=soar, wallet_engine=wallet),
+        CrossEngineAutomationBridge(
+            store=store,
+            orchestrator=UnifiedRiskOrchestrator(),
+            soar_engine=soar,
+            wallet_engine=wallet,
+            mule_engine=MuleDetectionEngine(),
+        ),
         store,
     )
 
@@ -12016,10 +12022,55 @@ def automation_summary(
         typer.echo(f"  Dispatches:           {summary_data['dispatch_count']}")
         typer.echo(f"  SOAR Triggers:        {summary_data['soar_triggered_count']}")
         typer.echo(f"  Tokens Suspended:     {summary_data['tokens_suspended_count']}")
+        typer.echo(f"  APP Scam Correlations:{summary_data['app_scam_correlations_count']:>2}")
         for status_key, cnt in summary_data["by_status"].items():
             typer.echo(f"    {status_key:22s}: {cnt}")
     else:
         typer.echo(json.dumps(summary_data, indent=2))
+
+
+@app.command("automation-correlate-app-scam")
+def automation_correlate_app_scam(
+    sender_account_id: Annotated[str, typer.Option("--sender", help="Victim sender account ID.")],
+    payee_account_id: Annotated[str, typer.Option("--payee", help="Beneficiary payee account ID.")],
+    amount: Annotated[float, typer.Option("--amount", help="Transfer amount.")],
+    score: Annotated[float, typer.Option("--score", help="APP scam risk score (0-1).")] = 0.88,
+    typology: Annotated[str, typer.Option("--typology", help="APP scam typology.")] = "unknown",
+    tenant_id: Annotated[str, typer.Option("--tenant-id", "-t", help="Tenant identifier.")] = (
+        "default"
+    ),
+    store_file: Annotated[
+        Path,
+        typer.Option("--store-file", "-s", help="Path to automation bridge state JSON file."),
+    ] = Path("automation_bridge_store.json"),
+    output_format: Annotated[
+        str, typer.Option("--format", "-f", help="Output format (table or json).")
+    ] = "table",
+) -> None:
+    """Correlate a confirmed APP scam with MuleDetectionEngine, Orchestrator, and SOAR."""
+    if amount <= 0:
+        _abort("amount must be greater than zero")
+    bridge, store = _load_automation_state(store_file)
+    record = bridge.correlate_app_scam_incident(
+        sender_account_id=sender_account_id,
+        payee_account_id=payee_account_id,
+        amount=amount,
+        risk_score=score,
+        typology=typology,
+        tenant_id=tenant_id,
+        source_event_type="cli.automation_correlate_app_scam",
+    )
+    _save_automation_state(store, store_file)
+    if output_format.lower() == "table":
+        typer.echo(f"Dispatch ID:       {record.dispatch_id}")
+        typer.echo(f"Beneficiary:       {record.entity_id}")
+        typer.echo(f"Action:            {BridgeRuleAction(record.action).value}")
+        typer.echo(f"Status:            {BridgeDispatchStatus(record.status).value}")
+        typer.echo(f"SOAR Execution:    {record.soar_execution_id or 'none'}")
+        patterns = record.metadata.get("patterns_detected", [])
+        typer.echo(f"Patterns Detected: {', '.join(patterns) if patterns else 'none'}")
+    else:
+        typer.echo(json.dumps(record.to_dict(), indent=2))
 
 
 def _load_app_scam_state(store_file: Path) -> tuple[AppScamDefenseEngine, AppScamStore]:
