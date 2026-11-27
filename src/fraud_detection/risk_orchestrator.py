@@ -44,6 +44,7 @@ class RiskDomain(StrEnum):
     SYNTHETIC_IDENTITY = "synthetic_identity"
     MULE = "mule"
     FIRST_PARTY = "first_party"
+    APP_SCAM = "app_scam"
     TRANSACTION = "transaction"
     CUSTOM = "custom"
 
@@ -73,6 +74,7 @@ class CrossSignalPattern(StrEnum):
     ATO_TO_MULE_EXFILTRATION = "ato_to_mule_exfiltration"
     SYNTHETIC_TO_AML_LAYERING = "synthetic_to_aml_layering"
     SYNTHETIC_BUST_OUT = "synthetic_bust_out"
+    APP_SCAM_TO_MULE_BENEFICIARY = "app_scam_to_mule_beneficiary"
     MULTI_VECTOR_SYNDICATE = "multi_vector_syndicate"
     ESCALATED_REPEAT_OFFENDER = "escalated_repeat_offender"
 
@@ -83,6 +85,7 @@ DEFAULT_DOMAIN_WEIGHTS: dict[str, float] = {
     RiskDomain.SYNTHETIC_IDENTITY.value: 1.10,
     RiskDomain.MULE.value: 1.15,
     RiskDomain.FIRST_PARTY.value: 0.95,
+    RiskDomain.APP_SCAM.value: 1.15,
     RiskDomain.TRANSACTION.value: 1.00,
     RiskDomain.CUSTOM.value: 0.90,
 }
@@ -305,6 +308,7 @@ class CrossSignalAnalyzer:
         synthetic = domain_scores.get(RiskDomain.SYNTHETIC_IDENTITY.value, 0.0)
         mule = domain_scores.get(RiskDomain.MULE.value, 0.0)
         first_party = domain_scores.get(RiskDomain.FIRST_PARTY.value, 0.0)
+        app_scam = domain_scores.get(RiskDomain.APP_SCAM.value, 0.0)
 
         if ato >= thr and mule >= thr:
             patterns.append(CrossSignalPattern.ATO_TO_MULE_EXFILTRATION)
@@ -321,6 +325,12 @@ class CrossSignalAnalyzer:
             rationale.append(
                 f"Synthetic identity ({synthetic:.2f}) + First-party ({first_party:.2f}) "
                 "indicates bust-out credit/refund abuse"
+            )
+        if app_scam >= thr and (mule >= thr or aml >= thr):
+            patterns.append(CrossSignalPattern.APP_SCAM_TO_MULE_BENEFICIARY)
+            rationale.append(
+                f"APP scam ({app_scam:.2f}) + Mule/AML ({max(mule, aml):.2f}) "
+                "indicates social engineering payout into mule beneficiary"
             )
 
         elevated_domains = [d for d, s in domain_scores.items() if s >= thr]

@@ -2352,6 +2352,27 @@ FastAPI APP Scam Defense REST endpoints:
 - `GET /v1/app-scam/metrics`: Inspect operational APP scam counts and protected-amount metrics.
 - Prometheus metrics: `fraud_app_scam_evaluations_total`, `fraud_app_scam_signals_total`, `fraud_app_scam_holds_total`.
 
+### APP Scam ↔ Mule Beneficiary Correlation (Phase 58)
+
+```bash
+# Correlate a confirmed APP scam with MuleDetectionEngine, UnifiedRiskOrchestrator, and SOAR
+fraud-detect automation-correlate-app-scam \
+  --sender acct_101 \
+  --payee mule_payee_909 \
+  --amount 6500 \
+  --score 0.91 \
+  --typology impersonation_bank \
+  --format table
+
+# View bridge summary including APP scam correlations
+fraud-detect automation-summary --format table
+```
+
+FastAPI & EventBus APP Scam ↔ Mule Correlation additions:
+- `POST /v1/automation/correlate-app-scam`: Correlate a confirmed APP scam incident with `MuleDetectionEngine`, `UnifiedRiskOrchestrator` (`APP_SCAM_TO_MULE_BENEFICIARY`), and `SoarEngine`.
+- `POST /v1/automation/policy`: Supports `auto_forward_app_scam_signals` and `auto_correlate_mule_beneficiaries` toggles.
+- Prometheus metric: `fraud_automation_bridge_app_scam_correlations_total`.
+
 ## Reference label-delay analysis
 
 

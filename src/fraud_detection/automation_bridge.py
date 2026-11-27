@@ -19,6 +19,11 @@ from typing import Any
 from uuid import uuid4
 
 from fraud_detection.events import EventBus, EventType, FraudDomainEvent
+from fraud_detection.mule_detection import (
+    MuleDetectionEngine,
+    MuleTransferRecord,
+    TransferDirection,
+)
 from fraud_detection.risk_orchestrator import (
     CrossSignalPattern,
     DomainRiskSignal,
@@ -50,6 +55,7 @@ class BridgeRuleAction(StrEnum):
     SUSPEND_ENTITY_WALLET_TOKENS = "suspend_entity_wallet_tokens"
     INGEST_ORCHESTRATOR_SIGNAL = "ingest_orchestrator_signal"
     FULL_CONTAINMENT_CASCADE = "full_containment_cascade"
+    CORRELATE_APP_SCAM_MULE = "correlate_app_scam_mule"
 
 
 class BridgeDispatchStatus(StrEnum):
@@ -69,6 +75,8 @@ class BridgePolicy:
     auto_trigger_soar: bool = True
     auto_suspend_wallet_tokens: bool = True
     auto_forward_wallet_signals: bool = True
+    auto_forward_app_scam_signals: bool = True
+    auto_correlate_mule_beneficiaries: bool = True
     min_soar_risk_level: UnifiedRiskLevel | str = UnifiedRiskLevel.HIGH
     cooldown_seconds: int = 300
 
@@ -83,6 +91,8 @@ class BridgePolicy:
             "auto_trigger_soar": self.auto_trigger_soar,
             "auto_suspend_wallet_tokens": self.auto_suspend_wallet_tokens,
             "auto_forward_wallet_signals": self.auto_forward_wallet_signals,
+            "auto_forward_app_scam_signals": self.auto_forward_app_scam_signals,
+            "auto_correlate_mule_beneficiaries": self.auto_correlate_mule_beneficiaries,
             "min_soar_risk_level": UnifiedRiskLevel(self.min_soar_risk_level).value,
             "cooldown_seconds": self.cooldown_seconds,
         }
@@ -94,6 +104,10 @@ class BridgePolicy:
             auto_trigger_soar=bool(payload.get("auto_trigger_soar", True)),
             auto_suspend_wallet_tokens=bool(payload.get("auto_suspend_wallet_tokens", True)),
             auto_forward_wallet_signals=bool(payload.get("auto_forward_wallet_signals", True)),
+            auto_forward_app_scam_signals=bool(payload.get("auto_forward_app_scam_signals", True)),
+            auto_correlate_mule_beneficiaries=bool(
+                payload.get("auto_correlate_mule_beneficiaries", True)
+            ),
             min_soar_risk_level=UnifiedRiskLevel(
                 str(payload.get("min_soar_risk_level", "high")).lower()
             ),
@@ -259,10 +273,17 @@ class AutomationBridgeStore:
                 tokens_suspended += len(rec.suspended_token_ids)
                 if rec.soar_execution_id:
                     soar_triggered += 1
+            app_scam_correlations = sum(
+                1
+                for rec in self._dispatches.values()
+                if BridgeRuleAction(rec.action) is BridgeRuleAction.CORRELATE_APP_SCAM_MULE
+                and BridgeDispatchStatus(rec.status) is BridgeDispatchStatus.EXECUTED
+            )
             return {
                 "dispatch_count": len(self._dispatches),
                 "soar_triggered_count": soar_triggered,
                 "tokens_suspended_count": tokens_suspended,
+                "app_scam_correlations_count": app_scam_correlations,
                 "by_status": by_status,
                 "by_action": by_action,
             }
@@ -315,6 +336,7 @@ class CrossEngineAutomationBridge:
         orchestrator: UnifiedRiskOrchestrator | None = None,
         soar_engine: SoarEngine | None = None,
         wallet_engine: WalletFraudEngine | None = None,
+        mule_engine: MuleDetectionEngine | None = None,
         policy: BridgePolicy | None = None,
         store: AutomationBridgeStore | None = None,
     ) -> None:
@@ -322,6 +344,7 @@ class CrossEngineAutomationBridge:
         self.orchestrator = orchestrator
         self.soar_engine = soar_engine
         self.wallet_engine = wallet_engine
+        self.mule_engine = mule_engine
         self.policy = policy or BridgePolicy()
         self.store = store or AutomationBridgeStore()
         self._lock = threading.RLock()
@@ -343,6 +366,8 @@ class CrossEngineAutomationBridge:
                 EventType.CROSS_SIGNAL_PATTERN_DETECTED,
                 EventType.WALLET_PROVISIONING_DECLINED,
                 EventType.WALLET_TOKEN_SUSPENDED,
+                EventType.APP_SCAM_BLOCKED,
+                EventType.APP_SCAM_HOLD_RESOLVED,
             )
             for ev_type in watched:
                 tok = self.event_bus.subscribe(self._on_event, event_type=ev_type)
@@ -631,4 +656,217 @@ class CrossEngineAutomationBridge:
                 EventType.WALLET_TOKEN_SUSPENDED,
             }:
                 return self._forward_wallet_signal(event, reference_time=now)
+            if event.event_type in {
+                EventType.APP_SCAM_BLOCKED,
+                EventType.APP_SCAM_HOLD_RESOLVED,
+            }:
+                return self._handle_app_scam_event(event, reference_time=now)
             return None
+
+    def _handle_app_scam_event(
+        self,
+        event: FraudDomainEvent,
+        *,
+        reference_time: datetime,
+    ) -> BridgeDispatchRecord | None:
+        if (
+            event.event_type is EventType.APP_SCAM_HOLD_RESOLVED
+            and str(event.payload.get("status", "")).lower() != "confirmed_scam_cancelled"
+        ):
+            return None
+        payee_id = str(event.payload.get("payee_account_id", "")).strip()
+        sender_id = str(event.payload.get("sender_account_id", "")).strip()
+        if not payee_id:
+            return None
+        raw_score = event.payload.get("risk_score")
+        risk_score = float(raw_score) if isinstance(raw_score, (int, float)) else 0.88
+        raw_amount = event.payload.get("amount")
+        amount = float(raw_amount) if isinstance(raw_amount, (int, float)) else 0.0
+        typology = str(event.payload.get("typology", "unknown"))
+        return self.correlate_app_scam_incident(
+            sender_account_id=sender_id or "unknown_sender",
+            payee_account_id=payee_id,
+            amount=amount,
+            risk_score=risk_score,
+            typology=typology,
+            tenant_id=event.tenant_id,
+            source_event_id=event.event_id,
+            source_event_type=event.event_type.value,
+            reference_time=reference_time,
+        )
+
+    def correlate_app_scam_incident(
+        self,
+        *,
+        sender_account_id: str,
+        payee_account_id: str,
+        amount: float,
+        risk_score: float = 0.88,
+        typology: str = "unknown",
+        tenant_id: str = "default",
+        source_event_id: str | None = None,
+        source_event_type: str = "manual",
+        reference_time: datetime | None = None,
+    ) -> BridgeDispatchRecord:
+        """Correlate a confirmed APP scam with MuleDetectionEngine, Orchestrator, and SOAR."""
+        now = reference_time or datetime.now(UTC)
+        action = BridgeRuleAction.CORRELATE_APP_SCAM_MULE
+        with self._lock:
+            if not self.policy.enabled:
+                skipped = BridgeDispatchRecord(
+                    entity_id=payee_account_id,
+                    tenant_id=tenant_id,
+                    action=action,
+                    status=BridgeDispatchStatus.SKIPPED_DISABLED,
+                    source_event_id=source_event_id,
+                    source_event_type=source_event_type,
+                    detail="Automation bridge is currently paused/disabled",
+                    dispatched_at=now.isoformat(),
+                )
+                self.store.save_dispatch(skipped)
+                self._emit_bridge_event(skipped)
+                return skipped
+
+            if self.store.is_in_cooldown(
+                tenant_id=tenant_id,
+                entity_id=payee_account_id,
+                action=action,
+                cooldown_seconds=self.policy.cooldown_seconds,
+                reference_time=now,
+            ):
+                cooled = BridgeDispatchRecord(
+                    entity_id=payee_account_id,
+                    tenant_id=tenant_id,
+                    action=action,
+                    status=BridgeDispatchStatus.SKIPPED_COOLDOWN,
+                    source_event_id=source_event_id,
+                    source_event_type=source_event_type,
+                    detail=(
+                        f"Beneficiary '{payee_account_id}' is within "
+                        f"{self.policy.cooldown_seconds}s cooldown"
+                    ),
+                    dispatched_at=now.isoformat(),
+                )
+                self.store.save_dispatch(cooled)
+                self._emit_bridge_event(cooled)
+                return cooled
+
+            self._reentrancy_depth += 1
+            try:
+                orch_sig_id: str | None = None
+                mule_risk_score: float | None = None
+                patterns: list[CrossSignalPattern] = []
+                soar_exec_id: str | None = None
+                effective_score = max(0.0, min(1.0, float(risk_score)))
+
+                if self.policy.auto_forward_app_scam_signals and self.orchestrator is not None:
+                    payee_sig = DomainRiskSignal(
+                        entity_id=payee_account_id,
+                        domain=RiskDomain.APP_SCAM,
+                        score=effective_score,
+                        tenant_id=tenant_id,
+                        reason_codes=[f"app_scam:{typology}"],
+                        metadata={
+                            "sender_account_id": sender_account_id,
+                            "amount": float(amount),
+                            "typology": typology,
+                        },
+                    )
+                    self.orchestrator.ingest_signal(payee_sig)
+                    orch_sig_id = payee_sig.signal_id
+
+                if self.policy.auto_correlate_mule_beneficiaries and self.mule_engine is not None:
+                    self.mule_engine.store.record_transfer(
+                        MuleTransferRecord(
+                            transfer_id=f"app_scam_{uuid4().hex[:10]}",
+                            account_id=payee_account_id,
+                            counterparty_id=sender_account_id,
+                            direction=TransferDirection.INBOUND,
+                            amount=max(0.01, float(amount)),
+                            timestamp=now,
+                            tenant_id=tenant_id,
+                            metadata={"source": "app_scam_correlation", "typology": typology},
+                        )
+                    )
+                    mule_assessment = self.mule_engine.evaluate_account(payee_account_id, now=now)
+                    mule_risk_score = mule_assessment.risk_score
+                    if self.orchestrator is not None:
+                        mule_sig = DomainRiskSignal(
+                            entity_id=payee_account_id,
+                            domain=RiskDomain.MULE,
+                            score=max(mule_assessment.risk_score, round(effective_score * 0.85, 4)),
+                            tenant_id=tenant_id,
+                            reason_codes=["app_scam_beneficiary_mule_correlation"],
+                            metadata={"mule_assessment_id": mule_assessment.assessment_id},
+                        )
+                        self.orchestrator.ingest_signal(mule_sig)
+
+                risk_level = (
+                    UnifiedRiskLevel.CRITICAL if effective_score >= 0.85 else UnifiedRiskLevel.HIGH
+                )
+                if self.orchestrator is not None and self.policy.auto_forward_app_scam_signals:
+                    unified = self.orchestrator.evaluate_entity(
+                        payee_account_id,
+                        tenant_id=tenant_id,
+                        reference_time=now,
+                    )
+                    patterns = list(unified.patterns_detected)
+                    effective_score = max(effective_score, unified.composite_score)
+                    risk_level = unified.risk_level
+
+                min_rank = _RISK_ORDER[UnifiedRiskLevel(self.policy.min_soar_risk_level)]
+                if (
+                    self.policy.auto_trigger_soar
+                    and self.soar_engine is not None
+                    and _RISK_ORDER[risk_level] >= min_rank
+                ):
+                    soar_assessment = UnifiedRiskAssessment(
+                        assessment_id=source_event_id or f"ora_{uuid4().hex[:12]}",
+                        entity_id=payee_account_id,
+                        tenant_id=tenant_id,
+                        composite_score=effective_score,
+                        risk_level=risk_level,
+                        action=OrchestratorAction.BLOCK_AND_ESCALATE,
+                        patterns_detected=patterns
+                        or [CrossSignalPattern.APP_SCAM_TO_MULE_BENEFICIARY],
+                    )
+                    soar_rec = self.soar_engine.execute_for_assessment(
+                        soar_assessment,
+                        reference_time=now,
+                    )
+                    soar_exec_id = soar_rec.execution_id
+
+                self.store.record_cooldown(
+                    tenant_id=tenant_id,
+                    entity_id=payee_account_id,
+                    action=action,
+                    reference_time=now,
+                )
+                record = BridgeDispatchRecord(
+                    entity_id=payee_account_id,
+                    tenant_id=tenant_id,
+                    action=action,
+                    status=BridgeDispatchStatus.EXECUTED,
+                    source_event_id=source_event_id,
+                    source_event_type=source_event_type,
+                    soar_execution_id=soar_exec_id,
+                    orchestrator_signal_id=orch_sig_id,
+                    detail=(
+                        f"APP scam ({typology}) correlated to beneficiary '{payee_account_id}': "
+                        f"SOAR={soar_exec_id or 'none'}, patterns={len(patterns)}"
+                    ),
+                    dispatched_at=now.isoformat(),
+                    metadata={
+                        "sender_account_id": sender_account_id,
+                        "payee_account_id": payee_account_id,
+                        "amount": float(amount),
+                        "typology": typology,
+                        "mule_risk_score": mule_risk_score,
+                        "patterns_detected": [p.value for p in patterns],
+                    },
+                )
+                self.store.save_dispatch(record)
+                self._emit_bridge_event(record)
+                return record
+            finally:
+                self._reentrancy_depth -= 1

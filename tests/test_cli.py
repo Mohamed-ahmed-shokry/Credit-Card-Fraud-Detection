@@ -11547,3 +11547,73 @@ def test_app_scam_cli_error_branches(tmp_path: Path) -> None:
     nondict = tmp_path / "nondict_app_scam.json"
     nondict.write_text("[]", encoding="utf-8")
     assert runner.invoke(app, ["app-scam-summary", "-s", str(nondict)]).exit_code == 2
+
+
+def test_automation_correlate_app_scam_cli(tmp_path: Path) -> None:
+    """Validate automation-correlate-app-scam CLI command and summary counter."""
+    store_file = tmp_path / "auto_app_scam.json"
+
+    tbl = runner.invoke(
+        app,
+        [
+            "automation-correlate-app-scam",
+            "--sender",
+            "victim-cli-1",
+            "--payee",
+            "mule-cli-1",
+            "--amount",
+            "5500",
+            "--score",
+            "0.91",
+            "--typology",
+            "impersonation_bank",
+            "-s",
+            str(store_file),
+            "-f",
+            "table",
+        ],
+    )
+    assert tbl.exit_code == 0, tbl.stdout
+    assert "correlate_app_scam_mule" in tbl.stdout
+    assert "app_scam_to_mule_beneficiary" in tbl.stdout
+
+    js = runner.invoke(
+        app,
+        [
+            "automation-correlate-app-scam",
+            "--sender",
+            "victim-cli-2",
+            "--payee",
+            "mule-cli-2",
+            "--amount",
+            "3200",
+            "-s",
+            str(store_file),
+            "-f",
+            "json",
+        ],
+    )
+    assert js.exit_code == 0, js.stdout
+    data = json.loads(js.stdout)
+    assert data["status"] == "executed"
+    assert data["soar_execution_id"] is not None
+
+    sum_tbl = runner.invoke(app, ["automation-summary", "-s", str(store_file), "-f", "table"])
+    assert sum_tbl.exit_code == 0
+    assert "APP Scam Correlations:" in sum_tbl.stdout
+
+    bad_amt = runner.invoke(
+        app,
+        [
+            "automation-correlate-app-scam",
+            "--sender",
+            "v1",
+            "--payee",
+            "m1",
+            "--amount",
+            "0",
+            "-s",
+            str(store_file),
+        ],
+    )
+    assert bad_amt.exit_code == 2
