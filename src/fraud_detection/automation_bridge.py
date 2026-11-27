@@ -270,10 +270,17 @@ class AutomationBridgeStore:
                 tokens_suspended += len(rec.suspended_token_ids)
                 if rec.soar_execution_id:
                     soar_triggered += 1
+            app_scam_correlations = sum(
+                1
+                for rec in self._dispatches.values()
+                if BridgeRuleAction(rec.action) is BridgeRuleAction.CORRELATE_APP_SCAM_MULE
+                and BridgeDispatchStatus(rec.status) is BridgeDispatchStatus.EXECUTED
+            )
             return {
                 "dispatch_count": len(self._dispatches),
                 "soar_triggered_count": soar_triggered,
                 "tokens_suspended_count": tokens_suspended,
+                "app_scam_correlations_count": app_scam_correlations,
                 "by_status": by_status,
                 "by_action": by_action,
             }
