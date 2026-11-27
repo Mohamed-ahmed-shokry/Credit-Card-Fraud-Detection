@@ -7,6 +7,11 @@ from pathlib import Path
 
 import pytest
 
+from fraud_detection.app_scam import (
+    AppPaymentContext,
+    AppScamDefenseEngine,
+    CoolingOffHoldStatus,
+)
 from fraud_detection.automation_bridge import (
     AutomationBridgeStore,
     BridgeDispatchRecord,
@@ -17,6 +22,7 @@ from fraud_detection.automation_bridge import (
 )
 from fraud_detection.cases import CaseManager
 from fraud_detection.events import EventBus, EventType, FraudDomainEvent
+from fraud_detection.mule_detection import MuleDetectionEngine
 from fraud_detection.risk_orchestrator import (
     CrossSignalPattern,
     DomainRiskSignal,
@@ -331,3 +337,123 @@ def test_cross_engine_bridge_edge_branches_and_bare_init() -> None:
     for tok in list(b_ext._subscription_tokens):  # noqa: SLF001
         bus.unsubscribe(tok)
     assert b_ext.detach() == 0
+
+
+def test_app_scam_to_mule_and_soar_live_event_bus_correlation() -> None:
+    bus = EventBus()
+    orch = UnifiedRiskOrchestrator(event_bus=bus)
+    soar = SoarEngine(event_bus=bus)
+    mule = MuleDetectionEngine()
+    app_scam = AppScamDefenseEngine(event_bus=bus)
+    bridge = CrossEngineAutomationBridge(
+        event_bus=bus,
+        orchestrator=orch,
+        soar_engine=soar,
+        mule_engine=mule,
+        policy=BridgePolicy(cooldown_seconds=300),
+    )
+    assert bridge.attach() is True
+
+    # 1. Critical APP scam block fires APP_SCAM_BLOCKED -> correlates Mule + Orchestrator + SOAR
+    blocked = app_scam.evaluate_payment(
+        AppPaymentContext(
+            sender_account_id="victim_1",
+            payee_account_id="mule_beneficiary_1",
+            amount=8500.0,
+            active_phone_call=True,
+            screen_share_or_rat_detected=True,
+            stated_purpose="safe_account",
+            tenant_id="t_scam",
+        )
+    )
+    assert blocked.action.value == "block_and_escalate"
+
+    dispatches = bridge.store.list_dispatches(
+        entity_id="mule_beneficiary_1",
+        action=BridgeRuleAction.CORRELATE_APP_SCAM_MULE,
+    )
+    assert len(dispatches) == 1
+    rec = dispatches[0]
+    assert rec.status is BridgeDispatchStatus.EXECUTED
+    assert rec.orchestrator_signal_id is not None
+    assert rec.soar_execution_id is not None
+    assert "app_scam_to_mule_beneficiary" in rec.metadata["patterns_detected"]
+    assert mule.store.get_profile("mule_beneficiary_1") is not None
+    assert bridge.store.summary()["app_scam_correlations_count"] == 1
+
+    # 2. Second correlation within cooldown -> SKIPPED_COOLDOWN
+    cooled = bridge.correlate_app_scam_incident(
+        sender_account_id="victim_2",
+        payee_account_id="mule_beneficiary_1",
+        amount=4000.0,
+        tenant_id="t_scam",
+    )
+    assert cooled.status is BridgeDispatchStatus.SKIPPED_COOLDOWN
+
+    # 3. Cooling-off hold resolved as RELEASED -> ignored; CONFIRMED_SCAM_CANCELLED -> correlated
+    held_ok = app_scam.evaluate_payment(
+        AppPaymentContext(
+            sender_account_id="victim_3",
+            payee_account_id="payee_released",
+            amount=600.0,
+            is_new_payee=False,
+            active_phone_call=True,
+        )
+    )
+    assert held_ok.hold_id is not None
+    app_scam.resolve_hold(held_ok.hold_id, outcome=CoolingOffHoldStatus.RELEASED)
+    assert bridge.store.list_dispatches(entity_id="payee_released") == []
+
+    held_scam = app_scam.evaluate_payment(
+        AppPaymentContext(
+            sender_account_id="victim_4",
+            payee_account_id="mule_beneficiary_2",
+            amount=700.0,
+            is_new_payee=False,
+            active_phone_call=True,
+        )
+    )
+    assert held_scam.hold_id is not None
+    app_scam.resolve_hold(held_scam.hold_id, outcome=CoolingOffHoldStatus.CONFIRMED_SCAM_CANCELLED)
+    dispatches_2 = bridge.store.list_dispatches(
+        entity_id="mule_beneficiary_2",
+        action=BridgeRuleAction.CORRELATE_APP_SCAM_MULE,
+    )
+    assert len(dispatches_2) == 1
+    assert dispatches_2[0].status is BridgeDispatchStatus.EXECUTED
+
+    # 4. Paused bridge -> SKIPPED_DISABLED
+    bridge.pause()
+    paused_rec = bridge.correlate_app_scam_incident(
+        sender_account_id="victim_5",
+        payee_account_id="mule_paused",
+        amount=1000.0,
+    )
+    assert paused_rec.status is BridgeDispatchStatus.SKIPPED_DISABLED
+    bridge.resume()
+
+    # 5. Missing payee_account_id in event payload -> ignored (None)
+    assert (
+        bridge.handle_event(FraudDomainEvent(event_type=EventType.APP_SCAM_BLOCKED, payload={}))
+        is None
+    )
+
+    # 6. Mule-only bridge (no orchestrator, no soar) + policy roundtrip
+    policy = BridgePolicy.from_dict(
+        {
+            "auto_forward_app_scam_signals": False,
+            "auto_correlate_mule_beneficiaries": True,
+            "cooldown_seconds": 0,
+        }
+    )
+    assert policy.to_dict()["auto_forward_app_scam_signals"] is False
+    mule_only_bridge = CrossEngineAutomationBridge(mule_engine=MuleDetectionEngine(), policy=policy)
+    bare_rec = mule_only_bridge.correlate_app_scam_incident(
+        sender_account_id="v_bare",
+        payee_account_id="p_bare",
+        amount=500.0,
+        risk_score=0.75,
+    )
+    assert bare_rec.status is BridgeDispatchStatus.EXECUTED
+    assert bare_rec.soar_execution_id is None
+    assert bare_rec.orchestrator_signal_id is None
