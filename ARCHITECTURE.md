@@ -1035,6 +1035,23 @@ flowchart LR
 - **Store, EventBus, API & CLI**: `AppScamStore` maintains thread-safe payment, assessment, and cooling-off hold ledgers with capacity eviction and JSON persistence; `AppScamDefenseEngine` escalates `HIGH`/`CRITICAL` scams to `CaseManager` and emits `APP_SCAM_ASSESSED`, `APP_SCAM_HOLD_PLACED`, `APP_SCAM_BLOCKED`, and `APP_SCAM_HOLD_RESOLVED`; FastAPI exposes `/v1/app-scam/*` endpoints and Prometheus counters (`fraud_app_scam_evaluations_total`, `fraud_app_scam_signals_total`, `fraud_app_scam_holds_total`); Typer CLI exposes `app-scam-evaluate`, `app-scam-hold-resolve`, and `app-scam-summary`.
 
 
+## Phase 58 — APP Scam ↔ Mule Beneficiary Correlation & Cross-Engine Automation Bridge Integration
+
+Phase 58 connects `AppScamDefenseEngine` (Phase 57) into `CrossEngineAutomationBridge` (Phase 56), `MuleDetectionEngine` (Phase 50), `UnifiedRiskOrchestrator` (Phase 53), and `SoarEngine` (Phase 54) over `EventBus` so confirmed APP scam blocks and cancelled cooling-off holds automatically correlate victim payouts with beneficiary mule risk and trigger reversible SOAR containment.
+
+```mermaid
+flowchart LR
+    AppScam["AppScamDefenseEngine\n(Phase 57)"] -->|"APP_SCAM_BLOCKED\nAPP_SCAM_HOLD_RESOLVED\n(confirmed_scam_cancelled)"| Bus["EventBus"]
+    Bus --> Bridge["CrossEngineAutomationBridge\n(Cooldown + Zero-Recursion Guard)"]
+    Bridge -->|"Record Inbound Transfer\n& Evaluate Beneficiary"| Mule["MuleDetectionEngine\n(Phase 50)"]
+    Bridge -->|"Ingest APP_SCAM + MULE\nDomainRiskSignals"| Orch["UnifiedRiskOrchestrator\n(APP_SCAM_TO_MULE_BENEFICIARY)"]
+    Bridge -->|"Execute Containment Playbook"| Soar["SoarEngine\n(Phase 54)"]
+```
+
+- **Orchestrator & Bridge Extensions**: `RiskDomain.APP_SCAM` and `CrossSignalPattern.APP_SCAM_TO_MULE_BENEFICIARY` detect compound social-engineering-to-mule payouts; `CrossEngineAutomationBridge.correlate_app_scam_incident(...)` and `BridgePolicy` flags (`auto_forward_app_scam_signals`, `auto_correlate_mule_beneficiaries`) run under per-beneficiary cooldowns and re-entrancy guards.
+- **API, Metrics & CLI**: FastAPI exposes `POST /v1/automation/correlate-app-scam` and `fraud_automation_bridge_app_scam_correlations_total`; Typer CLI exposes `automation-correlate-app-scam` and surfaces `APP Scam Correlations` in `automation-summary`.
+
+
 ## Extension guidance
 
 
