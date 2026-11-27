@@ -334,3 +334,27 @@ def test_orchestrator_edge_branches_and_string_domain() -> None:
     assert low_sig.risk_level is UnifiedRiskLevel.LOW
     assert low_sig.action is OrchestratorAction.ALLOW
     orch.store.save_assessment(low_sig)
+
+
+def test_app_scam_to_mule_beneficiary_cross_signal_pattern() -> None:
+    orch = UnifiedRiskOrchestrator()
+    assessment = orch.evaluate_entity(
+        "payee-mule-1",
+        signals=[
+            DomainRiskSignal(entity_id="payee-mule-1", domain=RiskDomain.APP_SCAM, score=0.88),
+            DomainRiskSignal(entity_id="payee-mule-1", domain=RiskDomain.MULE, score=0.78),
+        ],
+    )
+    assert CrossSignalPattern.APP_SCAM_TO_MULE_BENEFICIARY in assessment.patterns_detected
+    assert assessment.risk_level in {UnifiedRiskLevel.HIGH, UnifiedRiskLevel.CRITICAL}
+    restored = UnifiedRiskAssessment.from_dict(assessment.to_dict())
+    assert CrossSignalPattern.APP_SCAM_TO_MULE_BENEFICIARY in restored.patterns_detected
+
+    aml_assessment = orch.evaluate_entity(
+        "payee-aml-1",
+        signals=[
+            DomainRiskSignal(entity_id="payee-aml-1", domain="app_scam", score=0.82),
+            DomainRiskSignal(entity_id="payee-aml-1", domain=RiskDomain.AML, score=0.75),
+        ],
+    )
+    assert CrossSignalPattern.APP_SCAM_TO_MULE_BENEFICIARY in aml_assessment.patterns_detected
